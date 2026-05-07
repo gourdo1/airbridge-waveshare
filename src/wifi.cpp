@@ -52,9 +52,6 @@ static bool roaming_suspended = false;
 #define AP_RETRY_INTERVAL_MS    30000
 static uint32_t last_ap_retry = 0;
 
-#define BG_SCAN_INTERVAL_MS     120000
-static uint32_t last_bg_scan = 0;
-
 #define HINT_TIMEOUT_MS         5000
 #define CONNECT_TIMEOUT_MS      15000
 #define SMARTCONFIG_TIMEOUT_MS  60000
@@ -157,6 +154,14 @@ static void apply_pmf_override(bool disable) {
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
 }
 
+static void switch_to_pmf_disabled() {
+    apply_pmf_override(true);
+    pending_pmf_disable = true;
+    esp_wifi_disconnect();
+    delay(50);
+    esp_wifi_connect();
+}
+
 // Some routers (e.g. older OpenWrt builds, certain ISP-provisioned units)
 // advertise PMF capability but reject the handshake with reason 208
 // (WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG). Retry once with pmf_cfg cleared.
@@ -169,15 +174,9 @@ static void enter_pmf_retry() {
               "[WIFI] PMF retry: disabling pmf_cfg and reconnecting to '%s'\n",
               net.ssid.c_str());
 
-    apply_pmf_override(true);
-    pending_pmf_disable = true;
-
-    // Reuse the staged credentials (set by the previous WiFi.begin) to avoid
-    // re-resetting pmf_cfg. esp_wifi_disconnect aborts the in-flight assoc;
-    // esp_wifi_connect re-attempts with the new pmf_cfg.
-    esp_wifi_disconnect();
-    delay(50);
-    esp_wifi_connect();
+    // Reuses the staged credentials (set by the previous WiFi.begin) - no
+    // second WiFi.begin, which would reset pmf_cfg.
+    switch_to_pmf_disabled();
     set_state(WF_PMF_RETRY);
 }
 
@@ -188,6 +187,7 @@ static void begin_connect(uint8_t idx, bool use_hint) {
 
     connect_idx = idx;
     connect_retries = 0;
+    pending_pmf_disable = false;
     set_state(use_hint ? WF_HINT_TRY : WF_CONNECTING);
 
     NetworkHint *h = use_hint ? NetworkHints::find_best(net.ssid.c_str()) : nullptr;
@@ -202,18 +202,13 @@ static void begin_connect(uint8_t idx, bool use_hint) {
         set_state(WF_CONNECTING);
     }
 
-    // the cached hint says this BSSID needs PMF off, disable pmf_cfg and
-    // bounce the connect so the actual association attempt has it off.
-    // WiFi.begin always resets pmf_cfg.capable=true, so the override has to
-    // happen after begin().
+    // If the cached hint says this BSSID needs PMF off, bounce the connect
+    // (WiFi.begin always reset pmf_cfg.capable=true) so the actual
+    // association attempt has it off.
     if (h && (h->flags & HINT_FLAG_PMF_DISABLE)) {
         Log::logf(CAT_WIFI, LOG_INFO,
                   "[WIFI] PMF pre-disabled for '%s' (cached)\n", net.ssid.c_str());
-        apply_pmf_override(true);
-        pending_pmf_disable = true;
-        esp_wifi_disconnect();
-        delay(50);
-        esp_wifi_connect();
+        switch_to_pmf_disabled();
     }
 }
 
@@ -229,6 +224,7 @@ static void begin_connect_candidate(uint8_t cand_idx) {
 
     connect_idx = c.net_idx;
     connect_retries = 0;
+    pending_pmf_disable = false;
     set_state(WF_CONNECTING);
 
     Log::logf(CAT_WIFI, LOG_INFO,
@@ -244,11 +240,7 @@ static void begin_connect_candidate(uint8_t cand_idx) {
     if (h && (h->flags & HINT_FLAG_PMF_DISABLE)) {
         Log::logf(CAT_WIFI, LOG_INFO,
                   "[WIFI] PMF pre-disabled for this BSSID (cached)\n");
-        apply_pmf_override(true);
-        pending_pmf_disable = true;
-        esp_wifi_disconnect();
-        delay(50);
-        esp_wifi_connect();
+        switch_to_pmf_disabled();
     }
 }
 
@@ -319,7 +311,9 @@ static void on_connected() {
     set_state(WF_CONNECTED);
     low_rssi_count = 0;
     last_roam_check = millis();
-    last_bg_scan = millis();
+    // hint_refresh_pending was set by the same STA_GOT_IP that drove us here;
+    // we just upserted, so the WF_CONNECTED-branch drain has nothing left to do.
+    hint_refresh_pending = false;
     WebUI::push_event("wifi", "{\"connected\":true}");
 
     if (!ntp_done) {
@@ -499,13 +493,6 @@ void WiFiSetup::check() {
                 low_rssi_count = 0;
             }
         }
-/*
-        // periodic background scan to update RSSI for all networks
-        if (!roaming_suspended && millis() - last_bg_scan >= BG_SCAN_INTERVAL_MS) {
-            last_bg_scan = millis();
-            WiFi.scanNetworks(true);
-        }
-*/
         // Check if a background scan completed
         if (WiFi.scanComplete() >= 0) {
             process_scan_results();
@@ -572,6 +559,7 @@ void WiFiSetup::check() {
             if (should_switch) {
                 WiFi.disconnect();
                 delay(100);
+                low_rssi_count = 0;
                 begin_connect_candidate(0);
             } else {
                 set_state(WF_CONNECTED);
