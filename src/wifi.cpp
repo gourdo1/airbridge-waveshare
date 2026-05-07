@@ -14,6 +14,7 @@ typedef enum {
     WF_HINT_TRY,        // fast reconnect via BSSID+channel hint
     WF_SCANNING,
     WF_CONNECTING,      // WiFi.begin() called, waiting for IP
+    WF_PMF_RETRY,       // re-tried CONNECTING with pmf_cfg disabled
     WF_CONNECTED,
     WF_ROAM_SCAN,       // scanning for a better AP
     WF_AP_FALLBACK,     // AP+STA mode, periodically retrying STA
@@ -54,6 +55,8 @@ static volatile bool ntp_synced = false;
 static bool got_ip = false;
 static bool sta_disconnected = false;
 static volatile bool hint_refresh_pending = false;
+static volatile uint8_t last_disconnect_reason = 0;
+static bool pending_pmf_disable = false;
 
 
 static void ntp_sync_cb(struct timeval *tv) {
@@ -100,6 +103,7 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         sta_disconnected = true;
+        last_disconnect_reason = info.wifi_sta_disconnected.reason;
         break;
     default:
         break;
@@ -124,6 +128,39 @@ static uint8_t find_net_by_ssid(const char *ssid) {
             return i;
     }
     return 0xFF;
+}
+
+// Some routers (e.g. older OpenWrt builds, certain ISP-provisioned units)
+// advertise PMF capability but reject the handshake with reason 208
+// (WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG). Retry once with pmf_cfg cleared.
+static void enter_pmf_retry() {
+    auto &cfg = Config::get();
+    if (connect_idx >= cfg.wifi_net_count) return;
+    WiFiNetwork &net = cfg.wifi_nets[connect_idx];
+
+    Log::logf(CAT_WIFI, LOG_INFO,
+              "[WIFI] PMF retry: disabling pmf_cfg and reconnecting to '%s'\n",
+              net.ssid.c_str());
+
+    wifi_config_t wcfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &wcfg) == ESP_OK) {
+        wcfg.sta.pmf_cfg.capable = false;
+        wcfg.sta.pmf_cfg.required = false;
+        esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    }
+
+    pending_pmf_disable = true;
+
+    WiFi.disconnect();
+    delay(50);
+
+    NetworkHint *h = NetworkHints::find_best(net.ssid.c_str());
+    if (h) {
+        WiFi.begin(net.ssid.c_str(), net.pass.c_str(), h->channel, h->bssid);
+    } else {
+        WiFi.begin(net.ssid.c_str(), net.pass.c_str());
+    }
+    set_state(WF_PMF_RETRY);
 }
 
 static void begin_connect(uint8_t idx, bool use_hint) {
@@ -296,7 +333,8 @@ void WiFiSetup::check() {
     if (got_ip) {
         got_ip = false;
         sta_disconnected = false;
-        if (wf_state == WF_HINT_TRY || wf_state == WF_CONNECTING) {
+        if (wf_state == WF_HINT_TRY || wf_state == WF_CONNECTING ||
+            wf_state == WF_PMF_RETRY) {
             on_connected();
         } else if (wf_state == WF_AP_FALLBACK) {
             on_connected();
@@ -350,6 +388,11 @@ void WiFiSetup::check() {
 
     case WF_CONNECTING:
         if (elapsed > CONNECT_TIMEOUT_MS) {
+            if (last_disconnect_reason == 208) {
+                last_disconnect_reason = 0;
+                enter_pmf_retry();
+                break;
+            }
             connect_retries++;
             if (connect_retries < CONNECT_RETRIES) {
                 Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Connect timeout, retry %d\n", connect_retries);
@@ -363,6 +406,18 @@ void WiFiSetup::check() {
                     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] All networks exhausted\n");
                     enter_ap_fallback();
                 }
+            }
+        }
+        break;
+
+    case WF_PMF_RETRY:
+        if (elapsed > CONNECT_TIMEOUT_MS) {
+            Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] PMF retry timed out, advancing\n");
+            try_pos++;
+            if (try_pos < try_count) {
+                begin_connect(try_order[try_pos], false);
+            } else {
+                enter_ap_fallback();
             }
         }
         break;
@@ -535,6 +590,7 @@ const char *WiFiSetup::state_name() {
         case WF_HINT_TRY:     return "hint";
         case WF_SCANNING:     return "scanning";
         case WF_CONNECTING:   return "connecting";
+        case WF_PMF_RETRY:    return "pmf_retry";
         case WF_CONNECTED:    return "connected";
         case WF_ROAM_SCAN:    return "roaming";
         case WF_AP_FALLBACK:  return "ap_fallback";
