@@ -66,6 +66,10 @@ static bool sta_disconnected = false;
 static volatile bool hint_refresh_pending = false;
 static volatile uint8_t last_disconnect_reason = 0;
 static bool pending_pmf_disable = false;
+static volatile uint8_t ap_client_count = 0;
+static uint32_t ap_quiet_since_ms = 0;
+static bool pending_ap_teardown = false;
+#define AP_TEARDOWN_QUIET_MS    120000
 
 
 static void ntp_sync_cb(struct timeval *tv) {
@@ -113,6 +117,12 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         sta_disconnected = true;
         last_disconnect_reason = info.wifi_sta_disconnected.reason;
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+        ap_client_count = ap_client_count + 1;
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+        if (ap_client_count > 0) ap_client_count = ap_client_count - 1;
         break;
     default:
         break;
@@ -209,6 +219,7 @@ static void begin_connect(uint8_t idx, bool use_hint) {
 
 // Connect to a specific BSSID/channel from the scan_candidates list.
 // Used after process_scan_results when we want to target a particular AP
+// (including same-SSID roam targets).
 static void begin_connect_candidate(uint8_t cand_idx) {
     auto &cfg = Config::get();
     if (cand_idx >= scan_candidate_count) return;
@@ -384,8 +395,9 @@ void WiFiSetup::check() {
             on_connected();
         } else if (wf_state == WF_AP_FALLBACK) {
             on_connected();
-            // switch from AP+STA to STA only
-            WiFi.mode(WIFI_STA);
+            // Don't tear AP down immediately
+            pending_ap_teardown = true;
+            ap_quiet_since_ms = 0;
         }
         return;
     }
@@ -506,6 +518,25 @@ void WiFiSetup::check() {
             if (bssid) {
                 NetworkHints::upsert(WiFi.SSID().c_str(), bssid,
                                      WiFi.channel(), false);
+            }
+        }
+        // Pending AP teardown after recovering from WF_AP_FALLBACK. Wait for
+        // any AP-side clients to disconnect for AP_TEARDOWN_QUIET_MS before
+        // collapsing to STA-only.
+        if (pending_ap_teardown) {
+            if (ap_client_count == 0) {
+                if (ap_quiet_since_ms == 0) ap_quiet_since_ms = millis();
+                if (millis() - ap_quiet_since_ms >= AP_TEARDOWN_QUIET_MS) {
+                    Log::logf(CAT_WIFI, LOG_INFO,
+                              "[WIFI] AP teardown after %d s quiet\n",
+                              AP_TEARDOWN_QUIET_MS / 1000);
+                    WiFi.softAPdisconnect(true);
+                    WiFi.mode(WIFI_STA);
+                    pending_ap_teardown = false;
+                    ap_quiet_since_ms = 0;
+                }
+            } else {
+                ap_quiet_since_ms = 0;
             }
         }
         break;
