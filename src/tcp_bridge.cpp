@@ -166,7 +166,7 @@ void TcpBridge::poll_debug_clients() {
 void TcpBridge::task(void *param) {
     auto &cfg = Config::get();
 
-    if (cfg.wifi_mode == 2) {
+    if (cfg.wifi_mode == WIFI_MODE_OFF) {
         Log::logf(CAT_TCP, LOG_INFO, "[TCP] WiFi disabled, TCP bridge not starting\n");
         vTaskDelete(nullptr);
         return;

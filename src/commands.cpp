@@ -12,6 +12,28 @@
 #include "network_hints.h"
 
 
+static String parse_quoted_token(const String &s, int *pos) {
+    int i = *pos;
+    while (i < (int)s.length() && isspace((unsigned char)s[i])) i++;
+    if (i >= (int)s.length()) { *pos = i; return ""; }
+
+    String out;
+    if (s[i] == '"') {
+        i++;
+        int start = i;
+        while (i < (int)s.length() && s[i] != '"') i++;
+        out = s.substring(start, i);
+        if (i < (int)s.length()) i++;  // consume closing quote
+    } else {
+        int start = i;
+        while (i < (int)s.length() && !isspace((unsigned char)s[i])) i++;
+        out = s.substring(start, i);
+    }
+    *pos = i;
+    return out;
+}
+
+
 void dispatch_command(const char *line, String &response) {
     String cmd = String(line);
     cmd.trim();
@@ -299,11 +321,12 @@ void dispatch_command(const char *line, String &response) {
         } else if (sub.startsWith("ADD ")) {
             // WIFI ADD ssid password
             String args = cmd.substring(upper.indexOf("ADD ") + 4);
-            int sp = args.indexOf(' ');
-            String ssid = sp > 0 ? args.substring(0, sp) : args;
-            String pass = sp > 0 ? args.substring(sp + 1) : "";
-            ssid.trim(); pass.trim();
-            if (Config::add_network(ssid.c_str(), pass.c_str()))
+            int pos = 0;
+            String ssid = parse_quoted_token(args, &pos);
+            String pass = parse_quoted_token(args, &pos);
+            if (ssid.length() == 0)
+                response = "ERR: empty SSID\n";
+            else if (Config::add_network(ssid.c_str(), pass.c_str()))
                 response = "OK: added '" + ssid + "'\n";
             else
                 response = "ERR: list full\n";
@@ -314,7 +337,8 @@ void dispatch_command(const char *line, String &response) {
             else
                 response = "ERR: invalid index\n";
         } else {
-            response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N|HINTS|HINTS CLEAR]\n";
+            response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N|HINTS|HINTS CLEAR]\n"
+                       "     ADD: use \"quotes\" if SSID or password contains spaces\n";
         }
         return;
     }
@@ -442,7 +466,7 @@ void dispatch_command(const char *line, String &response) {
                    "  LOG [cat] level     Set log level (cats: GENERAL OXI TCP WIFI OTA WEB ARB HEALTH ALL)\n"
                    "  WIFI                WiFi status/management\n"
                    "  WIFI LIST           List configured networks\n"
-                   "  WIFI ADD ssid pass  Add network\n"
+                   "  WIFI ADD ssid pass  Add network (use \"quotes\" if either has spaces)\n"
                    "  WIFI REMOVE N       Remove network at index\n"
                    "  WIFI HINTS          Show cached BSSID/channel hints\n"
                    "  WIFI HINTS CLEAR    Drop all cached hints\n"

@@ -18,8 +18,9 @@ static void apply_defaults() {
         cfg.wifi_nets[i].pass = "";
         cfg.wifi_nets[i].enabled = false;
     }
-    cfg.wifi_mode = 1;                  // AP mode by default
+    cfg.wifi_mode = WIFI_MODE_AP_ONLY;   // virgin device: AP up, user provisions
     cfg.wifi_roam = true;
+    cfg.wifi_country = "01";             // worldwide / ESP-IDF default
     cfg.tcp_port = CFG_DEFAULT_TCP_PORT;
 
     cfg.oxi_enabled = true;
@@ -111,6 +112,7 @@ void Config::load() {
     cfg.hostname        = prefs.getString("hostname", cfg.hostname);
     cfg.wifi_mode       = prefs.getUChar("wifi_mode", cfg.wifi_mode);
     cfg.wifi_roam       = prefs.getBool("wifi_roam", cfg.wifi_roam);
+    cfg.wifi_country    = prefs.getString("wifi_country", cfg.wifi_country);
     cfg.tcp_port        = prefs.getUShort("tcp_port", cfg.tcp_port);
     load_wifi_nets();
 
@@ -146,6 +148,7 @@ void Config::save() {
     prefs.putString("hostname", cfg.hostname);
     prefs.putUChar("wifi_mode", cfg.wifi_mode);
     prefs.putBool("wifi_roam", cfg.wifi_roam);
+    prefs.putString("wifi_country", cfg.wifi_country);
     prefs.putUShort("tcp_port", cfg.tcp_port);
     // wifi_nets saved separately via save_wifi_nets()
 
@@ -234,6 +237,7 @@ static const KVEntry kv_table[] = {
     KV_STR("hostname", hostname),
     KV_U8("wifi_mode", wifi_mode),
     KV_BOOL("wifi_roam", wifi_roam),
+    KV_STR("wifi_country", wifi_country),
     KV_U16("tcp_port", tcp_port),
     KV_BOOL("oxi_enabled", oxi_enabled),
     KV_BOOL("oxi_auto_start", oxi_auto_start),

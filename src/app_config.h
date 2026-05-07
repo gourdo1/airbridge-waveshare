@@ -4,6 +4,14 @@
 
 #define WIFI_MAX_NETWORKS 4
 
+// wifi_mode values. The numeric IDs are pinned (0/1/2 match the legacy
+// 3-state field) so existing devices with saved configs keep working.
+#define WIFI_MODE_AUTO        0  // STA with auto AP+STA fallback (and quiet teardown)
+#define WIFI_MODE_AP_ONLY     1  // softAP only, no STA
+#define WIFI_MODE_OFF         2  // WiFi off
+#define WIFI_MODE_STA_ONLY    3  // STA only, no AP fallback
+#define WIFI_MODE_STA_AP      4  // STA + softAP always, no teardown
+
 struct WiFiNetwork {
     String      ssid;
     String      pass;
@@ -14,8 +22,9 @@ struct AirBridgeConfig {
     String      hostname;
     WiFiNetwork wifi_nets[WIFI_MAX_NETWORKS];
     uint8_t     wifi_net_count;     // populated slots
-    uint8_t     wifi_mode;          // 0=STA, 1=AP, 2=off
+    uint8_t     wifi_mode;          // see WIFI_MODE_* in app_config.h
     bool        wifi_roam;          // hysteresis-based roaming
+    String      wifi_country;       // ISO 3166 country code, "01" = worldwide
     uint16_t    tcp_port;
 
     bool        oxi_enabled;

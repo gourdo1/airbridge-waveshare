@@ -324,6 +324,15 @@ static void on_connected() {
 
 static void enter_ap_fallback() {
     auto &cfg = Config::get();
+    if (cfg.wifi_mode == WIFI_MODE_STA_ONLY) {
+        // STA-only: no softAP, just wait and retry the scan loop.
+        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] STA-only: retry in %d s\n",
+                  AP_RETRY_INTERVAL_MS / 1000);
+        set_state(WF_AP_FALLBACK);
+        last_ap_retry = millis();
+        return;
+    }
+    // AUTO / STA_AP: bring AP up (no-op if already up under STA_AP).
     WiFi.mode(WIFI_AP_STA);
     String ap = ap_ssid_str();
     WiFi.softAP(ap.c_str(), "airbridge");
@@ -343,12 +352,25 @@ static bool try_smartconfig() {
 }
 
 
+static void apply_country_code() {
+    auto &cfg = Config::get();
+    if (cfg.wifi_country.length() < 2) return;
+    esp_err_t err = esp_wifi_set_country_code(cfg.wifi_country.c_str(), true);
+    if (err == ESP_OK) {
+        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Country code: %s\n",
+                  cfg.wifi_country.c_str());
+    } else {
+        Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] Country code '%s' rejected (err=%d)\n",
+                  cfg.wifi_country.c_str(), err);
+    }
+}
+
 bool WiFiSetup::init() {
     auto &cfg = Config::get();
 
     WiFi.onEvent(wifi_event_cb);
 
-    if (cfg.wifi_mode == 2) {
+    if (cfg.wifi_mode == WIFI_MODE_OFF) {
         WiFi.mode(WIFI_OFF);
         set_state(WF_OFF);
         return false;
@@ -356,24 +378,39 @@ bool WiFiSetup::init() {
 
     WiFi.setHostname(cfg.hostname.c_str());
 
-    if (cfg.wifi_mode == 0 && cfg.wifi_net_count > 0) {
+    if (cfg.wifi_mode == WIFI_MODE_AP_ONLY) {
+        WiFi.mode(WIFI_AP);
+        apply_country_code();
+        String ap = ap_ssid_str();
+        WiFi.softAP(ap.c_str(), "airbridge");
+        delay(100);
+        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] AP mode: %s %s\n",
+                  ap.c_str(), WiFi.softAPIP().toString().c_str());
+        set_state(WF_OFF);
+        return true;
+    }
+
+    // AUTO, STA_ONLY, STA_AP all run STA. STA_AP also brings up softAP from boot.
+    if (cfg.wifi_mode == WIFI_MODE_STA_AP) {
+        WiFi.mode(WIFI_AP_STA);
+        String ap = ap_ssid_str();
+        WiFi.softAP(ap.c_str(), "airbridge");
+        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] STA+AP mode, AP: %s %s\n",
+                  ap.c_str(), WiFi.softAPIP().toString().c_str());
+    } else {
         WiFi.mode(WIFI_STA);
+    }
+    apply_country_code();
+
+    if (cfg.wifi_net_count > 0) {
         begin_connect(0, true);
         return true;
     }
-
-    if (cfg.wifi_mode == 0 && cfg.wifi_net_count == 0) {
-        try_smartconfig();
-        return true;
-    }
-
-    WiFi.mode(WIFI_AP);
-    String ap = ap_ssid_str();
-    WiFi.softAP(ap.c_str(), "airbridge");
-    delay(100);
-    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] AP mode: %s %s\n",
-              ap.c_str(), WiFi.softAPIP().toString().c_str());
-    set_state(WF_OFF);
+    // Slot list empty (virgin device or all networks removed): try
+    // SmartConfig. The runtime "configured but unreachable" path goes
+    // through AP fallback instead (handled in WF_SCANNING/WF_CONNECTING),
+    // so this branch only ever fires when wifi_net_count == 0.
+    try_smartconfig();
     return true;
 }
 
@@ -389,9 +426,12 @@ void WiFiSetup::check() {
             on_connected();
         } else if (wf_state == WF_AP_FALLBACK) {
             on_connected();
+
             // Don't tear AP down immediately
-            pending_ap_teardown = true;
-            ap_quiet_since_ms = 0;
+            if (cfg.wifi_mode == WIFI_MODE_AUTO) {
+                pending_ap_teardown = true;
+                ap_quiet_since_ms = 0;
+            }
         }
         return;
     }
@@ -592,7 +632,7 @@ void WiFiSetup::check() {
                 Config::add_network(WiFi.SSID().c_str(), WiFi.psk().c_str());
                 Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] SmartConfig: replaced oldest network\n");
             }
-            cfg.wifi_mode = 0;
+            cfg.wifi_mode = WIFI_MODE_AUTO;
             Config::save();
 
             uint8_t idx = find_net_by_ssid(WiFi.SSID().c_str());

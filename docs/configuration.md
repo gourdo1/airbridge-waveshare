@@ -8,24 +8,54 @@ Settings are stored in NVS (non-volatile storage) and persist across reboots.
 
 **CLI:** `$CONFIG key value` then `$CONFIG SAVE`
 
-**Provisioning:** Fill in `provision.env` and flash. Settings are applied automatically after upload.
+**Provisioning:** Copy `provision.env.example` to `provision.env`, fill in
+your values, and flash. `provision.py` runs after the upload completes and
+applies each line via the appropriate command:
+
+- Most keys go through `$CONFIG key value`.
+- `wifi_net=SSID PASSWORD` is routed through `$WIFI ADD ssid pass`. Use
+  shell-style double quotes if either field contains spaces:
+  `wifi_net="My Network" "correct horse battery staple"`. Multiple
+  `wifi_net=` lines provision multiple networks (up to 4). Provisioning
+  appends; existing networks on the device are kept.
 
 ## Settings reference
 
 ### WiFi & Network
 
+WiFi networks are managed as a list (up to 4 SSIDs) via the web UI's WiFi
+Networks card or the `$WIFI ADD ssid pass` / `$WIFI REMOVE N` commands. The
+top-level WiFi-related config keys are:
+
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hostname` | airbridge | Device hostname (mDNS + WiFi AP name) |
-| `wifi_ssid` | *(empty)* | WiFi network name (station mode) |
-| `wifi_pass` | *(empty)* | WiFi password |
-| `wifi_mode` | 1 | 0 = station (connect to router), 1 = AP (create hotspot), 2 = off |
+| `hostname` | airbridge | Device hostname (mDNS + softAP SSID prefix) |
+| `wifi_mode` | 1 | Operating mode, see table below |
+| `wifi_roam` | true | Enable hysteresis-based roaming (8 dB threshold) |
+| `wifi_country` | 01 | ISO 3166 country code; "01" = worldwide |
 | `tcp_port` | 23 | TCP command port |
 | `debug_port` | 8023 | Debug log stream port (read-only) |
 
-In AP mode, the device creates a network named `<hostname>_<MAC>` with password "airbridge" and serves the web UI at `192.168.4.1`.
+**`wifi_mode` values:**
 
-When station mode fails to connect, the device tries SmartConfig for 60 seconds, then falls back to AP+STA mode (AP for reachability, STA retrying in the background).
+| Value | Name | Behavior |
+|-------|------|----------|
+| 0 | auto | STA-first; on failure, automatic AP+STA fallback. AP tears itself down 2 minutes after STA recovers and the AP is client-free. |
+| 1 | AP only | softAP only, no STA attempts. Fast boot, useful as a setup-only or bench device. |
+| 2 | off | WiFi disabled entirely (serial/UART only). |
+| 3 | STA only | STA only, never falls back to AP. On total STA failure, keeps retrying scans every 30 s. |
+| 4 | STA+AP always | softAP up from boot alongside STA. AP is never torn down. |
+
+The softAP (when used) is named `<hostname>_<MAC>` with password `airbridge`,
+and serves the web UI at `192.168.4.1`.
+
+When station mode is configured but no networks reachable, the device tries
+SmartConfig for 60 seconds, then falls back per the mode table above.
+
+The `wifi_country` key affects channel allocation and TX power limits per
+regulatory domain. Use a 2-letter ISO code (`US`, `DE`, `JP`, `PL`, ...) or
+`01` to use the worldwide-safe defaults. Bad values are rejected with a
+log warning and the previous setting stays in effect.
 
 ### Web UI
 
@@ -110,6 +140,12 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$CONFIG key value` | Set value (not saved until SAVE) |
 | `$CONFIG SAVE` | Persist to NVS |
 | `$CONFIG RESET` | Reset all to defaults |
+| `$WIFI` / `$WIFI STATUS` | Connection state, RSSI, roaming flag |
+| `$WIFI LIST` | List configured networks |
+| `$WIFI ADD ssid pass` | Add a network (max 4) |
+| `$WIFI REMOVE N` | Remove network at index N |
+| `$WIFI HINTS` | Show cached BSSID/channel/PMF hints |
+| `$WIFI HINTS CLEAR` | Drop all cached hints |
 | `$FLASH [block] [FORCE]` | Flash uploaded ResMed firmware |
 | `$FLASH STATUS` | Flash progress |
 | `$FLASH CANCEL` | Abort flash |
@@ -119,4 +155,4 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$VERSION` | Firmware version |
 | `$REBOOT` | Restart device |
 
-Log categories: `OXI`, `TCP`, `OTA`, `WEB`, `ARB`, `HEALTH`, `ALL`
+Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`, `ALL`

@@ -14,6 +14,7 @@ Usage:
 
 import sys
 import os
+import shlex
 import time
 import serial
 import serial.tools.list_ports
@@ -116,6 +117,26 @@ def provision(port):
 
     errors = 0
     for key, value in entries:
+        if key == "wifi_net":
+            # value is "ssid password" with shell-style quoting for fields
+            # that contain spaces. Routed through $WIFI ADD instead of
+            # $CONFIG since multi-network state lives in its own NVS table.
+            try:
+                parts = shlex.split(value)
+            except ValueError:
+                parts = []
+            ssid = parts[0] if parts else ""
+            if not ssid:
+                print(f"    wifi_net: SKIPPED (empty)")
+                continue
+            resp = send_command(ser, f"$WIFI ADD {value}")
+            if resp.startswith("OK"):
+                print(f"    wifi_net = {ssid} ****")
+            else:
+                print(f"    wifi_net ({ssid}): FAILED ({resp})")
+                errors += 1
+            continue
+
         resp = send_command(ser, f"$CONFIG {key} {value}")
         if resp.startswith("OK"):
             print(f"    {key} = {value if 'pass' not in key else '****'}")

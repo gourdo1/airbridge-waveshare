@@ -8,7 +8,7 @@
 void OtaManager::init() {
     auto &cfg = Config::get();
 
-    if (cfg.wifi_mode == 2) return;     // no WiFi, no OTA
+    if (cfg.wifi_mode == WIFI_MODE_OFF) return;     // no WiFi, no OTA
 
     ArduinoOTA.setHostname(cfg.hostname.c_str());
     ArduinoOTA.setPort(DEFAULT_OTA_PORT);
