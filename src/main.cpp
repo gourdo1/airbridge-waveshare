@@ -10,6 +10,7 @@
 #include "airbridge_ota.h"
 #include "web_ui.h"
 #include "qframe.h"
+#include "network_hints.h"
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -145,6 +146,9 @@ void setup() {
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();
+    // NetworkHints must come up before Config::load runs the wnet migration,
+    // because that step calls NetworkHints::upsert with legacy hint values.
+    NetworkHints::init();
     Config::load();
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Config loaded\n");
 

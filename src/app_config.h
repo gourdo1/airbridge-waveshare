@@ -7,8 +7,6 @@
 struct WiFiNetwork {
     String      ssid;
     String      pass;
-    uint8_t     bssid[6];
-    uint8_t     channel;
     bool        enabled;
 };
 
@@ -76,6 +74,5 @@ namespace Config {
 
     bool add_network(const char *ssid, const char *pass);
     bool remove_network(uint8_t idx);
-    void update_network_hint(uint8_t idx, const uint8_t *bssid, uint8_t channel);
     void save_wifi_nets();
 }

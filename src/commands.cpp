@@ -9,6 +9,7 @@
 #include <esp_partition.h>
 #include <time.h>
 #include "wifi.h"
+#include "network_hints.h"
 
 
 void dispatch_command(const char *line, String &response) {
@@ -269,11 +270,32 @@ void dispatch_command(const char *line, String &response) {
                 for (int i = 0; i < wfg.wifi_net_count; i++) {
                     response += String(i) + ": " + wfg.wifi_nets[i].ssid;
                     if (i == WiFiSetup::connected_net_idx()) response += " [connected]";
-                    if (wfg.wifi_nets[i].channel > 0) response += " (ch" + String(wfg.wifi_nets[i].channel) + ")";
                     if (!wfg.wifi_nets[i].enabled) response += " [disabled]";
                     response += "\n";
                 }
             }
+        } else if (sub == "HINTS") {
+            int n = NetworkHints::count();
+            if (n == 0) {
+                response = "(no cached hints)\n";
+            } else {
+                for (int i = 0; i < n; i++) {
+                    const NetworkHint *h = NetworkHints::at(i);
+                    if (!h) continue;
+                    char line[96];
+                    snprintf(line, sizeof(line),
+                             "%d: %s ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X flags=0x%02X age=%lus\n",
+                             i, h->ssid, h->channel,
+                             h->bssid[0], h->bssid[1], h->bssid[2],
+                             h->bssid[3], h->bssid[4], h->bssid[5],
+                             h->flags,
+                             (unsigned long)((millis() - h->last_used_ms) / 1000UL));
+                    response += line;
+                }
+            }
+        } else if (sub == "HINTS CLEAR") {
+            NetworkHints::clear_all();
+            response = "OK: hints cleared\n";
         } else if (sub.startsWith("ADD ")) {
             // WIFI ADD ssid password
             String args = cmd.substring(upper.indexOf("ADD ") + 4);
@@ -292,7 +314,7 @@ void dispatch_command(const char *line, String &response) {
             else
                 response = "ERR: invalid index\n";
         } else {
-            response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N]\n";
+            response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N|HINTS|HINTS CLEAR]\n";
         }
         return;
     }
@@ -422,6 +444,8 @@ void dispatch_command(const char *line, String &response) {
                    "  WIFI LIST           List configured networks\n"
                    "  WIFI ADD ssid pass  Add network\n"
                    "  WIFI REMOVE N       Remove network at index\n"
+                   "  WIFI HINTS          Show cached BSSID/channel hints\n"
+                   "  WIFI HINTS CLEAR    Drop all cached hints\n"
                    "  TRANSPARENT         Enter raw UART mode\n"
                    "  VERSION             Firmware version info\n"
                    "  RESETREASON         Last reset reason\n"

@@ -1,6 +1,7 @@
 #include "app_config.h"
 #include "uart_arbiter.h"
 #include "qframe.h"
+#include "network_hints.h"
 #include <Preferences.h>
 
 #define CFG_DEFAULT_TCP_PORT    23
@@ -15,8 +16,6 @@ static void apply_defaults() {
     for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
         cfg.wifi_nets[i].ssid = "";
         cfg.wifi_nets[i].pass = "";
-        memset(cfg.wifi_nets[i].bssid, 0, 6);
-        cfg.wifi_nets[i].channel = 0;
         cfg.wifi_nets[i].enabled = false;
     }
     cfg.wifi_mode = 1;                  // AP mode by default
@@ -60,7 +59,9 @@ void Config::init() {
 
 static void load_wifi_nets() {
     Preferences wp;
-    wp.begin("wnet", true);
+    // writable: we may need to scrub legacy bssid_<i>/chan_<i> keys after
+    // migrating them to NetworkHints.
+    wp.begin("wnet", false);
     cfg.wifi_net_count = wp.getUChar("count", 0);
     if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) cfg.wifi_net_count = WIFI_MAX_NETWORKS;
     for (int i = 0; i < cfg.wifi_net_count; i++) {
@@ -69,12 +70,25 @@ static void load_wifi_nets() {
         cfg.wifi_nets[i].ssid = wp.getString(key, "");
         snprintf(key, sizeof(key), "pass_%d", i);
         cfg.wifi_nets[i].pass = wp.getString(key, "");
-        snprintf(key, sizeof(key), "bssid_%d", i);
-        wp.getBytes(key, cfg.wifi_nets[i].bssid, 6);
-        snprintf(key, sizeof(key), "chan_%d", i);
-        cfg.wifi_nets[i].channel = wp.getUChar(key, 0);
         snprintf(key, sizeof(key), "ena_%d", i);
         cfg.wifi_nets[i].enabled = wp.getBool(key, true);
+
+        // Legacy hint keys: bssid_<i> + chan_<i> used to live here. Migrate
+        // any populated values into NetworkHints, then nuke the old keys.
+        // Preferences::remove is a no-op on missing keys.
+        uint8_t bssid[6] = {0};
+        snprintf(key, sizeof(key), "bssid_%d", i);
+        wp.getBytes(key, bssid, 6);
+        wp.remove(key);
+        snprintf(key, sizeof(key), "chan_%d", i);
+        uint8_t channel = wp.getUChar(key, 0);
+        wp.remove(key);
+        const uint8_t zero[6] = {0};
+        if (channel > 0 && memcmp(bssid, zero, 6) != 0 &&
+            cfg.wifi_nets[i].ssid.length() > 0) {
+            NetworkHints::upsert(cfg.wifi_nets[i].ssid.c_str(),
+                                 bssid, channel, false);
+        }
     }
     wp.end();
 
@@ -84,8 +98,6 @@ static void load_wifi_nets() {
         if (old_ssid.length() > 0) {
             cfg.wifi_nets[0].ssid = old_ssid;
             cfg.wifi_nets[0].pass = prefs.getString("wifi_pass", "");
-            memset(cfg.wifi_nets[0].bssid, 0, 6);
-            cfg.wifi_nets[0].channel = 0;
             cfg.wifi_nets[0].enabled = true;
             cfg.wifi_net_count = 1;
             Config::save_wifi_nets();
@@ -292,8 +304,6 @@ String Config::dump() {
     // wifi networks
     for (int i = 0; i < cfg.wifi_net_count; i++) {
         out += "wifi_net_" + String(i) + "=" + cfg.wifi_nets[i].ssid;
-        if (cfg.wifi_nets[i].channel > 0)
-            out += " (ch" + String(cfg.wifi_nets[i].channel) + ")";
         if (!cfg.wifi_nets[i].enabled) out += " [disabled]";
         out += "\n";
     }
@@ -318,17 +328,11 @@ void Config::save_wifi_nets() {
             wp.putString(key, cfg.wifi_nets[i].ssid);
             snprintf(key, sizeof(key), "pass_%d", i);
             wp.putString(key, cfg.wifi_nets[i].pass);
-            snprintf(key, sizeof(key), "bssid_%d", i);
-            wp.putBytes(key, cfg.wifi_nets[i].bssid, 6);
-            snprintf(key, sizeof(key), "chan_%d", i);
-            wp.putUChar(key, cfg.wifi_nets[i].channel);
             snprintf(key, sizeof(key), "ena_%d", i);
             wp.putBool(key, cfg.wifi_nets[i].enabled);
         } else {
             snprintf(key, sizeof(key), "ssid_%d", i); wp.remove(key);
             snprintf(key, sizeof(key), "pass_%d", i); wp.remove(key);
-            snprintf(key, sizeof(key), "bssid_%d", i); wp.remove(key);
-            snprintf(key, sizeof(key), "chan_%d", i); wp.remove(key);
             snprintf(key, sizeof(key), "ena_%d", i); wp.remove(key);
         }
     }
@@ -340,8 +344,6 @@ bool Config::add_network(const char *ssid, const char *pass) {
     int idx = cfg.wifi_net_count;
     cfg.wifi_nets[idx].ssid = ssid;
     cfg.wifi_nets[idx].pass = pass ? pass : "";
-    memset(cfg.wifi_nets[idx].bssid, 0, 6);
-    cfg.wifi_nets[idx].channel = 0;
     cfg.wifi_nets[idx].enabled = true;
     cfg.wifi_net_count++;
     save_wifi_nets();
@@ -350,6 +352,8 @@ bool Config::add_network(const char *ssid, const char *pass) {
 
 bool Config::remove_network(uint8_t idx) {
     if (idx >= cfg.wifi_net_count) return false;
+    // drop any cached hints for this SSID before the slot goes away
+    NetworkHints::clear_for(cfg.wifi_nets[idx].ssid.c_str());
     // shift remaining entries down
     for (int i = idx; i < cfg.wifi_net_count - 1; i++)
         cfg.wifi_nets[i] = cfg.wifi_nets[i + 1];
@@ -357,16 +361,7 @@ bool Config::remove_network(uint8_t idx) {
     // clear the vacated slot
     cfg.wifi_nets[cfg.wifi_net_count].ssid = "";
     cfg.wifi_nets[cfg.wifi_net_count].pass = "";
-    memset(cfg.wifi_nets[cfg.wifi_net_count].bssid, 0, 6);
-    cfg.wifi_nets[cfg.wifi_net_count].channel = 0;
     cfg.wifi_nets[cfg.wifi_net_count].enabled = false;
     save_wifi_nets();
     return true;
-}
-
-void Config::update_network_hint(uint8_t idx, const uint8_t *bssid, uint8_t channel) {
-    if (idx >= cfg.wifi_net_count) return;
-    memcpy(cfg.wifi_nets[idx].bssid, bssid, 6);
-    cfg.wifi_nets[idx].channel = channel;
-    save_wifi_nets();
 }

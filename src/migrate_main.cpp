@@ -8,6 +8,7 @@
 #include "wifi.h"
 #include "airbridge_ota.h"
 #include "migrate.h"
+#include "network_hints.h"
 
 const char *airbridge_version()    { return "MIGRATE-" AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -31,6 +32,7 @@ void setup() {
     Log::printf("Heap: %d bytes\n", ESP.getFreeHeap());
 
     Config::init();
+    NetworkHints::init();
     Config::load();
 
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX, Config::get().uart_baud);

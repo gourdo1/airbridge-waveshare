@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "debug_log.h"
 #include "web_ui.h"
+#include "network_hints.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_smartconfig.h>
@@ -132,12 +133,12 @@ static void begin_connect(uint8_t idx, bool use_hint) {
     connect_retries = 0;
     set_state(use_hint ? WF_HINT_TRY : WF_CONNECTING);
 
-    bool has_hint = (net.channel > 0 && memcmp(net.bssid, "\0\0\0\0\0\0", 6) != 0);
+    NetworkHint *h = use_hint ? NetworkHints::find_best(net.ssid.c_str()) : nullptr;
 
-    if (use_hint && has_hint) {
+    if (h) {
         Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Fast connect to '%s' ch=%d\n",
-                  net.ssid.c_str(), net.channel);
-        WiFi.begin(net.ssid.c_str(), net.pass.c_str(), net.channel, net.bssid);
+                  net.ssid.c_str(), h->channel);
+        WiFi.begin(net.ssid.c_str(), net.pass.c_str(), h->channel, h->bssid);
     } else {
         Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Connecting to '%s'...\n", net.ssid.c_str());
         WiFi.begin(net.ssid.c_str(), net.pass.c_str());
@@ -207,20 +208,16 @@ static void process_scan_results() {
 }
 
 static void on_connected() {
-    auto &cfg = Config::get();
     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Connected to '%s' (%s)\n",
               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 
     connect_idx = find_net_by_ssid(WiFi.SSID().c_str());
 
-    // BSSID+channel hint
-    if (connect_idx < cfg.wifi_net_count) {
-        uint8_t *bssid = WiFi.BSSID();
-        if (bssid) {
-            Config::update_network_hint(connect_idx, bssid, WiFi.channel());
-            Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Hint saved: ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                      WiFi.channel(), bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-        }
+    // Persist the BSSID+channel we just connected on so the next reboot can
+    // fast-path. PMF flag is wired in by item 4.
+    uint8_t *bssid = WiFi.BSSID();
+    if (bssid) {
+        NetworkHints::upsert(WiFi.SSID().c_str(), bssid, WiFi.channel(), false);
     }
 
     set_state(WF_CONNECTED);

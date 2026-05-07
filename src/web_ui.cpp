@@ -8,6 +8,7 @@
 #include "debug_log.h"
 #include "app_config.h"
 #include "wifi.h"
+#include "network_hints.h"
 #include "crc.h"
 
 #include <WiFi.h>
@@ -1095,9 +1096,11 @@ static void handleWifiGet(AsyncWebServerRequest *request) {
         json += "{";
         jsonAddString(json, "ssid", cfg.wifi_nets[i].ssid.c_str(), false);
         jsonAddString(json, "enabled", cfg.wifi_nets[i].enabled ? "1" : "0");
-        bool has_hint = (cfg.wifi_nets[i].channel > 0);
-        jsonAddString(json, "hint", has_hint ? "1" : "0");
-        jsonAddInt(json, "channel", cfg.wifi_nets[i].channel);
+        // Hint info comes from NetworkHints now (one slot may have multiple
+        // BSSID hints with multi-AP roaming; pick the most recent here).
+        const NetworkHint *h = NetworkHints::find_best(cfg.wifi_nets[i].ssid.c_str());
+        jsonAddString(json, "hint", h ? "1" : "0");
+        jsonAddInt(json, "channel", h ? h->channel : 0);
         jsonAddInt(json, "rssi", WiFiSetup::net_rssi(i));
         json += "}";
     }
