@@ -53,6 +53,7 @@ static uint32_t last_bg_scan = 0;
 static volatile bool ntp_synced = false;
 static bool got_ip = false;
 static bool sta_disconnected = false;
+static volatile bool hint_refresh_pending = false;
 
 
 static void ntp_sync_cb(struct timeval *tv) {
@@ -95,6 +96,7 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         got_ip = true;
+        hint_refresh_pending = true;
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         sta_disconnected = true;
@@ -394,6 +396,16 @@ void WiFiSetup::check() {
         // Check if a background scan completed
         if (WiFi.scanComplete() >= 0) {
             process_scan_results();
+        }
+        // Refresh the hint on any (re)association we caught via STA_GOT_IP,
+        // including supplicant-driven reconnects we didn't initiate.
+        if (hint_refresh_pending) {
+            hint_refresh_pending = false;
+            uint8_t *bssid = WiFi.BSSID();
+            if (bssid) {
+                NetworkHints::upsert(WiFi.SSID().c_str(), bssid,
+                                     WiFi.channel(), false);
+            }
         }
         break;
 
