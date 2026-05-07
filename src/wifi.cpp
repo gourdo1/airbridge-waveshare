@@ -130,6 +130,14 @@ static uint8_t find_net_by_ssid(const char *ssid) {
     return 0xFF;
 }
 
+static void apply_pmf_override(bool disable) {
+    wifi_config_t wcfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &wcfg) != ESP_OK) return;
+    wcfg.sta.pmf_cfg.capable = !disable;
+    wcfg.sta.pmf_cfg.required = false;
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+}
+
 // Some routers (e.g. older OpenWrt builds, certain ISP-provisioned units)
 // advertise PMF capability but reject the handshake with reason 208
 // (WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG). Retry once with pmf_cfg cleared.
@@ -142,24 +150,15 @@ static void enter_pmf_retry() {
               "[WIFI] PMF retry: disabling pmf_cfg and reconnecting to '%s'\n",
               net.ssid.c_str());
 
-    wifi_config_t wcfg = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &wcfg) == ESP_OK) {
-        wcfg.sta.pmf_cfg.capable = false;
-        wcfg.sta.pmf_cfg.required = false;
-        esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    }
-
+    apply_pmf_override(true);
     pending_pmf_disable = true;
 
-    WiFi.disconnect();
+    // Reuse the staged credentials (set by the previous WiFi.begin) to avoid
+    // re-resetting pmf_cfg. esp_wifi_disconnect aborts the in-flight assoc;
+    // esp_wifi_connect re-attempts with the new pmf_cfg.
+    esp_wifi_disconnect();
     delay(50);
-
-    NetworkHint *h = NetworkHints::find_best(net.ssid.c_str());
-    if (h) {
-        WiFi.begin(net.ssid.c_str(), net.pass.c_str(), h->channel, h->bssid);
-    } else {
-        WiFi.begin(net.ssid.c_str(), net.pass.c_str());
-    }
+    esp_wifi_connect();
     set_state(WF_PMF_RETRY);
 }
 
@@ -182,6 +181,20 @@ static void begin_connect(uint8_t idx, bool use_hint) {
         Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Connecting to '%s'...\n", net.ssid.c_str());
         WiFi.begin(net.ssid.c_str(), net.pass.c_str());
         set_state(WF_CONNECTING);
+    }
+
+    // the cached hint says this BSSID needs PMF off, disable pmf_cfg and
+    // bounce the connect so the actual association attempt has it off.
+    // WiFi.begin always resets pmf_cfg.capable=true, so the override has to
+    // happen after begin().
+    if (h && (h->flags & HINT_FLAG_PMF_DISABLE)) {
+        Log::logf(CAT_WIFI, LOG_INFO,
+                  "[WIFI] PMF pre-disabled for '%s' (cached)\n", net.ssid.c_str());
+        apply_pmf_override(true);
+        pending_pmf_disable = true;
+        esp_wifi_disconnect();
+        delay(50);
+        esp_wifi_connect();
     }
 }
 
@@ -253,11 +266,14 @@ static void on_connected() {
     connect_idx = find_net_by_ssid(WiFi.SSID().c_str());
 
     // Persist the BSSID+channel we just connected on so the next reboot can
-    // fast-path. PMF flag is wired in by item 4.
+    // fast-path. If we got here via a PMF retry, mark that flag in the hint
+    // so subsequent reconnects skip the doomed first attempt.
     uint8_t *bssid = WiFi.BSSID();
     if (bssid) {
-        NetworkHints::upsert(WiFi.SSID().c_str(), bssid, WiFi.channel(), false);
+        NetworkHints::upsert(WiFi.SSID().c_str(), bssid, WiFi.channel(),
+                             pending_pmf_disable);
     }
+    pending_pmf_disable = false;
 
     set_state(WF_CONNECTED);
     low_rssi_count = 0;
