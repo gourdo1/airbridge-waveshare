@@ -25,10 +25,19 @@ static wifi_state_t wf_state = WF_OFF;
 static uint32_t state_entered_ms = 0;
 static bool ntp_done = false;
 
-static int8_t last_seen_rssi[WIFI_MAX_NETWORKS] = {};
+// Scan candidates track each visible (ssid, bssid) tuple separately so that
+// same-SSID multi-AP setups can roam by BSSID, not just by SSID slot.
+#define SCAN_CANDIDATES_MAX 16
+struct ScanCandidate {
+    uint8_t net_idx;        // index into wifi_nets
+    uint8_t bssid[6];
+    uint8_t channel;
+    int8_t  rssi;
+};
+static ScanCandidate scan_candidates[SCAN_CANDIDATES_MAX];
+static uint8_t scan_candidate_count = 0;
+
 static uint8_t connect_idx = 0xFF;
-static uint8_t try_order[WIFI_MAX_NETWORKS];
-static uint8_t try_count = 0;
 static uint8_t try_pos = 0;
 static uint8_t connect_retries = 0;
 
@@ -198,60 +207,81 @@ static void begin_connect(uint8_t idx, bool use_hint) {
     }
 }
 
+// Connect to a specific BSSID/channel from the scan_candidates list.
+// Used after process_scan_results when we want to target a particular AP
+static void begin_connect_candidate(uint8_t cand_idx) {
+    auto &cfg = Config::get();
+    if (cand_idx >= scan_candidate_count) return;
+    const ScanCandidate &c = scan_candidates[cand_idx];
+    if (c.net_idx >= cfg.wifi_net_count) return;
+    WiFiNetwork &net = cfg.wifi_nets[c.net_idx];
+
+    connect_idx = c.net_idx;
+    connect_retries = 0;
+    set_state(WF_CONNECTING);
+
+    Log::logf(CAT_WIFI, LOG_INFO,
+              "[WIFI] Connecting to '%s' bssid=%02X:%02X:%02X:%02X:%02X:%02X ch=%d (%d dBm)\n",
+              net.ssid.c_str(),
+              c.bssid[0], c.bssid[1], c.bssid[2],
+              c.bssid[3], c.bssid[4], c.bssid[5],
+              c.channel, c.rssi);
+    WiFi.begin(net.ssid.c_str(), net.pass.c_str(), c.channel, c.bssid);
+
+    // Apply cached PMF flag for this specific BSSID, if any.
+    NetworkHint *h = NetworkHints::find_exact(net.ssid.c_str(), c.bssid);
+    if (h && (h->flags & HINT_FLAG_PMF_DISABLE)) {
+        Log::logf(CAT_WIFI, LOG_INFO,
+                  "[WIFI] PMF pre-disabled for this BSSID (cached)\n");
+        apply_pmf_override(true);
+        pending_pmf_disable = true;
+        esp_wifi_disconnect();
+        delay(50);
+        esp_wifi_connect();
+    }
+}
+
 static void process_scan_results() {
     auto &cfg = Config::get();
     int16_t n = WiFi.scanComplete();
     if (n < 0) return;
 
-    // match visible APs against configured networks, sort by RSSI
-    struct { uint8_t net_idx; int32_t rssi; } candidates[WIFI_MAX_NETWORKS];
-    uint8_t nc = 0;
-
-    for (int i = 0; i < n && nc < WIFI_MAX_NETWORKS; i++) {
+    // Match visible APs against configured slots. No SSID dedup: each
+    // visible BSSID becomes its own candidate so roaming can target a
+    // specific AP under a same-SSID setup.
+    scan_candidate_count = 0;
+    for (int i = 0; i < n && scan_candidate_count < SCAN_CANDIDATES_MAX; i++) {
         uint8_t idx = find_net_by_ssid(WiFi.SSID(i).c_str());
         if (idx == 0xFF) continue;
-        // check if we already have a better entry for this network
-        bool dup = false;
-        for (uint8_t j = 0; j < nc; j++) {
-            if (candidates[j].net_idx == idx) {
-                if (WiFi.RSSI(i) > candidates[j].rssi)
-                    candidates[j].rssi = WiFi.RSSI(i);
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            candidates[nc].net_idx = idx;
-            candidates[nc].rssi = WiFi.RSSI(i);
-            nc++;
-        }
+        ScanCandidate &c = scan_candidates[scan_candidate_count++];
+        c.net_idx = idx;
+        uint8_t *bssid = WiFi.BSSID(i);
+        if (bssid) memcpy(c.bssid, bssid, 6);
+        else memset(c.bssid, 0, 6);
+        c.channel = (uint8_t)WiFi.channel(i);
+        c.rssi = (int8_t)WiFi.RSSI(i);
     }
 
-    // cache last-seen RSSI
-    memset(last_seen_rssi, 0, sizeof(last_seen_rssi));
-    for (uint8_t i = 0; i < nc; i++)
-        last_seen_rssi[candidates[i].net_idx] = (int8_t)candidates[i].rssi;
-
-    // sort by RSSI
-    for (uint8_t i = 0; i < nc; i++) {
-        for (uint8_t j = i + 1; j < nc; j++) {
-            if (candidates[j].rssi > candidates[i].rssi) {
-                auto tmp = candidates[i];
-                candidates[i] = candidates[j];
-                candidates[j] = tmp;
+    // Sort by RSSI descending (selection sort, max 16 entries).
+    for (uint8_t i = 0; i < scan_candidate_count; i++) {
+        for (uint8_t j = i + 1; j < scan_candidate_count; j++) {
+            if (scan_candidates[j].rssi > scan_candidates[i].rssi) {
+                ScanCandidate tmp = scan_candidates[i];
+                scan_candidates[i] = scan_candidates[j];
+                scan_candidates[j] = tmp;
             }
         }
     }
 
-    try_count = nc;
-    for (uint8_t i = 0; i < nc; i++) try_order[i] = candidates[i].net_idx;
     try_pos = 0;
-
     WiFi.scanDelete();
 
-    if (nc > 0) {
-        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Scan: %d known of %d visible, best='%s' (%d dBm)\n",
-                  nc, n, cfg.wifi_nets[try_order[0]].ssid.c_str(), (int)candidates[0].rssi);
+    if (scan_candidate_count > 0) {
+        const ScanCandidate &best = scan_candidates[0];
+        Log::logf(CAT_WIFI, LOG_INFO,
+                  "[WIFI] Scan: %d candidates of %d visible, best='%s' (%d dBm)\n",
+                  scan_candidate_count, n,
+                  cfg.wifi_nets[best.net_idx].ssid.c_str(), best.rssi);
     } else {
         Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Scan: 0 known of %d visible\n", n);
     }
@@ -386,8 +416,8 @@ void WiFiSetup::check() {
         int16_t result = WiFi.scanComplete();
         if (result >= 0) {
             process_scan_results();
-            if (try_count > 0) {
-                begin_connect(try_order[0], false);
+            if (scan_candidate_count > 0) {
+                begin_connect_candidate(0);
             } else if (cfg.wifi_net_count > 0) {
                 // No known APs visible - AP fallback
                 enter_ap_fallback();
@@ -415,11 +445,11 @@ void WiFiSetup::check() {
                 begin_connect(connect_idx, false);
             } else {
                 try_pos++;
-                if (try_pos < try_count) {
-                    Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Trying next network\n");
-                    begin_connect(try_order[try_pos], false);
+                if (try_pos < scan_candidate_count) {
+                    Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Trying next candidate\n");
+                    begin_connect_candidate(try_pos);
                 } else {
-                    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] All networks exhausted\n");
+                    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] All candidates exhausted\n");
                     enter_ap_fallback();
                 }
             }
@@ -430,8 +460,8 @@ void WiFiSetup::check() {
         if (elapsed > CONNECT_TIMEOUT_MS) {
             Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] PMF retry timed out, advancing\n");
             try_pos++;
-            if (try_pos < try_count) {
-                begin_connect(try_order[try_pos], false);
+            if (try_pos < scan_candidate_count) {
+                begin_connect_candidate(try_pos);
             } else {
                 enter_ap_fallback();
             }
@@ -484,32 +514,34 @@ void WiFiSetup::check() {
         int16_t result = WiFi.scanComplete();
         if (result >= 0) {
             process_scan_results();
-            // is best candidate is significantly better?
+            // Compare best candidate to the current connection by BSSID,
+            // not by SSID slot, so same-SSID multi-AP setups can roam.
             bool should_switch = false;
-            uint8_t best_idx = 0xFF;
-            if (try_count > 0 && try_order[0] != connect_idx) {
+            uint8_t *cur_bssid = WiFi.BSSID();
+            if (scan_candidate_count > 0 && cur_bssid &&
+                memcmp(scan_candidates[0].bssid, cur_bssid, 6) != 0) {
                 int8_t current_rssi = WiFi.RSSI();
-                int8_t candidate_rssi = last_seen_rssi[try_order[0]];
+                int8_t candidate_rssi = scan_candidates[0].rssi;
                 if (candidate_rssi > current_rssi + ROAM_HYSTERESIS_DB) {
                     should_switch = true;
-                    best_idx = try_order[0];
                     Log::logf(CAT_WIFI, LOG_INFO,
-                              "[WIFI] Candidate '%s' %d dBm beats current %d dBm by >=%d\n",
-                              cfg.wifi_nets[best_idx].ssid.c_str(),
+                              "[WIFI] Candidate '%s' bssid=%02X:%02X:%02X:%02X:%02X:%02X "
+                              "%d dBm beats current %d dBm by >=%d\n",
+                              cfg.wifi_nets[scan_candidates[0].net_idx].ssid.c_str(),
+                              scan_candidates[0].bssid[0], scan_candidates[0].bssid[1],
+                              scan_candidates[0].bssid[2], scan_candidates[0].bssid[3],
+                              scan_candidates[0].bssid[4], scan_candidates[0].bssid[5],
                               candidate_rssi, current_rssi, ROAM_HYSTERESIS_DB);
                 } else {
                     Log::logf(CAT_WIFI, LOG_DEBUG,
-                              "[WIFI] Candidate '%s' %d dBm vs current %d dBm (<%d hysteresis), staying\n",
-                              cfg.wifi_nets[try_order[0]].ssid.c_str(),
+                              "[WIFI] Candidate %d dBm vs current %d dBm (<%d hysteresis), staying\n",
                               candidate_rssi, current_rssi, ROAM_HYSTERESIS_DB);
                 }
             }
-            if (should_switch && best_idx < cfg.wifi_net_count) {
-                Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Roaming to '%s'\n",
-                          cfg.wifi_nets[best_idx].ssid.c_str());
+            if (should_switch) {
                 WiFi.disconnect();
                 delay(100);
-                begin_connect(best_idx, true);
+                begin_connect_candidate(0);
             } else {
                 set_state(WF_CONNECTED);
                 low_rssi_count = 0;
@@ -639,5 +671,15 @@ int8_t WiFiSetup::net_rssi(uint8_t idx) {
     // For the connected network, return live RSSI
     if (idx == connect_idx && (wf_state == WF_CONNECTED || wf_state == WF_ROAM_SCAN))
         return WiFi.RSSI();
-    return last_seen_rssi[idx];
+    // Strongest RSSI seen in the last scan for any BSSID under this slot.
+    int8_t best = 0;
+    bool any = false;
+    for (uint8_t i = 0; i < scan_candidate_count; i++) {
+        if (scan_candidates[i].net_idx != idx) continue;
+        if (!any || scan_candidates[i].rssi > best) {
+            best = scan_candidates[i].rssi;
+            any = true;
+        }
+    }
+    return any ? best : 0;
 }
