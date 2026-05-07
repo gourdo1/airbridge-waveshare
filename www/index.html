@@ -266,9 +266,6 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         <!-- Telemetry -->
         <div class="telemetry-header">
           <h3>Live Telemetry</h3>
-          <div style="display:flex;gap:8px;align-items:center">
-            <span style="color:var(--text-dim);font-size:13px" id="liveStatus">Idle</span>
-          </div>
         </div>
 
         <div class="chart-card">
@@ -1479,8 +1476,6 @@ async function backfillLive() {
     }
     liveSeq = d.seq;
     updateCharts();
-    var ls = document.getElementById('liveStatus');
-    if (ls) ls.textContent = d.active === 'yes' ? 'Live' : 'Idle';
   } catch(e) { console.error(e); }
   liveBusy = false;
 }

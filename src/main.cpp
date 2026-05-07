@@ -133,7 +133,9 @@ static void attempt_recovery() {
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
         Config::invalidate_device_info();
-        LiveStream::resync();
+        // AirSense may have rebooted; force re-subscribe regardless of
+        // the broker's stale subscribed flags.
+        LiveStream::reattach();
     }
 }
 

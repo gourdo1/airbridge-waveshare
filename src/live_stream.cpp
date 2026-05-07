@@ -177,6 +177,18 @@ void resync() {
     }
 }
 
+void reattach() {
+    for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
+        if (!streams[i].in_use || streams[i].ref_count == 0) continue;
+        streams[i].subscribed = false;
+        if (device_subscribe(i, true)) {
+            streams[i].subscribed = true;
+            Log::logf(CAT_GENERAL, LOG_INFO,
+                      "[LS] %s reattached\n", streams[i].tag);
+        }
+    }
+}
+
 void on_l_frame(const uint8_t *payload, uint16_t len) {
     if (!initialized || len < LIVE_STREAM_TAG_LEN) return;
 

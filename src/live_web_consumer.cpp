@@ -96,7 +96,7 @@ void shutdown() {
 void acquire() {
     if (client_count == 0) release_ms = 0;
     client_count++;
-    if (client_count == 1 && handle < 0) do_subscribe();
+    // subscribe/unsubscribe is deferred to tick()
 }
 
 void release() {
@@ -108,8 +108,11 @@ void release() {
 }
 
 void tick() {
-    if (release_ms == 0 || client_count != 0) return;
-    if (millis() - release_ms >= LWC_GRACE_MS) {
+    if (client_count > 0 && handle < 0) {
+        do_subscribe();
+    }
+    if (release_ms != 0 && client_count == 0 &&
+        millis() - release_ms >= LWC_GRACE_MS) {
         do_unsubscribe();
         release_ms = 0;
     }

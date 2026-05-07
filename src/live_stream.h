@@ -53,6 +53,7 @@ void unsubscribe(consumer_handle_t h);
 void suspend();
 void resume();
 void resync();
+void reattach();
 
 // Fed by uart_arbiter rx_task on every QFRAME_TYPE_L frame.
 void on_l_frame(const uint8_t *payload, uint16_t len);
