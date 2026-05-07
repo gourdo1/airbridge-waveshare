@@ -84,6 +84,7 @@ namespace Arbiter {
 
     uint32_t get_tx_count();
     uint32_t get_rx_count();
+    uint32_t get_l_rx_count();
     uint32_t get_timeout_count();
     uint32_t get_error_count();
 

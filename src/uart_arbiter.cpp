@@ -1,6 +1,7 @@
 #include "uart_arbiter.h"
 #include "app_config.h"
 #include "debug_log.h"
+#include "live_stream.h"
 #include <freertos/queue.h>
 
 #define ARBITER_QUEUE_DEPTH     8
@@ -32,6 +33,7 @@ static uint32_t current_baud = 0;
 
 static uint32_t stat_tx = 0;
 static uint32_t stat_rx = 0;
+static uint32_t stat_l_rx = 0;
 static uint32_t stat_timeout = 0;
 static uint32_t stat_error = 0;
 
@@ -155,11 +157,24 @@ static void rx_task(void *param) {
                 // Complete frame
                 const qframe_t *f = qframe_parser_frame(&rx_parser);
                 if (f && f->crc_valid) {
-                    memcpy((void*)&last_rx_frame, f, sizeof(qframe_t));
-                    rx_frame_available = true;
-                    stat_rx++;
-                    if (rx_ready) {
-                        xSemaphoreGive(rx_ready);
+                    if (f->type == QFRAME_TYPE_L) {
+                        // Unsolicited live stream sample. Route to LiveStream
+                        stat_rx++;
+                        stat_l_rx++;
+                        Log::logf(CAT_ARB, LOG_DEBUG,
+                                  "[ARB] RX-L tag=%c%c%c len=%u t=%lu\n",
+                                  f->payload_len > 0 ? (char)f->payload[0] : '?',
+                                  f->payload_len > 1 ? (char)f->payload[1] : '?',
+                                  f->payload_len > 2 ? (char)f->payload[2] : '?',
+                                  f->payload_len, millis());
+                        LiveStream::on_l_frame(f->payload, f->payload_len);
+                    } else {
+                        memcpy((void*)&last_rx_frame, f, sizeof(qframe_t));
+                        rx_frame_available = true;
+                        stat_rx++;
+                        if (rx_ready) {
+                            xSemaphoreGive(rx_ready);
+                        }
                     }
                 } else {
                     stat_error++;
@@ -469,6 +484,7 @@ static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len) {
 
 uint32_t Arbiter::get_tx_count()       { return stat_tx; }
 uint32_t Arbiter::get_rx_count()       { return stat_rx; }
+uint32_t Arbiter::get_l_rx_count()     { return stat_l_rx; }
 uint32_t Arbiter::get_timeout_count()  { return stat_timeout; }
 uint32_t Arbiter::get_error_count()    { return stat_error; }
 

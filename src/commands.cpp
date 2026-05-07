@@ -10,6 +10,8 @@
 #include <time.h>
 #include "wifi.h"
 #include "network_hints.h"
+#include "live_stream.h"
+#include "live_pmd.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -63,8 +65,12 @@ void dispatch_command(const char *line, String &response) {
         response += "uart_baud: " + String(Arbiter::get_baud()) + "\n";
         response += "uart_tx: " + String(Arbiter::get_tx_count()) + "\n";
         response += "uart_rx: " + String(Arbiter::get_rx_count()) + "\n";
+        response += "uart_l_rx: " + String(Arbiter::get_l_rx_count()) + "\n";
         response += "uart_timeout: " + String(Arbiter::get_timeout_count()) + "\n";
         response += "uart_error: " + String(Arbiter::get_error_count()) + "\n";
+        response += "live_pmd: " +
+                    String(LiveStream::is_stream_active(LivePmd::TAG) ? "subscribed" : "idle") +
+                    "\n";
         response += "heap: " + String(ESP.getFreeHeap()) + "\n";
         return;
     }

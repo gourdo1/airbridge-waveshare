@@ -267,8 +267,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         <div class="telemetry-header">
           <h3>Live Telemetry</h3>
           <div style="display:flex;gap:8px;align-items:center">
-            <span style="color:var(--text-dim);font-size:13px" id="liveStatus">Stopped</span>
-            <button class="btn" id="btnLive" onclick="toggleLive()" style="padding:6px 16px">Start</button>
+            <span style="color:var(--text-dim);font-size:13px" id="liveStatus">Idle</span>
           </div>
         </div>
 
@@ -286,6 +285,14 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div><span class="value" style="color:var(--blue)" id="chartFlowVal">--</span><span class="unit"> L/min</span></div>
           </div>
           <canvas id="cFlow" height="140"></canvas>
+        </div>
+
+        <div class="chart-card">
+          <div class="chart-header">
+            <span class="label">Mask Leak</span>
+            <div><span class="value" style="color:var(--orange)" id="chartLeakVal">--</span><span class="unit"> L/min</span></div>
+          </div>
+          <canvas id="cLeak" height="120"></canvas>
         </div>
 
         <div class="chart-row-2">
@@ -550,6 +557,8 @@ function initSSE() {
   evtSrc.onopen = () => {
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
+    // Reconnected: pull whatever we missed during the disconnect.
+    if (typeof backfillLive === 'function') backfillLive();
   };
 }
 
@@ -648,7 +657,26 @@ function updateFlashFromPush(d) {
 }
 
 function updateChartsFromPush(d) {
-  if (typeof addLiveSample === 'function') addLiveSample(d);
+  // SSE "live" event: { seq, samples:[[mkp,rfl,lyk],...], spo2, pulse }
+  if (d.samples && d.samples.length) {
+    d.samples.forEach(s => {
+      waveData.press.push(s[0]);
+      waveData.flow.push(s[1]);
+      waveData.leak.push(s[2]);
+    });
+    for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
+  }
+  // Slow charts: ~0.5 Hz (every 10 SSE events at 5 Hz fire rate).
+  slowTick++;
+  if (slowTick >= 10) {
+    slowData.spo2.push(d.spo2 >= 0 ? d.spo2 : -32768);
+    slowData.pulse.push(d.pulse >= 0 ? d.pulse : -32768);
+    while (slowData.spo2.length > SLOW_PTS) slowData.spo2.shift();
+    while (slowData.pulse.length > SLOW_PTS) slowData.pulse.shift();
+    slowTick = 0;
+  }
+  liveSeq = d.seq;
+  updateCharts();
 }
 
 // Navigation
@@ -1340,11 +1368,11 @@ function pollFlash() {
 async function cancelFlash() { try { await api('/api/flash/cancel', {method:'POST'}); } catch(e) { console.error(e); } }
 
 // Charts
-const WAVE_PTS = 120;
-const waveData = {press:[],flow:[]};
+const WAVE_PTS = 500;     // ~20 s @ 25 Hz; covers 4-5 breath cycles
+const waveData = {press:[],flow:[],leak:[]};
 const slowData = {spo2:[],pulse:[]};
 const SLOW_PTS = 150;
-let liveTimer = null, liveSeq = 0, slowTick = 0;
+let liveSeq = 0, slowTick = 0;
 
 function drawChart(canvasId, data, label, color, minY, maxY, unit, scale, signed) {
   const c = document.getElementById(canvasId); if (!c) return;
@@ -1415,10 +1443,12 @@ function drawChart(canvasId, data, label, color, minY, maxY, unit, scale, signed
 function updateCharts() {
   drawChart('cPress', waveData.press, 'Pressure', '#22d3ee', 0, 1500, '', 50, false);
   drawChart('cFlow', waveData.flow, 'Flow (L/min)', '#818cf8', -500, 500, ' ', 8.33, true);
+  drawChart('cLeak', waveData.leak, 'Leak (L/min)', '#fb923c', 0, 50, '', 0.833, false);
   drawChart('cSpo2', slowData.spo2, 'SpO2', '#4ade80', 80, 100, '%', 1, false);
   drawChart('cPulse', slowData.pulse, 'Pulse', '#e94560', 40, 160, '', 1, false);
   // Update chart header values
-  var p = waveData.press, f = waveData.flow, s = slowData.spo2, hr = slowData.pulse;
+  var p = waveData.press, f = waveData.flow, lk = waveData.leak,
+      s = slowData.spo2, hr = slowData.pulse;
   var el;
   function lastValid(arr, scale) {
     for (var i = arr.length - 1; i >= 0; i--) { if (arr[i] > -32000) return (arr[i]/scale).toFixed(1); }
@@ -1426,58 +1456,40 @@ function updateCharts() {
   }
   el = document.getElementById('chartPressVal'); if (el) el.textContent = lastValid(p, 50);
   el = document.getElementById('chartFlowVal'); if (el) el.textContent = lastValid(f, 8.33);
+  el = document.getElementById('chartLeakVal'); if (el) el.textContent = lastValid(lk, 0.833);
   el = document.getElementById('chartSpo2Val'); if (el) { var v = lastValid(s, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
   el = document.getElementById('chartPulseVal'); if (el) { var v = lastValid(hr, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
 }
 
 let liveBusy = false;
-async function pollLive() {
+async function backfillLive() {
   if (liveBusy) return;
   liveBusy = true;
   try {
     const r = await api('/api/live?since='+liveSeq);
     if (!r) { liveBusy=false; return; }
     const d = await r.json();
-    liveSeq = d.seq;
     if (d.samples && d.samples.length) {
-      d.samples.forEach(s => { waveData.press.push(s[0]); waveData.flow.push(s[1]); });
+      d.samples.forEach(s => {
+        waveData.press.push(s[0]);
+        waveData.flow.push(s[1]);
+        waveData.leak.push(s[2]);
+      });
       for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
     }
-    slowTick++;
-    if (slowTick >= 4) {
-      slowData.spo2.push(d.spo2 >= 0 ? d.spo2 : -32768);
-      slowData.pulse.push(d.pulse >= 0 ? d.pulse : -32768);
-      while (slowData.spo2.length > SLOW_PTS) slowData.spo2.shift();
-      while (slowData.pulse.length > SLOW_PTS) slowData.pulse.shift();
-      slowTick = 0;
-    }
+    liveSeq = d.seq;
     updateCharts();
-    document.getElementById('liveStatus').textContent = 'Running (' + waveData.press.length + ' pts)';
+    var ls = document.getElementById('liveStatus');
+    if (ls) ls.textContent = d.active === 'yes' ? 'Live' : 'Idle';
   } catch(e) { console.error(e); }
   liveBusy = false;
-}
-
-function toggleLive() {
-  if (liveTimer) {
-    clearInterval(liveTimer); liveTimer = null;
-    api('/api/live', {method:'POST',headers:{'Content-Type':'application/json'},body:'{"action":"stop"}'});
-    document.getElementById('btnLive').textContent = 'Start';
-    document.getElementById('liveStatus').textContent = 'Stopped';
-  } else {
-    liveSeq = 0; slowTick = 0;
-    for (const k in waveData) waveData[k] = [];
-    for (const k in slowData) slowData[k] = [];
-    api('/api/live', {method:'POST',headers:{'Content-Type':'application/json'},body:'{"action":"start"}'});
-    liveTimer = setInterval(pollLive, 500);
-    document.getElementById('btnLive').textContent = 'Stop';
-    document.getElementById('liveStatus').textContent = 'Starting...';
-  }
 }
 
 // Init
 const ht = window.location.hash.slice(1);
 showTab(tabNames.includes(ht) ? ht : 'status');
 initSSE();
+backfillLive();
 </script>
 </body>
 </html>

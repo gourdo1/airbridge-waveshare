@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "wifi.h"
 #include "network_hints.h"
+#include "live_web_consumer.h"
 #include "crc.h"
 
 #include <WiFi.h>
@@ -466,135 +467,42 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
 }
 
 
-#define LIVE_BUF_SIZE   64
-
-struct live_sample_t {
-    int16_t press;
-    int16_t flow;
-};
-
-static live_sample_t live_buf[LIVE_BUF_SIZE];
-static uint16_t live_head = 0;
-static uint16_t live_seq = 0;
-static volatile bool live_running = false;
-static TaskHandle_t live_task_handle = nullptr;
-
-
-static int16_t parse_signed_hex(const char *resp, int bits = 16) {
-    const char *v = qframe_response_value(resp);
-    if (!v) return -32768;
-    long val = strtol(v, nullptr, 16);
-    long half = 1L << (bits - 1);
-    if (val >= half) val -= (half << 1);
-    return (int16_t)val;
-}
-
-static void live_sampler_task(void *param) {
-    TickType_t last_wake = xTaskGetTickCount();
-    while (live_running) {
-        char resp[64] = {};
-        uint16_t resp_len;
-        int16_t press = -32768, flow = -32768;
-
-        resp_len = sizeof(resp);
-        if (Arbiter::send_cmd("G S #MKP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, &resp_len, 200)) {
-            press = parse_signed_hex(resp);
-        }
-
-        resp_len = sizeof(resp);
-        memset(resp, 0, sizeof(resp));
-        if (Arbiter::send_cmd("G S #RFL", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, &resp_len, 200)) {
-            flow = parse_signed_hex(resp, 12);
-        }
-
-        uint16_t idx = live_head % LIVE_BUF_SIZE;
-        live_buf[idx] = {press, flow};
-        live_head++;
-        live_seq++;
-
-        // Build JSON and push via SSE
-        {
-            const oxi_reading_t &r = OxiArbiter::get_reading();
-            String json = "{";
-            jsonAddInt(json, "seq", live_seq, false);
-            jsonAddInt(json, "press", press);
-            jsonAddInt(json, "flow", flow);
-            jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
-            jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
-            json += '}';
-            WebUI::push_event("live", json);
-        }
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(500));
-    }
-    live_task_handle = nullptr;
-    vTaskDelete(nullptr);
-}
-
+#define LIVE_BATCH_MAX  128
 
 static void handleLive(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
-    if (!live_running && !live_task_handle) {
-        live_running = true;
-        live_head = 0;
-        live_seq = 0;
-        xTaskCreatePinnedToCore(live_sampler_task, "live_sample", 6144,
-                                nullptr, 2, &live_task_handle, 1);
-    }
-
     uint16_t since = 0;
-    if (request->hasArg("since")) {
+    if (request->hasArg("since"))
         since = (uint16_t)request->arg("since").toInt();
-    }
 
-    uint16_t cur_seq = live_seq;
-    uint16_t available = cur_seq - since;
-    if (available > LIVE_BUF_SIZE) available = LIVE_BUF_SIZE;
+    LivePmd::Sample samples[LIVE_BATCH_MAX];
+    uint16_t cur_seq = 0;
+    int n = LiveWebConsumer::get_samples(samples, LIVE_BATCH_MAX, since, &cur_seq);
 
     const oxi_reading_t &r = OxiArbiter::get_reading();
 
-    String json = "{";
+    String json;
+    json.reserve(64 + n * 24);
+    json = "{";
     jsonAddInt(json, "seq", cur_seq, false);
-    jsonAddInt(json, "rate", 2);  // Hz
+    jsonAddInt(json, "rate", 25);
+    jsonAddString(json, "active", LiveWebConsumer::is_active() ? "yes" : "no");
     jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
     jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
     json += ",\"samples\":[";
-
-    for (uint16_t i = 0; i < available; i++) {
-        uint16_t idx = (cur_seq - available + i) % LIVE_BUF_SIZE;
+    for (int i = 0; i < n; i++) {
         if (i > 0) json += ',';
         json += '[';
-        json += String(live_buf[idx].press);
+        json += String(samples[i].mkp);
         json += ',';
-        json += String(live_buf[idx].flow);
+        json += String(samples[i].rfl);
+        json += ',';
+        json += String(samples[i].lyk);
         json += ']';
     }
-
     json += "]}";
     request->send(200, "application/json", json);
-}
-
-
-static void handleLiveControl(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
-
-    String body = getBody(request);
-    if (body.indexOf("stop") >= 0) {
-        live_running = false;
-        request->send(200, "application/json", "{\"ok\":true,\"running\":false}");
-    } else {
-        if (!live_running && !live_task_handle) {
-            live_running = true;
-            live_head = 0;
-            live_seq = 0;
-            xTaskCreatePinnedToCore(live_sampler_task, "live_sample", 6144,
-                                    nullptr, 2, &live_task_handle, 1);
-        }
-        request->send(200, "application/json", "{\"ok\":true,\"running\":true}");
-    }
 }
 
 
@@ -1215,6 +1123,13 @@ void WebUI::init(uint16_t port) {
 
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");
+    // Tie LiveWebConsumer PMD subscription to SSE client presence 
+    events->onConnect([](AsyncEventSourceClient *) {
+        LiveWebConsumer::acquire();
+    });
+    events->onDisconnect([](AsyncEventSourceClient *) {
+        LiveWebConsumer::release();
+    });
     http->addHandler(events);
 
     http->on("/", HTTP_GET, handleRoot);
@@ -1224,7 +1139,6 @@ void WebUI::init(uint16_t port) {
     http->on("/api/config", HTTP_GET, handleGetConfig);
     http->on("/api/config", HTTP_POST, handlePostConfig, NULL, handleJsonBody);
     http->on("/api/live", HTTP_GET, handleLive);
-    http->on("/api/live", HTTP_POST, handleLiveControl, NULL, handleJsonBody);
     http->on("/api/upload", HTTP_POST, handleUploadDone, handleUploadChunk);
     http->on("/api/ble", HTTP_GET, handleBleStatus);
     http->on("/api/ble", HTTP_POST, handleBleAction, NULL, handleJsonBody);

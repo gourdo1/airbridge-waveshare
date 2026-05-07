@@ -11,6 +11,8 @@
 #include "web_ui.h"
 #include "qframe.h"
 #include "network_hints.h"
+#include "live_stream.h"
+#include "live_web_consumer.h"
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -131,6 +133,7 @@ static void attempt_recovery() {
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
         Config::invalidate_device_info();
+        LiveStream::resync();
     }
 }
 
@@ -178,6 +181,9 @@ void setup() {
     OxiBle::init();
     OxiUdp::init();
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] BLE oximetry started\n");
+
+    LiveStream::init();
+    LiveWebConsumer::init();
 
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }
@@ -261,13 +267,19 @@ void loop() {
         WiFiSetup::resume_roaming();
     }
 
+    static bool prev_ota_active = false;
     if (ota_active) {
         OxiBle::suspend();
+        if (!prev_ota_active) LiveStream::suspend();
     } else {
         OxiBle::resume();
+        if (prev_ota_active) LiveStream::resume();
     }
+    prev_ota_active = ota_active;
 
     sync_resmed_clock();
+
+    LiveWebConsumer::tick();
 
     OxiArbiter::poll();
 
@@ -278,6 +290,9 @@ void loop() {
         system_state_t st = Arbiter::get_state();
         if (st == SYS_IDLE || st == SYS_THERAPY) {
             poll_therapy_state();
+            // Catch-up resync if AirSense rebooted out from under us, or
+            // any consumer's initial subscribe attempt failed.
+            LiveStream::resync();
         } else if (st == SYS_ERROR) {
             attempt_recovery();
         }

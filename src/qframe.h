@@ -14,6 +14,8 @@
 #define QFRAME_TYPE_E       'E'  // error response
 #define QFRAME_TYPE_F       'F'  // flash data
 #define QFRAME_TYPE_P       'P'  // flash progress
+#define QFRAME_TYPE_L       'L'  // unsolicited live stream sample (device -> host)
+                                 // and oximetry injection (host -> device)
 
 
 typedef enum {
