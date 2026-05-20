@@ -32,6 +32,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .topbar .page-title{font-size:16px;font-weight:600}
 .live-badge{background:var(--accent);color:#000;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:1px}
 .topbar .right{display:flex;align-items:center;gap:16px;font-size:12px;color:var(--text-dim)}
+.wifi-bars{display:inline-flex;align-items:flex-end;gap:2px;height:12px;vertical-align:middle}
+.wifi-bars span{width:3px;border-radius:1px;background:#475569}
+.wifi-bars span:nth-child(1){height:4px}
+.wifi-bars span:nth-child(2){height:6px}
+.wifi-bars span:nth-child(3){height:9px}
+.wifi-bars span:nth-child(4){height:12px}
+.wifi-bars span.on{background:var(--accent)}
 .content{flex:1;overflow-y:auto;padding:20px 24px}
 
 /* Panes */
@@ -182,7 +189,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
       </div>
       <div class="right">
         <span id="topUptime">--</span>
-        <span id="topWifi">WiFi: --</span>
+        <span id="topWifi" class="wifi-bars" title="--"><span></span><span></span><span></span><span></span></span>
         <span id="topHeap">-- free</span>
         <button class="btn" onclick="loadStatus()" style="padding:4px 12px;font-size:11px">Refresh</button>
       </div>
@@ -728,11 +735,32 @@ async function api(url, opts) {
 
 const ROP_NAMES = {0:'Standby',1:'Running',2:'Power Recovery',3:'Power Save',4:'Calibration',5:'Upgrade'};
 
+function fmtRssi(rssi) {
+  var v = Number(rssi);
+  return Number.isFinite(v) && v < 0 ? Math.round(v) + ' dBm' : '--';
+}
+function wifiSignalLevel(rssi) {
+  var v = Number(rssi);
+  if (!Number.isFinite(v) || v >= 0) return 0;
+  if (v >= -55) return 4;
+  if (v >= -65) return 3;
+  if (v >= -75) return 2;
+  return 1;
+}
+function updateWifiBars(el, rssi) {
+  if (!el) return;
+  var level = wifiSignalLevel(rssi);
+  el.title = fmtRssi(rssi);
+  for (var i = 0; i < el.children.length; i++) {
+    el.children[i].className = (i < level) ? 'on' : '';
+  }
+}
+
 function renderStatus(d) {
   // Topbar - update from any push, even without full status
   var el;
   el = document.getElementById('topHeap'); if (el && d.heap) el.textContent = (d.heap/1024).toFixed(1) + ' KB free';
-  el = document.getElementById('topWifi'); if (el && d.rssi !== undefined) el.textContent = 'WiFi: ' + d.rssi + ' dBm';
+  if (d.rssi !== undefined) updateWifiBars(document.getElementById('topWifi'), d.rssi);
   if (d.uptime !== undefined) {
     var s = d.uptime, days = (s/86400)|0, hrs = ((s%86400)/3600)|0, mins = ((s%3600)/60)|0;
     var ut = '';
