@@ -57,12 +57,39 @@ static void serial_poll() {
     }
 }
 
-// Health monitoring: poll ROP every 10s to detect therapy state
+// Health monitoring:
+//   ROP every 10s to detect therapy state
+//   MHR every 30 min and once on therapy stop
 #define HEALTH_POLL_INTERVAL_MS     10000
 #define HEALTH_TIMEOUT_MS           500
+#define MHR_POLL_INTERVAL_MS        (30UL * 60 * 1000)
 
 static uint32_t last_health_poll = 0;
+static uint32_t last_mhr_poll = 0;
 static uint32_t consecutive_timeouts = 0;
+
+static void poll_mhr() {
+    char mhr_resp[32] = {};
+    uint16_t mhr_len = sizeof(mhr_resp);
+    if (!Arbiter::send_cmd("G S #MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                           mhr_resp, &mhr_len)) {
+        // UART unhappy; leave cache alone and retry next opportunity.
+        return;
+    }
+    const char *mv = qframe_response_value(mhr_resp);
+    int new_mhr = mv ? (int)strtol(mv, nullptr, 16) : -1;
+    int prev_mhr = Arbiter::get_cached_mhr();
+    Arbiter::set_cached_mhr(new_mhr);
+    last_mhr_poll = millis();
+    if (new_mhr != prev_mhr) {
+        WebUI::push_status_event();
+    }
+}
+
+static bool mhr_poll_due() {
+    if (Arbiter::get_cached_mhr() < 0) return true;
+    return millis() - last_mhr_poll >= MHR_POLL_INTERVAL_MS;
+}
 
 static void poll_therapy_state() {
     char resp[64] = {};
@@ -77,30 +104,22 @@ static void poll_therapy_state() {
 
         const char *rv = qframe_response_value(resp);
         if (rv) {
-            uint32_t val = strtoul(rv, nullptr, 16);
-            system_state_t current = Arbiter::get_state();
+            int new_rop = (int)strtoul(rv, nullptr, 16);
+            int prev_rop = Arbiter::get_cached_rop();
+            Arbiter::set_cached_rop(new_rop);
 
-            if (val == 1 && current == SYS_IDLE) {
+            system_state_t current = Arbiter::get_state();
+            if (new_rop == 1 && current == SYS_IDLE) {
                 Arbiter::set_state(SYS_THERAPY);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy started\n");
-            } else if (val == 0 && current == SYS_THERAPY) {
+            } else if (new_rop == 0 && current == SYS_THERAPY) {
                 Arbiter::set_state(SYS_IDLE);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy ended\n");
+                poll_mhr();
             }
 
-            if (Arbiter::get_state() != current) {
-                int mhr = -1;
-                char mhr_resp[32] = {};
-                uint16_t mhr_len = sizeof(mhr_resp);
-                if (Arbiter::send_cmd("G S #MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                      mhr_resp, &mhr_len)) {
-                    const char *mv = qframe_response_value(mhr_resp);
-                    if (mv) mhr = (int)strtol(mv, nullptr, 16);
-                }
-                char buf[64];
-                snprintf(buf, sizeof(buf), "{\"system\":\"%s\",\"mhr\":%d}",
-                         system_state_name(Arbiter::get_state()), mhr);
-                WebUI::push_event("status", buf);
+            if (new_rop != prev_rop) {
+                WebUI::push_status_event();
             }
         }
     } else {
@@ -295,6 +314,8 @@ void loop() {
             // Catch-up resync if AirSense rebooted out from under us, or
             // any consumer's initial subscribe attempt failed.
             LiveStream::resync();
+            // MHR refreshed 30 min cadence and at therapy-stop transition
+            if (mhr_poll_due()) poll_mhr();
         } else if (st == SYS_ERROR) {
             attempt_recovery();
         }

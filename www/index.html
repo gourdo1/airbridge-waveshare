@@ -726,7 +726,7 @@ async function api(url, opts) {
   return r;
 }
 
-const ROP_NAMES = {0:'Standby',1:'Normal',2:'Power Recovery',3:'Power Save',4:'Calibration',5:'Upgrade'};
+const ROP_NAMES = {0:'Standby',1:'Running',2:'Power Recovery',3:'Power Save',4:'Calibration',5:'Upgrade'};
 
 function renderStatus(d) {
   // Topbar - update from any push, even without full status

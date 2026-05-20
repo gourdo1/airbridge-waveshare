@@ -408,6 +408,13 @@ bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,
 system_state_t Arbiter::get_state()         { return sys_state; }
 void Arbiter::set_state(system_state_t s)   { sys_state = s; }
 
+static volatile int cached_rop = -1;
+static volatile int cached_mhr = -1;
+int  Arbiter::get_cached_rop()              { return cached_rop; }
+int  Arbiter::get_cached_mhr()              { return cached_mhr; }
+void Arbiter::set_cached_rop(int v)         { cached_rop = v; }
+void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
+
 void Arbiter::enter_transparent(Stream *bridge) {
     transparent_bridge = bridge;
     qframe_parser_reset(&transparent_parser);

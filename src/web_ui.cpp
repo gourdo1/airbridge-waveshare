@@ -144,13 +144,12 @@ static void handleRoot(AsyncWebServerRequest *request) {
 static void handleStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
-    system_state_t sys = Arbiter::get_state();
     oxi_state_t oxi = OxiBle::get_state();
     const oxi_reading_t &r = OxiArbiter::get_reading();
 
-    int rop = -1, mhr = -1;
-    readSetting("ROP", rop);
-    readSetting("MHR", mhr);
+    int rop = Arbiter::get_cached_rop();
+    int mhr = Arbiter::get_cached_mhr();
+    system_state_t sys = Arbiter::get_state();
 
     char dac_resp[32] = {}, tic_resp[32] = {};
     uint16_t dac_len = sizeof(dac_resp), tic_len = sizeof(tic_resp);
@@ -668,6 +667,11 @@ static void handleCmd(AsyncWebServerRequest *request) {
         if (ok && resp_len > 0) {
             jsonAddString(json, "response", resp);
         }
+        if (ok && cmd.startsWith("P S #ROP ")) {
+            int new_rop = (int)strtoul(cmd.c_str() + 9, nullptr, 16);
+            Arbiter::set_cached_rop(new_rop);
+            WebUI::push_status_event();
+        }
     }
 
     json += '}';
@@ -1159,29 +1163,78 @@ void WebUI::init(uint16_t port) {
     Log::logf(CAT_WEB, LOG_INFO, "[WEB] HTTP server on port %d\n", port);
 }
 
+static String build_status_payload() {
+    system_state_t sys = Arbiter::get_state();
+    oxi_state_t oxi = OxiBle::get_state();
+    const oxi_reading_t &r = OxiArbiter::get_reading();
+
+    String sj;
+    sj.reserve(256);
+    sj = "{";
+    jsonAddString(sj, "system", system_state_name(sys), false);
+    jsonAddInt(sj, "rop", Arbiter::get_cached_rop());
+    jsonAddInt(sj, "mhr", Arbiter::get_cached_mhr());
+    jsonAddString(sj, "oxi", oxi_state_name(oxi));
+    jsonAddString(sj, "oxi_addr", OxiArbiter::get_source_id());
+    jsonAddString(sj, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
+    jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
+    jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
+    jsonAddInt(sj, "heap", ESP.getFreeHeap());
+    jsonAddInt(sj, "rssi", WiFi.RSSI());
+    jsonAddInt(sj, "uptime", millis() / 1000);
+    sj += '}';
+    return sj;
+}
+
+struct PublishedStatusSnapshot {
+    int             rop      = INT_MIN;
+    int             mhr      = INT_MIN;
+    system_state_t  sys      = (system_state_t)0xFF;
+    oxi_state_t     oxi      = (oxi_state_t)0xFF;
+    bool            feeding  = false;
+    int             spo2     = INT_MIN;
+    int             pulse    = INT_MIN;
+};
+static PublishedStatusSnapshot last_published;
+
+static PublishedStatusSnapshot current_snapshot() {
+    PublishedStatusSnapshot s;
+    s.rop     = Arbiter::get_cached_rop();
+    s.mhr     = Arbiter::get_cached_mhr();
+    s.sys     = Arbiter::get_state();
+    s.oxi     = OxiBle::get_state();
+    s.feeding = OxiArbiter::is_feeding();
+    const oxi_reading_t &r = OxiArbiter::get_reading();
+    s.spo2    = r.valid ? r.spo2 : -1;
+    s.pulse   = r.valid ? r.pulse_bpm : -1;
+    return s;
+}
+
+static bool snapshot_differs(const PublishedStatusSnapshot &a,
+                             const PublishedStatusSnapshot &b) {
+    return a.rop     != b.rop     ||
+           a.mhr     != b.mhr     ||
+           a.sys     != b.sys     ||
+           a.oxi     != b.oxi     ||
+           a.feeding != b.feeding ||
+           a.spo2    != b.spo2    ||
+           a.pulse   != b.pulse;
+}
+
 static uint32_t last_status_push = 0;
 
+void WebUI::push_status_event() {
+    if (!events || events->count() == 0) return;
+    last_published = current_snapshot();
+    last_status_push = millis();
+    String sj = build_status_payload();
+    events->send(sj.c_str(), "status", millis());
+}
+
 void WebUI::handle() {
-    // Push immediately on BLE state change, or every 3s
-    bool ble_changed = OxiBle::state_changed();
-    if (events && events->count() > 0 && (ble_changed || millis() - last_status_push >= 3000)) {
-        last_status_push = millis();
-
-        system_state_t sys = Arbiter::get_state();
-        oxi_state_t oxi = OxiBle::get_state();
-        const oxi_reading_t &r = OxiArbiter::get_reading();
-
-        String sj = "{";
-        jsonAddString(sj, "system", system_state_name(sys), false);
-        jsonAddString(sj, "oxi", oxi_state_name(oxi));
-        jsonAddString(sj, "oxi_addr", OxiArbiter::get_source_id());
-        jsonAddString(sj, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
-        jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
-        jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
-        jsonAddInt(sj, "heap", ESP.getFreeHeap());
-        jsonAddInt(sj, "rssi", WiFi.RSSI());
-        jsonAddInt(sj, "uptime", millis() / 1000);
-        sj += '}';
-        events->send(sj.c_str(), "status", millis());
+    if (!events || events->count() == 0) return;
+    if (snapshot_differs(current_snapshot(), last_published) ||
+        millis() - last_status_push >= 10000) {
+        WebUI::push_status_event();
     }
 }

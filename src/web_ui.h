@@ -9,4 +9,6 @@ namespace WebUI {
     // event: event type name (e.g., "status", "ble", "flash", "live")
     void push_event(const char *event, const char *json);
     void push_event(const char *event, const String &json);
+
+    void push_status_event();
 }
