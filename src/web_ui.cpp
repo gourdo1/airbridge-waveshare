@@ -892,6 +892,15 @@ static void handleReport(AsyncWebServerRequest *request) {
 static esp_ota_handle_t esp_ota_handle = 0;
 static const esp_partition_t *esp_ota_part = nullptr;
 
+static void abortEspOtaUpload() {
+    if (esp_ota_handle) {
+        esp_ota_abort(esp_ota_handle);
+        esp_ota_handle = 0;
+    }
+    esp_ota_part = nullptr;
+    Arbiter::set_state(SYS_IDLE);
+}
+
 static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
@@ -928,8 +937,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         if (uploadSize == 0 && len > 0 && data[0] != 0xE9) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Not an ESP32 binary (magic=0x%02X)\n", data[0]);
             uploadOk = false;
-            esp_ota_abort(esp_ota_handle);
-            esp_ota_part = nullptr;
+            abortEspOtaUpload();
             return;
         }
         if (uploadSize == 0) Arbiter::set_state(SYS_OTA_ESP);
@@ -938,6 +946,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_write failed at %u: %s\n",
                       uploadSize, esp_err_to_name(err));
             uploadOk = false;
+            abortEspOtaUpload();
             return;
         }
         uploadCrc = crc16_ccitt(data, len, uploadCrc);
