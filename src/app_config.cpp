@@ -296,8 +296,9 @@ bool Config::set_value(const char *key, const char *value) {
 }
 
 void Config::foreach_kv(kv_visitor_fn fn, void *ctx) {
+    String val;
     for (const KVEntry *e = kv_table; e->key; e++) {
-        String val;
+        val = "";
         get_value(e->key, val);
         fn(e->key, val, ctx);
     }

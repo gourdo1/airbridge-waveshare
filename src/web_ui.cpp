@@ -16,6 +16,7 @@
 #include <ESPAsyncWebServer.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
+#include <stdarg.h>
 #include <time.h>
 
 extern const char *airbridge_version();
@@ -104,7 +105,9 @@ static void jsonAddInt(String &out, const char *key, int val, bool comma = true)
     out += '"';
     out += key;
     out += "\":";
-    out += String(val);
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d", val);
+    out += buf;
 }
 
 
@@ -141,8 +144,77 @@ static void handleRoot(AsyncWebServerRequest *request) {
 }
 
 
-static void handleStatus(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
+struct FixedJson {
+    char *buf;
+    size_t cap;
+    size_t len;
+    bool overflow;
+};
+
+static void fixedJsonPut(FixedJson &json, char c) {
+    if (json.len + 1 >= json.cap) {
+        json.overflow = true;
+        return;
+    }
+    json.buf[json.len++] = c;
+    json.buf[json.len] = '\0';
+}
+
+static void fixedJsonAppend(FixedJson &json, const char *s) {
+    while (*s) fixedJsonPut(json, *s++);
+}
+
+static void fixedJsonPrintf(FixedJson &json, const char *fmt, ...) {
+    if (json.len >= json.cap) {
+        json.overflow = true;
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(json.buf + json.len, json.cap - json.len, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || (size_t)n >= json.cap - json.len) {
+        json.len = json.cap ? json.cap - 1 : 0;
+        if (json.cap) json.buf[json.len] = '\0';
+        json.overflow = true;
+        return;
+    }
+    json.len += (size_t)n;
+}
+
+static void fixedJsonAddString(FixedJson &json, const char *key, const char *val, bool comma = true) {
+    if (comma) fixedJsonPut(json, ',');
+    fixedJsonPut(json, '"');
+    fixedJsonAppend(json, key);
+    fixedJsonAppend(json, "\":\"");
+
+    if (!val) val = "";
+    while (*val) {
+        if (*val == '"') fixedJsonAppend(json, "\\\"");
+        else if (*val == '\\') fixedJsonAppend(json, "\\\\");
+        else if (*val == '\n') fixedJsonAppend(json, "\\n");
+        else if (*val == '\r') fixedJsonAppend(json, "\\r");
+        else if (*val == '\t') fixedJsonAppend(json, "\\t");
+        else if ((uint8_t)*val >= 0x20) fixedJsonPut(json, *val);
+        val++;
+    }
+
+    fixedJsonPut(json, '"');
+}
+
+static void fixedJsonAddInt(FixedJson &json, const char *key, long val, bool comma = true) {
+    if (comma) fixedJsonPut(json, ',');
+    fixedJsonPut(json, '"');
+    fixedJsonAppend(json, key);
+    fixedJsonAppend(json, "\":");
+    fixedJsonPrintf(json, "%ld", val);
+}
+
+static size_t buildStatusJson(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
 
     oxi_state_t oxi = OxiBle::get_state();
     const oxi_reading_t &r = OxiArbiter::get_reading();
@@ -174,7 +246,6 @@ static void handleStatus(AsyncWebServerRequest *request) {
         const char *dv = qframe_response_value(dac_resp);
         const char *tv = qframe_response_value(tic_resp);
         if (dv && tv && strlen(dv) >= 8 && strlen(tv) >= 6) {
-            // Insert separators so sscanf can parse fixed-width fields
             int dd, mm, yyyy, hh, mn, ss;
             if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
                 sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
@@ -184,26 +255,56 @@ static void handleStatus(AsyncWebServerRequest *request) {
         }
     }
 
-    String json = "{";
-    jsonAddString(json, "version", airbridge_version(), false);
-    jsonAddString(json, "built", airbridge_build_date());
-    jsonAddString(json, "system", system_state_name(sys));
-    jsonAddInt(json, "rop", rop);
-    jsonAddString(json, "pna", cfg.device_pna.c_str());
-    jsonAddString(json, "srn", cfg.device_srn.c_str());
-    jsonAddString(json, "esp_time", esp_time);
-    jsonAddString(json, "resmed_time", resmed_time);
-    jsonAddString(json, "oxi", oxi_state_name(oxi));
-    jsonAddString(json, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
-    jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
-    jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
-    jsonAddInt(json, "heap", ESP.getFreeHeap());
-    jsonAddInt(json, "rssi", WiFi.RSSI());
-    jsonAddInt(json, "mhr", mhr);
-    jsonAddInt(json, "uptime", millis() / 1000);
-    json += '}';
+    FixedJson json = {out, cap, 0, false};
+    fixedJsonPut(json, '{');
+    fixedJsonAddString(json, "version", airbridge_version(), false);
+    fixedJsonAddString(json, "built", airbridge_build_date());
+    fixedJsonAddString(json, "system", system_state_name(sys));
+    fixedJsonAddInt(json, "rop", rop);
+    fixedJsonAddString(json, "pna", cfg.device_pna.c_str());
+    fixedJsonAddString(json, "srn", cfg.device_srn.c_str());
+    fixedJsonAddString(json, "esp_time", esp_time);
+    fixedJsonAddString(json, "resmed_time", resmed_time);
+    fixedJsonAddString(json, "oxi", oxi_state_name(oxi));
+    fixedJsonAddString(json, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
+    fixedJsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
+    fixedJsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
+    fixedJsonAddInt(json, "heap", ESP.getFreeHeap());
+    fixedJsonAddInt(json, "rssi", WiFi.RSSI());
+    fixedJsonAddInt(json, "mhr", mhr);
+    fixedJsonAddInt(json, "uptime", millis() / 1000);
+    fixedJsonPut(json, '}');
 
-    request->send(200, "application/json", json);
+    return json.overflow ? 0 : json.len;
+}
+
+static const uint32_t STATUS_CACHE_TTL_MS = 500;
+static const size_t STATUS_JSON_MAX = 512;
+static String status_cache;
+static uint32_t status_cache_built_at = 0;
+
+static bool refreshStatusCacheIfNeeded() {
+    uint32_t now = millis();
+    if (status_cache.length() > 0 && now - status_cache_built_at < STATUS_CACHE_TTL_MS)
+        return true;
+
+    char body[STATUS_JSON_MAX];
+    size_t len = buildStatusJson(body, sizeof(body));
+    if (len == 0) return false;
+
+    status_cache = body;
+    status_cache_built_at = millis();
+    return true;
+}
+
+static void handleStatus(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+
+    if (!refreshStatusCacheIfNeeded()) {
+        request->send(503, "application/json", "{\"ok\":false,\"error\":\"status_unavailable\"}");
+        return;
+    }
+    request->send(200, "application/json", status_cache);
 }
 
 
@@ -266,7 +367,6 @@ static void emitVarList(String &json, const char * const *cmds, const char *grou
         emitVar(json, v, group, raw, ok, first);
     }
 }
-
 
 static void handleGetSettings(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
@@ -345,11 +445,7 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
         auto *c = (decltype(ctx)*)p;
         if (!c->first) *c->json += ',';
         c->first = false;
-        *c->json += '"';
-        *c->json += key;
-        *c->json += "\":\"";
-        *c->json += val;
-        *c->json += '"';
+        jsonAddString(*c->json, key, val.c_str(), false);
     }, &ctx);
     json += '}';
     request->send(200, "application/json", json);
@@ -809,7 +905,7 @@ static const report_var_t REPORT_VARS[] = {
     {NULL, NULL, 0, 0, NULL, NULL}
 };
 
-static String period_label(int raw) {
+static const char *period_label(int raw, char *buf, size_t len) {
     switch (raw) {
         case 1:   return "1 Day";
         case 7:   return "1 Week";
@@ -817,7 +913,9 @@ static String period_label(int raw) {
         case 90:  return "3 Months";
         case 180: return "6 Months";
         case 365: return "1 Year";
-        default:  return String(raw) + " days";
+        default:
+            snprintf(buf, len, "%d days", raw);
+            return buf;
     }
 }
 
@@ -858,7 +956,7 @@ static void handleReport(AsyncWebServerRequest *request) {
             jsonAddString(json, "value", buf);
         } else if (ok && v->scale_div == -2) {
             // Period enum
-            jsonAddString(json, "value", period_label(raw).c_str());
+            jsonAddString(json, "value", period_label(raw, buf, sizeof(buf)));
         } else if (ok && v->scale_div == -1) {
             // I:E ratio: raw/100
             if (raw > 0) {
@@ -877,7 +975,12 @@ static void handleReport(AsyncWebServerRequest *request) {
             snprintf(buf, sizeof(buf), "%.*f", v->decimals, disp);
             jsonAddString(json, "value", buf);
         } else {
-            jsonAddString(json, "value", ok ? String(raw).c_str() : "--");
+            if (ok) {
+                snprintf(buf, sizeof(buf), "%d", raw);
+                jsonAddString(json, "value", buf);
+            } else {
+                jsonAddString(json, "value", "--");
+            }
         }
         jsonAddString(json, "unit", v->unit);
         jsonAddString(json, "section", v->section);
