@@ -40,12 +40,12 @@ static int find_stream_idx(const char *tag) {
     return -1;
 }
 
-static bool device_subscribe(int sidx, bool on) {
+static bool device_subscribe(int sidx, bool on, cmd_source_t src = CMD_SRC_INTERNAL) {
     char cmd[16];
     snprintf(cmd, sizeof(cmd), "P S &%s %d", streams[sidx].tag, on ? 1 : 0);
     char resp[32] = {};
     uint16_t resp_len = sizeof(resp);
-    return Arbiter::send_cmd(cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+    return Arbiter::send_cmd(cmd, src, CMD_PRIO_NORMAL,
                              resp, &resp_len, LS_DEVICE_CMD_TIMEOUT);
 }
 
@@ -134,21 +134,40 @@ void unsubscribe(consumer_handle_t h) {
     if (sidx >= 0 && sidx < LIVE_STREAMS_MAX && streams[sidx].in_use) {
         if (streams[sidx].ref_count > 0) streams[sidx].ref_count--;
         if (streams[sidx].ref_count == 0 && streams[sidx].subscribed) {
-            device_subscribe(sidx, false);
-            streams[sidx].subscribed = false;
-            Log::logf(CAT_GENERAL, LOG_INFO,
-                      "[LS] %s unsubscribed (refs=0)\n", streams[sidx].tag);
+            if (device_subscribe(sidx, false)) {
+                streams[sidx].subscribed = false;
+                Log::logf(CAT_GENERAL, LOG_INFO,
+                          "[LS] %s unsubscribed (refs=0)\n", streams[sidx].tag);
+            } else {
+                Log::logf(CAT_GENERAL, LOG_WARN,
+                          "[LS] %s unsubscribe failed (refs=0)\n", streams[sidx].tag);
+            }
         }
     }
 }
 
-void suspend() {
+static bool suspend_with_source(cmd_source_t src) {
+    bool ok = true;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use || !streams[i].subscribed) continue;
-        device_subscribe(i, false);
-        streams[i].subscribed = false;
-        Log::logf(CAT_GENERAL, LOG_INFO, "[LS] %s suspended\n", streams[i].tag);
+        if (device_subscribe(i, false, src)) {
+            streams[i].subscribed = false;
+            Log::logf(CAT_GENERAL, LOG_INFO, "[LS] %s suspended\n", streams[i].tag);
+        } else {
+            ok = false;
+            Log::logf(CAT_GENERAL, LOG_ERROR,
+                      "[LS] %s suspend failed\n", streams[i].tag);
+        }
     }
+    return ok;
+}
+
+bool suspend() {
+    return suspend_with_source(CMD_SRC_INTERNAL);
+}
+
+bool suspend_for_ota() {
+    return suspend_with_source(CMD_SRC_OTA);
 }
 
 void resume() {

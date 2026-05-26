@@ -102,6 +102,13 @@ static uart_ticket_t* pq_pop(TickType_t wait) {
 
 static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len);
 
+static bool uart_source_allowed(cmd_source_t src) {
+    system_state_t st = sys_state;
+    if (st == SYS_TRANSPARENT) return false;
+    if (st == SYS_OTA_AIRSENSE && src != CMD_SRC_OTA) return false;
+    return true;
+}
+
 typedef enum {
     RX_SLOT_FREE,
     RX_SLOT_RESERVED,
@@ -343,6 +350,26 @@ static void rx_task(void *param) {
 
 static void lcd_check();
 
+static void finish_ticket(uart_ticket_t *t) {
+    if (t->no_ack) {
+        // send_frame: arbiter is sole owner of the heap ticket.
+        free(t);
+        return;
+    }
+
+    xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
+    if (t->cancelled) {
+        xSemaphoreGive(cleanup_mutex);
+        Log::logf(CAT_ARB, LOG_WARN, "[ARB] Ticket %u cancelled by caller\n",
+                  t->ticket_id);
+        if (t->done) vSemaphoreDelete(t->done);
+        free(t);
+    } else {
+        xSemaphoreGive(t->done);  // hand off; caller frees ticket + sem
+        xSemaphoreGive(cleanup_mutex);
+    }
+}
+
 static void arbiter_task(void *param) {
     while (true) {
         uart_ticket_t *t = pq_pop(pdMS_TO_TICKS(100));
@@ -351,8 +378,32 @@ static void arbiter_task(void *param) {
             continue;
         }
 
+        if (!uart_source_allowed(t->source)) {
+            t->success = false;
+            t->timed_out = false;
+            t->resp_len = 0;
+            stat_error++;
+            Log::logf(CAT_ARB, LOG_WARN,
+                      "[ARB] TX blocked by state=%s src=%d t=%lu\n",
+                      system_state_name(sys_state), t->source, millis());
+            finish_ticket(t);
+            continue;
+        }
+
         // Send frame
         current_ticket = t;
+        if (!uart_source_allowed(t->source)) {
+            current_ticket = nullptr;
+            t->success = false;
+            t->timed_out = false;
+            t->resp_len = 0;
+            stat_error++;
+            Log::logf(CAT_ARB, LOG_WARN,
+                      "[ARB] TX blocked before write by state=%s src=%d t=%lu\n",
+                      system_state_name(sys_state), t->source, millis());
+            finish_ticket(t);
+            continue;
+        }
         if (!t->no_ack) Arbiter::clear_rx_frames();
 
         uart->write(t->frame, t->frame_len);
@@ -404,24 +455,7 @@ static void arbiter_task(void *param) {
         }
 
         current_ticket = nullptr;
-
-        if (t->no_ack) {
-            // send_frame: arbiter is sole owner of the heap ticket.
-            free(t);
-            continue;
-        }
-
-        xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
-        if (t->cancelled) {
-            xSemaphoreGive(cleanup_mutex);
-            Log::logf(CAT_ARB, LOG_WARN, "[ARB] Ticket %u cancelled by caller\n",
-                      t->ticket_id);
-            if (t->done) vSemaphoreDelete(t->done);
-            free(t);
-        } else {
-            xSemaphoreGive(t->done);  // hand off; caller frees ticket + sem
-            xSemaphoreGive(cleanup_mutex);
-        }
+        finish_ticket(t);
     }
 }
 
@@ -444,6 +478,9 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
 }
 
 bool Arbiter::submit(uart_ticket_t *ticket) {
+    if (!ticket || !uart_source_allowed(ticket->source)) {
+        return false;
+    }
     if (!ticket->done) {
         ticket->done = xSemaphoreCreateBinary();
     }
@@ -456,8 +493,7 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
 {
     if (timeout_ms == 0) timeout_ms = Config::get().uart_cmd_timeout_ms;
 
-    // Reject all commands while in transparent mode
-    if (sys_state == SYS_TRANSPARENT) {
+    if (!uart_source_allowed(src)) {
         if (resp_len) *resp_len = 0;
         return false;
     }
@@ -536,7 +572,7 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
 bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,
                          cmd_source_t src, cmd_priority_t prio)
 {
-    if (sys_state == SYS_TRANSPARENT) return false;
+    if (!uart_source_allowed(src)) return false;
     if (frame_len > QFRAME_MAX_RAW) return false;
 
     // Heap-allocated: arbiter owns the ticket after push and frees it after send.
@@ -562,6 +598,17 @@ bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,
 
 system_state_t Arbiter::get_state()         { return sys_state; }
 void Arbiter::set_state(system_state_t s)   { sys_state = s; }
+
+bool Arbiter::wait_idle(uint16_t timeout_ms) {
+    uint32_t start = millis();
+    while (current_ticket != nullptr) {
+        if ((uint32_t)(millis() - start) >= timeout_ms) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return true;
+}
 
 static volatile int cached_rop = -1;
 static volatile int cached_mhr = -1;

@@ -50,7 +50,8 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx);
 // Unsubscribe; safe to call with handle == -1 (no-op).
 void unsubscribe(consumer_handle_t h);
 
-void suspend();
+bool suspend();
+bool suspend_for_ota();
 void resume();
 void resync();
 void reattach();

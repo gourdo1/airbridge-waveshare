@@ -291,7 +291,7 @@ void loop() {
     static bool prev_ota_active = false;
     if (ota_active) {
         OxiBle::suspend();
-        if (!prev_ota_active) LiveStream::suspend();
+        if (!prev_ota_active && sys_st == SYS_OTA_ESP) LiveStream::suspend();
     } else {
         OxiBle::resume();
         if (prev_ota_active) LiveStream::resume();

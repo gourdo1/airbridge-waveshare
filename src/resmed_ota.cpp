@@ -4,6 +4,7 @@
 #include "crc.h"
 #include "debug_log.h"
 #include "app_config.h"
+#include "live_stream.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
@@ -509,13 +510,23 @@ static void flash_task(void *param) {
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Using partition '%s' (0x%X, %u bytes)\n",
               part->label, part->address, part->size);
 
-    // BLX safety check
-    if ((is_full && p->flash_blx) || strcmp(p->block, "BLX") == 0) {
-        if (!check_bid(part, 0, p->force_blx)) goto done;
+    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    strncpy(flash_phase, "Claim UART", sizeof(flash_phase));
+    if (!Arbiter::wait_idle(3000)) {
+        snprintf(flash_error, sizeof(flash_error), "UART busy before OTA");
+        goto cleanup;
     }
 
+    strncpy(flash_phase, "Suspend streams", sizeof(flash_phase));
+    if (!LiveStream::suspend_for_ota()) {
+        snprintf(flash_error, sizeof(flash_error), "Failed to stop live streams");
+        goto cleanup;
+    }
 
-    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    // BLX safety check
+    if ((is_full && p->flash_blx) || strcmp(p->block, "BLX") == 0) {
+        if (!check_bid(part, 0, p->force_blx)) goto cleanup;
+    }
 
     if (!enter_bootloader()) goto cleanup;
     if (flash_cancel) goto cleanup;

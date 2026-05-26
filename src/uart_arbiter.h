@@ -68,6 +68,7 @@ namespace Arbiter {
 
     system_state_t get_state();
     void set_state(system_state_t state);
+    bool wait_idle(uint16_t timeout_ms);
 
     void enter_transparent(Stream *bridge);
     void exit_transparent();
