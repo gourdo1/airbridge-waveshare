@@ -74,6 +74,7 @@ namespace Arbiter {
 
     void write_raw(const uint8_t *data, size_t len);
 
+    void clear_rx_frames();
     bool wait_frame(qframe_t *out, uint16_t timeout_ms);
 
     void set_baud(uint32_t baud);

@@ -475,10 +475,23 @@ size_t uploadSize = 0;
 static bool uploadOk = false;
 static uint16_t uploadCrc = 0xFFFF;
 
+typedef enum {
+    UPLOAD_NONE,
+    UPLOAD_RESMED,
+    UPLOAD_ESP,
+} upload_kind_t;
+
+static upload_kind_t uploadKind = UPLOAD_NONE;
+
+static bool hasValidResmedUpload() {
+    return uploadKind == UPLOAD_RESMED && uploadOk && uploadSize > 0 && resmed_part;
+}
+
 static void handleUploadChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Upload start: %s\n", filename.c_str());
+        uploadKind = UPLOAD_RESMED;
         uploadSize = 0;
         uploadOk = false;
         uploadCrc = 0xFFFF;
@@ -486,6 +499,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
         resmed_part = ResmedOta::get_staging_partition();
         if (!resmed_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No staging partition found\n");
+            uploadKind = UPLOAD_NONE;
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Staging to '%s' (0x%X, %u bytes)\n",
@@ -495,12 +509,13 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
         if (err != ESP_OK) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Erase failed: %s\n", esp_err_to_name(err));
             resmed_part = nullptr;
+            uploadKind = UPLOAD_NONE;
             return;
         }
         uploadOk = true;
     }
 
-    if (resmed_part && uploadOk && len > 0) {
+    if (uploadKind == UPLOAD_RESMED && resmed_part && uploadOk && len > 0) {
         // reject ESP32 binaries uploaded to resmed slot
         if (uploadSize == 0 && len > 0 && data[0] == 0xE9) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Rejected: ESP32 binary uploaded to ResMed slot\n");
@@ -534,10 +549,11 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
     String json = "{";
-    jsonAddString(json, "ok", uploadOk ? "true" : "false", false);
+    bool validUpload = hasValidResmedUpload();
+    jsonAddString(json, "ok", validUpload ? "true" : "false", false);
     jsonAddInt(json, "size", uploadSize);
 
-    if (uploadOk && resmed_part && uploadSize > 0) {
+    if (validUpload) {
         char hexcrc[8];
         snprintf(hexcrc, sizeof(hexcrc), "%04X", uploadCrc);
         jsonAddString(json, "crc", hexcrc);
@@ -788,7 +804,7 @@ static void handleFlashStatus(AsyncWebServerRequest *request) {
         jsonAddString(json, "error", err);
     }
 
-    if (uploadSize > 0) {
+    if (hasValidResmedUpload()) {
         const char *detected = ResmedOta::detect_block(uploadSize);
         jsonAddString(json, "detected_block", detected ? detected : "unknown");
         jsonAddInt(json, "fw_size", uploadSize);
@@ -806,8 +822,8 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
         return;
     }
 
-    if (uploadSize == 0) {
-        request->send(400, "application/json", "{\"ok\":false,\"error\":\"no firmware uploaded\"}");
+    if (!hasValidResmedUpload()) {
+        request->send(400, "application/json", "{\"ok\":false,\"error\":\"no valid ResMed firmware uploaded\"}");
         return;
     }
 
@@ -1001,6 +1017,7 @@ static void abortEspOtaUpload() {
         esp_ota_handle = 0;
     }
     esp_ota_part = nullptr;
+    uploadKind = UPLOAD_NONE;
     Arbiter::set_state(SYS_IDLE);
 }
 
@@ -1013,6 +1030,8 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA start: %s\n", filename.c_str());
+        uploadKind = UPLOAD_ESP;
+        resmed_part = nullptr;
         uploadSize = 0;
         uploadOk = false;
         uploadCrc = 0xFFFF;
@@ -1020,6 +1039,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         esp_ota_part = esp_ota_get_next_update_partition(NULL);
         if (!esp_ota_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No OTA partition found\n");
+            uploadKind = UPLOAD_NONE;
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] OTA target: '%s' (0x%X, %u bytes)\n",
@@ -1029,6 +1049,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         if (err != ESP_OK) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_begin failed: %s\n", esp_err_to_name(err));
             esp_ota_part = nullptr;
+            uploadKind = UPLOAD_NONE;
             Arbiter::set_state(SYS_IDLE);
             return;
         }
@@ -1067,7 +1088,7 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     String json = "{";
     bool ok = false;
 
-    if (uploadOk && esp_ota_part) {
+    if (uploadKind == UPLOAD_ESP && uploadOk && uploadSize > 0 && esp_ota_part) {
         esp_err_t err = esp_ota_end(esp_ota_handle);
         if (err == ESP_OK) {
             err = esp_ota_set_boot_partition(esp_ota_part);
@@ -1095,6 +1116,7 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
 
     esp_ota_handle = 0;
     esp_ota_part = nullptr;
+    uploadKind = UPLOAD_NONE;
     Arbiter::set_state(SYS_IDLE);
 
     json += '}';

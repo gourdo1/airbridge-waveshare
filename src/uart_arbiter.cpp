@@ -10,19 +10,27 @@
 #define RX_TASK_STACK           3072
 #define RX_TASK_PRIO            6
 #define RX_BUF_SIZE             1024
+#define RX_FRAME_QUEUE_DEPTH    4
 
 static HardwareSerial *uart = nullptr;
 static TaskHandle_t arbiter_task_handle = nullptr;
 static TaskHandle_t rx_task_handle = nullptr;
 
 static SemaphoreHandle_t cleanup_mutex = nullptr;
+static SemaphoreHandle_t rx_ready = nullptr;
 
 static volatile system_state_t sys_state = SYS_IDLE;
 static volatile uart_ticket_t *current_ticket = nullptr;
-static SemaphoreHandle_t rx_ready = nullptr;
 static qframe_parser_t rx_parser;
-static qframe_t last_rx_frame;
-static volatile bool rx_frame_available = false;
+
+static portMUX_TYPE rx_frame_mux = portMUX_INITIALIZER_UNLOCKED;
+static qframe_t rx_frame_storage[RX_FRAME_QUEUE_DEPTH];
+static uint8_t rx_frame_queue[RX_FRAME_QUEUE_DEPTH];
+static uint8_t rx_frame_slot_state[RX_FRAME_QUEUE_DEPTH];
+static uint8_t rx_frame_head = 0;
+static uint8_t rx_frame_tail = 0;
+static uint8_t rx_frame_count = 0;
+static uint32_t rx_frame_epoch = 0;
 
 static volatile bool transparent_active = false;
 static Stream *transparent_bridge = nullptr;
@@ -93,6 +101,139 @@ static uart_ticket_t* pq_pop(TickType_t wait) {
 }
 
 static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len);
+
+typedef enum {
+    RX_SLOT_FREE,
+    RX_SLOT_RESERVED,
+    RX_SLOT_QUEUED,
+} rx_slot_state_t;
+
+typedef enum {
+    RX_PUSH_STORED,
+    RX_PUSH_STORED_DROPPED_OLD,
+    RX_PUSH_DROPPED_FULL,
+    RX_PUSH_DROPPED_STALE,
+} rx_push_result_t;
+
+static int rx_frame_priority(uint8_t type) {
+    switch (type) {
+        case QFRAME_TYPE_E: return 3;
+        case QFRAME_TYPE_R: return 2;
+        default: return 1;
+    }
+}
+
+static uint8_t rx_queue_slot(uint8_t logical_index) {
+    return (rx_frame_tail + logical_index) % RX_FRAME_QUEUE_DEPTH;
+}
+
+static int rx_find_free_slot() {
+    for (uint8_t i = 0; i < RX_FRAME_QUEUE_DEPTH; i++) {
+        if (rx_frame_slot_state[i] == RX_SLOT_FREE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static uint8_t rx_queue_clear_locked() {
+    uint8_t cleared = rx_frame_count;
+    for (uint8_t i = 0; i < rx_frame_count; i++) {
+        uint8_t slot = rx_frame_queue[rx_queue_slot(i)];
+        rx_frame_slot_state[slot] = RX_SLOT_FREE;
+    }
+    rx_frame_head = 0;
+    rx_frame_tail = 0;
+    rx_frame_count = 0;
+    rx_frame_epoch++;
+    return cleared;
+}
+
+static uint8_t rx_queue_drop_at(uint8_t logical_index) {
+    uint8_t dropped_slot = rx_frame_queue[rx_queue_slot(logical_index)];
+
+    for (uint8_t i = logical_index; i + 1 < rx_frame_count; i++) {
+        rx_frame_queue[rx_queue_slot(i)] = rx_frame_queue[rx_queue_slot(i + 1)];
+    }
+    rx_frame_head = (rx_frame_head + RX_FRAME_QUEUE_DEPTH - 1) % RX_FRAME_QUEUE_DEPTH;
+    rx_frame_count--;
+
+    return dropped_slot;
+}
+
+static rx_push_result_t rx_queue_push(const qframe_t *frame) {
+    bool overflow = false;
+    uint8_t slot = 0;
+    uint32_t epoch = 0;
+
+    portENTER_CRITICAL(&rx_frame_mux);
+    if (rx_frame_count >= RX_FRAME_QUEUE_DEPTH) {
+        int new_prio = rx_frame_priority(frame->type);
+        uint8_t drop_index = 0;
+        bool found_lower_priority = false;
+
+        for (uint8_t i = 0; i < rx_frame_count; i++) {
+            uint8_t queued_slot = rx_frame_queue[rx_queue_slot(i)];
+            if (rx_frame_priority(rx_frame_storage[queued_slot].type) < new_prio) {
+                drop_index = i;
+                found_lower_priority = true;
+                break;
+            }
+        }
+
+        if (!found_lower_priority) {
+            portEXIT_CRITICAL(&rx_frame_mux);
+            return RX_PUSH_DROPPED_FULL;
+        }
+
+        slot = rx_queue_drop_at(drop_index);
+        overflow = true;
+    } else {
+        int free_slot = rx_find_free_slot();
+        if (free_slot < 0) {
+            portEXIT_CRITICAL(&rx_frame_mux);
+            return RX_PUSH_DROPPED_FULL;
+        }
+        slot = (uint8_t)free_slot;
+    }
+
+    rx_frame_slot_state[slot] = RX_SLOT_RESERVED;
+    epoch = rx_frame_epoch;
+    portEXIT_CRITICAL(&rx_frame_mux);
+
+    memcpy(&rx_frame_storage[slot], frame, sizeof(qframe_t));
+
+    portENTER_CRITICAL(&rx_frame_mux);
+    if (epoch != rx_frame_epoch) {
+        rx_frame_slot_state[slot] = RX_SLOT_FREE;
+        portEXIT_CRITICAL(&rx_frame_mux);
+        return RX_PUSH_DROPPED_STALE;
+    }
+    rx_frame_queue[rx_frame_head] = slot;
+    rx_frame_head = (rx_frame_head + 1) % RX_FRAME_QUEUE_DEPTH;
+    rx_frame_count++;
+    rx_frame_slot_state[slot] = RX_SLOT_QUEUED;
+    portEXIT_CRITICAL(&rx_frame_mux);
+
+    return overflow ? RX_PUSH_STORED_DROPPED_OLD : RX_PUSH_STORED;
+}
+
+static bool rx_queue_pop(qframe_t *out) {
+    bool ok = false;
+
+    portENTER_CRITICAL(&rx_frame_mux);
+    if (rx_frame_count > 0) {
+        uint8_t slot = rx_frame_queue[rx_frame_tail];
+        rx_frame_tail = (rx_frame_tail + 1) % RX_FRAME_QUEUE_DEPTH;
+        rx_frame_count--;
+        if (out) memcpy(out, &rx_frame_storage[slot], sizeof(qframe_t));
+        rx_frame_slot_state[slot] = RX_SLOT_FREE;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&rx_frame_mux);
+
+    return ok;
+}
 
 
 static void rx_task(void *param) {
@@ -169,11 +310,24 @@ static void rx_task(void *param) {
                                   f->payload_len, millis());
                         LiveStream::on_l_frame(f->payload, f->payload_len);
                     } else {
-                        memcpy((void*)&last_rx_frame, f, sizeof(qframe_t));
-                        rx_frame_available = true;
                         stat_rx++;
-                        if (rx_ready) {
-                            xSemaphoreGive(rx_ready);
+                        rx_push_result_t push_result = rx_queue_push(f);
+                        if (push_result == RX_PUSH_STORED ||
+                            push_result == RX_PUSH_STORED_DROPPED_OLD) {
+                            if (rx_ready) {
+                                xSemaphoreGive(rx_ready);
+                            }
+                        }
+                        if (push_result == RX_PUSH_STORED_DROPPED_OLD) {
+                            stat_error++;
+                            Log::logf(CAT_ARB, LOG_WARN,
+                                      "[ARB] RX queue full, dropped queued frame t=%lu\n",
+                                      millis());
+                        } else if (push_result == RX_PUSH_DROPPED_FULL) {
+                            stat_error++;
+                            Log::logf(CAT_ARB, LOG_WARN,
+                                      "[ARB] RX queue full, dropped incoming frame t=%lu\n",
+                                      millis());
                         }
                     }
                 } else {
@@ -199,8 +353,7 @@ static void arbiter_task(void *param) {
 
         // Send frame
         current_ticket = t;
-        rx_frame_available = false;
-        xSemaphoreTake(rx_ready, 0);
+        if (!t->no_ack) Arbiter::clear_rx_frames();
 
         uart->write(t->frame, t->frame_len);
         uart->flush();
@@ -218,37 +371,39 @@ static void arbiter_task(void *param) {
             t->success = true;
             t->timed_out = false;
             t->resp_len = 0;
-        } else if (xSemaphoreTake(rx_ready, pdMS_TO_TICKS(t->timeout_ms)) == pdTRUE
-            && rx_frame_available) {
-            // Got response
-            t->resp_type = last_rx_frame.type;
-            t->resp_len = last_rx_frame.payload_len;
-            if (t->resp_len > 0) {
-                memcpy(t->resp_payload, last_rx_frame.payload,
-                       min((int)t->resp_len, (int)sizeof(t->resp_payload)));
-            }
-            t->success = (last_rx_frame.type == QFRAME_TYPE_R);
-            t->timed_out = false;
-            {
-                char snip[33] = {};
-                if (t->resp_len > 0) memcpy(snip, t->resp_payload, min((int)t->resp_len, 32));
-                Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX %s %s t=%lu\n",
-                          snip, t->success ? "ok" : "err", millis());
-            }
-            if (last_rx_frame.type == QFRAME_TYPE_E) {
-                stat_error++;
-            }
         } else {
-            t->success = false;
-            t->timed_out = true;
-            t->resp_len = 0;
-            stat_timeout++;
-            Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX timeout after %dms src=%d t=%lu\n",
-                      t->timeout_ms, t->source, millis());
+            qframe_t rx;
+            bool got_rx = Arbiter::wait_frame(&rx, t->timeout_ms);
+            if (got_rx) {
+                // Got response
+                t->resp_type = rx.type;
+                t->resp_len = rx.payload_len;
+                if (t->resp_len > 0) {
+                    memcpy(t->resp_payload, rx.payload,
+                           min((int)t->resp_len, (int)sizeof(t->resp_payload)));
+                }
+                t->success = (rx.type == QFRAME_TYPE_R);
+                t->timed_out = false;
+                {
+                    char snip[33] = {};
+                    if (t->resp_len > 0) memcpy(snip, t->resp_payload, min((int)t->resp_len, 32));
+                    Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX %s %s t=%lu\n",
+                              snip, t->success ? "ok" : "err", millis());
+                }
+                if (rx.type == QFRAME_TYPE_E) {
+                    stat_error++;
+                }
+            } else {
+                t->success = false;
+                t->timed_out = true;
+                t->resp_len = 0;
+                stat_timeout++;
+                Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX timeout after %dms src=%d t=%lu\n",
+                          t->timeout_ms, t->source, millis());
+            }
         }
 
         current_ticket = nullptr;
-        rx_frame_available = false;
 
         if (t->no_ack) {
             // send_frame: arbiter is sole owner of the heap ticket.
@@ -443,16 +598,46 @@ void Arbiter::write_raw(const uint8_t *data, size_t len) {
     }
 }
 
+void Arbiter::clear_rx_frames() {
+    uint8_t cleared;
+    portENTER_CRITICAL(&rx_frame_mux);
+    cleared = rx_queue_clear_locked();
+    portEXIT_CRITICAL(&rx_frame_mux);
+    if (rx_ready) {
+        xSemaphoreTake(rx_ready, 0);
+    }
+    if (cleared > 0) {
+        Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX queue cleared (%u frame%s) t=%lu\n",
+                  cleared, cleared == 1 ? "" : "s", millis());
+    }
+}
+
 bool Arbiter::wait_frame(qframe_t *out, uint16_t timeout_ms) {
-    rx_frame_available = false;
-    xSemaphoreTake(rx_ready, 0);  // clear stale
-    if (xSemaphoreTake(rx_ready, pdMS_TO_TICKS(timeout_ms)) == pdTRUE
-        && rx_frame_available) {
-        if (out) memcpy(out, (void*)&last_rx_frame, sizeof(qframe_t));
-        rx_frame_available = false;
+    if (rx_queue_pop(out)) {
         return true;
     }
-    return false;
+    if (timeout_ms == 0 || !rx_ready) {
+        return false;
+    }
+
+    uint32_t start = millis();
+    while (true) {
+        uint32_t elapsed = (uint32_t)(millis() - start);
+        if (elapsed >= timeout_ms) {
+            break;
+        }
+        uint32_t remaining = timeout_ms - elapsed;
+        if (xSemaphoreTake(rx_ready, pdMS_TO_TICKS(remaining)) != pdTRUE) {
+            break;
+        }
+        if (rx_queue_pop(out)) {
+            return true;
+        }
+        // A stale coalesced wake can remain after immediate queue drains.
+        // Consume it and keep waiting for the real timeout window.
+    }
+    // Covers a frame pushed exactly as the semaphore wait timed out.
+    return rx_queue_pop(out);
 }
 
 void Arbiter::set_baud(uint32_t baud) {
@@ -462,7 +647,7 @@ void Arbiter::set_baud(uint32_t baud) {
         // Flush RX hardware buffer (contains garbage from old baud)
         while (uart->available()) uart->read();
         qframe_parser_reset(&rx_parser);
-        rx_frame_available = false;
+        Arbiter::clear_rx_frames();
         Log::logf(CAT_ARB, LOG_INFO, "[ARB] set_baud: %u -> %u\n", current_baud, baud);
         current_baud = baud;
     }

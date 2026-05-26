@@ -182,6 +182,7 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
     int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
     if (frame_len < 0) return false;
 
+    Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
 
     qframe_t rx;
@@ -237,6 +238,7 @@ static bool negotiate_baud_460800() {
     uint8_t bdd_frame[64];
     int bdd_len = qframe_build_cmd("P S #BDD 0002", bdd_frame, sizeof(bdd_frame));
     if (bdd_len <= 0) return false;
+    Arbiter::clear_rx_frames();
     Arbiter::write_raw(bdd_frame, bdd_len);
     vTaskDelay(pdMS_TO_TICKS(100));
     qframe_t rx;
@@ -369,6 +371,7 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
             snprintf(flash_error, sizeof(flash_error), "Erase frame build error");
             return false;
         }
+        Arbiter::clear_rx_frames();
         Arbiter::write_raw(frame, frame_len);
 
         if (!wait_for_erase(30000)) return false;

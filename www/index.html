@@ -1318,8 +1318,16 @@ async function uploadFile(file) {
     const xhr = new XMLHttpRequest();
     xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded/e.total*100)+'%'; };
     xhr.onload = () => {
-      if (xhr.status === 200) { const d = JSON.parse(xhr.responseText); showMsg(msgEl, 'Upload OK: '+d.size+' bytes, CRC: '+(d.crc||'n/a'), 'ok', 0); showFwWarnings(d); showFlashCard(); }
-      else showMsg(msgEl, 'Upload failed: ' + xhr.statusText, 'err');
+      let d = {};
+      try { d = JSON.parse(xhr.responseText || '{}'); }
+      catch(e) { showMsg(msgEl, 'Upload failed: bad server response', 'err'); return; }
+      if (xhr.status === 200 && d.ok === 'true') {
+        showMsg(msgEl, 'Upload OK: '+d.size+' bytes, CRC: '+(d.crc||'n/a'), 'ok', 0);
+        showFwWarnings(d);
+        showFlashCard();
+      } else {
+        showMsg(msgEl, 'Upload failed: ' + (d.error || xhr.statusText || xhr.status), 'err');
+      }
     };
     xhr.onerror = () => showMsg(msgEl, 'Upload error', 'err');
     xhr.open('POST', '/api/upload'); xhr.send(fd);
