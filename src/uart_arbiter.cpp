@@ -36,6 +36,20 @@ static volatile bool transparent_active = false;
 static Stream *transparent_bridge = nullptr;
 static volatile uint32_t transparent_last_activity = 0;
 static qframe_parser_t transparent_parser;      // shadow parser for BDD sniffing
+static uint32_t transparent_pending_baud = 0;
+static uint32_t transparent_pending_baud_at = 0;
+static uint32_t transparent_reboot_baud_at = 0;
+
+static const uint32_t TRANSPARENT_REBOOT_BAUD_DELAY_MS = 25;
+static const uint32_t RESMED_DEFAULT_BAUD = 57600;
+
+static qframe_parse_state_t transparent_tx_state = QFP_IDLE;
+static uint8_t transparent_tx_type = 0;
+static uint16_t transparent_tx_declared_len = 0;
+static uint16_t transparent_tx_raw_count = 0;
+static uint8_t transparent_tx_payload_len = 0;
+static uint8_t transparent_tx_len_chars[3];
+static uint8_t transparent_tx_payload[17];
 
 static uint32_t current_baud = 0;
 
@@ -101,6 +115,7 @@ static uart_ticket_t* pq_pop(TickType_t wait) {
 }
 
 static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len);
+static void transparent_apply_baud(uint32_t new_baud, const char *reason);
 
 static bool uart_source_allowed(cmd_source_t src) {
     system_state_t st = sys_state;
@@ -242,13 +257,203 @@ static bool rx_queue_pop(qframe_t *out) {
     return ok;
 }
 
+static void transparent_apply_baud(uint32_t new_baud, const char *reason) {
+    if (new_baud && new_baud != current_baud) {
+        if (transparent_bridge) transparent_bridge->flush();
+        vTaskDelay(pdMS_TO_TICKS(10));
+        uart->updateBaudRate(new_baud);
+        Log::logf(CAT_ARB, LOG_INFO,
+                  "[ARB] transparent baud (%s): %u -> %u\n",
+                  reason ? reason : "unknown", current_baud, new_baud);
+        current_baud = new_baud;
+    }
+}
+
+static const char *transparent_reboot_command(const uint8_t *payload,
+                                              uint16_t len) {
+    if (len < 13 || payload[8] != ' ') return nullptr;
+
+    const char *name = nullptr;
+    if (memcmp(payload, "P S #RES", 8) == 0) {
+        name = "RES";
+    } else if (memcmp(payload, "P S #BLL", 8) == 0) {
+        name = "BLL";
+    } else {
+        return nullptr;
+    }
+
+    const char *value = (const char *)payload + 9;
+    char *end = nullptr;
+    unsigned long raw = strtoul(value, &end, 16);
+    if (end == value || raw == 0) return nullptr;
+
+    return name;
+}
+
+static void transparent_schedule_reboot_baud(const char *cmd) {
+    transparent_reboot_baud_at = millis() + TRANSPARENT_REBOOT_BAUD_DELAY_MS;
+    Log::logf(CAT_ARB, LOG_DEBUG,
+              "[ARB] transparent %s pending default baud in %ums\n",
+              cmd ? cmd : "reset", TRANSPARENT_REBOOT_BAUD_DELAY_MS);
+}
+
+static void transparent_check_reboot_baud(bool force) {
+    if (!transparent_reboot_baud_at) return;
+    if (!force && (int32_t)(millis() - transparent_reboot_baud_at) < 0) return;
+
+    transparent_reboot_baud_at = 0;
+    transparent_pending_baud = 0;
+    transparent_pending_baud_at = 0;
+    transparent_apply_baud(RESMED_DEFAULT_BAUD, "reset");
+}
+
+static void transparent_tx_reset() {
+    transparent_tx_state = QFP_IDLE;
+    transparent_tx_type = 0;
+    transparent_tx_declared_len = 0;
+    transparent_tx_raw_count = 0;
+    transparent_tx_payload_len = 0;
+}
+
+static void transparent_tx_handle_frame() {
+    if (transparent_tx_type != QFRAME_TYPE_Q) return;
+
+    transparent_tx_payload[min((size_t)transparent_tx_payload_len,
+                               sizeof(transparent_tx_payload) - 1)] = '\0';
+    uint32_t new_baud = parse_bdd_baud(transparent_tx_payload,
+                                       transparent_tx_payload_len);
+    if (new_baud) {
+        transparent_pending_baud = new_baud;
+        transparent_pending_baud_at = millis();
+        Log::logf(CAT_ARB, LOG_DEBUG,
+                  "[ARB] BDD transparent pending baud %u\n", new_baud);
+    }
+
+    const char *reboot_cmd = transparent_reboot_command(transparent_tx_payload,
+                                                        transparent_tx_payload_len);
+    if (reboot_cmd) {
+        transparent_schedule_reboot_baud(reboot_cmd);
+    }
+}
+
+static void transparent_tx_feed(uint8_t byte) {
+    switch (transparent_tx_state) {
+    case QFP_IDLE:
+        if (byte == QFRAME_SYNC) {
+            transparent_tx_reset();
+            transparent_tx_raw_count = 1;
+            transparent_tx_state = QFP_TYPE;
+        }
+        break;
+
+    case QFP_TYPE:
+        transparent_tx_type = byte;
+        transparent_tx_raw_count++;
+        transparent_tx_state = QFP_LEN0;
+        break;
+
+    case QFP_LEN0:
+        transparent_tx_len_chars[0] = byte;
+        transparent_tx_raw_count++;
+        transparent_tx_state = QFP_LEN1;
+        break;
+
+    case QFP_LEN1:
+        transparent_tx_len_chars[1] = byte;
+        transparent_tx_raw_count++;
+        transparent_tx_state = QFP_LEN2;
+        break;
+
+    case QFP_LEN2: {
+        transparent_tx_len_chars[2] = byte;
+        transparent_tx_raw_count++;
+        int n0 = hex_nibble(transparent_tx_len_chars[0]);
+        int n1 = hex_nibble(transparent_tx_len_chars[1]);
+        int n2 = hex_nibble(transparent_tx_len_chars[2]);
+        if (n0 < 0 || n1 < 0 || n2 < 0) {
+            transparent_tx_reset();
+            break;
+        }
+        transparent_tx_declared_len = (n0 << 8) | (n1 << 4) | n2;
+        if (transparent_tx_declared_len < 9 || transparent_tx_declared_len > QFRAME_MAX_RAW) {
+            transparent_tx_reset();
+            break;
+        }
+        transparent_tx_state = QFP_PAYLOAD;
+        break;
+    }
+
+    case QFP_PAYLOAD:
+        if (transparent_tx_raw_count >= (transparent_tx_declared_len - 4)) {
+            transparent_tx_state = QFP_CRC1;
+        } else if (byte == QFRAME_SYNC) {
+            transparent_tx_raw_count++;
+            transparent_tx_state = QFP_PAYLOAD_ESC;
+        } else {
+            transparent_tx_raw_count++;
+            if (transparent_tx_payload_len < sizeof(transparent_tx_payload)) {
+                transparent_tx_payload[transparent_tx_payload_len++] = byte;
+            }
+        }
+        break;
+
+    case QFP_PAYLOAD_ESC:
+        transparent_tx_raw_count++;
+        if (byte == QFRAME_SYNC) {
+            if (transparent_tx_payload_len < sizeof(transparent_tx_payload)) {
+                transparent_tx_payload[transparent_tx_payload_len++] = QFRAME_SYNC;
+            }
+            transparent_tx_state = QFP_PAYLOAD;
+        } else {
+            transparent_tx_reset();
+            transparent_tx_feed(byte);
+        }
+        break;
+
+    case QFP_CRC1:
+        transparent_tx_state = QFP_CRC2;
+        break;
+
+    case QFP_CRC2:
+        transparent_tx_state = QFP_CRC3;
+        break;
+
+    case QFP_CRC3:
+        transparent_tx_handle_frame();
+        transparent_tx_reset();
+        break;
+
+    case QFP_COMPLETE:
+    case QFP_ERROR:
+        transparent_tx_reset();
+        break;
+    }
+}
+
+static void transparent_sniff_tx(const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        transparent_tx_feed(data[i]);
+    }
+}
+
 
 static void rx_task(void *param) {
     uint8_t buf[64];
     qframe_parser_init(&rx_parser);
 
     while (true) {
+        transparent_check_reboot_baud(false);
+
         if (transparent_active) {
+            if (transparent_pending_baud &&
+                (uint32_t)(millis() - transparent_pending_baud_at) > 1000) {
+                Log::logf(CAT_ARB, LOG_WARN,
+                          "[ARB] BDD transparent pending baud %u expired\n",
+                          transparent_pending_baud);
+                transparent_pending_baud = 0;
+                transparent_pending_baud_at = 0;
+            }
+
             // In transparent mode, forward raw bytes to bridge
             // Also feed a shadow parser to detect BDD R-frame responses
             int avail = uart->available();
@@ -275,14 +480,16 @@ static void rx_task(void *param) {
                         }
                         if (f && f->crc_valid && f->type == QFRAME_TYPE_R) {
                             uint32_t new_baud = parse_bdd_baud(f->payload, f->payload_len);
-                            if (new_baud && new_baud != current_baud) {
-                                if (transparent_bridge) transparent_bridge->flush();
-                                vTaskDelay(pdMS_TO_TICKS(10));
-                                uart->updateBaudRate(new_baud);
-                                Log::logf(CAT_ARB, LOG_INFO, "[ARB] BDD transparent: baud %u -> %u\n",
-                                          current_baud, new_baud);
-                                current_baud = new_baud;
+                            if (!new_baud && transparent_pending_baud) {
+                                new_baud = transparent_pending_baud;
                             }
+                            transparent_pending_baud = 0;
+                            transparent_pending_baud_at = 0;
+                            transparent_apply_baud(new_baud, "BDD");
+                        } else if (f && f->crc_valid && f->type == QFRAME_TYPE_E) {
+                            transparent_pending_baud = 0;
+                            transparent_pending_baud_at = 0;
+                            transparent_reboot_baud_at = 0;
                         }
                         qframe_parser_reset(&transparent_parser);
                     }
@@ -620,6 +827,10 @@ void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
 void Arbiter::enter_transparent(Stream *bridge) {
     transparent_bridge = bridge;
     qframe_parser_reset(&transparent_parser);
+    transparent_tx_reset();
+    transparent_pending_baud = 0;
+    transparent_pending_baud_at = 0;
+    transparent_reboot_baud_at = 0;
     transparent_last_activity = millis();
     transparent_active = true;
     sys_state = SYS_TRANSPARENT;
@@ -634,11 +845,16 @@ void Arbiter::exit_transparent() {
     transparent_bridge = nullptr;
     qframe_parser_reset(&rx_parser);
     qframe_parser_reset(&transparent_parser);
+    transparent_tx_reset();
+    transparent_pending_baud = 0;
+    transparent_pending_baud_at = 0;
+    transparent_check_reboot_baud(true);
     sys_state = SYS_IDLE;
 }
 
 void Arbiter::write_raw(const uint8_t *data, size_t len) {
     if (uart && (transparent_active || sys_state == SYS_OTA_AIRSENSE)) {
+        if (transparent_active) transparent_sniff_tx(data, len);
         uart->write(data, len);
         uart->flush();
         if (transparent_active) transparent_last_activity = millis();
@@ -716,9 +932,18 @@ uint32_t Arbiter::bdd_key_to_baud(uint16_t key) {
 // Parse BDD response payload, return new baud rate or 0 if not BDD.
 static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len) {
     if (len < 10 || memcmp(payload, "P S #BDD", 8) != 0) return 0;
-    const char *val = qframe_response_value((const char *)payload);
-    if (!val) return 0;
-    return Arbiter::bdd_key_to_baud((uint16_t)strtoul(val, nullptr, 16));
+
+    const char *text = (const char *)payload;
+    const char *val = qframe_response_value(text);
+    if (!val) {
+        if (len < 13 || payload[8] != ' ') return 0;
+        val = text + 9;
+    }
+
+    char *end = nullptr;
+    unsigned long key = strtoul(val, &end, 16);
+    if (end == val) return 0;
+    return Arbiter::bdd_key_to_baud((uint16_t)key);
 }
 
 uint32_t Arbiter::get_tx_count()       { return stat_tx; }
