@@ -2,7 +2,7 @@
 
 ## What you need
 
-- M5Stamp Pico (ESP32-PICO-D4)
+- M5Stamp Pico (ESP32-PICO-D4) or XIAO ESP32S3 Plus
 - MP1584 buck converter (24V to 3.3V)
 - AirSense 10 with edge connector access
 - USB-to-serial adapter (3.3V) for initial flash
@@ -15,7 +15,13 @@ See [hardware.md](hardware.md) for the pinout, wiring diagram, and power notes.
 ## Flash firmware
 
 ```bash
-pio run -t upload
+pio run -e m5stamp-pico -t upload
+```
+
+For the XIAO ESP32S3 Plus SDMMC4 build:
+
+```bash
+pio run -e xiao-esp32s3-plus-sdmmc4 -t upload
 ```
 
 ## Configure WiFi

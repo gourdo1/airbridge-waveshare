@@ -51,6 +51,32 @@ Hot-plugging the stepdown module may trip the AirSense overcurrent protection, c
       for medical electrical equipment
 ```
 
+## XIAO ESP32S3 Plus
+
+The `xiao-esp32s3-plus` and `xiao-esp32s3-plus-sdmmc4` build targets keep
+the same AirSense UART role, but move the pins to match the AirCANnect-style
+XIAO layout:
+
+| Signal | XIAO ESP32S3 Plus GPIO |
+|--------|-------------------------|
+| AirSense TX -> AirBridge RX | GPIO2 |
+| AirSense RX <- AirBridge TX | GPIO1 |
+
+The `xiao-esp32s3-plus-sdmmc4` target enables SDMMC4 as an optional
+compile-time capability:
+
+| SD signal | XIAO ESP32S3 Plus GPIO |
+|-----------|-------------------------|
+| CLK       | GPIO13 |
+| CMD       | GPIO11 |
+| D0        | GPIO12 |
+| D1        | GPIO38 |
+| D2        | GPIO39 |
+| D3        | GPIO40 |
+
+Use pull-ups on CMD and D0-D3. If early prototypes are wired with long leads,
+drop `AB_SDMMC_FREQ_KHZ` from `40000` to `20000` in the build flags.
+
 ## Enclosure
 
 STL files for 3D-printed case in [`docs/stl/`](stl/).
