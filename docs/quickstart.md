@@ -77,6 +77,7 @@ pio run -e ota -t upload
 The device scans for BLE pulse oximeters automatically. Supported devices:
 - Nonin 3230 (BLE)
 - Wellue O2Ring
+- ACCARE WS20A
 - Generic BLE PLX / Heart Rate sensors
 
 Go to the **Bluetooth** tab in the web UI to scan, connect, and manage oximeter devices. When connected, SpO2 and pulse data are injected into the AirSense data stream.

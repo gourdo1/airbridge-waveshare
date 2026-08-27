@@ -30,6 +30,12 @@ static const NimBLEUUID VIATOM_SERVICE_UUID("14839AC4-7D7E-415C-9A42-167340CF233
 static const NimBLEUUID VIATOM_READ_UUID("0734594A-A8E7-4B1A-A6B1-CD5243059A57");
 static const NimBLEUUID VIATOM_WRITE_UUID("8B00ACE7-EB0B-49B0-BBE9-9AEE0A26E1A3");
 
+// ACCARE WS20A proprietary
+static const NimBLEUUID WS20A_NOTIFY_SERVICE_UUID((uint16_t)0xFFE0);
+static const NimBLEUUID WS20A_WRITE_SERVICE_UUID((uint16_t)0xFFE5);
+static const NimBLEUUID WS20A_NOTIFY_UUID((uint16_t)0xFFE4);
+static const NimBLEUUID WS20A_WRITE_UUID((uint16_t)0xFFE9);
+
 static TaskHandle_t oxi_task_handle = nullptr;
 static volatile oxi_state_t state = OXI_DISABLED;
 static volatile bool state_dirty = false;
@@ -183,6 +189,145 @@ static void nonin_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size
 }
 
 
+// ACCARE WS20A: FE 5A LEN CMD PAYLOAD... SUM
+// SUM is the low byte of the sum over LEN, CMD, and payload.
+static NimBLERemoteCharacteristic *ws20a_write_chr = nullptr;
+#define WS20A_RX_BUF_LEN 256
+static uint8_t ws20a_rx_buf[WS20A_RX_BUF_LEN];
+static size_t ws20a_rx_len = 0;
+static uint32_t ws20a_frame_errors = 0;
+
+static bool ws20a_send_command(uint8_t cmd, const uint8_t *payload, size_t payload_len) {
+    uint8_t frame[32];
+    if (!ws20a_write_chr || payload_len > sizeof(frame) - 5) return false;
+
+    size_t frame_len = payload_len + 5;
+    frame[0] = 0xFE;
+    frame[1] = 0x5A;
+    frame[2] = (uint8_t)frame_len;
+    frame[3] = cmd;
+    if (payload_len > 0) memcpy(frame + 4, payload, payload_len);
+
+    uint8_t sum = 0;
+    for (size_t i = 2; i < frame_len - 1; i++) sum += frame[i];
+    frame[frame_len - 1] = sum;
+
+    bool response = ws20a_write_chr->canWrite();
+    if (!response && !ws20a_write_chr->canWriteNoResponse()) return false;
+    if (!ws20a_write_chr->writeValue(frame, frame_len, response)) {
+        Log::logf(CAT_OXI, LOG_WARN, "[OXI] WS20A command 0x%02X write failed\n", cmd);
+        return false;
+    }
+
+    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] WS20A command 0x%02X sent\n", cmd);
+    return true;
+}
+
+static void ws20a_process_frame(const uint8_t *frame, size_t frame_len) {
+    uint8_t cmd = frame[3];
+    const uint8_t *payload = frame + 4;
+    size_t payload_len = frame_len - 5;
+
+    if (cmd == 0x12) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] WS20A measurement started\n");
+        return;
+    }
+
+    if (cmd != 0x10) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] WS20A RX cmd=0x%02X len=%u\n",
+                  cmd, (unsigned)payload_len);
+        return;
+    }
+
+    if (payload_len < 15) {
+        Log::logf(CAT_OXI, LOG_WARN, "[OXI] WS20A realtime packet too short: %u\n",
+                  (unsigned)payload_len);
+        return;
+    }
+
+    uint16_t pulse = ((uint16_t)payload[0] << 8) | payload[1];
+    uint8_t spo2 = payload[2];
+    uint16_t pi = ((uint16_t)payload[3] << 8) | payload[4];
+    uint8_t battery = payload[5];
+    uint8_t seq = payload[14];
+
+    Log::logf(CAT_OXI, LOG_DEBUG,
+              "[OXI] WS20A: SpO2=%d HR=%d PI=%d battery=%d seq=%d\n",
+              spo2, pulse, pi, battery, seq);
+
+    if (spo2 >= 50 && spo2 <= 100 && pulse >= 25 && pulse <= 250) {
+        OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)pulse, true);
+    } else {
+        OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+    }
+}
+
+static void ws20a_process_rx() {
+    while (ws20a_rx_len >= 2) {
+        if (ws20a_rx_buf[0] != 0xFE || ws20a_rx_buf[1] != 0x5A) {
+            memmove(ws20a_rx_buf, ws20a_rx_buf + 1, --ws20a_rx_len);
+            continue;
+        }
+
+        if (ws20a_rx_len < 3) return;
+        size_t frame_len = ws20a_rx_buf[2];
+        if (frame_len < 5) {
+            ws20a_frame_errors++;
+            Log::logf(CAT_OXI, LOG_WARN, "[OXI] WS20A invalid frame length: %u\n",
+                      (unsigned)frame_len);
+            memmove(ws20a_rx_buf, ws20a_rx_buf + 1, --ws20a_rx_len);
+            continue;
+        }
+        if (ws20a_rx_len < frame_len) return;
+
+        uint8_t sum = 0;
+        for (size_t i = 2; i < frame_len - 1; i++) sum += ws20a_rx_buf[i];
+        if (sum != ws20a_rx_buf[frame_len - 1]) {
+            ws20a_frame_errors++;
+            Log::logf(CAT_OXI, LOG_WARN,
+                      "[OXI] WS20A checksum mismatch: expected=%02X actual=%02X errors=%lu\n",
+                      ws20a_rx_buf[frame_len - 1], sum, (unsigned long)ws20a_frame_errors);
+            memmove(ws20a_rx_buf, ws20a_rx_buf + 1, --ws20a_rx_len);
+            continue;
+        }
+
+        ws20a_process_frame(ws20a_rx_buf, frame_len);
+        ws20a_rx_len -= frame_len;
+        if (ws20a_rx_len > 0) {
+            memmove(ws20a_rx_buf, ws20a_rx_buf + frame_len, ws20a_rx_len);
+        }
+    }
+
+    if (ws20a_rx_len == 1 && ws20a_rx_buf[0] != 0xFE) ws20a_rx_len = 0;
+}
+
+static void ws20a_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
+    if (len > 0) {
+        char hex[64] = {};
+        int n = len > 20 ? 20 : (int)len;
+        for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02X ", data[i]);
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] WS20A RX len=%d: %s\n", (int)len, hex);
+    }
+
+    while (len > 0) {
+        size_t available = sizeof(ws20a_rx_buf) - ws20a_rx_len;
+        if (available == 0) {
+            ws20a_frame_errors++;
+            ws20a_rx_len = 0;
+            available = sizeof(ws20a_rx_buf);
+            Log::logf(CAT_OXI, LOG_WARN, "[OXI] WS20A RX buffer overflow\n");
+        }
+
+        size_t chunk_len = len < available ? len : available;
+        memcpy(ws20a_rx_buf + ws20a_rx_len, data, chunk_len);
+        ws20a_rx_len += chunk_len;
+        data += chunk_len;
+        len -= chunk_len;
+        ws20a_process_rx();
+    }
+}
+
+
 // Viatom/Wellue: response packet header is 7 bytes (0x55, cmd, ~cmd, blk_lo, blk_hi, len_lo, len_hi)
 // CMD_READ_SENSORS response: payload byte 0 = SpO2, byte 1 = HR
 static NimBLERemoteCharacteristic *viatom_write_chr = nullptr;
@@ -227,13 +372,18 @@ class OxiScanCB : public NimBLEScanCallbacks {
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
                        dev->isAdvertisingService(VIATOM_SERVICE_UUID) ||
+                       dev->isAdvertisingService(WS20A_NOTIFY_SERVICE_UUID) ||
+                       dev->isAdvertisingService(WS20A_WRITE_SERVICE_UUID) ||
                        name.startsWith("Nonin") ||
                        name.startsWith("O2Ring") ||
                        name.startsWith("O2M") ||
                        name.startsWith("CheckMe") ||
                        name.startsWith("Checkme") ||
                        name.startsWith("CheckO2") ||
-                       name.startsWith("SleepU");
+                       name.startsWith("SleepU") ||
+                       name.startsWith("WS20") ||
+                       name.startsWith("ACCARE") ||
+                       name.startsWith("Accare");
 
         if (is_oxi && scan_mutex && xSemaphoreTake(scan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (scan_result_count < MAX_SCAN_RESULTS) {
@@ -265,6 +415,8 @@ class OxiClientCB : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient *client, int reason) override {
         Log::logf(CAT_OXI, LOG_INFO, "[OXI] Disconnected (reason=0x%X)\n", reason);
         viatom_write_chr = nullptr;
+        ws20a_write_chr = nullptr;
+        ws20a_rx_len = 0;
         OxiArbiter::stop_feed();
         if (state == OXI_STREAMING || state == OXI_BONDING) {
             set_state(OXI_DISCONNECTED);
@@ -338,6 +490,41 @@ static bool subscribe_services(NimBLEClient *cl) {
                 if (viatom_write_chr) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Viatom write chr found\n");
                 got_spo2 = got_hr = true;
             }
+        }
+    }
+
+    if (!got_spo2) {
+        NimBLERemoteService *wsNotifySvc = cl->getService(WS20A_NOTIFY_SERVICE_UUID);
+        NimBLERemoteService *wsWriteSvc = cl->getService(WS20A_WRITE_SERVICE_UUID);
+        NimBLERemoteCharacteristic *wsNotify = nullptr;
+        if (wsNotifySvc) wsNotify = wsNotifySvc->getCharacteristic(WS20A_NOTIFY_UUID);
+        if (!wsNotify && wsWriteSvc) wsNotify = wsWriteSvc->getCharacteristic(WS20A_NOTIFY_UUID);
+
+        NimBLERemoteCharacteristic *wsWrite = nullptr;
+        if (wsWriteSvc) wsWrite = wsWriteSvc->getCharacteristic(WS20A_WRITE_UUID);
+
+        bool can_subscribe = wsNotify && (wsNotify->canNotify() || wsNotify->canIndicate());
+        bool can_write = wsWrite && (wsWrite->canWrite() || wsWrite->canWriteNoResponse());
+        if (can_subscribe && can_write) {
+            bool notifications = wsNotify->canNotify();
+            if (wsNotify->subscribe(notifications, ws20a_notify_cb)) {
+                ws20a_write_chr = wsWrite;
+                ws20a_rx_len = 0;
+                ws20a_frame_errors = 0;
+                uint8_t start_payload = 0x00;
+                if (ws20a_send_command(0x12, &start_payload, 1)) {
+                    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Subscribed WS20A realtime data\n");
+                    got_spo2 = got_hr = true;
+                } else {
+                    ws20a_write_chr = nullptr;
+                }
+            } else {
+                Log::logf(CAT_OXI, LOG_WARN, "[OXI] WS20A notification subscribe failed\n");
+            }
+        } else if (wsNotifySvc || wsWriteSvc) {
+            Log::logf(CAT_OXI, LOG_WARN,
+                      "[OXI] WS20A characteristics unavailable: notify=%d write=%d\n",
+                      can_subscribe, can_write);
         }
     }
 

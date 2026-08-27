@@ -95,7 +95,7 @@ When NTP syncs, the ResMed device clock is set automatically. If NTP is unavaila
 | `oxi_enabled` | true | Enable BLE oximeter support |
 | `oxi_auto_start` | true | Start feeding data automatically on connect |
 | `oxi_feed_therapy_only` | false | Only inject readings during active therapy |
-| `oxi_device_type` | 0 | 0 = auto-detect, 1 = Nonin, 2 = O2Ring, 3 = PLX |
+| `oxi_device_type` | 0 | 0 = auto-detect, 1 = Nonin, 2 = O2Ring, 3 = PLX, 4 = WS20A |
 | `oxi_device_addr` | *(empty)* | Preferred oximeter MAC (AA:BB:CC:DD:EE:FF) |
 | `oxi_interval_ms` | 500 | Injection interval in milliseconds |
 | `oxi_lframe_continuous` | true | Send L-frames even when no valid reading (keeps link alive) |

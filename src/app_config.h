@@ -30,7 +30,7 @@ struct AirBridgeConfig {
     bool        oxi_enabled;
     bool        oxi_auto_start;
     bool        oxi_feed_therapy_only;
-    uint8_t     oxi_device_type;    // 0=auto, 1=Nonin, 2=O2Ring, 3=PLX generic
+    uint8_t     oxi_device_type;    // 0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A
     String      oxi_device_addr;
     uint16_t    oxi_interval_ms;
     bool        oxi_lframe_continuous; // send L-frames even when no valid reading
