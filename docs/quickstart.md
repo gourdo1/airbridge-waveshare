@@ -76,7 +76,8 @@ pio run -e ota -t upload
 
 The device scans for BLE pulse oximeters automatically. Supported devices:
 - Nonin 3230 (BLE)
-- Wellue O2Ring
+- Wellue/Viatom devices: O2Ring, Checkme O2, SleepU, O2M
+- OxyII devices, including O2Ring-S
 - ACCARE WS20A
 - Generic BLE PLX / Heart Rate sensors
 

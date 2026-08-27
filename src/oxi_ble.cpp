@@ -30,6 +30,11 @@ static const NimBLEUUID VIATOM_SERVICE_UUID("14839AC4-7D7E-415C-9A42-167340CF233
 static const NimBLEUUID VIATOM_READ_UUID("0734594A-A8E7-4B1A-A6B1-CD5243059A57");
 static const NimBLEUUID VIATOM_WRITE_UUID("8B00ACE7-EB0B-49B0-BBE9-9AEE0A26E1A3");
 
+// OxyII proprietary (O2Ring-S and related devices)
+static const NimBLEUUID OXYII_SERVICE_UUID("E8FB0001-A14B-98F9-831B-4E2941D01248");
+static const NimBLEUUID OXYII_WRITE_UUID("E8FB0002-A14B-98F9-831B-4E2941D01248");
+static const NimBLEUUID OXYII_NOTIFY_UUID("E8FB0003-A14B-98F9-831B-4E2941D01248");
+
 // ACCARE WS20A proprietary
 static const NimBLEUUID WS20A_NOTIFY_SERVICE_UUID((uint16_t)0xFFE0);
 static const NimBLEUUID WS20A_WRITE_SERVICE_UUID((uint16_t)0xFFE5);
@@ -365,22 +370,310 @@ static void viatom_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, siz
     }
 }
 
+
+// OxyII: A5 CMD ~CMD 00 SEQ LEN_LO LEN_HI PAYLOAD... CRC8
+#define OXYII_CMD_LIVE_SAMPLES       0x04
+#define OXYII_CMD_SETUP              0x10
+#define OXYII_CMD_SET_TIME           0xC0
+#define OXYII_CMD_AUTH               0xFF
+#define OXYII_NO_PENDING_CMD         0xFE
+#define OXYII_SENSOR_POLL_MS         1000
+#define OXYII_RESPONSE_TIMEOUT_MS    1500
+#define OXYII_RX_BUF_LEN             640
+#define OXYII_TX_BUF_LEN             32
+
+static const uint8_t oxyii_lepucloud_md5[16] = {
+    0xC2, 0xA7, 0xCF, 0x50, 0xDA, 0xFE, 0xD8, 0x85,
+    0xA8, 0xF8, 0xF7, 0xEA, 0xC4, 0x43, 0x35, 0xF3,
+};
+
+static NimBLERemoteCharacteristic *oxyii_write_chr = nullptr;
+static uint8_t oxyii_rx_buf[OXYII_RX_BUF_LEN];
+static size_t oxyii_rx_len = 0;
+static size_t oxyii_rx_want = 0;
+static volatile uint8_t oxyii_pending_cmd = OXYII_NO_PENDING_CMD;
+static volatile uint32_t oxyii_pending_ms = 0;
+static uint32_t oxyii_last_poll_ms = 0;
+static uint8_t oxyii_sequence = 0;
+static volatile bool oxyii_need_auth = false;
+static volatile bool oxyii_need_setup = false;
+static volatile bool oxyii_need_time_sync = false;
+
+static const char *oxyii_command_name(uint8_t cmd) {
+    switch (cmd) {
+        case OXYII_CMD_LIVE_SAMPLES: return "live_samples";
+        case OXYII_CMD_SETUP: return "setup";
+        case OXYII_CMD_SET_TIME: return "set_time";
+        case OXYII_CMD_AUTH: return "auth";
+        case OXYII_NO_PENDING_CMD: return "none";
+        default: return "unknown";
+    }
+}
+
+static void oxyii_reset_rx() {
+    oxyii_rx_len = 0;
+    oxyii_rx_want = 0;
+}
+
+static void oxyii_clear_pending() {
+    oxyii_pending_cmd = OXYII_NO_PENDING_CMD;
+    oxyii_pending_ms = 0;
+}
+
+static void oxyii_reset() {
+    oxyii_write_chr = nullptr;
+    oxyii_reset_rx();
+    oxyii_clear_pending();
+    oxyii_last_poll_ms = 0;
+    oxyii_sequence = 0;
+    oxyii_need_auth = false;
+    oxyii_need_setup = false;
+    oxyii_need_time_sync = false;
+}
+
+static void oxyii_process_frame(const uint8_t *frame, size_t frame_len) {
+    if (frame_len < 8 || frame[0] != 0xA5) return;
+
+    uint8_t cmd = frame[1];
+    if (frame[2] != (uint8_t)~cmd) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII RX invalid command complement\n");
+        return;
+    }
+
+    size_t payload_len = frame[5] | ((size_t)frame[6] << 8);
+    if (payload_len + 8 != frame_len ||
+        crc8_ccitt(frame, frame_len - 1) != frame[frame_len - 1]) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII RX decode failed len=%u\n",
+                  (unsigned)frame_len);
+        return;
+    }
+
+    uint8_t pending_cmd = oxyii_pending_cmd;
+    oxyii_clear_pending();
+    if (pending_cmd == OXYII_CMD_SETUP && cmd == OXYII_CMD_SETUP) {
+        oxyii_need_time_sync = true;
+        return;
+    }
+    if (pending_cmd == OXYII_CMD_SET_TIME && cmd == OXYII_CMD_SET_TIME) return;
+    if (pending_cmd != OXYII_CMD_LIVE_SAMPLES || cmd != OXYII_CMD_LIVE_SAMPLES) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII RX ignored cmd=%s pending=%s\n",
+                  oxyii_command_name(cmd), oxyii_command_name(pending_cmd));
+        return;
+    }
+
+    if (payload_len < 9) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII live packet too short: %u\n",
+                  (unsigned)payload_len);
+        return;
+    }
+
+    const uint8_t *payload = frame + 7;
+    uint8_t spo2 = payload[6];
+    uint8_t pulse = payload[8];
+    bool valid = spo2 > 0 && spo2 <= 100 && pulse > 0 && pulse != 0xFF && pulse < 250;
+    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII: SpO2=%d HR=%d valid=%d\n",
+              spo2, pulse, valid);
+    if (valid) {
+        OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)pulse, true);
+    } else {
+        OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+    }
+}
+
+static void oxyii_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
+    if (!data || len == 0) return;
+
+    if (data[0] == 0xA5) oxyii_reset_rx();
+    if (oxyii_rx_len == 0 && data[0] != 0xA5) return;
+    if (oxyii_rx_len + len > sizeof(oxyii_rx_buf)) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII RX buffer overflow\n");
+        oxyii_reset_rx();
+        return;
+    }
+
+    memcpy(oxyii_rx_buf + oxyii_rx_len, data, len);
+    oxyii_rx_len += len;
+
+    if (oxyii_rx_want == 0 && oxyii_rx_len >= 7) {
+        size_t payload_len = oxyii_rx_buf[5] | ((size_t)oxyii_rx_buf[6] << 8);
+        oxyii_rx_want = payload_len + 8;
+        if (oxyii_rx_want > sizeof(oxyii_rx_buf)) {
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII RX too large: %u\n",
+                      (unsigned)oxyii_rx_want);
+            oxyii_reset_rx();
+            return;
+        }
+    }
+
+    if (oxyii_rx_want == 0 || oxyii_rx_len < oxyii_rx_want) return;
+    oxyii_process_frame(oxyii_rx_buf, oxyii_rx_want);
+    oxyii_reset_rx();
+}
+
+static bool oxyii_write_frame(uint8_t cmd, const uint8_t *payload, size_t payload_len) {
+    if (!oxyii_write_chr || payload_len > 0xFFFF) return false;
+
+    size_t frame_len = payload_len + 8;
+    if (frame_len > OXYII_TX_BUF_LEN) return false;
+
+    uint8_t frame[OXYII_TX_BUF_LEN] = {};
+    frame[0] = 0xA5;
+    frame[1] = cmd;
+    frame[2] = (uint8_t)~cmd;
+    frame[4] = oxyii_sequence++;
+    frame[5] = payload_len & 0xFF;
+    frame[6] = (payload_len >> 8) & 0xFF;
+    if (payload && payload_len > 0) memcpy(frame + 7, payload, payload_len);
+    frame[frame_len - 1] = crc8_ccitt(frame, frame_len - 1);
+    return oxyii_write_chr->writeValue(frame, frame_len, false);
+}
+
+static bool oxyii_send_command(uint8_t cmd, const uint8_t *payload, size_t payload_len,
+                               uint32_t now_ms, bool expect_reply = true) {
+    if (!oxyii_write_frame(cmd, payload, payload_len)) return false;
+
+    if (expect_reply) {
+        oxyii_pending_cmd = cmd;
+        oxyii_pending_ms = now_ms;
+    }
+    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII TX cmd=%s payload_len=%u\n",
+              oxyii_command_name(cmd), (unsigned)payload_len);
+    return true;
+}
+
+static bool oxyii_send_auth(uint32_t now_ms) {
+    time_t seconds = time(nullptr);
+    if (seconds < 1704067200) return false;
+
+    uint8_t session_key[16] = {};
+    for (size_t i = 0; i < 8; i++) session_key[i] = oxyii_lepucloud_md5[i * 2];
+    session_key[8] = '0';
+    session_key[9] = '0';
+    session_key[10] = '0';
+    session_key[11] = '0';
+
+    uint32_t timestamp = (uint32_t)seconds;
+    // The device expects bit shifts 0, 1, 2, and 3 here.
+    for (uint8_t i = 0; i < 4; i++) {
+        session_key[12 + i] = (timestamp >> i) & 0xFF;
+    }
+
+    uint8_t payload[16];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = session_key[i] ^ oxyii_lepucloud_md5[i];
+    }
+    return oxyii_send_command(OXYII_CMD_AUTH, payload, sizeof(payload), now_ms, false);
+}
+
+static bool oxyii_sync_datetime(uint32_t now_ms) {
+    if (!WiFiSetup::time_synced()) return false;
+
+    time_t now = time(nullptr);
+    if (now < 1704067200) return false;
+
+    struct tm t;
+    localtime_r(&now, &t);
+
+    uint8_t payload[8] = {};
+    uint16_t year = t.tm_year + 1900;
+    payload[0] = year & 0xFF;
+    payload[1] = (year >> 8) & 0xFF;
+    payload[2] = t.tm_mon + 1;
+    payload[3] = t.tm_mday;
+    payload[4] = t.tm_hour;
+    payload[5] = t.tm_min;
+    payload[6] = t.tm_sec;
+    return oxyii_send_command(OXYII_CMD_SET_TIME, payload, sizeof(payload), now_ms);
+}
+
+static void oxyii_poll(uint32_t now_ms) {
+    if (!oxyii_write_chr || !pClient || !pClient->isConnected()) return;
+
+    if (oxyii_pending_cmd != OXYII_NO_PENDING_CMD &&
+        now_ms - oxyii_pending_ms >= OXYII_RESPONSE_TIMEOUT_MS) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII response timeout cmd=%s\n",
+                  oxyii_command_name(oxyii_pending_cmd));
+        oxyii_reset_rx();
+        oxyii_clear_pending();
+    }
+    if (oxyii_pending_cmd != OXYII_NO_PENDING_CMD) return;
+
+    if (oxyii_need_auth) {
+        if (time(nullptr) < 1704067200) return;
+        if (oxyii_send_auth(now_ms)) {
+            oxyii_need_auth = false;
+            oxyii_need_setup = true;
+        } else {
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII auth write failed\n");
+        }
+        return;
+    }
+
+    if (oxyii_need_setup) {
+        uint8_t payload = 0;
+        if (oxyii_send_command(OXYII_CMD_SETUP, &payload, sizeof(payload), now_ms)) {
+            oxyii_need_setup = false;
+        } else {
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII setup write failed\n");
+        }
+        return;
+    }
+
+    if (oxyii_need_time_sync) {
+        if (!WiFiSetup::time_synced()) {
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Skipping OxyII datetime - NTP not synced\n");
+        } else if (!oxyii_sync_datetime(now_ms)) {
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII datetime write failed\n");
+        }
+        oxyii_need_time_sync = false;
+        return;
+    }
+
+    if (now_ms - oxyii_last_poll_ms < OXYII_SENSOR_POLL_MS) return;
+    if (!oxyii_send_command(OXYII_CMD_LIVE_SAMPLES, nullptr, 0, now_ms)) {
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII poll write failed\n");
+    }
+    oxyii_last_poll_ms = now_ms;
+}
+
+static bool has_oxyii_manufacturer(const NimBLEAdvertisedDevice *dev) {
+    for (uint8_t i = 0; i < dev->getManufacturerDataCount(); i++) {
+        std::string data = dev->getManufacturerData(i);
+        if (data.size() < 2) continue;
+
+        uint16_t company = (uint8_t)data[0] | ((uint16_t)(uint8_t)data[1] << 8);
+        if (company == 0x036F || company == 0xF34E) return true;
+    }
+    return false;
+}
+
 class OxiScanCB : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
         String name = dev->getName().c_str();
-        bool is_oxi = dev->isAdvertisingService(PLX_SERVICE_UUID) ||
+        bool is_oxi = has_oxyii_manufacturer(dev) ||
+                       dev->isAdvertisingService(PLX_SERVICE_UUID) ||
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
                        dev->isAdvertisingService(VIATOM_SERVICE_UUID) ||
+                       dev->isAdvertisingService(OXYII_SERVICE_UUID) ||
                        dev->isAdvertisingService(WS20A_NOTIFY_SERVICE_UUID) ||
                        dev->isAdvertisingService(WS20A_WRITE_SERVICE_UUID) ||
                        name.startsWith("Nonin") ||
+                       name.startsWith("O2 ") ||
                        name.startsWith("O2Ring") ||
                        name.startsWith("O2M") ||
+                       name.startsWith("S8-AW") ||
+                       name.startsWith("T8520_") ||
                        name.startsWith("CheckMe") ||
                        name.startsWith("Checkme") ||
                        name.startsWith("CheckO2") ||
                        name.startsWith("SleepU") ||
+                       name.startsWith("SleepO2") ||
+                       name.startsWith("WearO2") ||
+                       name.startsWith("KidsO2") ||
+                       name.startsWith("BabyO2") ||
+                       name.startsWith("OxyLink") ||
+                       name.startsWith("Oxylink") ||
                        name.startsWith("WS20") ||
                        name.startsWith("ACCARE") ||
                        name.startsWith("Accare");
@@ -415,6 +708,7 @@ class OxiClientCB : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient *client, int reason) override {
         Log::logf(CAT_OXI, LOG_INFO, "[OXI] Disconnected (reason=0x%X)\n", reason);
         viatom_write_chr = nullptr;
+        oxyii_reset();
         ws20a_write_chr = nullptr;
         ws20a_rx_len = 0;
         OxiArbiter::stop_feed();
@@ -489,6 +783,30 @@ static bool subscribe_services(NimBLEClient *cl) {
                 viatom_write_chr = viatomSvc->getCharacteristic(VIATOM_WRITE_UUID);
                 if (viatom_write_chr) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Viatom write chr found\n");
                 got_spo2 = got_hr = true;
+            }
+        }
+    }
+
+    if (!got_spo2) {
+        NimBLERemoteService *oxyiiSvc = cl->getService(OXYII_SERVICE_UUID);
+        if (oxyiiSvc) {
+            NimBLERemoteCharacteristic *oxyiiNotify = oxyiiSvc->getCharacteristic(OXYII_NOTIFY_UUID);
+            NimBLERemoteCharacteristic *oxyiiWrite = oxyiiSvc->getCharacteristic(OXYII_WRITE_UUID);
+            if (oxyiiNotify && oxyiiNotify->canNotify() && oxyiiWrite) {
+                oxyii_reset();
+                oxyii_write_chr = oxyiiWrite;
+                oxyii_need_auth = true;
+                if (oxyiiNotify->subscribe(true, oxyii_notify_cb)) {
+                    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Subscribed OxyII notify\n");
+                    got_spo2 = got_hr = true;
+                } else {
+                    Log::logf(CAT_OXI, LOG_WARN, "[OXI] OxyII notification subscribe failed\n");
+                    oxyii_reset();
+                }
+            } else {
+                Log::logf(CAT_OXI, LOG_WARN,
+                          "[OXI] OxyII characteristics unavailable: notify=%d write=%d\n",
+                          oxyiiNotify && oxyiiNotify->canNotify(), oxyiiWrite != nullptr);
             }
         }
     }
@@ -931,6 +1249,10 @@ void OxiBle::task(void *param) {
                 cmd[7] = crc8_ccitt(cmd, 7);
                 viatom_write_chr->writeValue(cmd, sizeof(cmd), false);
             }
+        }
+
+        if (state == OXI_STREAMING && oxyii_write_chr && pClient->isConnected()) {
+            oxyii_poll(millis());
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
