@@ -18,6 +18,7 @@
 
 #include "air10_edf.h"
 #include "air10_stored.h"
+#include "air10_str_timeline.h"
 #include "crc.h"
 #include "debug_log.h"
 #include "edf_catalog.h"
@@ -40,7 +41,6 @@ constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t SUMMARY_READY_ATTEMPTS = 5;
-constexpr uint32_t STR_RETENTION_DAYS = 365;
 constexpr uint32_t CLOCK_VALID_AFTER = 1700000000UL;
 constexpr int16_t EDF_MISSING = -1;
 constexpr size_t RECOVERY_HEADER_MAX = 8192;
@@ -931,10 +931,41 @@ static bool render_str_header(uint16_t first_day, uint32_t records,
            written == Air10Edf::header_size(Air10Edf::str_schema());
 }
 
+static bool valid_str_record(const uint8_t *record, size_t size) {
+    return record && size >= 4 &&
+           read_le16(record + size - 2) == crc16_ccitt(record, size - 2);
+}
+
 static bool valid_str_record(const uint8_t *record, size_t size,
                              uint16_t expected_day) {
-    return size >= 4 && read_le16(record) == expected_day &&
-           read_le16(record + size - 2) == crc16_ccitt(record, size - 2);
+    return record && read_le16(record) == expected_day &&
+           valid_str_record(record, size);
+}
+
+static bool parse_edf_start_day(const uint8_t *text, uint16_t &epoch_day) {
+    if (!text || text[2] != '.' || text[5] != '.') return false;
+    const uint8_t digit_offsets[] = {0, 1, 3, 4, 6, 7};
+    for (uint8_t offset : digit_offsets)
+        if (text[offset] < '0' || text[offset] > '9') return false;
+
+    const unsigned day = (text[0] - '0') * 10 + text[1] - '0';
+    const unsigned month = (text[3] - '0') * 10 + text[4] - '0';
+    const unsigned short_year = (text[6] - '0') * 10 + text[7] - '0';
+    const int year = short_year >= 85 ? 1900 + short_year
+                                      : 2000 + short_year;
+    const int32_t parsed = civil_epoch_day(year, month, day);
+    int check_year = 0;
+    unsigned check_month = 0;
+    unsigned check_day = 0;
+    if (month < 1 || month > 12 || day < 1 || day > 31 || parsed < 0 ||
+        parsed >= UINT16_MAX) {
+        return false;
+    }
+    epoch_day_to_civil(parsed, check_year, check_month, check_day);
+    if (check_year != year || check_month != month || check_day != day)
+        return false;
+    epoch_day = static_cast<uint16_t>(parsed);
+    return true;
 }
 
 static bool parse_therapy_day(const char *text, uint16_t &epoch_day) {
@@ -994,14 +1025,22 @@ static bool str_contains_day(const char *therapy_day) {
     return present;
 }
 
-static void render_empty_str_record(uint16_t epoch_day, uint8_t *record,
-                                    size_t size) {
-    memset(record, 0xFF, size);
+static bool set_str_record_day(uint16_t epoch_day, uint8_t *record,
+                               size_t size) {
+    if (!record || size < 4 || epoch_day == UINT16_MAX) return false;
     record[0] = static_cast<uint8_t>(epoch_day);
     record[1] = static_cast<uint8_t>(epoch_day >> 8);
     const uint16_t crc = crc16_ccitt(record, size - 2);
     record[size - 2] = static_cast<uint8_t>(crc);
     record[size - 1] = static_cast<uint8_t>(crc >> 8);
+    return true;
+}
+
+static bool render_empty_str_record(uint16_t epoch_day, uint8_t *record,
+                                    size_t size) {
+    if (!record || size < 4) return false;
+    memset(record, 0xFF, size);
+    return set_str_record_day(epoch_day, record, size);
 }
 
 static bool update_str_file(const uint8_t *incoming_record) {
@@ -1012,6 +1051,11 @@ static bool update_str_file(const uint8_t *incoming_record) {
     const size_t header_size = Air10Edf::header_size(schema);
     const size_t record_size = Air10Edf::record_size(schema);
     if (post_processing_cancelled()) return false;
+    if (!valid_str_record(incoming_record, record_size,
+                          session_epoch_day)) {
+        post_error("incoming STR record invalid");
+        return false;
+    }
     uint8_t *header = static_cast<uint8_t *>(allocate_large(header_size));
     uint8_t *work = static_cast<uint8_t *>(allocate_large(record_size));
     if (!header || !work) {
@@ -1023,23 +1067,27 @@ static bool update_str_file(const uint8_t *incoming_record) {
 
     fs::File input;
     fs::File output;
-    uint16_t existing_first = session_epoch_day;
     uint32_t existing_records = 0;
     bool valid = true;
     bool cancelled = false;
+    Air10StrTimeline::Scan scan;
     if (storage->exists(FINAL)) {
         input = storage->open(FINAL, FILE_READ);
         uint8_t fixed[256];
         uint32_t stored_header_size = 0;
         uint32_t signal_count = 0;
+        uint16_t header_start_day = 0;
         if (!input || input.read(fixed, sizeof(fixed)) != sizeof(fixed) ||
             !parse_decimal_field(fixed + 184, 8, stored_header_size) ||
             !parse_decimal_field(fixed + 236, 8, existing_records) ||
             !parse_decimal_field(fixed + 252, 4, signal_count) ||
+            !parse_edf_start_day(fixed + 168, header_start_day) ||
             stored_header_size != header_size ||
             signal_count != schema.signal_count ||
-            existing_records > STR_RETENTION_DAYS ||
+            existing_records > Air10StrTimeline::RECORD_LIMIT ||
             input.size() != header_size + existing_records * record_size ||
+            !Air10StrTimeline::begin(header_start_day, existing_records,
+                                     scan) ||
             !render_str_header(session_epoch_day, 0, header, header_size)) {
             valid = false;
         }
@@ -1069,12 +1117,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
                 valid = false;
                 break;
             }
-            if (i == 0) existing_first = read_le16(work);
-            const uint32_t expected_day =
-                static_cast<uint32_t>(existing_first) + i;
-            if (expected_day > UINT16_MAX ||
-                !valid_str_record(work, record_size,
-                                  static_cast<uint16_t>(expected_day))) {
+            if (!valid_str_record(work, record_size) ||
+                !Air10StrTimeline::scan_record(scan, i, read_le16(work))) {
                 valid = false;
             }
         }
@@ -1085,26 +1129,17 @@ static bool update_str_file(const uint8_t *incoming_record) {
             if (!cancelled) post_error("existing STR validation failed");
             return false;
         }
+    } else if (!Air10StrTimeline::begin(session_epoch_day, 0, scan)) {
+        heap_caps_free(header);
+        heap_caps_free(work);
+        post_error("STR timeline initialization failed");
+        return false;
     }
 
-    const uint32_t existing_last = existing_records
-        ? static_cast<uint32_t>(existing_first) + existing_records - 1
-        : session_epoch_day;
-    const uint32_t last_day = existing_records
-        ? max(existing_last, static_cast<uint32_t>(session_epoch_day))
-        : session_epoch_day;
-    const uint32_t retention_first = last_day >= STR_RETENTION_DAYS - 1
-        ? last_day - (STR_RETENTION_DAYS - 1) : 0;
-    const uint32_t combined_first = existing_records
-        ? min(static_cast<uint32_t>(existing_first),
-              static_cast<uint32_t>(session_epoch_day))
-        : session_epoch_day;
-    const uint16_t first_day = static_cast<uint16_t>(
-        max(combined_first, retention_first));
-    const uint32_t new_records = last_day - first_day + 1;
-    if (existing_last > UINT16_MAX || session_epoch_day < first_day ||
-        new_records > STR_RETENTION_DAYS ||
-        !render_str_header(first_day, new_records, header, header_size)) {
+    Air10StrTimeline::Plan plan;
+    if (!Air10StrTimeline::make_plan(scan, session_epoch_day, plan) ||
+        !render_str_header(plan.start_day, plan.record_count,
+                           header, header_size)) {
         if (input) input.close();
         heap_caps_free(header);
         heap_caps_free(work);
@@ -1112,14 +1147,58 @@ static bool update_str_file(const uint8_t *incoming_record) {
         return false;
     }
 
-    const uint32_t skipped_records = existing_records && first_day > existing_first
-        ? min(static_cast<uint32_t>(first_day - existing_first), existing_records)
-        : 0;
-    const size_t input_offset = header_size +
-                                static_cast<size_t>(skipped_records) * record_size;
-    if (input && !input.seek(input_offset)) valid = false;
-    if (post_processing_cancelled()) {
+    const size_t timeline_size =
+        static_cast<size_t>(plan.record_count) * record_size;
+    uint8_t *timeline = static_cast<uint8_t *>(allocate_large(timeline_size));
+    uint8_t *present = static_cast<uint8_t *>(
+        allocate_large(plan.record_count));
+    if (!timeline || !present || post_processing_cancelled()) {
         if (input) input.close();
+        if (timeline) heap_caps_free(timeline);
+        if (present) heap_caps_free(present);
+        heap_caps_free(header);
+        heap_caps_free(work);
+        if (!post_processing_cancelled())
+            post_error("STR timeline allocation failed");
+        return false;
+    }
+    memset(present, 0, plan.record_count);
+    Air10StrTimeline::Buffer timeline_buffer = {
+        timeline, present, plan.record_count,
+    };
+    Air10StrTimeline::BuildStats build_stats;
+
+    if (input && !input.seek(header_size)) valid = false;
+    for (uint32_t i = 0; valid && i < existing_records; i++) {
+        if (post_processing_cancelled()) {
+            valid = false;
+            cancelled = true;
+            break;
+        }
+        uint16_t day = 0;
+        if (input.read(work, record_size) != record_size ||
+            !valid_str_record(work, record_size) ||
+            !Air10StrTimeline::record_day(scan, i, read_le16(work), day) ||
+            !set_str_record_day(day, work, record_size) ||
+            !Air10StrTimeline::place_record(plan, timeline_buffer, day, work,
+                                            record_size, build_stats)) {
+            valid = false;
+        }
+    }
+    if (valid &&
+        (!Air10StrTimeline::place_record(
+             plan, timeline_buffer, session_epoch_day, incoming_record,
+             record_size, build_stats) ||
+         !Air10StrTimeline::fill_missing(
+             plan, timeline_buffer, record_size, render_empty_str_record,
+             build_stats))) {
+        valid = false;
+    }
+
+    if (input) input.close();
+    if (post_processing_cancelled()) {
+        heap_caps_free(timeline);
+        heap_caps_free(present);
         heap_caps_free(header);
         heap_caps_free(work);
         return false;
@@ -1129,35 +1208,24 @@ static bool update_str_file(const uint8_t *incoming_record) {
     if (!valid || !output || !write_exact(output, header, header_size))
         valid = false;
 
-    for (uint32_t day = first_day; valid && day <= last_day; day++) {
+    for (uint32_t i = 0; valid && i < plan.record_count; i++) {
         if (post_processing_cancelled()) {
             valid = false;
             cancelled = true;
             break;
         }
-        const bool from_existing = existing_records &&
-            day >= existing_first && day <= existing_last;
-        if (from_existing && input.read(work, record_size) != record_size) {
-            valid = false;
-            break;
-        }
-        const uint8_t *record = work;
-        if (day == session_epoch_day) {
-            record = incoming_record;
-        } else if (!from_existing) {
-            render_empty_str_record(static_cast<uint16_t>(day), work,
-                                    record_size);
-        }
+        const uint8_t *record = timeline + static_cast<size_t>(i) * record_size;
         if (!write_exact(output, record, record_size)) valid = false;
     }
     if (output) {
         output.flush();
         output.close();
     }
-    if (input) input.close();
 
     if (cancelled) {
         storage->remove(PART);
+        heap_caps_free(timeline);
+        heap_caps_free(present);
         heap_caps_free(header);
         heap_caps_free(work);
         return false;
@@ -1165,15 +1233,25 @@ static bool update_str_file(const uint8_t *incoming_record) {
 
     if (!valid || !publish_single_file(PART, FINAL, BACKUP)) {
         storage->remove(PART);
+        heap_caps_free(timeline);
+        heap_caps_free(present);
         heap_caps_free(header);
         heap_caps_free(work);
         post_error("STR publish failed");
         return false;
     }
+    Log::logf(CAT_GENERAL, LOG_INFO,
+              "[EDF] STR timeline %04X-%04X records=%u fillers=%u "
+              "replaced=%u discarded=%u\n",
+              plan.start_day, plan.end_day, plan.record_count,
+              build_stats.filler_records, build_stats.replaced_records,
+              build_stats.discarded_records);
+    heap_caps_free(timeline);
+    heap_caps_free(present);
     heap_caps_free(header);
     heap_caps_free(work);
     portENTER_CRITICAL(&status_mux);
-    status.str_records = new_records;
+    status.str_records = plan.record_count;
     portEXIT_CRITICAL(&status_mux);
     return true;
 }
