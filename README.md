@@ -7,6 +7,7 @@ ESP32 bridge for ResMed AirSense 10 CPAP.
 ## What it does
 
 - **Oximetry** - feeds SpO2/pulse into AirSense for native SAD.edf recording. BLE (Nonin 3150, O2Ring, O2Ring-S, Checkme O2, WS20A, generic PLX/HR sensors) and UDP for integrating unsupported devices.
+- **SD recording and export** - records therapy in Air10 EDF format and synchronizes files to SMB and SleepHQ on SD-capable hardware.
 - **Web UI** - read/write all therapy settings, live pressure/flow waveforms, BLE device management, ResMed firmware upload
 - **TCP-UART bridge** - send commands to AirSense over WiFi. Single UART writer (arbiter) with priority queue prevents collisions between concurrent sources (TCP clients, BLE feeder, health monitor, web UI).
 - **ResMed OTA** - flash AirSense firmware (BLX/CMX/CDX) over UART from web UI or CLI. Handles baud negotiation, block chaining, bootloader re-entry.

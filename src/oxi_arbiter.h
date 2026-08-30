@@ -23,7 +23,7 @@ namespace OxiArbiter {
     void stop_feed();
     bool is_feeding();
 
-    const oxi_reading_t& get_reading();
+    void snapshot(oxi_reading_t &reading, oxi_source_t *source = nullptr);
     oxi_source_t active_source();
 
     void poll();

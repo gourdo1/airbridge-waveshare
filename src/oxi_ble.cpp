@@ -177,7 +177,8 @@ static void hr_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t 
         hr = data[1];
     }
     // HR-only service - feed with current SpO2 from arbiter reading
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
     if (hr > 0 && hr < 500) {
         OxiArbiter::feed(OXI_SRC_BLE, r.spo2, (int16_t)hr, r.valid);
     }

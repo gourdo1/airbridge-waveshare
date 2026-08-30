@@ -72,6 +72,7 @@ const char *Log::cat_name(log_cat_t cat) {
         case CAT_WEB:     return "WEB";
         case CAT_ARB:     return "ARB";
         case CAT_HEALTH:  return "HEALTH";
+        case CAT_EXPORT:  return "EXPORT";
         default:          return "?";
     }
 }

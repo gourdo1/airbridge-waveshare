@@ -20,6 +20,7 @@ typedef enum {
     CAT_WEB,
     CAT_ARB,
     CAT_HEALTH,
+    CAT_EXPORT,
     CAT_COUNT
 } log_cat_t;
 

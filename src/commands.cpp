@@ -12,6 +12,7 @@
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_pmd.h"
+#include "export_sync.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -35,6 +36,13 @@ static String parse_quoted_token(const String &s, int *pos) {
     return out;
 }
 
+static bool config_key_sensitive(const String &key) {
+    String normalized = key;
+    normalized.toLowerCase();
+    return normalized.indexOf("pass") >= 0 ||
+           normalized.indexOf("secret") >= 0;
+}
+
 
 void dispatch_command(const char *line, String &response) {
     String cmd = String(line);
@@ -45,7 +53,8 @@ void dispatch_command(const char *line, String &response) {
     if (upper == "STATUS") {
         system_state_t sys = Arbiter::get_state();
         oxi_state_t oxi = OxiBle::get_state();
-        const oxi_reading_t &r = OxiArbiter::get_reading();
+        oxi_reading_t r;
+        OxiArbiter::snapshot(r);
 
         Config::refresh_device_info();
         auto &cfg = Config::get();
@@ -87,7 +96,8 @@ void dispatch_command(const char *line, String &response) {
             response = "OK: oximetry feed stopped\n";
         } else if (sub == "STATUS") {
             oxi_state_t st = OxiBle::get_state();
-            const oxi_reading_t &r = OxiArbiter::get_reading();
+            oxi_reading_t r;
+            OxiArbiter::snapshot(r);
             response = "state: " + String(oxi_state_name(st)) + "\n";
             response += "feeding: " + String(OxiArbiter::is_feeding() ? "yes" : "no") + "\n";
             if (r.valid) {
@@ -155,7 +165,9 @@ void dispatch_command(const char *line, String &response) {
                 String val = sub.substring(space + 1);
                 val.trim();
                 if (Config::set_value(key.c_str(), val.c_str())) {
-                    response = "OK: " + key + "=" + val + "\n";
+                    response = "OK: " + key + "=" +
+                               (config_key_sensitive(key) && val.length()
+                                    ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + key + "'\n";
                 }
@@ -163,11 +175,66 @@ void dispatch_command(const char *line, String &response) {
                 // Get single key
                 String val;
                 if (Config::get_value(sub.c_str(), val)) {
-                    response = sub + "=" + val + "\n";
+                    response = sub + "=" +
+                               (config_key_sensitive(sub) && val.length()
+                                    ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + sub + "'\n";
                 }
             }
+        }
+        return;
+    }
+
+    if (upper.startsWith("EXPORT")) {
+        String sub = cmd.substring(6);
+        sub.trim();
+        sub.toUpperCase();
+        if (sub.length() == 0 || sub == "STATUS") {
+            ExportSync::Status export_status;
+            ExportSync::get_status(export_status);
+            response = "smb state=" + String(ExportSync::state_name(
+                export_status.state));
+            response += " files=" + String(export_status.files_uploaded);
+            response += "/" + String(export_status.files_seen);
+            response += " skipped=" + String(export_status.files_skipped);
+            response += " bytes=" + String(
+                static_cast<unsigned long long>(export_status.bytes_uploaded));
+            if (export_status.current_day[0])
+                response += " day=" + String(export_status.current_day);
+            if (export_status.last_error[0])
+                response += " error=" + String(export_status.last_error);
+            response += "\n";
+            ExportSync::SleepHqStatus sleephq_status;
+            ExportSync::get_sleephq_status(sleephq_status);
+            response += "sleephq state=" + String(ExportSync::state_name(
+                sleephq_status.state));
+            response += " files=" + String(sleephq_status.files_uploaded);
+            response += "/" + String(sleephq_status.files_seen);
+            response += " skipped=" + String(sleephq_status.files_skipped);
+            response += " bytes=" + String(static_cast<unsigned long long>(
+                sleephq_status.bytes_uploaded));
+            if (sleephq_status.import_id)
+                response += " import=" + String(sleephq_status.import_id);
+            if (sleephq_status.import_status[0])
+                response += " import_status=" +
+                            String(sleephq_status.import_status);
+            if (sleephq_status.current_day[0])
+                response += " day=" + String(sleephq_status.current_day);
+            if (sleephq_status.last_error[0])
+                response += " error=" + String(sleephq_status.last_error);
+            response += "\n";
+        } else if (sub == "SMB") {
+            response = ExportSync::request_manual_smb()
+                ? "OK: SMB sync queued\n"
+                : "ERR: SMB sync is disabled or unavailable\n";
+        } else if (sub == "SLEEPHQ") {
+            response = ExportSync::request_manual_sleephq()
+                ? "OK: SleepHQ sync queued\n"
+                : "ERR: SleepHQ sync is disabled or unavailable\n";
+        } else {
+            response = "ERR: use EXPORT STATUS, EXPORT SMB, or "
+                       "EXPORT SLEEPHQ\n";
         }
         return;
     }
@@ -466,6 +533,7 @@ void dispatch_command(const char *line, String &response) {
                    "  CONFIG [key [val]]  Get/set config\n"
                    "  CONFIG SAVE|RESET   Save/reset config\n"
                    "  CONFIG DUMP         Show all config\n"
+                   "  EXPORT STATUS|SMB|SLEEPHQ  Export status/manual sync\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
                    "  LOG                 Show all category log levels\n"

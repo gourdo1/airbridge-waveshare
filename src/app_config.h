@@ -57,6 +57,19 @@ struct AirBridgeConfig {
 
     uint8_t     mitm_mode;          // 0=off, 1=forward, 2=log, 3=filter
 
+    bool        smb_enabled;
+    bool        smb_auto_after_therapy;
+    String      smb_endpoint;       // //host/share/optional/path
+    String      smb_user;
+    String      smb_password;
+
+    bool        sleephq_enabled;
+    bool        sleephq_auto_after_therapy;
+    String      sleephq_client_id;
+    String      sleephq_client_secret;
+    String      sleephq_team_id;
+    String      sleephq_device_id;
+
     // Runtime cache
     String      device_pna;         // #PNA
     String      device_srn;         // #SRN

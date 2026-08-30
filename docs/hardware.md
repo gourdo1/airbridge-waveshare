@@ -76,6 +76,7 @@ compile-time capability:
 
 Use pull-ups on CMD and D0-D3. If early prototypes are wired with long leads,
 drop `AB_SDMMC_FREQ_KHZ` from `40000` to `20000` in the build flags.
+This target supports local therapy recording and SMB/SleepHQ export.
 
 ## Enclosure
 

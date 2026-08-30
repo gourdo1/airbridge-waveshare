@@ -27,7 +27,8 @@ static uint8_t batch_n = 0;
 static void flush_batch() {
     if (batch_n == 0) return;
 
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
     char json[256];
     int n = snprintf(json, sizeof(json),
                      "{\"seq\":%u,\"samples\":[", head);

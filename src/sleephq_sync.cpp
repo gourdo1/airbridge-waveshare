@@ -1,0 +1,751 @@
+#include "sleephq_sync.h"
+
+#include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+
+#include "crc.h"
+#include "debug_log.h"
+#include "sleephq_client.h"
+#include "string_util.h"
+
+namespace SleepHqSync {
+namespace {
+
+using aircannect::BackgroundOperationControl;
+using aircannect::BackgroundOperationStop;
+using aircannect::SleepHqClient;
+using aircannect::SleepHqConfig;
+using aircannect::SleepHqImportInfo;
+using aircannect::SleepHqImportStatusKind;
+using aircannect::SleepHqUploadRequest;
+using aircannect::SleepHqUploadResult;
+using aircannect::copy_cstr;
+using aircannect::sleephq_classify_import_status;
+
+constexpr uint8_t JOURNAL_VERSION = 1;
+constexpr size_t JOURNAL_SIZE = 64;
+constexpr size_t JOURNAL_CRC_OFFSET = JOURNAL_SIZE - 4;
+constexpr size_t MARKER_SIZE = 16;
+constexpr size_t FILE_COUNT = 13;
+constexpr uint8_t PHASE_UPLOADING = 1;
+constexpr uint8_t PHASE_PROCESSING = 2;
+constexpr uint32_t IMPORT_POLL_INTERVAL_MS = 5000;
+constexpr uint32_t IMPORT_POLL_TIMEOUT_MS = 15 * 60 * 1000UL;
+
+struct Journal {
+    uint8_t phase;
+    uint8_t flags;
+    uint16_t uploaded_mask;
+    uint32_t import_id;
+    uint32_t team_id;
+    uint32_t finalized_epoch;
+    char therapy_day[9];
+    char file_prefix[16];
+};
+
+enum class JournalLoad : uint8_t {
+    Missing,
+    Valid,
+    Invalid,
+};
+
+struct StatePaths {
+    char directory[48];
+    char journal[80];
+    char journal_part[88];
+    char journal_backup[88];
+};
+
+struct FileSpec {
+    char local_path[128];
+    char remote_path[64];
+    char name[80];
+    bool required;
+};
+
+struct FileReader {
+    fs::FS *storage;
+    fs::File file;
+    char path[128];
+    uint64_t size;
+
+    bool open() {
+        if (file) file.close();
+        if (!storage) return false;
+        file = storage->open(path, FILE_READ);
+        if (!file || file.isDirectory() || file.size() != size) {
+            if (file) file.close();
+            return false;
+        }
+        return true;
+    }
+
+    static bool read(void *context, uint8_t *out, size_t length,
+                     size_t &read_size) {
+        FileReader *reader = static_cast<FileReader *>(context);
+        read_size = 0;
+        if (!reader || !reader->file || !out) return false;
+        read_size = reader->file.read(out, length);
+        return read_size == length;
+    }
+
+    static bool reset(void *context) {
+        FileReader *reader = static_cast<FileReader *>(context);
+        return reader && reader->open();
+    }
+};
+
+static uint16_t get_le16(const uint8_t *data) {
+    return static_cast<uint16_t>(data[0]) |
+           static_cast<uint16_t>(data[1]) << 8;
+}
+
+static uint32_t get_le32(const uint8_t *data) {
+    return static_cast<uint32_t>(data[0]) |
+           static_cast<uint32_t>(data[1]) << 8 |
+           static_cast<uint32_t>(data[2]) << 16 |
+           static_cast<uint32_t>(data[3]) << 24;
+}
+
+static void put_le16(uint8_t *data, uint16_t value) {
+    data[0] = static_cast<uint8_t>(value);
+    data[1] = static_cast<uint8_t>(value >> 8);
+}
+
+static void put_le32(uint8_t *data, uint32_t value) {
+    data[0] = static_cast<uint8_t>(value);
+    data[1] = static_cast<uint8_t>(value >> 8);
+    data[2] = static_cast<uint8_t>(value >> 16);
+    data[3] = static_cast<uint8_t>(value >> 24);
+}
+
+static void set_error(char *out, size_t out_size, const char *error) {
+    copy_cstr(out, out_size, error ? error : "sleephq_sync_failed");
+}
+
+static bool operation_allows(const BackgroundOperationControl &operation,
+                             char *error, size_t error_size) {
+    const BackgroundOperationStop stop = operation.stop_reason(millis());
+    if (stop == BackgroundOperationStop::None) return true;
+    set_error(error, error_size,
+              aircannect::background_operation_stop_error(stop));
+    return false;
+}
+
+static void publish(const Progress &progress, ProgressCallback callback,
+                    void *context) {
+    if (callback) callback(context, progress);
+}
+
+static uint32_t config_hash(const Config &config) {
+    uint32_t crc = crc32_ieee_initial();
+    const char *values[] = {
+        config.client_id, config.team_id, config.device_id,
+    };
+    for (const char *value : values) {
+        crc = crc32_ieee_update(
+            crc, reinterpret_cast<const uint8_t *>(value), strlen(value));
+        const uint8_t separator = '\n';
+        crc = crc32_ieee_update(crc, &separator, 1);
+    }
+    return crc32_ieee_finish(crc);
+}
+
+static bool build_state_paths(const Config &config, StatePaths &paths) {
+    const uint32_t hash = config_hash(config);
+    const int directory_length = snprintf(
+        paths.directory, sizeof(paths.directory), "/airbridge/shq_%08lx",
+        static_cast<unsigned long>(hash));
+    const int journal_length = snprintf(
+        paths.journal, sizeof(paths.journal), "%s/inflight.bin",
+        paths.directory);
+    const int part_length = snprintf(
+        paths.journal_part, sizeof(paths.journal_part), "%s.part",
+        paths.journal);
+    const int backup_length = snprintf(
+        paths.journal_backup, sizeof(paths.journal_backup), "%s.bak",
+        paths.journal);
+    return directory_length > 0 &&
+           static_cast<size_t>(directory_length) < sizeof(paths.directory) &&
+           journal_length > 0 &&
+           static_cast<size_t>(journal_length) < sizeof(paths.journal) &&
+           part_length > 0 &&
+           static_cast<size_t>(part_length) < sizeof(paths.journal_part) &&
+           backup_length > 0 &&
+           static_cast<size_t>(backup_length) < sizeof(paths.journal_backup);
+}
+
+static bool ensure_state_directory(fs::FS &storage,
+                                   const StatePaths &paths) {
+    return storage.exists(paths.directory) || storage.mkdir(paths.directory);
+}
+
+static void recover_journal(fs::FS &storage, const StatePaths &paths) {
+    storage.remove(paths.journal_part);
+    if (!storage.exists(paths.journal) &&
+        storage.exists(paths.journal_backup)) {
+        (void)storage.rename(paths.journal_backup, paths.journal);
+    } else if (storage.exists(paths.journal) &&
+               storage.exists(paths.journal_backup)) {
+        storage.remove(paths.journal_backup);
+    }
+}
+
+static bool replace_file(fs::FS &storage, const char *path,
+                         const char *part, const char *backup,
+                         const uint8_t *data, size_t size) {
+    storage.remove(part);
+    fs::File file = storage.open(part, FILE_WRITE);
+    const bool written = file && file.write(data, size) == size;
+    if (file) {
+        file.flush();
+        file.close();
+    }
+    if (!written) {
+        storage.remove(part);
+        return false;
+    }
+
+    storage.remove(backup);
+    if (storage.exists(path) && !storage.rename(path, backup)) {
+        storage.remove(part);
+        return false;
+    }
+    if (!storage.rename(part, path)) {
+        (void)storage.rename(backup, path);
+        storage.remove(part);
+        return false;
+    }
+    storage.remove(backup);
+    return true;
+}
+
+static void encode_journal(const Journal &journal, uint8_t *data) {
+    memset(data, 0, JOURNAL_SIZE);
+    memcpy(data, "ABSQ", 4);
+    data[4] = JOURNAL_VERSION;
+    data[5] = journal.phase;
+    data[6] = journal.flags;
+    put_le16(data + 8, journal.uploaded_mask);
+    put_le16(data + 10, FILE_COUNT);
+    put_le32(data + 12, journal.import_id);
+    put_le32(data + 16, journal.team_id);
+    put_le32(data + 20, journal.finalized_epoch);
+    memcpy(data + 24, journal.therapy_day, 8);
+    memcpy(data + 32, journal.file_prefix, 15);
+    put_le32(data + JOURNAL_CRC_OFFSET,
+             crc32_ieee(data, JOURNAL_CRC_OFFSET));
+}
+
+static bool valid_digits(const char *text, size_t length) {
+    for (size_t i = 0; i < length; i++)
+        if (text[i] < '0' || text[i] > '9') return false;
+    return true;
+}
+
+static bool decode_journal(const uint8_t *data, Journal &journal) {
+    if (memcmp(data, "ABSQ", 4) != 0 || data[4] != JOURNAL_VERSION ||
+        (data[5] != PHASE_UPLOADING && data[5] != PHASE_PROCESSING) ||
+        get_le16(data + 10) != FILE_COUNT || !get_le32(data + 12) ||
+        !get_le32(data + 16) ||
+        get_le32(data + JOURNAL_CRC_OFFSET) !=
+            crc32_ieee(data, JOURNAL_CRC_OFFSET) ||
+        !valid_digits(reinterpret_cast<const char *>(data + 24), 8) ||
+        !valid_digits(reinterpret_cast<const char *>(data + 32), 8) ||
+        data[40] != '_' ||
+        !valid_digits(reinterpret_cast<const char *>(data + 41), 6)) {
+        return false;
+    }
+
+    memset(&journal, 0, sizeof(journal));
+    journal.phase = data[5];
+    journal.flags = data[6];
+    journal.uploaded_mask = get_le16(data + 8);
+    journal.import_id = get_le32(data + 12);
+    journal.team_id = get_le32(data + 16);
+    journal.finalized_epoch = get_le32(data + 20);
+    memcpy(journal.therapy_day, data + 24, 8);
+    memcpy(journal.file_prefix, data + 32, 15);
+    return true;
+}
+
+static JournalLoad load_journal(fs::FS &storage, const StatePaths &paths,
+                                Journal &journal) {
+    recover_journal(storage, paths);
+    if (!storage.exists(paths.journal)) return JournalLoad::Missing;
+    uint8_t data[JOURNAL_SIZE];
+    fs::File file = storage.open(paths.journal, FILE_READ);
+    const bool valid = file && file.size() == sizeof(data) &&
+                       file.read(data, sizeof(data)) == sizeof(data) &&
+                       decode_journal(data, journal);
+    if (file) file.close();
+    return valid ? JournalLoad::Valid : JournalLoad::Invalid;
+}
+
+static bool write_journal(fs::FS &storage, const StatePaths &paths,
+                          const Journal &journal) {
+    uint8_t data[JOURNAL_SIZE];
+    encode_journal(journal, data);
+    return ensure_state_directory(storage, paths) &&
+           replace_file(storage, paths.journal, paths.journal_part,
+                        paths.journal_backup, data, sizeof(data));
+}
+
+static void remove_journal(fs::FS &storage, const StatePaths &paths) {
+    storage.remove(paths.journal);
+    storage.remove(paths.journal_part);
+    storage.remove(paths.journal_backup);
+}
+
+static bool marker_path(const StatePaths &paths,
+                        const EdfCatalog::Entry &entry,
+                        char *path, size_t path_size,
+                        char *part = nullptr, size_t part_size = 0,
+                        char *backup = nullptr, size_t backup_size = 0) {
+    const int path_length = snprintf(path, path_size, "%s/%s.done",
+                                     paths.directory, entry.file_prefix);
+    if (path_length <= 0 || static_cast<size_t>(path_length) >= path_size)
+        return false;
+    if (part) {
+        const int part_length = snprintf(part, part_size, "%s.part", path);
+        if (part_length <= 0 ||
+            static_cast<size_t>(part_length) >= part_size) return false;
+    }
+    if (backup) {
+        const int backup_length = snprintf(backup, backup_size, "%s.bak",
+                                           path);
+        if (backup_length <= 0 ||
+            static_cast<size_t>(backup_length) >= backup_size) return false;
+    }
+    return true;
+}
+
+static void encode_marker(const EdfCatalog::Entry &entry, uint8_t *data) {
+    memset(data, 0, MARKER_SIZE);
+    memcpy(data, "ABSD", 4);
+    data[4] = JOURNAL_VERSION;
+    data[5] = entry.flags;
+    put_le32(data + 8, entry.finalized_epoch);
+    put_le32(data + 12, crc32_ieee(data, 12));
+}
+
+static bool marker_valid(fs::FS &storage, const StatePaths &paths,
+                         const EdfCatalog::Entry &entry) {
+    char path[80];
+    if (!marker_path(paths, entry, path, sizeof(path))) return false;
+    uint8_t data[MARKER_SIZE];
+    fs::File file = storage.open(path, FILE_READ);
+    const bool valid = file && file.size() == sizeof(data) &&
+        file.read(data, sizeof(data)) == sizeof(data) &&
+        memcmp(data, "ABSD", 4) == 0 && data[4] == JOURNAL_VERSION &&
+        data[5] == entry.flags && get_le32(data + 8) == entry.finalized_epoch &&
+        get_le32(data + 12) == crc32_ieee(data, 12);
+    if (file) file.close();
+    return valid;
+}
+
+static bool write_marker(fs::FS &storage, const StatePaths &paths,
+                         const EdfCatalog::Entry &entry) {
+    char path[80];
+    char part[88];
+    char backup[88];
+    if (!marker_path(paths, entry, path, sizeof(path), part, sizeof(part),
+                     backup, sizeof(backup))) return false;
+    uint8_t data[MARKER_SIZE];
+    encode_marker(entry, data);
+    return ensure_state_directory(storage, paths) &&
+           replace_file(storage, path, part, backup, data, sizeof(data));
+}
+
+static EdfCatalog::Entry journal_entry(const Journal &journal) {
+    EdfCatalog::Entry entry = {};
+    copy_cstr(entry.therapy_day, sizeof(entry.therapy_day),
+              journal.therapy_day);
+    copy_cstr(entry.file_prefix, sizeof(entry.file_prefix),
+              journal.file_prefix);
+    entry.flags = journal.flags;
+    entry.finalized_epoch = journal.finalized_epoch;
+    return entry;
+}
+
+static bool build_file_spec(size_t index, const Journal &journal,
+                            FileSpec &file) {
+    memset(&file, 0, sizeof(file));
+    if (index == 0) {
+        copy_cstr(file.local_path, sizeof(file.local_path),
+                  "/Identification.tgt");
+        copy_cstr(file.name, sizeof(file.name), "Identification.tgt");
+        copy_cstr(file.remote_path, sizeof(file.remote_path), "./");
+        file.required = true;
+        return true;
+    }
+    if (index == 1) {
+        copy_cstr(file.local_path, sizeof(file.local_path),
+                  "/Identification.crc");
+        copy_cstr(file.name, sizeof(file.name), "Identification.crc");
+        copy_cstr(file.remote_path, sizeof(file.remote_path), "./");
+        file.required = true;
+        return true;
+    }
+    if (index == 2) {
+        copy_cstr(file.local_path, sizeof(file.local_path), "/STR.edf");
+        copy_cstr(file.name, sizeof(file.name), "STR.edf");
+        copy_cstr(file.remote_path, sizeof(file.remote_path), "./");
+        file.required = (journal.flags & EdfCatalog::ENTRY_STR_READY) != 0;
+        return true;
+    }
+    if (index >= FILE_COUNT) return false;
+
+    static const char *const suffixes[] = {
+        "BRP", "PLD", "SAD", "EVE", "CSL",
+    };
+    const size_t session_index = index - 3;
+    const char *suffix = suffixes[session_index / 2];
+    const char *extension = (session_index & 1u) ? "crc" : "edf";
+    const int path_length = snprintf(
+        file.local_path, sizeof(file.local_path), "/DATALOG/%s/%s_%s.%s",
+        journal.therapy_day, journal.file_prefix, suffix, extension);
+    const int name_length = snprintf(file.name, sizeof(file.name), "%s_%s.%s",
+                                     journal.file_prefix, suffix, extension);
+    const int remote_length = snprintf(
+        file.remote_path, sizeof(file.remote_path), "./DATALOG/%s/",
+        journal.therapy_day);
+    file.required = true;
+    return path_length > 0 &&
+           static_cast<size_t>(path_length) < sizeof(file.local_path) &&
+           name_length > 0 &&
+           static_cast<size_t>(name_length) < sizeof(file.name) &&
+           remote_length > 0 &&
+           static_cast<size_t>(remote_length) < sizeof(file.remote_path);
+}
+
+static bool delay_with_abort(BackgroundOperationControl &operation,
+                             uint32_t delay_ms,
+                             char *error, size_t error_size) {
+    const uint32_t started = millis();
+    while (static_cast<uint32_t>(millis() - started) < delay_ms) {
+        if (!operation_allows(operation, error, error_size)) return false;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return true;
+}
+
+static bool status_needs_process(const char *status) {
+    return !status || !status[0] || strcasecmp(status, "created") == 0 ||
+           strcasecmp(status, "new") == 0 ||
+           strcasecmp(status, "ready") == 0 ||
+           strcasecmp(status, "uploaded") == 0 ||
+           strcasecmp(status, "uploading") == 0;
+}
+
+static bool finish_import(fs::FS &storage, const StatePaths &paths,
+                          const Journal &journal, Progress &progress,
+                          ProgressCallback callback, void *callback_context,
+                          char *error, size_t error_size) {
+    const EdfCatalog::Entry entry = journal_entry(journal);
+    if (!write_marker(storage, paths, entry)) {
+        set_error(error, error_size, "done_marker_write");
+        return false;
+    }
+    remove_journal(storage, paths);
+    progress.current_day[0] = 0;
+    publish(progress, callback, callback_context);
+    return true;
+}
+
+static bool poll_import(fs::FS &storage, const StatePaths &paths,
+                        SleepHqClient &client, Journal &journal,
+                        BackgroundOperationControl &operation,
+                        Progress &progress, ProgressCallback callback,
+                        void *callback_context,
+                        char *error, size_t error_size) {
+    const uint32_t started = millis();
+    bool process_requested = false;
+    while (true) {
+        if (!operation_allows(operation, error, error_size)) return false;
+
+        SleepHqImportInfo info;
+        if (!client.get_import(journal.import_id, info, &operation)) {
+            set_error(error, error_size, client.last_error());
+            return false;
+        }
+        operation.note_progress(millis());
+        progress.import_id = journal.import_id;
+        copy_cstr(progress.import_status, sizeof(progress.import_status),
+                  info.status);
+        publish(progress, callback, callback_context);
+
+        const SleepHqImportStatusKind kind =
+            sleephq_classify_import_status(info.status);
+        if (kind == SleepHqImportStatusKind::Success)
+            return finish_import(storage, paths, journal, progress, callback,
+                                 callback_context, error, error_size);
+        if (kind == SleepHqImportStatusKind::Failure) {
+            remove_journal(storage, paths);
+            set_error(error, error_size,
+                      info.failed_reason[0] ? info.failed_reason
+                                            : "import_failed");
+            return false;
+        }
+
+        if (!process_requested && status_needs_process(info.status)) {
+            SleepHqImportInfo processed;
+            if (!client.process_import(journal.import_id, &processed,
+                                       &operation)) {
+                set_error(error, error_size, client.last_error());
+                return false;
+            }
+            operation.note_progress(millis());
+            process_requested = true;
+            copy_cstr(progress.import_status,
+                      sizeof(progress.import_status), processed.status);
+            publish(progress, callback, callback_context);
+            const SleepHqImportStatusKind processed_kind =
+                sleephq_classify_import_status(processed.status);
+            if (processed_kind == SleepHqImportStatusKind::Success)
+                return finish_import(storage, paths, journal, progress,
+                                     callback, callback_context,
+                                     error, error_size);
+            if (processed_kind == SleepHqImportStatusKind::Failure) {
+                remove_journal(storage, paths);
+                set_error(error, error_size,
+                          processed.failed_reason[0]
+                              ? processed.failed_reason : "import_failed");
+                return false;
+            }
+        }
+
+        if (static_cast<uint32_t>(millis() - started) >=
+            IMPORT_POLL_TIMEOUT_MS) {
+            set_error(error, error_size, "import_process_timeout");
+            return false;
+        }
+        if (!delay_with_abort(operation, IMPORT_POLL_INTERVAL_MS,
+                              error, error_size)) return false;
+    }
+}
+
+static bool run_journal(fs::FS &storage, const StatePaths &paths,
+                        SleepHqClient &client, Journal &journal,
+                        BackgroundOperationControl &operation,
+                        Progress &progress, ProgressCallback callback,
+                        void *callback_context,
+                        char *error, size_t error_size) {
+    copy_cstr(progress.current_day, sizeof(progress.current_day),
+              journal.therapy_day);
+    progress.import_id = journal.import_id;
+    publish(progress, callback, callback_context);
+
+    if (journal.phase == PHASE_UPLOADING) {
+        for (size_t index = 0; index < FILE_COUNT; index++) {
+            const uint16_t bit = static_cast<uint16_t>(1u << index);
+            if (journal.uploaded_mask & bit) continue;
+            if (!operation_allows(operation, error, error_size)) return false;
+
+            FileSpec spec;
+            if (!build_file_spec(index, journal, spec)) {
+                set_error(error, error_size, "local_path_build");
+                return false;
+            }
+            progress.files_seen++;
+            publish(progress, callback, callback_context);
+
+            fs::File input = storage.open(spec.local_path, FILE_READ);
+            if (!input || input.isDirectory()) {
+                if (input) input.close();
+                if (spec.required) {
+                    snprintf(error, error_size, "local_missing:%s",
+                             spec.local_path);
+                    return false;
+                }
+                journal.uploaded_mask |= bit;
+                progress.files_skipped++;
+                if (!write_journal(storage, paths, journal)) {
+                    set_error(error, error_size, "inflight_write");
+                    return false;
+                }
+                continue;
+            }
+            const uint64_t file_size = input.size();
+            input.close();
+
+            FileReader reader = {};
+            reader.storage = &storage;
+            reader.size = file_size;
+            copy_cstr(reader.path, sizeof(reader.path), spec.local_path);
+            if (!reader.open()) {
+                set_error(error, error_size, "local_open");
+                return false;
+            }
+
+            SleepHqUploadRequest request;
+            request.import_id = journal.import_id;
+            request.name = spec.name;
+            request.path = spec.remote_path;
+            request.size = file_size;
+            request.read = FileReader::read;
+            request.reset = FileReader::reset;
+            request.ctx = &reader;
+            request.operation = &operation;
+            SleepHqUploadResult result;
+            const bool uploaded = client.upload_file(request, result);
+            reader.file.close();
+            if (!uploaded) {
+                set_error(error, error_size, client.last_error());
+                return false;
+            }
+
+            journal.uploaded_mask |= bit;
+            progress.files_uploaded++;
+            progress.bytes_uploaded += result.bytes;
+            operation.note_progress(millis());
+            if (!write_journal(storage, paths, journal)) {
+                set_error(error, error_size, "inflight_write");
+                return false;
+            }
+            publish(progress, callback, callback_context);
+            Log::logf(CAT_EXPORT, LOG_INFO,
+                      "[SLEEPHQ] uploaded %s bytes=%llu import=%lu\n",
+                      spec.local_path,
+                      static_cast<unsigned long long>(result.bytes),
+                      static_cast<unsigned long>(journal.import_id));
+        }
+
+        journal.phase = PHASE_PROCESSING;
+        if (!write_journal(storage, paths, journal)) {
+            set_error(error, error_size, "inflight_write");
+            return false;
+        }
+    }
+
+    return poll_import(storage, paths, client, journal, operation,
+                       progress, callback, callback_context,
+                       error, error_size);
+}
+
+static bool same_entry(const Journal &journal,
+                       const EdfCatalog::Entry &entry) {
+    return strcmp(journal.file_prefix, entry.file_prefix) == 0 &&
+           journal.finalized_epoch == entry.finalized_epoch &&
+           journal.flags == entry.flags;
+}
+
+}  // namespace
+
+bool configured(const Config &config) {
+    return config.client_id[0] && config.client_secret[0];
+}
+
+bool complete(fs::FS &storage, const Config &config,
+              const EdfCatalog::Entry &entry) {
+    StatePaths paths = {};
+    return configured(config) && build_state_paths(config, paths) &&
+           marker_valid(storage, paths, entry);
+}
+
+bool sync_session(fs::FS &storage, const Config &config,
+                  const EdfCatalog::Entry &entry,
+                  BackgroundOperationControl &operation,
+                  Progress &progress, ProgressCallback callback,
+                  void *callback_context, char *error, size_t error_size) {
+    if (!configured(config)) {
+        set_error(error, error_size, "not_configured");
+        return false;
+    }
+
+    StatePaths paths = {};
+    if (!build_state_paths(config, paths) ||
+        !ensure_state_directory(storage, paths)) {
+        set_error(error, error_size, "state_directory");
+        return false;
+    }
+
+    SleepHqConfig client_config;
+    copy_cstr(client_config.client_id, sizeof(client_config.client_id),
+              config.client_id);
+    copy_cstr(client_config.client_secret,
+              sizeof(client_config.client_secret), config.client_secret);
+    copy_cstr(client_config.team_id, sizeof(client_config.team_id),
+              config.team_id);
+    copy_cstr(client_config.device_id, sizeof(client_config.device_id),
+              config.device_id);
+    SleepHqClient client;
+    if (!client.configure(client_config)) {
+        set_error(error, error_size, "not_configured");
+        return false;
+    }
+
+    Journal journal = {};
+    const JournalLoad loaded = load_journal(storage, paths, journal);
+    if (loaded == JournalLoad::Invalid) {
+        Log::logf(CAT_EXPORT, LOG_WARN,
+                  "[SLEEPHQ] discarded invalid inflight journal\n");
+        remove_journal(storage, paths);
+    } else if (loaded == JournalLoad::Valid) {
+        const bool requested_entry = same_entry(journal, entry);
+        if (!run_journal(storage, paths, client, journal, operation,
+                         progress, callback, callback_context,
+                         error, error_size)) {
+            client.disconnect();
+            return false;
+        }
+        if (requested_entry) {
+            client.disconnect();
+            return true;
+        }
+    }
+
+    if (marker_valid(storage, paths, entry)) {
+        progress.files_skipped += FILE_COUNT;
+        publish(progress, callback, callback_context);
+        client.disconnect();
+        return true;
+    }
+
+    uint32_t team_id = 0;
+    if (!client.resolve_team_id(team_id, &operation)) {
+        set_error(error, error_size, client.last_error());
+        client.disconnect();
+        return false;
+    }
+    operation.note_progress(millis());
+
+    SleepHqImportInfo import;
+    if (!client.create_import(team_id, import, &operation) || !import.id) {
+        set_error(error, error_size,
+                  client.last_error()[0] ? client.last_error()
+                                         : "import_id_missing");
+        client.disconnect();
+        return false;
+    }
+    operation.note_progress(millis());
+
+    journal.phase = PHASE_UPLOADING;
+    journal.flags = entry.flags;
+    journal.import_id = import.id;
+    journal.team_id = team_id;
+    journal.finalized_epoch = entry.finalized_epoch;
+    copy_cstr(journal.therapy_day, sizeof(journal.therapy_day),
+              entry.therapy_day);
+    copy_cstr(journal.file_prefix, sizeof(journal.file_prefix),
+              entry.file_prefix);
+    if (!write_journal(storage, paths, journal)) {
+        set_error(error, error_size, "inflight_write");
+        client.disconnect();
+        return false;
+    }
+
+    Log::logf(CAT_EXPORT, LOG_INFO,
+              "[SLEEPHQ] import created id=%lu day=%s\n",
+              static_cast<unsigned long>(journal.import_id),
+              journal.therapy_day);
+    const bool success = run_journal(
+        storage, paths, client, journal, operation, progress,
+        callback, callback_context, error, error_size);
+    client.disconnect();
+    return success;
+}
+
+}  // namespace SleepHqSync

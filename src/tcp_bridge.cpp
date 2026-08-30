@@ -3,9 +3,12 @@
 #include "debug_log.h"
 #include "web_ui.h"
 #include "app_config.h"
+#include "live_stream.h"
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <WiFiClient.h>
+#include <esp_heap_caps.h>
+#include <freertos/queue.h>
 
 extern const char *airbridge_version();
 
@@ -18,9 +21,218 @@ static TaskHandle_t tcp_task_handle = nullptr;
 #define TCP_TASK_STACK  6144
 #define TCP_TASK_PRIO   3
 #define TCP_LINE_MAX    512
+#define FRAMED_TX_DEPTH 8
+#define FRAMED_MAX_STREAMS 12
 
 static char line_buf[TCP_LINE_MAX];
 static int line_pos = 0;
+
+static StaticQueue_t framed_tx_queue_state;
+static QueueHandle_t framed_tx_queue = nullptr;
+static uint8_t *framed_tx_storage = nullptr;
+static bool framed_accepting = false;
+static bool framed_queue_failed = false;
+static uint32_t framed_sink_inflight = 0;
+
+typedef struct {
+    char tag[4];
+    LiveStream::external_handle_t handle;
+} framed_stream_lease_t;
+
+static framed_stream_lease_t framed_streams[FRAMED_MAX_STREAMS];
+static uint8_t framed_stream_count = 0;
+
+static bool framed_queue_init() {
+    size_t bytes = FRAMED_TX_DEPTH * sizeof(qframe_t);
+    framed_tx_storage = static_cast<uint8_t *>(
+        heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!framed_tx_storage) {
+        framed_tx_storage = static_cast<uint8_t *>(
+            heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+    }
+    if (!framed_tx_storage) return false;
+
+    framed_tx_queue = xQueueCreateStatic(FRAMED_TX_DEPTH, sizeof(qframe_t),
+                                         framed_tx_storage,
+                                         &framed_tx_queue_state);
+    if (!framed_tx_queue) {
+        heap_caps_free(framed_tx_storage);
+        framed_tx_storage = nullptr;
+        return false;
+    }
+    __atomic_store_n(&framed_accepting, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&framed_queue_failed, false, __ATOMIC_RELEASE);
+    return true;
+}
+
+static bool framed_enqueue(const qframe_t *frame, void *) {
+    __atomic_fetch_add(&framed_sink_inflight, 1, __ATOMIC_ACQ_REL);
+    QueueHandle_t queue = framed_tx_queue;
+    bool accepting = __atomic_load_n(&framed_accepting, __ATOMIC_ACQUIRE) &&
+                     queue;
+    bool queued = accepting && xQueueSend(queue, frame, 0) == pdTRUE;
+    if (accepting && !queued) {
+        __atomic_store_n(&framed_queue_failed, true, __ATOMIC_RELEASE);
+    }
+    __atomic_fetch_sub(&framed_sink_inflight, 1, __ATOMIC_ACQ_REL);
+    return queued;
+}
+
+static bool framed_enqueue_text(uint8_t type, const char *text) {
+    if (!text) return false;
+    qframe_t frame = {};
+    frame.type = type;
+    frame.payload_len = min(strlen(text), (size_t)QFRAME_MAX_PAYLOAD);
+    memcpy(frame.payload, text, frame.payload_len);
+    frame.crc_valid = true;
+    return framed_enqueue(&frame, nullptr);
+}
+
+static bool framed_flush() {
+    qframe_t frame;
+    uint8_t raw[QFRAME_MAX_RAW];
+    while (framed_tx_queue && xQueueReceive(framed_tx_queue, &frame, 0) == pdTRUE) {
+        int raw_len = qframe_build(frame.type, frame.payload, frame.payload_len,
+                                   raw, sizeof(raw));
+        if (raw_len < 0) return false;
+
+        size_t sent = 0;
+        while (sent < (size_t)raw_len && client.connected()) {
+            size_t n = client.write(raw + sent, raw_len - sent);
+            if (!n) return false;
+            sent += n;
+        }
+        if (sent != (size_t)raw_len) return false;
+    }
+    return true;
+}
+
+static void framed_queue_shutdown() {
+    __atomic_store_n(&framed_accepting, false, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&framed_sink_inflight, __ATOMIC_ACQUIRE) != 0) {
+        vTaskDelay(1);
+    }
+    if (framed_tx_queue) vQueueDelete(framed_tx_queue);
+    framed_tx_queue = nullptr;
+    if (framed_tx_storage) heap_caps_free(framed_tx_storage);
+    framed_tx_storage = nullptr;
+}
+
+static bool payload_starts_with(const qframe_t *frame, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    return frame && frame->payload_len >= prefix_len &&
+           memcmp(frame->payload, prefix, prefix_len) == 0;
+}
+
+static bool framed_requires_transparent(const qframe_t *request) {
+    return payload_starts_with(request, "P F ") ||
+           payload_starts_with(request, "P S #BDD ") ||
+           payload_starts_with(request, "P S #BLL ") ||
+           payload_starts_with(request, "P S #RES ") ||
+           payload_starts_with(request, "P S #PIP ");
+}
+
+static uart_response_policy_t framed_response_policy(const qframe_t *request) {
+    uart_response_policy_t policy = {};
+    uint16_t normal_timeout = Config::get().uart_cmd_timeout_ms;
+
+    policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_E;
+    policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
+    policy.success_types = QFRAME_MASK_R;
+    policy.first_timeout_ms = normal_timeout;
+    policy.overall_timeout_ms = normal_timeout;
+
+    if (payload_starts_with(request, "G V ")) {
+        policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_K | QFRAME_MASK_E;
+        policy.terminal_types = QFRAME_MASK_K | QFRAME_MASK_E;
+        policy.success_types = QFRAME_MASK_K;
+        policy.first_timeout_ms = max(normal_timeout, (uint16_t)1500);
+        policy.overall_timeout_ms = policy.first_timeout_ms;
+    } else if (payload_starts_with(request, "G F ")) {
+        policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_K | QFRAME_MASK_E;
+        policy.terminal_types = QFRAME_MASK_E;
+        policy.success_types = QFRAME_MASK_R | QFRAME_MASK_K;
+        policy.first_timeout_ms = max(normal_timeout, (uint16_t)1500);
+        policy.interframe_timeout_ms = 350;
+        policy.overall_timeout_ms = 15000;
+        policy.complete_on_idle = true;
+    }
+    return policy;
+}
+
+static int framed_find_stream(const char tag[4]) {
+    for (uint8_t i = 0; i < framed_stream_count; i++) {
+        if (memcmp(framed_streams[i].tag, tag, 3) == 0) return i;
+    }
+    return -1;
+}
+
+static bool framed_parse_stream_control(const qframe_t *frame,
+                                        char tag[4], bool *enabled) {
+    if (!frame || frame->payload_len != 10 ||
+        memcmp(frame->payload, "P S &", 5) != 0 ||
+        frame->payload[8] != ' ' ||
+        (frame->payload[9] != '0' && frame->payload[9] != '1')) {
+        return false;
+    }
+    for (uint8_t i = 0; i < 3; i++) {
+        uint8_t c = frame->payload[5 + i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+        tag[i] = (char)c;
+    }
+    tag[3] = 0;
+    *enabled = frame->payload[9] == '1';
+    return true;
+}
+
+static bool framed_stream_control(const qframe_t *frame) {
+    char tag[4];
+    bool enabled = false;
+    if (!framed_parse_stream_control(frame, tag, &enabled)) return false;
+
+    int existing = framed_find_stream(tag);
+    bool ok = true;
+    if (enabled && existing < 0) {
+        if (framed_stream_count >= FRAMED_MAX_STREAMS) {
+            ok = false;
+        } else {
+            LiveStream::external_handle_t handle =
+                LiveStream::acquire_external(tag);
+            if (handle < 0) {
+                ok = false;
+            } else {
+                memcpy(framed_streams[framed_stream_count].tag, tag, 4);
+                framed_streams[framed_stream_count].handle = handle;
+                framed_stream_count++;
+            }
+        }
+    } else if (!enabled && existing >= 0) {
+        LiveStream::release_external(framed_streams[existing].handle);
+        for (uint8_t i = existing; i + 1 < framed_stream_count; i++) {
+            framed_streams[i] = framed_streams[i + 1];
+        }
+        framed_stream_count--;
+    }
+
+    char response[32];
+    if (ok) {
+        snprintf(response, sizeof(response), "P S &%s %u = %u",
+                 tag, enabled ? 1 : 0, enabled ? 1 : 0);
+        framed_enqueue_text(QFRAME_TYPE_R, response);
+    } else {
+        snprintf(response, sizeof(response), "P S &%s %u = 6009",
+                 tag, enabled ? 1 : 0);
+        framed_enqueue_text(QFRAME_TYPE_E, response);
+    }
+    return true;
+}
+
+static void framed_release_streams() {
+    while (framed_stream_count > 0) {
+        framed_stream_count--;
+        LiveStream::release_external(framed_streams[framed_stream_count].handle);
+    }
+}
 
 
 
@@ -49,6 +261,8 @@ static void handle_line(const char *line) {
                 resp_len -= 2;
             }
             response = String(resp_buf) + "\n";
+        } else if (resp_len > 0) {
+            response = "ERR:" + String(resp_buf) + "\n";
         } else {
             response = "ERR:TIMEOUT\n";
         }
@@ -97,6 +311,137 @@ static void handle_transparent() {
     if (client.connected()) {
         client.println("OK: transparent mode exited");
     }
+}
+
+static void handle_framed() {
+    if (!framed_queue_init()) {
+        client.println("ERR: unable to allocate framed queue");
+        return;
+    }
+
+    uart_frame_listener_t listener = Arbiter::add_frame_listener(
+        QFRAME_MASK_L, framed_enqueue, nullptr);
+    if (listener < 0) {
+        framed_queue_shutdown();
+        client.println("ERR: no UART frame listener available");
+        return;
+    }
+
+    framed_stream_count = 0;
+    client.println("OK: entering framed arbiter mode");
+    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Framed arbiter mode entered\n");
+
+    qframe_parser_t parser;
+    qframe_parser_init(&parser);
+    uart_transaction_t *active = nullptr;
+
+    while (client.connected()) {
+        if (!framed_flush() ||
+            __atomic_load_n(&framed_queue_failed, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+
+        if (active) {
+            if (!Arbiter::transaction_done(active)) {
+                vTaskDelay(1);
+                continue;
+            }
+
+            uart_transaction_result_t result = {};
+            if (!Arbiter::finish_transaction(active, &result)) {
+                framed_enqueue_text(QFRAME_TYPE_E,
+                                    "AIRBRIDGE TRANSACTION FINALIZE FAILED");
+            } else if (result.sink_failed) {
+                __atomic_store_n(&framed_queue_failed, true,
+                                 __ATOMIC_RELEASE);
+            } else if (result.timed_out) {
+                framed_enqueue_text(QFRAME_TYPE_E, "AIRBRIDGE TIMEOUT");
+            } else if (!result.success && !result.protocol_error) {
+                framed_enqueue_text(QFRAME_TYPE_E,
+                                    "AIRBRIDGE TRANSACTION FAILED");
+            }
+            active = nullptr;
+            continue;
+        }
+
+        while (client.available() && !active &&
+               !__atomic_load_n(&framed_queue_failed, __ATOMIC_ACQUIRE)) {
+            uint8_t byte = (uint8_t)client.read();
+            if (!qframe_parser_feed(&parser, byte)) {
+                if (parser.state == QFP_ERROR) {
+                    framed_enqueue_text(QFRAME_TYPE_E,
+                                        "AIRBRIDGE INVALID FRAME");
+                    qframe_parser_reset(&parser);
+                }
+                continue;
+            }
+
+            const qframe_t *request = qframe_parser_frame(&parser);
+            if (!request || !request->crc_valid) {
+                framed_enqueue_text(QFRAME_TYPE_E, "AIRBRIDGE BAD CRC");
+                qframe_parser_reset(&parser);
+                continue;
+            }
+
+            if (request->type == QFRAME_TYPE_Q &&
+                framed_stream_control(request)) {
+                qframe_parser_reset(&parser);
+                continue;
+            }
+
+            if (request->type == QFRAME_TYPE_Q &&
+                framed_requires_transparent(request)) {
+                framed_enqueue_text(QFRAME_TYPE_E,
+                                    "AIRBRIDGE USE TRANSPARENT");
+                qframe_parser_reset(&parser);
+                continue;
+            }
+
+            uint8_t raw[QFRAME_MAX_RAW];
+            int raw_len = qframe_build(request->type, request->payload,
+                                       request->payload_len,
+                                       raw, sizeof(raw));
+            if (raw_len < 0) {
+                framed_enqueue_text(QFRAME_TYPE_E,
+                                    "AIRBRIDGE FRAME TOO LARGE");
+                qframe_parser_reset(&parser);
+                continue;
+            }
+
+            if (request->type == QFRAME_TYPE_Q) {
+                uart_response_policy_t policy =
+                    framed_response_policy(request);
+                active = Arbiter::begin_frame(raw, (uint16_t)raw_len,
+                                              CMD_SRC_TCP, CMD_PRIO_NORMAL,
+                                              policy, framed_enqueue, nullptr);
+                if (!active) {
+                    framed_enqueue_text(QFRAME_TYPE_E,
+                                        "AIRBRIDGE UART BUSY");
+                }
+            } else if (request->type == QFRAME_TYPE_L) {
+                if (!Arbiter::send_frame(raw, (uint16_t)raw_len,
+                                         CMD_SRC_TCP, CMD_PRIO_NORMAL)) {
+                    framed_enqueue_text(QFRAME_TYPE_E,
+                                        "AIRBRIDGE UART BUSY");
+                }
+            } else {
+                framed_enqueue_text(QFRAME_TYPE_E,
+                                    "AIRBRIDGE USE TRANSPARENT");
+            }
+            qframe_parser_reset(&parser);
+        }
+
+        vTaskDelay(1);
+    }
+
+    __atomic_store_n(&framed_accepting, false, __ATOMIC_RELEASE);
+    if (active) {
+        Arbiter::cancel_transaction(active);
+    }
+    Arbiter::remove_frame_listener(listener);
+    framed_release_streams();
+    framed_queue_shutdown();
+    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Framed arbiter mode exited\n");
 }
 
 
@@ -207,6 +552,8 @@ void TcpBridge::task(void *param) {
 
                     if (strcasecmp(line_buf, "$TRANSPARENT") == 0) {
                         handle_transparent();
+                    } else if (strcasecmp(line_buf, "$FRAMED") == 0) {
+                        handle_framed();
                     } else {
                         handle_line(line_buf);
                     }
@@ -227,5 +574,3 @@ void TcpBridge::init() {
     xTaskCreatePinnedToCore(TcpBridge::task, "tcp_srv", TCP_TASK_STACK,
                             nullptr, TCP_TASK_PRIO, &tcp_task_handle, 0);
 }
-
-

@@ -14,6 +14,9 @@
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_web_consumer.h"
+#include "sd_storage.h"
+#include "edf_recorder.h"
+#include "export_sync.h"
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -120,9 +123,12 @@ static void poll_therapy_state() {
             if (new_rop == 1 && current == SYS_IDLE) {
                 Arbiter::set_state(SYS_THERAPY);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy started\n");
+                ExportSync::therapy_started();
+                EdfRecorder::therapy_started();
             } else if (new_rop == 0 && current == SYS_THERAPY) {
                 Arbiter::set_state(SYS_IDLE);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy ended\n");
+                EdfRecorder::therapy_ended();
                 poll_mhr();
             }
 
@@ -141,6 +147,7 @@ static void poll_therapy_state() {
             system_state_t current = Arbiter::get_state();
             if (current != SYS_ERROR && current != SYS_TRANSPARENT &&
                 current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
+                if (current == SYS_THERAPY) EdfRecorder::therapy_ended();
                 Arbiter::set_state(SYS_ERROR);
                 Log::logf(CAT_HEALTH, LOG_ERROR, "[HEALTH] UART unresponsive, entering ERROR state\n");
             }
@@ -185,6 +192,8 @@ void setup() {
     Config::load();
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Config loaded\n");
 
+    SdStorage::init();
+
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX, Config::get().uart_baud);
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] UART arbiter started\n");
 
@@ -214,6 +223,8 @@ void setup() {
 
     LiveStream::init();
     LiveWebConsumer::init();
+    EdfRecorder::init();
+    ExportSync::init();
 
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }

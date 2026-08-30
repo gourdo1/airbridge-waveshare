@@ -51,6 +51,19 @@ static void apply_defaults() {
     cfg.udp_oxi_port = 8025;
 
     cfg.mitm_mode = 0;
+
+    cfg.smb_enabled = false;
+    cfg.smb_auto_after_therapy = true;
+    cfg.smb_endpoint = "";
+    cfg.smb_user = "";
+    cfg.smb_password = "";
+
+    cfg.sleephq_enabled = false;
+    cfg.sleephq_auto_after_therapy = true;
+    cfg.sleephq_client_id = "";
+    cfg.sleephq_client_secret = "";
+    cfg.sleephq_team_id = "";
+    cfg.sleephq_device_id = "";
 }
 
 void Config::init() {
@@ -142,6 +155,19 @@ void Config::load() {
     cfg.tz              = prefs.getString("tz", cfg.tz);
     cfg.udp_oxi_port    = prefs.getUShort("udp_oxi_port", cfg.udp_oxi_port);
     cfg.mitm_mode       = prefs.getUChar("mitm_mode", cfg.mitm_mode);
+
+    cfg.smb_enabled     = prefs.getBool("smb_enable", cfg.smb_enabled);
+    cfg.smb_auto_after_therapy = prefs.getBool("smb_auto", cfg.smb_auto_after_therapy);
+    cfg.smb_endpoint    = prefs.getString("smb_ep", cfg.smb_endpoint);
+    cfg.smb_user        = prefs.getString("smb_user", cfg.smb_user);
+    cfg.smb_password    = prefs.getString("smb_pass", cfg.smb_password);
+
+    cfg.sleephq_enabled = prefs.getBool("shq_enable", cfg.sleephq_enabled);
+    cfg.sleephq_auto_after_therapy = prefs.getBool("shq_auto", cfg.sleephq_auto_after_therapy);
+    cfg.sleephq_client_id = prefs.getString("shq_id", cfg.sleephq_client_id);
+    cfg.sleephq_client_secret = prefs.getString("shq_secret", cfg.sleephq_client_secret);
+    cfg.sleephq_team_id = prefs.getString("shq_team", cfg.sleephq_team_id);
+    cfg.sleephq_device_id = prefs.getString("shq_device", cfg.sleephq_device_id);
 }
 
 void Config::save() {
@@ -178,6 +204,19 @@ void Config::save() {
     prefs.putString("tz", cfg.tz);
     prefs.putUShort("udp_oxi_port", cfg.udp_oxi_port);
     prefs.putUChar("mitm_mode", cfg.mitm_mode);
+
+    prefs.putBool("smb_enable", cfg.smb_enabled);
+    prefs.putBool("smb_auto", cfg.smb_auto_after_therapy);
+    prefs.putString("smb_ep", cfg.smb_endpoint);
+    prefs.putString("smb_user", cfg.smb_user);
+    prefs.putString("smb_pass", cfg.smb_password);
+
+    prefs.putBool("shq_enable", cfg.sleephq_enabled);
+    prefs.putBool("shq_auto", cfg.sleephq_auto_after_therapy);
+    prefs.putString("shq_id", cfg.sleephq_client_id);
+    prefs.putString("shq_secret", cfg.sleephq_client_secret);
+    prefs.putString("shq_team", cfg.sleephq_team_id);
+    prefs.putString("shq_device", cfg.sleephq_device_id);
 }
 
 void Config::reset_defaults() {
@@ -260,6 +299,17 @@ static const KVEntry kv_table[] = {
     KV_STR("tz", tz),
     KV_U16("udp_oxi_port", udp_oxi_port),
     KV_U8("mitm_mode", mitm_mode),
+    KV_BOOL("smb_enabled", smb_enabled),
+    KV_BOOL("smb_auto_after_therapy", smb_auto_after_therapy),
+    KV_STR("smb_endpoint", smb_endpoint),
+    KV_STR("smb_user", smb_user),
+    KV_STR("smb_password", smb_password),
+    KV_BOOL("sleephq_enabled", sleephq_enabled),
+    KV_BOOL("sleephq_auto_after_therapy", sleephq_auto_after_therapy),
+    KV_STR("sleephq_client_id", sleephq_client_id),
+    KV_STR("sleephq_client_secret", sleephq_client_secret),
+    KV_STR("sleephq_team_id", sleephq_team_id),
+    KV_STR("sleephq_device_id", sleephq_device_id),
     { nullptr, KVEntry::U8, nullptr }
 };
 
@@ -315,7 +365,8 @@ String Config::dump() {
     // KV table entries
     foreach_kv([](const char *key, const String &val, void *p) {
         String v = val;
-        if (strstr(key, "pass") && v.length() > 0) v = "****";
+        if ((strstr(key, "pass") || strstr(key, "secret")) &&
+            v.length() > 0) v = "****";
         *(String*)p += String(key) + "=" + v + "\n";
     }, &out);
     return out;

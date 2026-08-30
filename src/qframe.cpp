@@ -193,6 +193,36 @@ int qframe_build_cmd(const char *cmd, uint8_t *out_buf, uint16_t out_buf_size) {
                         out_buf, out_buf_size);
 }
 
+qframe_type_mask_t qframe_type_mask(uint8_t type) {
+    switch (type) {
+        case QFRAME_TYPE_E:     return QFRAME_MASK_E;
+        case QFRAME_TYPE_FLASH: return QFRAME_MASK_FLASH;
+        case QFRAME_TYPE_K:     return QFRAME_MASK_K;
+        case QFRAME_TYPE_L:     return QFRAME_MASK_L;
+        case QFRAME_TYPE_O:     return QFRAME_MASK_O;
+        case QFRAME_TYPE_P:     return QFRAME_MASK_P;
+        case QFRAME_TYPE_Q:     return QFRAME_MASK_Q;
+        case QFRAME_TYPE_R:     return QFRAME_MASK_R;
+        case QFRAME_TYPE_T:     return QFRAME_MASK_T;
+        default:                return 0;
+    }
+}
+
+const char *qframe_type_name(uint8_t type) {
+    switch (type) {
+        case QFRAME_TYPE_E:     return "error";
+        case QFRAME_TYPE_FLASH: return "flash";
+        case QFRAME_TYPE_K:     return "stored";
+        case QFRAME_TYPE_L:     return "live";
+        case QFRAME_TYPE_O:     return "dump/reset";
+        case QFRAME_TYPE_P:     return "progress/reset";
+        case QFRAME_TYPE_Q:     return "command";
+        case QFRAME_TYPE_R:     return "response";
+        case QFRAME_TYPE_T:     return "reserved";
+        default:                return "unknown";
+    }
+}
+
 const char *qframe_response_value(const char *resp) {
     if (!resp) return NULL;
     const char *eq = strstr(resp, "= ");

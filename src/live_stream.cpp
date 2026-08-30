@@ -21,6 +21,7 @@ struct Stream {
 
 struct Consumer {
     bool          in_use;
+    uint16_t      inflight;
     int8_t        stream_idx;
     consumer_cb_t cb;
     void         *ctx;
@@ -29,6 +30,14 @@ struct Consumer {
 static Stream    streams[LIVE_STREAMS_MAX];
 static Consumer  consumers[LIVE_CONSUMERS_MAX];
 static bool      initialized = false;
+static SemaphoreHandle_t control_mutex = nullptr;
+static portMUX_TYPE data_mux = portMUX_INITIALIZER_UNLOCKED;
+
+class ControlGuard {
+public:
+    ControlGuard() { xSemaphoreTake(control_mutex, portMAX_DELAY); }
+    ~ControlGuard() { xSemaphoreGive(control_mutex); }
+};
 
 static int find_stream_idx(const char *tag) {
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
@@ -37,6 +46,28 @@ static int find_stream_idx(const char *tag) {
             return i;
         }
     }
+    return -1;
+}
+
+static int create_stream(const char *tag, decode_fn_t decode_fn,
+                         uint16_t sample_size) {
+    for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
+        if (streams[i].in_use) continue;
+        memcpy(streams[i].tag, tag, LIVE_STREAM_TAG_LEN);
+        streams[i].tag[LIVE_STREAM_TAG_LEN] = 0;
+        streams[i].decode_fn = decode_fn;
+        streams[i].sample_size = sample_size;
+        portENTER_CRITICAL(&data_mux);
+        streams[i].in_use = true;
+        portEXIT_CRITICAL(&data_mux);
+        Log::logf(CAT_GENERAL, LOG_INFO,
+                  "[LS] stream '%s' registered%s\n", streams[i].tag,
+                  decode_fn ? "" : " (raw)");
+        return i;
+    }
+    Log::logf(CAT_GENERAL, LOG_WARN,
+              "[LS] stream table full, '%c%c%c' rejected\n",
+              tag[0], tag[1], tag[2]);
     return -1;
 }
 
@@ -51,6 +82,11 @@ static bool device_subscribe(int sidx, bool on, cmd_source_t src = CMD_SRC_INTER
 
 void init() {
     if (initialized) return;
+    control_mutex = xSemaphoreCreateMutex();
+    if (!control_mutex) {
+        Log::logf(CAT_GENERAL, LOG_ERROR, "[LS] control mutex init failed\n");
+        return;
+    }
     memset(streams, 0, sizeof(streams));
     memset(consumers, 0, sizeof(consumers));
     initialized = true;
@@ -59,31 +95,28 @@ void init() {
 
 bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_size) {
     if (!initialized) init();
+    if (!initialized) return false;
+    ControlGuard guard;
     if (!tag || !decode_fn || sample_size == 0 || sample_size > LS_DECODE_BUF)
         return false;
-    if (find_stream_idx(tag) >= 0) return false;
-
-    for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
-        if (!streams[i].in_use) {
-            memcpy(streams[i].tag, tag, LIVE_STREAM_TAG_LEN);
-            streams[i].tag[LIVE_STREAM_TAG_LEN] = 0;
-            streams[i].decode_fn   = decode_fn;
-            streams[i].sample_size = sample_size;
-            streams[i].ref_count   = 0;
-            streams[i].subscribed  = false;
-            streams[i].in_use      = true;
-            Log::logf(CAT_GENERAL, LOG_INFO,
-                      "[LS] stream '%s' registered\n", streams[i].tag);
-            return true;
-        }
+    int sidx = find_stream_idx(tag);
+    if (sidx >= 0) {
+        if (streams[sidx].decode_fn) return false;
+        portENTER_CRITICAL(&data_mux);
+        streams[sidx].decode_fn = decode_fn;
+        streams[sidx].sample_size = sample_size;
+        portEXIT_CRITICAL(&data_mux);
+        Log::logf(CAT_GENERAL, LOG_INFO,
+                  "[LS] stream '%s' decoder attached\n", streams[sidx].tag);
+        return true;
     }
-    Log::logf(CAT_GENERAL, LOG_WARN,
-              "[LS] stream table full, '%c%c%c' rejected\n",
-              tag[0], tag[1], tag[2]);
-    return false;
+    return create_stream(tag, decode_fn, sample_size) >= 0;
 }
 
 consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
+    if (!initialized) init();
+    if (!initialized) return -1;
+    ControlGuard guard;
     if (!cb) return -1;
     int sidx = find_stream_idx(tag);
     if (sidx < 0) {
@@ -95,19 +128,24 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
 
     int cidx = -1;
     for (int i = 0; i < LIVE_CONSUMERS_MAX; i++) {
-        if (!consumers[i].in_use) { cidx = i; break; }
+        if (!consumers[i].in_use && consumers[i].inflight == 0) {
+            cidx = i;
+            break;
+        }
     }
     if (cidx < 0) {
         Log::logf(CAT_GENERAL, LOG_WARN, "[LS] consumer table full\n");
         return -1;
     }
 
-    consumers[cidx].in_use     = true;
+    portENTER_CRITICAL(&data_mux);
     consumers[cidx].stream_idx = (int8_t)sidx;
     consumers[cidx].cb         = cb;
     consumers[cidx].ctx        = ctx;
+    consumers[cidx].in_use     = true;
 
     streams[sidx].ref_count++;
+    portEXIT_CRITICAL(&data_mux);
     if (streams[sidx].ref_count == 1 && !streams[sidx].subscribed) {
         if (device_subscribe(sidx, true)) {
             streams[sidx].subscribed = true;
@@ -123,16 +161,32 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
 }
 
 void unsubscribe(consumer_handle_t h) {
+    if (!initialized) return;
+    ControlGuard guard;
     if (h < 0 || h >= LIVE_CONSUMERS_MAX) return;
     if (!consumers[h].in_use) return;
 
     int sidx = consumers[h].stream_idx;
+    portENTER_CRITICAL(&data_mux);
     consumers[h].in_use = false;
-    consumers[h].cb     = nullptr;
-    consumers[h].ctx    = nullptr;
+    portEXIT_CRITICAL(&data_mux);
+
+    while (true) {
+        portENTER_CRITICAL(&data_mux);
+        bool idle = consumers[h].inflight == 0;
+        if (idle) {
+            consumers[h].cb = nullptr;
+            consumers[h].ctx = nullptr;
+        }
+        portEXIT_CRITICAL(&data_mux);
+        if (idle) break;
+        vTaskDelay(1);
+    }
 
     if (sidx >= 0 && sidx < LIVE_STREAMS_MAX && streams[sidx].in_use) {
+        portENTER_CRITICAL(&data_mux);
         if (streams[sidx].ref_count > 0) streams[sidx].ref_count--;
+        portEXIT_CRITICAL(&data_mux);
         if (streams[sidx].ref_count == 0 && streams[sidx].subscribed) {
             if (device_subscribe(sidx, false)) {
                 streams[sidx].subscribed = false;
@@ -146,7 +200,87 @@ void unsubscribe(consumer_handle_t h) {
     }
 }
 
+static int8_t acquire_raw(const char *tag, cmd_source_t source,
+                          const char *owner) {
+    if (!initialized) init();
+    if (!initialized) return -1;
+    ControlGuard guard;
+    if (!tag || !tag[0] || !tag[1] || !tag[2]) return -1;
+
+    int sidx = find_stream_idx(tag);
+    bool created = sidx < 0;
+    if (created) sidx = create_stream(tag, nullptr, 0);
+    if (sidx < 0 || streams[sidx].ref_count == UINT8_MAX) return -1;
+
+    if (streams[sidx].ref_count == 0 && !streams[sidx].subscribed) {
+        if (!device_subscribe(sidx, true, source)) {
+            Log::logf(CAT_GENERAL, LOG_WARN,
+                      "[LS] %s subscribe to %s failed\n",
+                      owner, streams[sidx].tag);
+            if (created) {
+                portENTER_CRITICAL(&data_mux);
+                memset(&streams[sidx], 0, sizeof(streams[sidx]));
+                portEXIT_CRITICAL(&data_mux);
+            }
+            return -1;
+        }
+        streams[sidx].subscribed = true;
+    }
+    streams[sidx].ref_count++;
+    Log::logf(CAT_GENERAL, LOG_INFO,
+              "[LS] %s %s lease acquired (refs=%u)\n",
+              streams[sidx].tag, owner, streams[sidx].ref_count);
+    return (int8_t)sidx;
+}
+
+static void release_raw(int8_t h, cmd_source_t source, const char *owner) {
+    if (!initialized) return;
+    ControlGuard guard;
+    if (h < 0 || h >= LIVE_STREAMS_MAX || !streams[h].in_use ||
+        streams[h].ref_count == 0) {
+        return;
+    }
+
+    streams[h].ref_count--;
+    if (streams[h].ref_count == 0 && streams[h].subscribed) {
+        if (device_subscribe(h, false, source)) {
+            streams[h].subscribed = false;
+        } else {
+            Log::logf(CAT_GENERAL, LOG_WARN,
+                      "[LS] %s unsubscribe from %s failed\n",
+                      owner, streams[h].tag);
+        }
+    }
+    Log::logf(CAT_GENERAL, LOG_INFO,
+              "[LS] %s %s lease released (refs=%u)\n",
+              streams[h].tag, owner, streams[h].ref_count);
+    if (streams[h].ref_count == 0 && !streams[h].subscribed &&
+        !streams[h].decode_fn) {
+        portENTER_CRITICAL(&data_mux);
+        memset(&streams[h], 0, sizeof(streams[h]));
+        portEXIT_CRITICAL(&data_mux);
+    }
+}
+
+external_handle_t acquire_external(const char *tag) {
+    return acquire_raw(tag, CMD_SRC_TCP, "external");
+}
+
+void release_external(external_handle_t h) {
+    release_raw(h, CMD_SRC_TCP, "external");
+}
+
+internal_handle_t acquire_internal(const char *tag) {
+    return acquire_raw(tag, CMD_SRC_INTERNAL, "internal");
+}
+
+void release_internal(internal_handle_t h) {
+    release_raw(h, CMD_SRC_INTERNAL, "internal");
+}
+
 static bool suspend_with_source(cmd_source_t src) {
+    if (!initialized) return true;
+    ControlGuard guard;
     bool ok = true;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use || !streams[i].subscribed) continue;
@@ -171,6 +305,8 @@ bool suspend_for_ota() {
 }
 
 void resume() {
+    if (!initialized) return;
+    ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use) continue;
         if (streams[i].ref_count > 0 && !streams[i].subscribed) {
@@ -184,6 +320,8 @@ void resume() {
 }
 
 void resync() {
+    if (!initialized) return;
+    ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use) continue;
         if (streams[i].ref_count > 0 && !streams[i].subscribed) {
@@ -197,6 +335,8 @@ void resync() {
 }
 
 void reattach() {
+    if (!initialized) return;
+    ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use || streams[i].ref_count == 0) continue;
         streams[i].subscribed = false;
@@ -212,6 +352,15 @@ void on_l_frame(const uint8_t *payload, uint16_t len) {
     if (!initialized || len < LIVE_STREAM_TAG_LEN) return;
 
     int sidx = -1;
+    decode_fn_t decode_fn = nullptr;
+    uint16_t sample_size = 0;
+    char tag[LIVE_STREAM_TAG_LEN + 1] = {};
+    consumer_cb_t callbacks[LIVE_CONSUMERS_MAX] = {};
+    void *contexts[LIVE_CONSUMERS_MAX] = {};
+    uint8_t callback_slots[LIVE_CONSUMERS_MAX] = {};
+    uint8_t callback_count = 0;
+
+    portENTER_CRITICAL(&data_mux);
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (streams[i].in_use &&
             memcmp(streams[i].tag, payload, LIVE_STREAM_TAG_LEN) == 0) {
@@ -219,39 +368,61 @@ void on_l_frame(const uint8_t *payload, uint16_t len) {
             break;
         }
     }
-    if (sidx < 0) return;
+    if (sidx >= 0) {
+        decode_fn = streams[sidx].decode_fn;
+        sample_size = streams[sidx].sample_size;
+        memcpy(tag, streams[sidx].tag, sizeof(tag));
+        if (decode_fn && sample_size > 0) {
+            for (uint8_t i = 0; i < LIVE_CONSUMERS_MAX; i++) {
+                if (!consumers[i].in_use || consumers[i].stream_idx != sidx ||
+                    !consumers[i].cb) {
+                    continue;
+                }
+                callbacks[callback_count] = consumers[i].cb;
+                contexts[callback_count] = consumers[i].ctx;
+                callback_slots[callback_count] = i;
+                consumers[i].inflight++;
+                callback_count++;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&data_mux);
+
+    if (sidx < 0 || !decode_fn || sample_size == 0) return;
 
     // Decode once into a stack buffer, then fan out to consumers.
     uint8_t sample_buf[LS_DECODE_BUF];
-    uint16_t sample_size = streams[sidx].sample_size;
-    if (sample_size > sizeof(sample_buf)) return;
-    if (!streams[sidx].decode_fn(payload, len, sample_buf, sample_size))
-        return;
+    bool decoded = sample_size <= sizeof(sample_buf) &&
+                   decode_fn(payload, len, sample_buf, sample_size);
 
-    for (int i = 0; i < LIVE_CONSUMERS_MAX; i++) {
-        if (!consumers[i].in_use) continue;
-        if (consumers[i].stream_idx != sidx) continue;
-        consumer_cb_t cb = consumers[i].cb;
-        void *ctx = consumers[i].ctx;
-        if (!cb) continue;
-
-        int64_t t0 = esp_timer_get_time();
-        cb(sample_buf, sample_size, ctx);
-        int64_t dt = esp_timer_get_time() - t0;
-        if (dt > LS_CB_WARN_US) {
-            Log::logf(CAT_GENERAL, LOG_WARN,
-                      "[LS] %s consumer cb slow: %lld us\n",
-                      streams[sidx].tag, (long long)dt);
+    for (uint8_t i = 0; i < callback_count; i++) {
+        if (decoded) {
+            int64_t t0 = esp_timer_get_time();
+            callbacks[i](sample_buf, sample_size, contexts[i]);
+            int64_t dt = esp_timer_get_time() - t0;
+            if (dt > LS_CB_WARN_US) {
+                Log::logf(CAT_GENERAL, LOG_WARN,
+                          "[LS] %s consumer cb slow: %lld us\n",
+                          tag, (long long)dt);
+            }
         }
+        portENTER_CRITICAL(&data_mux);
+        Consumer &consumer = consumers[callback_slots[i]];
+        if (consumer.inflight > 0) consumer.inflight--;
+        portEXIT_CRITICAL(&data_mux);
     }
 }
 
 bool is_stream_active(const char *tag) {
+    if (!initialized) return false;
+    ControlGuard guard;
     int sidx = find_stream_idx(tag);
     return sidx >= 0 && streams[sidx].subscribed;
 }
 
 bool is_active() {
+    if (!initialized) return false;
+    ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (streams[i].in_use && streams[i].subscribed) return true;
     }

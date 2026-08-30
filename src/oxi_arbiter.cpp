@@ -42,6 +42,7 @@ static volatile bool feeding = false;
 static oxi_source_t src_active = OXI_SRC_NONE;
 static uint32_t src_last_time = 0;
 static char source_id[32] = "";
+static portMUX_TYPE reading_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #define SOURCE_TIMEOUT_MS 10000
 
@@ -64,15 +65,18 @@ static void inject_lframe() {
 
     auto &cfg = Config::get();
     if (cfg.oxi_feed_therapy_only && st != SYS_THERAPY) return;
-    if (!cfg.oxi_lframe_continuous && !reading.valid) return;
+    oxi_reading_t current;
+    oxi_source_t current_source;
+    OxiArbiter::snapshot(current, &current_source);
+    if (!cfg.oxi_lframe_continuous && !current.valid) return;
 
-    if (reading.valid != last_valid) {
-        if (reading.valid)
+    if (current.valid != last_valid) {
+        if (current.valid)
             Log::logf(CAT_OXI, LOG_INFO, "[OXI] Finger detected: SpO2=%d%% HR=%d bpm (%s)\n",
-                      reading.spo2, reading.pulse_bpm, src_name(src_active));
+                      current.spo2, current.pulse_bpm, src_name(current_source));
         else
             Log::logf(CAT_OXI, LOG_INFO, "[OXI] Finger lost\n");
-        last_valid = reading.valid;
+        last_valid = current.valid;
     }
 
     uint8_t toggle = oxh_toggle ? 0x02 : 0x00;
@@ -82,11 +86,11 @@ static void inject_lframe() {
     uint16_t hrr;
     uint8_t sar;
 
-    if (reading.valid) {
+    if (current.valid) {
         oxs = 0x81 | toggle;
         sas = 0x80 | toggle;
-        hrr = (uint16_t)reading.pulse_bpm;
-        sar = (uint8_t)reading.spo2;
+        hrr = (uint16_t)current.pulse_bpm;
+        sar = (uint8_t)current.spo2;
     } else {
         oxs = 0x99 | toggle;
         sas = 0x98 | toggle;
@@ -100,8 +104,8 @@ static void inject_lframe() {
     oxh_seq = (oxh_seq + 1) & 0xFF;
 
     Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] L-frame seq=%02X %s SpO2=%d HR=%d t=%lu\n",
-              (oxh_seq - 1) & 0xFF, reading.valid ? "valid" : "no-finger",
-              reading.spo2, reading.pulse_bpm, millis());
+              (oxh_seq - 1) & 0xFF, current.valid ? "valid" : "no-finger",
+              current.spo2, current.pulse_bpm, millis());
 
     uint8_t frame_buf[32];
     int frame_len = qframe_build('L', (const uint8_t *)payload, 16,
@@ -122,17 +126,21 @@ void OxiArbiter::init() {
 }
 
 void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool valid) {
-    if (src_active != OXI_SRC_NONE && src_active != src) return;
+    bool source_claimed = false;
+    portENTER_CRITICAL(&reading_mux);
+    if (src_active != OXI_SRC_NONE && src_active != src) {
+        portEXIT_CRITICAL(&reading_mux);
+        return;
+    }
 
     // Only claim source on valid data
     if (src_active == OXI_SRC_NONE && valid) {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source active: %s\n", src_name(src));
-        Arbiter::lcd_message("Oximeter Connected", 15000);
-        if (Config::get().oxi_auto_start && !feeding) {
-            start_feed();
-        }
+        source_claimed = true;
     }
-    if (!valid && src_active == OXI_SRC_NONE) return;
+    if (!valid && src_active == OXI_SRC_NONE) {
+        portEXIT_CRITICAL(&reading_mux);
+        return;
+    }
 
     src_active = src;
     src_last_time = millis();
@@ -140,6 +148,13 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
     reading.pulse_bpm = pulse_bpm;
     reading.valid = valid;
     reading.timestamp_ms = millis();
+    portEXIT_CRITICAL(&reading_mux);
+
+    if (source_claimed) {
+        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source active: %s\n", src_name(src));
+        Arbiter::lcd_message("Oximeter Connected", 15000);
+        if (Config::get().oxi_auto_start && !feeding) start_feed();
+    }
 }
 
 void OxiArbiter::start_feed() {
@@ -154,9 +169,20 @@ void OxiArbiter::stop_feed() {
 
 bool OxiArbiter::is_feeding() { return feeding; }
 
-const oxi_reading_t& OxiArbiter::get_reading() { return reading; }
+void OxiArbiter::snapshot(oxi_reading_t &out, oxi_source_t *source) {
+    portENTER_CRITICAL(&reading_mux);
+    out = reading;
+    if (source) *source = src_active;
+    portEXIT_CRITICAL(&reading_mux);
+}
 
-oxi_source_t OxiArbiter::active_source() { return src_active; }
+oxi_source_t OxiArbiter::active_source() {
+    oxi_source_t source;
+    portENTER_CRITICAL(&reading_mux);
+    source = src_active;
+    portEXIT_CRITICAL(&reading_mux);
+    return source;
+}
 
 void OxiArbiter::set_source_id(const char *id) {
     strncpy(source_id, id ? id : "", sizeof(source_id) - 1);
@@ -167,17 +193,25 @@ const char *OxiArbiter::get_source_id() { return source_id; }
 
 void OxiArbiter::poll() {
     // release source after timeout
+    oxi_source_t timed_out_source = OXI_SRC_NONE;
+    portENTER_CRITICAL(&reading_mux);
     if (src_active != OXI_SRC_NONE && millis() - src_last_time > SOURCE_TIMEOUT_MS) {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source %s timed out\n", src_name(src_active));
+        timed_out_source = src_active;
         src_active = OXI_SRC_NONE;
-        source_id[0] = '\0';
         reading.valid = false;
+    }
+    portEXIT_CRITICAL(&reading_mux);
+    if (timed_out_source != OXI_SRC_NONE) {
+        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source %s timed out\n",
+                  src_name(timed_out_source));
+        source_id[0] = '\0';
         if (feeding) stop_feed();
     }
 
     // inject at configured interval
     auto &cfg = Config::get();
-    if (feeding && src_active != OXI_SRC_NONE && millis() - last_inject >= cfg.oxi_interval_ms) {
+    if (feeding && active_source() != OXI_SRC_NONE &&
+        millis() - last_inject >= cfg.oxi_interval_ms) {
         last_inject = millis();
         inject_lframe();
     }

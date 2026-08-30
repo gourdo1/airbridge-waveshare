@@ -35,24 +35,29 @@ inline const char *system_state_name(system_state_t s) {
     return (s < sizeof(names)/sizeof(names[0])) ? names[s] : "?";
 }
 
+typedef bool (*uart_frame_sink_t)(const qframe_t *frame, void *context);
+
 typedef struct {
-    cmd_source_t    source;
-    cmd_priority_t  priority;
-    uint8_t         frame[QFRAME_MAX_RAW];
-    uint16_t        frame_len;
-    uint32_t        ticket_id;
-    uint16_t        timeout_ms;
-    bool            no_ack;
+    qframe_type_mask_t accepted_types;
+    qframe_type_mask_t terminal_types;
+    qframe_type_mask_t success_types;
+    uint16_t first_timeout_ms;
+    uint16_t interframe_timeout_ms;
+    uint32_t overall_timeout_ms;
+    bool complete_on_idle;
+} uart_response_policy_t;
 
-    uint8_t         resp_payload[QFRAME_MAX_PAYLOAD];
-    uint16_t        resp_len;
-    uint8_t         resp_type;
-    bool            success;
-    bool            timed_out;
+typedef struct {
+    bool success;
+    bool timed_out;
+    bool protocol_error;
+    bool sink_failed;
+    uint8_t terminal_type;
+    uint16_t frame_count;
+} uart_transaction_result_t;
 
-    volatile bool   cancelled;
-    SemaphoreHandle_t done;
-} uart_ticket_t;
+struct uart_transaction_t;
+typedef int8_t uart_frame_listener_t;
 
 namespace Arbiter {
     void init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud);
@@ -64,7 +69,43 @@ namespace Arbiter {
     bool send_frame(const uint8_t *frame, uint16_t frame_len,
                     cmd_source_t src, cmd_priority_t prio);
 
-    bool submit(uart_ticket_t *ticket);
+    uart_transaction_t *begin_cmd(const char *cmd,
+                                  cmd_source_t src,
+                                  cmd_priority_t prio,
+                                  const uart_response_policy_t &policy,
+                                  uart_frame_sink_t sink = nullptr,
+                                  void *sink_context = nullptr);
+
+    uart_transaction_t *begin_frame(const uint8_t *frame,
+                                    uint16_t frame_len,
+                                    cmd_source_t src,
+                                    cmd_priority_t prio,
+                                    const uart_response_policy_t &policy,
+                                    uart_frame_sink_t sink = nullptr,
+                                    void *sink_context = nullptr);
+
+    // The caller owns a returned transaction until exactly one successful
+    // finish_transaction() or cancel_transaction() call. Cancellation waits
+    // until the arbiter can no longer invoke the transaction sink.
+    bool transaction_done(const uart_transaction_t *transaction);
+    bool finish_transaction(uart_transaction_t *transaction,
+                            uart_transaction_result_t *result,
+                            uint32_t wait_ms = 0);
+    void cancel_transaction(uart_transaction_t *transaction);
+
+    bool transact_cmd(const char *cmd,
+                      cmd_source_t src,
+                      cmd_priority_t prio,
+                      const uart_response_policy_t &policy,
+                      uart_frame_sink_t sink,
+                      void *sink_context,
+                      uart_transaction_result_t *result);
+
+    uart_frame_listener_t add_frame_listener(qframe_type_mask_t types,
+                                             uart_frame_sink_t sink,
+                                             void *context);
+    // Waits for callbacks already in flight. Do not call from the listener.
+    void remove_frame_listener(uart_frame_listener_t listener);
 
     system_state_t get_state();
     void set_state(system_state_t state);

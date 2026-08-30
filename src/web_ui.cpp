@@ -11,6 +11,10 @@
 #include "network_hints.h"
 #include "live_web_consumer.h"
 #include "crc.h"
+#include "sd_storage.h"
+#include "edf_recorder.h"
+#include "edf_catalog.h"
+#include "export_sync.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -217,7 +221,18 @@ static size_t buildStatusJson(char *out, size_t cap) {
     out[0] = '\0';
 
     oxi_state_t oxi = OxiBle::get_state();
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
+    SdStorage::Status sd;
+    SdStorage::get_status(sd);
+    EdfRecorder::Status edf;
+    EdfRecorder::get_status(edf);
+    EdfCatalog::Status catalog;
+    EdfCatalog::get_status(catalog);
+    ExportSync::Status export_status;
+    ExportSync::get_status(export_status);
+    ExportSync::SleepHqStatus sleephq_status;
+    ExportSync::get_sleephq_status(sleephq_status);
 
     int rop = Arbiter::get_cached_rop();
     int mhr = Arbiter::get_cached_mhr();
@@ -273,13 +288,49 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddInt(json, "rssi", WiFi.RSSI());
     fixedJsonAddInt(json, "mhr", mhr);
     fixedJsonAddInt(json, "uptime", millis() / 1000);
+    fixedJsonAddString(json, "sd", !sd.supported ? "unsupported" :
+                       sd.mounted ? "mounted" : "unavailable");
+    fixedJsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
+    fixedJsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+    fixedJsonAddString(json, "edf", !edf.supported ? "unsupported" :
+                       edf.active ? "recording" :
+                       edf.post_processing ? "post-processing" :
+                       edf.ready ? "ready" : "unavailable");
+    fixedJsonAddString(json, "edf_prefix", edf.file_prefix);
+    fixedJsonAddInt(json, "edf_dropped", edf.raw_dropped);
+    fixedJsonAddInt(json, "edf_errors", edf.write_errors);
+    fixedJsonAddInt(json, "edf_post_errors", edf.post_errors);
+    fixedJsonAddInt(json, "edf_str_records", edf.str_records);
+    fixedJsonAddString(json, "edf_identification",
+                       edf.identification_ready ? "ready" : "missing");
+    fixedJsonAddInt(json, "edf_catalog_entries", catalog.entries);
+    fixedJsonAddInt(json, "edf_catalog_generation", catalog.generation);
+    fixedJsonAddString(json, "smb_sync",
+                       ExportSync::state_name(export_status.state));
+    fixedJsonAddInt(json, "smb_files_uploaded",
+                    export_status.files_uploaded);
+    fixedJsonAddInt(json, "smb_files_skipped",
+                    export_status.files_skipped);
+    fixedJsonAddString(json, "smb_error", export_status.last_error);
+    fixedJsonAddString(json, "sleephq_sync",
+                       ExportSync::state_name(sleephq_status.state));
+    fixedJsonAddInt(json, "sleephq_files_uploaded",
+                    sleephq_status.files_uploaded);
+    fixedJsonAddInt(json, "sleephq_files_skipped",
+                    sleephq_status.files_skipped);
+    fixedJsonAddInt(json, "sleephq_import_id",
+                    sleephq_status.import_id);
+    fixedJsonAddString(json, "sleephq_import_status",
+                       sleephq_status.import_status);
+    fixedJsonAddString(json, "sleephq_error",
+                       sleephq_status.last_error);
     fixedJsonPut(json, '}');
 
     return json.overflow ? 0 : json.len;
 }
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
-static const size_t STATUS_JSON_MAX = 512;
+static const size_t STATUS_JSON_MAX = 1408;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 
@@ -445,7 +496,8 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
         auto *c = (decltype(ctx)*)p;
         if (!c->first) *c->json += ',';
         c->first = false;
-        jsonAddString(*c->json, key, val.c_str(), false);
+        const bool sensitive = strstr(key, "pass") || strstr(key, "secret");
+        jsonAddString(*c->json, key, sensitive ? "" : val.c_str(), false);
     }, &ctx);
     json += '}';
     request->send(200, "application/json", json);
@@ -467,6 +519,32 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     json += String(count);
     json += '}';
     request->send(200, "application/json", json);
+}
+
+static void handleSmbSync(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    if (Arbiter::get_cached_rop() == 1) {
+        request->send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"therapy_active\"}");
+        return;
+    }
+    const bool queued = ExportSync::request_manual_smb();
+    request->send(queued ? 202 : 409, "application/json",
+                  queued ? "{\"ok\":true,\"state\":\"pending\"}" :
+                           "{\"ok\":false,\"error\":\"unavailable\"}");
+}
+
+static void handleSleepHqSync(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    if (Arbiter::get_cached_rop() == 1) {
+        request->send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"therapy_active\"}");
+        return;
+    }
+    const bool queued = ExportSync::request_manual_sleephq();
+    request->send(queued ? 202 : 409, "application/json",
+                  queued ? "{\"ok\":true,\"state\":\"pending\"}" :
+                           "{\"ok\":false,\"error\":\"unavailable\"}");
 }
 
 
@@ -591,7 +669,8 @@ static void handleLive(AsyncWebServerRequest *request) {
     uint16_t cur_seq = 0;
     int n = LiveWebConsumer::get_samples(samples, LIVE_BATCH_MAX, since, &cur_seq);
 
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
 
     String json;
     json.reserve(64 + n * 24);
@@ -621,7 +700,8 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
     oxi_state_t st = OxiBle::get_state();
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
     auto &cfg = Config::get();
 
     String json = "{";
@@ -1276,6 +1356,8 @@ void WebUI::init(uint16_t port) {
     http->on("/api/settings", HTTP_POST, handlePostSettings, NULL, handleJsonBody);
     http->on("/api/config", HTTP_GET, handleGetConfig);
     http->on("/api/config", HTTP_POST, handlePostConfig, NULL, handleJsonBody);
+    http->on("/api/export/smb", HTTP_POST, handleSmbSync);
+    http->on("/api/export/sleephq", HTTP_POST, handleSleepHqSync);
     http->on("/api/live", HTTP_GET, handleLive);
     http->on("/api/upload", HTTP_POST, handleUploadDone, handleUploadChunk);
     http->on("/api/ble", HTTP_GET, handleBleStatus);
@@ -1300,7 +1382,8 @@ void WebUI::init(uint16_t port) {
 static String build_status_payload() {
     system_state_t sys = Arbiter::get_state();
     oxi_state_t oxi = OxiBle::get_state();
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
 
     String sj;
     sj.reserve(256);
@@ -1338,7 +1421,8 @@ static PublishedStatusSnapshot current_snapshot() {
     s.sys     = Arbiter::get_state();
     s.oxi     = OxiBle::get_state();
     s.feeding = OxiArbiter::is_feeding();
-    const oxi_reading_t &r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
     s.spo2    = r.valid ? r.spo2 : -1;
     s.pulse   = r.valid ? r.pulse_bpm : -1;
     return s;

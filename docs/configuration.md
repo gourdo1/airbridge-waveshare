@@ -88,6 +88,26 @@ The web UI Device tab has a timezone helper that detects your browser's timezone
 
 When NTP syncs, the ResMed device clock is set automatically. If NTP is unavailable, the ResMed clock is used as fallback for the ESP system time.
 
+### Storage export
+
+SMB and SleepHQ export require SD support and a mounted card. Both are disabled
+by default. Automatic export sends pending recordings after startup and therapy,
+only while therapy is inactive.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `smb_enabled` | false | Enable SMB export |
+| `smb_auto_after_therapy` | true | Automatically sync pending recordings after startup and therapy |
+| `smb_endpoint` | *(empty)* | Destination in `//host/share/optional/path` form |
+| `smb_user` | *(empty)* | SMB username |
+| `smb_password` | *(empty)* | SMB password |
+| `sleephq_enabled` | false | Enable SleepHQ export |
+| `sleephq_auto_after_therapy` | true | Automatically sync pending recordings after startup and therapy |
+| `sleephq_client_id` | *(empty)* | SleepHQ API client ID |
+| `sleephq_client_secret` | *(empty)* | SleepHQ API client secret |
+| `sleephq_team_id` | *(empty)* | Optional numeric team ID; current team is resolved when empty |
+| `sleephq_device_id` | *(empty)* | Optional SleepHQ device ID attached to new imports |
+
 ### Oximetry
 
 | Key | Default | Description |
@@ -140,6 +160,9 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$CONFIG key value` | Set value (not saved until SAVE) |
 | `$CONFIG SAVE` | Persist to NVS |
 | `$CONFIG RESET` | Reset all to defaults |
+| `$EXPORT STATUS` | Show SMB and SleepHQ state, progress, and last error |
+| `$EXPORT SMB` | Sync pending recordings to SMB |
+| `$EXPORT SLEEPHQ` | Sync pending recordings to SleepHQ |
 | `$WIFI` / `$WIFI STATUS` | Connection state, RSSI, roaming flag |
 | `$WIFI LIST` | List configured networks |
 | `$WIFI ADD ssid pass` | Add a network (max 4) |
@@ -152,6 +175,7 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$LOG` | Show log levels |
 | `$LOG category level` | Set log level (ERROR/WARN/INFO/DEBUG) |
 | `$TRANSPARENT` | Raw UART passthrough (60s idle timeout) |
+| `$FRAMED` | Switch to framed UART mode |
 | `$VERSION` | Firmware version |
 | `$REBOOT` | Restart device |
 
