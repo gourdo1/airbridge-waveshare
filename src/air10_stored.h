@@ -15,5 +15,10 @@ struct Value {
 };
 
 bool parse_value(const uint8_t *payload, size_t payload_len, Value &out);
+bool contains_minute(const Value &value, uint16_t expected,
+                     uint16_t tolerance);
+bool contains_interval(const Value &starts, const Value &ends,
+                       uint16_t expected_start, uint16_t expected_end,
+                       uint16_t tolerance);
 
 }  // namespace Air10Stored

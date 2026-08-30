@@ -22,6 +22,15 @@ bool parse_hex(const uint8_t *text, size_t width, uint32_t &value) {
     return true;
 }
 
+bool minute_matches(int32_t sample, uint16_t expected,
+                    uint16_t tolerance) {
+    if (sample < 0 || sample > 1440 || expected > 1440) return false;
+    const uint32_t difference = sample > expected
+        ? static_cast<uint32_t>(sample - expected)
+        : static_cast<uint32_t>(expected - sample);
+    return difference <= tolerance;
+}
+
 }  // namespace
 
 bool parse_value(const uint8_t *payload, size_t payload_len, Value &out) {
@@ -51,6 +60,32 @@ bool parse_value(const uint8_t *payload, size_t payload_len, Value &out) {
     }
     out.present = true;
     return true;
+}
+
+bool contains_minute(const Value &value, uint16_t expected,
+                     uint16_t tolerance) {
+    if (!value.present || expected > 1440) return false;
+    for (uint8_t i = 0; i < value.sample_count; i++)
+        if (minute_matches(value.samples[i], expected, tolerance)) return true;
+    return false;
+}
+
+bool contains_interval(const Value &starts, const Value &ends,
+                       uint16_t expected_start, uint16_t expected_end,
+                       uint16_t tolerance) {
+    if (!starts.present || !ends.present || expected_start > 1440 ||
+        expected_end > 1440) {
+        return false;
+    }
+    const uint8_t count = starts.sample_count < ends.sample_count
+        ? starts.sample_count : ends.sample_count;
+    for (uint8_t i = 0; i < count; i++) {
+        if (minute_matches(starts.samples[i], expected_start, tolerance) &&
+            minute_matches(ends.samples[i], expected_end, tolerance)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace Air10Stored

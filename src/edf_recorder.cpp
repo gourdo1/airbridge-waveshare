@@ -40,7 +40,10 @@ constexpr uint8_t STREAM_COUNT = 4;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
-constexpr uint8_t SUMMARY_READY_ATTEMPTS = 5;
+constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
+constexpr uint16_t STR_GENERATION_POLL_MS = 100;
+constexpr uint16_t MASK_OFF_TOLERANCE_MINUTES = 1;
+constexpr uint32_t STR_FINAL_SAVE_TIMEOUT_MS = 60000;
 constexpr uint32_t CLOCK_VALID_AFTER = 1700000000UL;
 constexpr int16_t EDF_MISSING = -1;
 constexpr size_t RECOVERY_HEADER_MAX = 8192;
@@ -281,7 +284,9 @@ static bool stored_value_sink(const qframe_t *frame, void *context) {
 }
 
 static bool read_stored_value(const char *tag, uint16_t epoch_day,
-                              Air10Stored::Value &value) {
+                              Air10Stored::Value &value,
+                              uint8_t attempts = STORED_TRANSFER_ATTEMPTS) {
+    if (!attempts) return false;
     char command[28];
     snprintf(command, sizeof(command), "G V #%s %04X 0", tag, epoch_day);
 
@@ -292,14 +297,25 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
     policy.first_timeout_ms = STORED_TIMEOUT_MS;
     policy.overall_timeout_ms = STORED_TIMEOUT_MS;
 
-    StoredCapture capture = {};
-    uart_transaction_result_t result = {};
-    if (!Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                               policy, stored_value_sink, &capture, &result) ||
-        !result.success || !capture.received) {
-        return false;
+    for (uint8_t attempt = 0; attempt < attempts; attempt++) {
+        if (post_processing_cancelled()) return false;
+        StoredCapture capture = {};
+        uart_transaction_result_t result = {};
+        if (Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                                  policy, stored_value_sink, &capture,
+                                  &result) &&
+            result.success && capture.received &&
+            Air10Stored::parse_value(capture.payload, capture.payload_len,
+                                     value)) {
+            return true;
+        }
+        if (attempt + 1 < attempts) {
+            Log::logf(CAT_GENERAL, LOG_DEBUG,
+                      "[EDF] STR retry %s day=%04X attempt=%u/%u\n",
+                      tag, epoch_day, attempt + 2, attempts);
+        }
     }
-    return Air10Stored::parse_value(capture.payload, capture.payload_len, value);
+    return false;
 }
 
 static bool read_numeric_variable(const char *name, int16_t &value) {
@@ -313,6 +329,12 @@ static bool read_numeric_variable(const char *name, int16_t &value) {
     return true;
 }
 
+static bool read_u32_variable(const char *name, uint32_t &value) {
+    char text[24] = {};
+    return read_variable(name, text, sizeof(text)) &&
+           parse_hex_value(text, strlen(text), value);
+}
+
 static int32_t civil_epoch_day(int year, unsigned month, unsigned day) {
     year -= month <= 2;
     const int era = (year >= 0 ? year : year - 399) / 400;
@@ -322,6 +344,112 @@ static int32_t civil_epoch_day(int year, unsigned month, unsigned day) {
     const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 -
                                 year_of_era / 100 + day_of_year;
     return era * 146097 + static_cast<int>(day_of_era) - 719468;
+}
+
+static bool expected_mask_off_minute(uint32_t ended_epoch,
+                                     uint16_t &minute) {
+    if (ended_epoch < CLOCK_VALID_AFTER) return false;
+    time_t ended = ended_epoch;
+    struct tm ended_tm;
+    localtime_r(&ended, &ended_tm);
+    int32_t ended_day = civil_epoch_day(ended_tm.tm_year + 1900,
+                                        ended_tm.tm_mon + 1,
+                                        ended_tm.tm_mday);
+    if (ended_tm.tm_hour < 12) ended_day--;
+    if (ended_day < session_epoch_day ||
+        ended_day > static_cast<int32_t>(session_epoch_day) + 1) {
+        return false;
+    }
+    if (ended_day != session_epoch_day) {
+        minute = 1440;
+        return true;
+    }
+    minute = static_cast<uint16_t>(
+        (ended_tm.tm_hour >= 12 ? ended_tm.tm_hour - 12
+                                : ended_tm.tm_hour + 12) * 60 +
+        ended_tm.tm_min);
+    return true;
+}
+
+static bool wait_for_final_str_save(uint32_t ended_epoch) {
+    uint16_t expected_off = 0;
+    if (!expected_mask_off_minute(ended_epoch, expected_off)) {
+        post_error("STR end time invalid");
+        return false;
+    }
+    const uint16_t expected_on = static_cast<uint16_t>(
+        (session_start_seconds_of_day / 60 + 12 * 60) % (24 * 60));
+
+    const uint32_t started = millis();
+    uint32_t observed_generation = 0;
+    bool have_generation = read_u32_variable("ZEN", observed_generation);
+    bool inspect_record = true;
+    uint8_t generation_read_failures = 0;
+    Log::logf(CAT_GENERAL, LOG_INFO,
+              "[EDF] waiting for final STR mask=%u-%u ZEN=%s%lu\n",
+              expected_on, expected_off, have_generation ? "" : "?",
+              static_cast<unsigned long>(observed_generation));
+
+    while (!post_processing_cancelled() &&
+           Arbiter::get_state() == SYS_IDLE &&
+           static_cast<uint32_t>(millis() - started) <
+               STR_FINAL_SAVE_TIMEOUT_MS) {
+        if (inspect_record) {
+            uint32_t generation_before = 0;
+            const bool have_before =
+                read_u32_variable("ZEN", generation_before);
+            Air10Stored::Value mask_on = {};
+            Air10Stored::Value mask_off = {};
+            const bool have_mask_on = read_stored_value(
+                "ONT", session_epoch_day, mask_on);
+            const bool have_mask_off = read_stored_value(
+                "OFT", session_epoch_day, mask_off);
+            if (have_mask_on && have_mask_off &&
+                Air10Stored::contains_interval(
+                    mask_on, mask_off, expected_on, expected_off,
+                    MASK_OFF_TOLERANCE_MINUTES)) {
+                Log::logf(CAT_GENERAL, LOG_INFO,
+                          "[EDF] final STR ready mask=%u-%u dt=%lums\n",
+                          expected_on, expected_off,
+                          static_cast<unsigned long>(millis() - started));
+                return true;
+            }
+
+            uint32_t generation_after = 0;
+            const bool have_after =
+                read_u32_variable("ZEN", generation_after);
+            if (have_after) {
+                observed_generation = generation_after;
+                have_generation = true;
+                generation_read_failures = 0;
+            }
+            inspect_record = !have_mask_on || !have_mask_off ||
+                             !have_before || !have_after ||
+                             generation_before != generation_after;
+        }
+
+        if (!post_processing_delay(STR_GENERATION_POLL_MS)) return false;
+        uint32_t generation = 0;
+        if (read_u32_variable("ZEN", generation)) {
+            generation_read_failures = 0;
+            if (!have_generation || generation != observed_generation) {
+                Log::logf(CAT_GENERAL, LOG_DEBUG,
+                          "[EDF] STR ZEN %lu -> %lu\n",
+                          static_cast<unsigned long>(observed_generation),
+                          static_cast<unsigned long>(generation));
+                observed_generation = generation;
+                have_generation = true;
+                inspect_record = true;
+            }
+        } else if (++generation_read_failures >= 5) {
+            generation_read_failures = 0;
+            inspect_record = true;
+        }
+    }
+
+    if (!post_processing_cancelled() && Arbiter::get_state() == SYS_IDLE)
+        post_error("STR final save timeout");
+    return false;
 }
 
 static void reset_schema(StreamSchema &schema, const char *tag) {
@@ -812,26 +940,9 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
     memset(samples, 0xFF, sample_count * sizeof(int16_t));
 
     Air10Stored::Value therapy_duration = {};
-    bool summary_ready = false;
-    for (uint8_t attempt = 0; attempt < SUMMARY_READY_ATTEMPTS; attempt++) {
-        if (post_processing_cancelled()) {
-            heap_caps_free(samples);
-            return false;
-        }
-        if (read_stored_value("THD", session_epoch_day, therapy_duration) &&
-            therapy_duration.present && therapy_duration.sample_count == 1 &&
-            therapy_duration.samples[0] > 0) {
-            summary_ready = true;
-            break;
-        }
-        if (attempt + 1 < SUMMARY_READY_ATTEMPTS) {
-            if (!post_processing_delay(100U << attempt)) {
-                heap_caps_free(samples);
-                return false;
-            }
-        }
-    }
-    if (!summary_ready) {
+    if (!read_stored_value("THD", session_epoch_day, therapy_duration) ||
+        !therapy_duration.present || therapy_duration.sample_count != 1 ||
+        therapy_duration.samples[0] <= 0) {
         heap_caps_free(samples);
         post_error("STR summary not ready");
         return false;
@@ -2247,7 +2358,7 @@ static void update_record_status() {
     portEXIT_CRITICAL(&status_mux);
 }
 
-static void stop_session() {
+static void stop_session(const ControlEvent &event) {
     if (!status.active) return;
     capture_active = false;
     release_streams();
@@ -2282,6 +2393,7 @@ static void stop_session() {
     const bool identification_ready = !post_processing_cancelled() &&
                                       write_identification();
     const bool str_ready = !post_processing_cancelled() &&
+                           wait_for_final_str_save(event.epoch) &&
                            update_str_summary();
     const bool interrupted = post_processing_cancelled();
     EdfCatalog::Entry catalog_entry;
@@ -2308,7 +2420,7 @@ static void recorder_task(void *) {
         ControlEvent control;
         while (xQueueReceive(control_queue, &control, 0) == pdTRUE) {
             if (control.kind == ControlKind::Start) start_session(control);
-            else stop_session();
+            else stop_session(control);
         }
 
         RawFrame raw;
