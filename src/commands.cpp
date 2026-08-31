@@ -6,6 +6,7 @@
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
+#include "airbridge_ota.h"
 #include <esp_partition.h>
 #include <time.h>
 #include "wifi.h"
@@ -156,6 +157,7 @@ void dispatch_command(const char *line, String &response) {
             response = "OK: config saved to NVS\n";
         } else if (subUpper == "RESET") {
             Config::reset_defaults();
+            OtaManager::config_changed();
             response = "OK: config reset to defaults\n";
         } else {
             // "CONFIG key value" or "CONFIG key"
@@ -165,6 +167,8 @@ void dispatch_command(const char *line, String &response) {
                 String val = sub.substring(space + 1);
                 val.trim();
                 if (Config::set_value(key.c_str(), val.c_str())) {
+                    if (key.equalsIgnoreCase("update_url"))
+                        OtaManager::config_changed();
                     response = "OK: " + key + "=" +
                                (config_key_sensitive(key) && val.length()
                                     ? "****" : val) + "\n";

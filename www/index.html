@@ -433,9 +433,19 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div style="font-size:24px">&#9881;</div>
             <div>
               <div style="font-weight:600;font-size:15px">AirBridge Firmware</div>
-              <div style="font-size:12px;color:var(--text-dim)">ESP32-PICO-D4 &middot; <span id="espFwVer">--</span></div>
+              <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwTarget">--</span> &middot; <span id="espFwVer">--</span></div>
             </div>
           </div>
+          <div class="row">
+            <label>Latest release</label>
+            <span class="value" id="espFwLatest">--</span>
+          </div>
+          <div class="btn-row" style="margin-bottom:14px">
+            <button class="btn" id="btnOtaCheck" onclick="otaCheckRelease()">Check for updates</button>
+            <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none">Install update</button>
+          </div>
+          <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
+          <div class="msg" id="otaReleaseMsg"></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
             <div>
               <div class="upload-area" id="espDropZone" style="padding:24px;border-color:var(--accent)">
@@ -717,6 +727,7 @@ function showTab(id) {
   }
   if (id === 'ota') {
     checkFlashReady();
+    loadOtaStatus();
     var ev = document.getElementById('espFwVer');
     if (ev && lastStatus.version) ev.textContent = lastStatus.version + (lastStatus.built ? ' (' + lastStatus.built + ')' : '');
   }
@@ -1041,9 +1052,10 @@ function wifiRemove(idx) {
 
 async function loadConfig() {
   const sp = document.getElementById('configSpinner'); sp.style.display = 'block';
-  var CFG_SECTIONS = ['WiFi & Network','Time & Timezone','Oximetry','Storage Export','UART','Advanced'];
+  var CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','Storage Export','UART','Advanced'];
   var CFG_META = {
     hostname:['WiFi & Network','Device hostname (mDNS + AP name)'],wifi_mode:['WiFi & Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['WiFi & Network','Enable hysteresis-based roaming'],wifi_country:['WiFi & Network','ISO 3166 country code (01 = worldwide)'],tcp_port:['WiFi & Network','TCP command port'],debug_port:['WiFi & Network','Debug log stream port (read-only)'],http_port:['WiFi & Network','Web server port'],http_user:['WiFi & Network','Web UI username'],http_pass:['WiFi & Network','Web UI password'],ota_password:['WiFi & Network','ArduinoOTA password'],udp_oxi_port:['WiFi & Network','UDP oximetry port (0=disabled)'],
+    update_url:['Firmware Updates','Release manifest URL (empty disables automatic checks)'],
     ntp_server:['Time & Timezone','NTP server (empty = DHCP or pool.ntp.org)'],tz:['Time & Timezone','POSIX timezone string'],
     oxi_enabled:['Oximetry','Enable BLE oximeter support'],oxi_auto_start:['Oximetry','Auto-start feeding on connect'],oxi_feed_therapy_only:['Oximetry','Only inject during active therapy'],oxi_device_type:['Oximetry','0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A'],oxi_device_addr:['Oximetry','Preferred oximeter MAC'],oxi_interval_ms:['Oximetry','Injection interval (ms)'],oxi_lframe_continuous:['Oximetry','Send L-frames even without valid reading'],oxi_require_known:['Oximetry','Only auto-connect to known devices'],
     smb_enabled:['Storage Export','Enable SMB synchronization',[['0','disabled'],['1','enabled']]],smb_auto_after_therapy:['Storage Export','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],smb_endpoint:['Storage Export','//host/share/optional/path'],smb_user:['Storage Export','SMB username'],smb_password:['Storage Export','SMB password'],
@@ -1244,6 +1256,107 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
   if (e.key === 'ArrowUp' && cmdHistory.length) { histIdx = Math.max(0, histIdx - 1); e.target.value = cmdHistory[histIdx] || ''; }
   if (e.key === 'ArrowDown') { histIdx = Math.min(cmdHistory.length, histIdx + 1); e.target.value = cmdHistory[histIdx] || ''; }
 });
+
+let otaStatusTimer = null;
+
+function renderOtaStatus(d) {
+  var target = document.getElementById('espFwTarget');
+  if (target) target.textContent = d.release_target || '--';
+  var version = document.getElementById('espFwVer');
+  if (version) version.textContent = d.version || '--';
+
+  var latest = '--';
+  if (!d.enabled) latest = 'Checks disabled';
+  else if (d.checking) latest = 'Checking...';
+  else if (d.update_version) latest = d.update_version + (d.update_available ? ' available' : ' (current)');
+  else if (d.checked) latest = 'Current';
+  document.getElementById('espFwLatest').textContent = latest;
+
+  var active = d.checking || d.installing || d.reboot_pending;
+  var check = document.getElementById('btnOtaCheck');
+  check.disabled = !d.enabled || active;
+  var install = document.getElementById('btnOtaInstall');
+  install.style.display = d.update_available ? '' : 'none';
+  install.textContent = d.update_version ? 'Install ' + d.update_version : 'Install update';
+  install.disabled = !d.installable || active;
+
+  var progress = document.getElementById('otaReleaseProgress');
+  var bar = document.getElementById('otaReleaseBar');
+  progress.style.display = d.installing || d.reboot_pending ? 'block' : 'none';
+  bar.style.width = (d.reboot_pending ? 100 : (d.progress || 0)) + '%';
+
+  var msgEl = document.getElementById('otaReleaseMsg');
+  if (d.reboot_pending) showMsg(msgEl, 'Update complete. Restarting...', 'ok', 0);
+  else if (d.installing) showMsg(msgEl, 'Installing update: ' + (d.progress || 0) + '%', 'ok', 0);
+  else if (d.error) showMsg(msgEl, d.error, 'err', 0);
+}
+
+async function loadOtaStatus() {
+  try {
+    var r = await api('/api/ota');
+    if (!r) return null;
+    var d = await r.json();
+    renderOtaStatus(d);
+    return d;
+  } catch(e) { return null; }
+}
+
+function pollOtaStatus(restarting) {
+  if (otaStatusTimer) clearTimeout(otaStatusTimer);
+  var started = Date.now();
+  var poll = async function() {
+    if (Date.now() - started > 120000) {
+      showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status.', 'err', 0);
+      return;
+    }
+    var d = await loadOtaStatus();
+    if (!d) {
+      if (restarting) {
+        showMsg(document.getElementById('otaReleaseMsg'), 'Device restarting...', 'ok', 0);
+        otaStatusTimer = setTimeout(poll, 2000);
+      }
+      return;
+    }
+    if (d.checking || d.installing || d.reboot_pending) {
+      otaStatusTimer = setTimeout(poll, 1000);
+    } else if (d.error) {
+      showMsg(document.getElementById('otaReleaseMsg'), d.error, 'err', 0);
+    } else if (restarting) {
+      showMsg(document.getElementById('otaReleaseMsg'), 'Device is back online with firmware ' + (d.version || '--') + '.', 'ok', 0);
+    } else if (d.update_available) {
+      showMsg(document.getElementById('otaReleaseMsg'), 'Version ' + d.update_version + ' is available.', 'ok', 0);
+    } else if (d.checked && !d.error) {
+      showMsg(document.getElementById('otaReleaseMsg'), 'This device is up to date.', 'ok');
+    }
+  };
+  otaStatusTimer = setTimeout(poll, 500);
+}
+
+async function otaCheckRelease() {
+  var msgEl = document.getElementById('otaReleaseMsg');
+  showMsg(msgEl, 'Checking for updates...', 'ok', 0);
+  try {
+    var r = await api('/api/ota/check', {method:'POST'});
+    if (!r) return;
+    var d = await r.json();
+    renderOtaStatus(d);
+    if (!r.ok) throw new Error(d.error || 'Update check rejected');
+    pollOtaStatus(false);
+  } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
+}
+
+async function otaInstallRelease() {
+  var msgEl = document.getElementById('otaReleaseMsg');
+  showMsg(msgEl, 'Starting release update...', 'ok', 0);
+  try {
+    var r = await api('/api/ota/install', {method:'POST'});
+    if (!r) return;
+    var d = await r.json();
+    renderOtaStatus(d);
+    if (!r.ok) throw new Error(d.error || 'Update install rejected');
+    pollOtaStatus(true);
+  } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
+}
 
 // Upload
 const dz = document.getElementById('dropZone'), fi = document.getElementById('fileInput');

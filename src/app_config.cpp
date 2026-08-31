@@ -45,6 +45,7 @@ static void apply_defaults() {
     cfg.http_pass = "airbridge";
 
     cfg.ota_password = "airbridge";
+    cfg.update_url = AB_DEFAULT_UPDATE_URL;
 
     cfg.ntp_server = "";
     cfg.tz = "UTC0";
@@ -151,6 +152,7 @@ void Config::load() {
     cfg.http_pass       = prefs.getString("http_pass", cfg.http_pass);
 
     cfg.ota_password    = prefs.getString("ota_pass", cfg.ota_password);
+    cfg.update_url      = prefs.getString("update_url", cfg.update_url);
     cfg.ntp_server      = prefs.getString("ntp_server", cfg.ntp_server);
     cfg.tz              = prefs.getString("tz", cfg.tz);
     cfg.udp_oxi_port    = prefs.getUShort("udp_oxi_port", cfg.udp_oxi_port);
@@ -200,6 +202,7 @@ void Config::save() {
     prefs.putString("http_pass", cfg.http_pass);
 
     prefs.putString("ota_pass", cfg.ota_password);
+    prefs.putString("update_url", cfg.update_url);
     prefs.putString("ntp_server", cfg.ntp_server);
     prefs.putString("tz", cfg.tz);
     prefs.putUShort("udp_oxi_port", cfg.udp_oxi_port);
@@ -295,6 +298,7 @@ static const KVEntry kv_table[] = {
     KV_STR("http_user", http_user),
     KV_STR("http_pass", http_pass),
     KV_STR("ota_password", ota_password),
+    KV_STR("update_url", update_url),
     KV_STR("ntp_server", ntp_server),
     KV_STR("tz", tz),
     KV_U16("udp_oxi_port", udp_oxi_port),

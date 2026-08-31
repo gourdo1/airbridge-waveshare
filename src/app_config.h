@@ -49,6 +49,7 @@ struct AirBridgeConfig {
     String      http_pass;
 
     String      ota_password;
+    String      update_url;          // release manifest, empty disables checks
 
     String      ntp_server;         // empty = DHCP or pool.ntp.org
     String      tz;                 // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3

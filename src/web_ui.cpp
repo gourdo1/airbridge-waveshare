@@ -15,6 +15,7 @@
 #include "edf_recorder.h"
 #include "edf_catalog.h"
 #include "export_sync.h"
+#include "airbridge_ota.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -112,6 +113,15 @@ static void jsonAddInt(String &out, const char *key, int val, bool comma = true)
     char buf[12];
     snprintf(buf, sizeof(buf), "%d", val);
     out += buf;
+}
+
+static void jsonAddBool(String &out, const char *key, bool val,
+                        bool comma = true) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    out += val ? "true" : "false";
 }
 
 
@@ -508,12 +518,15 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
     String body = getBody(request);
+    String previous_update_url = Config::get().update_url;
     int count = 0;
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         if (Config::set_value(key.c_str(), val.c_str())) (*(int*)p)++;
     }, &count);
 
     if (count > 0) Config::save();
+    if (Config::get().update_url != previous_update_url)
+        OtaManager::config_changed();
 
     String json = "{\"ok\":true,\"saved\":";
     json += String(count);
@@ -568,6 +581,10 @@ static bool hasValidResmedUpload() {
 static void handleUploadChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
+        if (!checkAuth(request) || !OtaManager::begin_manual_upload()) {
+            uploadOk = false;
+            return;
+        }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Upload start: %s\n", filename.c_str());
         uploadKind = UPLOAD_RESMED;
         uploadSize = 0;
@@ -578,6 +595,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
         if (!resmed_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No staging partition found\n");
             uploadKind = UPLOAD_NONE;
+            OtaManager::end_manual_upload(false, "staging_partition_missing");
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Staging to '%s' (0x%X, %u bytes)\n",
@@ -588,6 +606,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Erase failed: %s\n", esp_err_to_name(err));
             resmed_part = nullptr;
             uploadKind = UPLOAD_NONE;
+            OtaManager::end_manual_upload(false, "staging_erase_failed");
             return;
         }
         uploadOk = true;
@@ -628,6 +647,8 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
 
     String json = "{";
     bool validUpload = hasValidResmedUpload();
+    OtaManager::end_manual_upload(validUpload,
+                                  validUpload ? nullptr : "resmed_upload_failed");
     jsonAddString(json, "ok", validUpload ? "true" : "false", false);
     jsonAddInt(json, "size", uploadSize);
 
@@ -902,7 +923,14 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
         return;
     }
 
+    if (!OtaManager::begin_resmed_flash()) {
+        request->send(409, "application/json",
+                      "{\"ok\":false,\"error\":\"another OTA is active\"}");
+        return;
+    }
+
     if (!hasValidResmedUpload()) {
+        OtaManager::cancel_resmed_flash_claim();
         request->send(400, "application/json", "{\"ok\":false,\"error\":\"no valid ResMed firmware uploaded\"}");
         return;
     }
@@ -1098,14 +1126,15 @@ static void abortEspOtaUpload() {
     }
     esp_ota_part = nullptr;
     uploadKind = UPLOAD_NONE;
+    OtaManager::end_manual_upload(false, "esp_upload_aborted");
     Arbiter::set_state(SYS_IDLE);
 }
 
 static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
-        if (ResmedOta::is_active()) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA rejected: ResMed flash active\n");
+        if (!checkAuth(request) || !OtaManager::begin_manual_upload()) {
+            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA rejected: OTA busy\n");
             uploadOk = false;
             return;
         }
@@ -1120,6 +1149,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         if (!esp_ota_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No OTA partition found\n");
             uploadKind = UPLOAD_NONE;
+            OtaManager::end_manual_upload(false, "ota_partition_missing");
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] OTA target: '%s' (0x%X, %u bytes)\n",
@@ -1130,6 +1160,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_begin failed: %s\n", esp_err_to_name(err));
             esp_ota_part = nullptr;
             uploadKind = UPLOAD_NONE;
+            OtaManager::end_manual_upload(false, "esp_ota_begin_failed");
             Arbiter::set_state(SYS_IDLE);
             return;
         }
@@ -1197,10 +1228,50 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     esp_ota_handle = 0;
     esp_ota_part = nullptr;
     uploadKind = UPLOAD_NONE;
+    OtaManager::end_manual_upload(ok, ok ? nullptr : "esp_upload_failed");
     Arbiter::set_state(SYS_IDLE);
 
     json += '}';
     request->send(200, "application/json", json);
+}
+
+static void sendOtaStatus(AsyncWebServerRequest *request, int status_code) {
+    OtaManager::Status status;
+    OtaManager::get_status(status);
+    String json = "{";
+    json.reserve(512);
+    jsonAddString(json, "version", airbridge_version(), false);
+    jsonAddString(json, "release_target", status.release_target);
+    jsonAddBool(json, "enabled", status.enabled);
+    jsonAddBool(json, "checking", status.checking);
+    jsonAddBool(json, "checked", status.checked);
+    jsonAddBool(json, "update_available", status.update_available);
+    jsonAddBool(json, "installable", status.installable);
+    jsonAddBool(json, "installing", status.installing);
+    jsonAddBool(json, "reboot_pending", status.reboot_pending);
+    jsonAddInt(json, "progress", status.progress);
+    jsonAddInt(json, "bytes", status.bytes);
+    jsonAddInt(json, "total_size", status.total_size);
+    jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
+    jsonAddString(json, "update_version", status.update_version);
+    jsonAddString(json, "error", status.error);
+    json += '}';
+    request->send(status_code, "application/json", json);
+}
+
+static void handleOtaStatus(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    sendOtaStatus(request, 200);
+}
+
+static void handleOtaCheck(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    sendOtaStatus(request, OtaManager::request_check() ? 202 : 409);
+}
+
+static void handleOtaInstall(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    sendOtaStatus(request, OtaManager::request_install() ? 202 : 409);
 }
 
 // WiFi management
@@ -1371,6 +1442,9 @@ void WebUI::init(uint16_t port) {
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
+    http->on("/api/ota", HTTP_GET, handleOtaStatus);
+    http->on("/api/ota/check", HTTP_POST, handleOtaCheck);
+    http->on("/api/ota/install", HTTP_POST, handleOtaInstall);
     http->on("/api/reboot", HTTP_POST, handleReboot);
 
     DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");

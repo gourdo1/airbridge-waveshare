@@ -70,12 +70,16 @@ log warning and the previous setting stays in effect.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `ota_password` | airbridge | ArduinoOTA password |
+| `update_url` | GitHub latest-release manifest | Release manifest URL; empty disables update checks |
 
 Set the `AIRBRIDGE_OTA_PASS` environment variable to match when uploading:
 ```bash
 export AIRBRIDGE_OTA_PASS=airbridge
 pio run -e ota -t upload
 ```
+
+Update checks are automatic. Installing an available update requires
+confirmation on the OTA tab.
 
 ### Time & Timezone
 

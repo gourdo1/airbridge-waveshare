@@ -11,6 +11,7 @@ ESP32 bridge for ResMed AirSense 10 CPAP.
 - **Web UI** - read/write all therapy settings, live pressure/flow waveforms, BLE device management, ResMed firmware upload
 - **TCP-UART bridge** - send commands to AirSense over WiFi. Single UART writer (arbiter) with priority queue prevents collisions between concurrent sources (TCP clients, BLE feeder, health monitor, web UI).
 - **ResMed OTA** - flash AirSense firmware (BLX/CMX/CDX) over UART from web UI or CLI. Handles baud negotiation, block chaining, bootloader re-entry.
+- **AirBridge updates** - checks HTTPS release manifests for the exact board target and installs verified firmware from the web UI.
 
 ## First setup
 

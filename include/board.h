@@ -67,3 +67,19 @@
 
 #define DEFAULT_HOSTNAME    "airbridge"
 #define DEFAULT_OTA_PORT    3232
+
+#ifndef AB_OTA_RELEASE_TARGET
+#if defined(AB_BOARD_XIAO_ESP32S3_PLUS) && AB_STORAGE_SDMMC_ENABLED
+#define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus-sdmmc4"
+#elif defined(AB_BOARD_XIAO_ESP32S3_PLUS)
+#define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus"
+#else
+#define AB_OTA_RELEASE_TARGET "m5stamp-pico"
+#endif
+#endif
+
+#ifndef AB_DEFAULT_UPDATE_URL
+#define AB_DEFAULT_UPDATE_URL                                                \
+    "https://github.com/m-kozlowski/airbridge/releases/latest/download/"   \
+    "airbridge-release.json"
+#endif

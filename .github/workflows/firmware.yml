@@ -1,0 +1,83 @@
+name: firmware
+run-name: firmware release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PLATFORMIO_VERSION: '6.1.19'
+      PLATFORMIO_BUILD_CACHE_DIR: ${{ github.workspace }}/.pio/build-cache
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Cache PlatformIO dependencies
+        continue-on-error: true
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/libdeps
+          key: >-
+            ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-deps-${{
+            hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-deps-
+
+      - name: Create build environment
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install \
+            --disable-pip-version-check \
+            platformio=="$PLATFORMIO_VERSION"
+
+      - name: Test release packager
+        run: python3 -m unittest discover -s test/python -v
+
+      - name: Build firmware artifacts
+        run: |
+          .ci-venv/bin/python python/tools/build_release.py \
+            --pio .ci-venv/bin/pio \
+            --output dist
+
+      - name: Build release notes
+        run: |
+          python3 python/tools/build_release_notes.py \
+            "$GITHUB_REF_NAME" \
+            --output dist/RELEASE_NOTES.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            dist/airbridge-*.bin
+            dist/airbridge-release.json
+            dist/RELEASE_NOTES.md
+            dist/SHA256SUMS
+          )
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file dist/RELEASE_NOTES.md
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi
