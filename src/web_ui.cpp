@@ -16,6 +16,7 @@
 #include "edf_catalog.h"
 #include "export_sync.h"
 #include "airbridge_ota.h"
+#include "custom_settings.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -112,6 +113,17 @@ static void jsonAddInt(String &out, const char *key, int val, bool comma = true)
     out += "\":";
     char buf[12];
     snprintf(buf, sizeof(buf), "%d", val);
+    out += buf;
+}
+
+static void jsonAddUInt32(String &out, const char *key, uint32_t val,
+                          bool comma = true) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)val);
     out += buf;
 }
 
@@ -378,23 +390,22 @@ static void emitVar(String &json, const var_def_t *v, const char *group, int raw
     jsonAddString(json, "label", v->label);
     jsonAddString(json, "group", group);
     jsonAddInt(json, "value", ok ? raw : -1);
+    jsonAddBool(json, "editable", true);
 
     if (v->type == SET_ENUM) {
         jsonAddString(json, "type", "enum");
         if (v->enum_options) {
             json += ",\"options\":[";
-            String opts = v->enum_options;
-            int start = 0;
+            const char *start = v->enum_options;
             bool firstOpt = true;
-            for (int j = 0; j <= (int)opts.length(); j++) {
-                if (j == (int)opts.length() || opts[j] == ',') {
-                    if (!firstOpt) json += ',';
-                    json += '"';
-                    json += opts.substring(start, j);
-                    json += '"';
-                    firstOpt = false;
-                    start = j + 1;
-                }
+            while (start) {
+                const char *end = strchr(start, ',');
+                if (!firstOpt) json += ',';
+                json += '"';
+                for (const char *p = start; p != end && *p; p++) json += *p;
+                json += '"';
+                firstOpt = false;
+                start = end ? end + 1 : nullptr;
             }
             json += ']';
         }
@@ -421,6 +432,7 @@ static void emitVar(String &json, const var_def_t *v, const char *group, int raw
 
 static void emitVarList(String &json, const char * const *cmds, const char *group, bool &first) {
     for (int i = 0; cmds[i]; i++) {
+        if (CustomSettings::contains(cmds[i])) continue;
         const var_def_t *v = var_lookup(cmds[i]);
         if (!v) continue;
         int raw = 0;
@@ -429,42 +441,122 @@ static void emitVarList(String &json, const char * const *cmds, const char *grou
     }
 }
 
+static double customDisplayValue(uint32_t raw, int16_t scale) {
+    if (scale > 0) return (double)raw / scale;
+    if (scale < 0) return (double)raw * -(int32_t)scale;
+    return raw;
+}
+
+static double customDisplayStep(int16_t raw_step, int16_t scale) {
+    if (scale > 0) return (double)raw_step / scale;
+    if (scale < 0) return (double)raw_step * -(int32_t)scale;
+    return raw_step;
+}
+
+struct custom_emit_context_t {
+    String *json;
+    const char *group;
+    bool *first;
+};
+
+static void emitCustomVar(const CustomSettings::entry_view_t &entry,
+                          bool value_ok, uint32_t raw, void *context) {
+    custom_emit_context_t *emit = static_cast<custom_emit_context_t *>(context);
+    String &json = *emit->json;
+    if (!*emit->first) json += ',';
+    *emit->first = false;
+
+    json += '{';
+    jsonAddString(json, "cmd", entry.name, false);
+    jsonAddString(json, "label", entry.label);
+    jsonAddString(json, "group", emit->group);
+    if (value_ok) jsonAddUInt32(json, "value", raw);
+    else jsonAddInt(json, "value", -1);
+    jsonAddBool(json, "editable", (entry.flags & 0x04) != 0);
+    jsonAddString(json, "source", "custom");
+
+    if (entry.kind == CustomSettings::KIND_ENUM) {
+        jsonAddString(json, "type", "enum");
+        json += ",\"options\":[";
+        for (uint8_t i = 0; i < entry.option_count; i++) {
+            if (i) json += ',';
+            json += '{';
+            jsonAddInt(json, "value", entry.options[i].value, false);
+            jsonAddString(json, "label", entry.options[i].label);
+            json += '}';
+        }
+        json += ']';
+    } else {
+        jsonAddString(json, "type", "numeric");
+        jsonAddInt(json, "scale", entry.scale);
+        jsonAddInt(json, "raw_step", entry.step);
+        jsonAddInt(json, "decimals", entry.decimals);
+        jsonAddUInt32(json, "raw_min", entry.minimum);
+        jsonAddUInt32(json, "raw_max", entry.maximum);
+        jsonAddString(json, "units", entry.units);
+
+        char number[32];
+        if (value_ok) {
+            snprintf(number, sizeof(number), "%.*f", entry.decimals,
+                     customDisplayValue(raw, entry.scale));
+            jsonAddString(json, "display", number);
+        }
+        snprintf(number, sizeof(number), "%.*f", entry.decimals,
+                 customDisplayValue(entry.minimum, entry.scale));
+        jsonAddString(json, "min", number);
+        snprintf(number, sizeof(number), "%.*f", entry.decimals,
+                 customDisplayValue(entry.maximum, entry.scale));
+        jsonAddString(json, "max", number);
+        snprintf(number, sizeof(number), "%.*f", entry.decimals,
+                 customDisplayStep(entry.step, entry.scale));
+        jsonAddString(json, "step", number);
+    }
+    json += '}';
+}
+
+static void emitCustomCategory(String &json, uint8_t category, uint8_t mop,
+                               const char *group, bool &first) {
+    custom_emit_context_t context = {&json, group, &first};
+    CustomSettings::visit_category(category, mop, emitCustomVar, &context);
+}
+
 static void handleGetSettings(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
+    if (!CustomSettings::ensure_loaded()) {
+        request->send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"settings_metadata_unavailable\"}");
+        return;
+    }
 
     int mop = 0;
     readSetting("MOP", mop);
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
-    String json = "[";
+    String json;
+    json.reserve(4096);
+    json = '[';
     bool first = true;
-
-    emitVarList(json, PATIENT_VARS, "patient", first);
 
     // Mode selector
     {
         const var_def_t *v = var_lookup("MOP");
-        if (v) {
+        if (v && !CustomSettings::contains("MOP")) {
             int raw = mop;
-            emitVar(json, v, "clinical", raw, true, first);
+            emitVar(json, v, "therapy", raw, true, first);
         }
     }
 
-    // Mode settings
-    emitVarList(json, MODE_LAYOUT[mop], "mode", first);
-    {
-        static const char * const mask_var[] = {"MSK", NULL};
-        emitVarList(json, mask_var, "mode", first);
-    }
-
+    emitVarList(json, MODE_LAYOUT[mop], "therapy", first);
+    emitCustomCategory(json, 0, mop, "therapy", first);
     emitVarList(json, COMFORT_LAYOUT[mop], "comfort", first);
     emitVarList(json, EPR_VARS, "comfort", first);
-
-    emitVarList(json, CLIMATE_VARS, "climate", first);
-
-    emitVarList(json, SYSTEM_VARS, "system", first);
-
-    emitVarList(json, ALARM_VARS, "alarm", first);
+    emitCustomCategory(json, 1, mop, "comfort", first);
+    emitVarList(json, ACCESSORY_VARS, "accessories", first);
+    emitCustomCategory(json, 2, mop, "accessories", first);
+    emitVarList(json, OPTION_VARS, "options", first);
+    emitCustomCategory(json, 3, mop, "options", first);
+    emitVarList(json, CONFIGURATION_VARS, "configuration", first);
+    emitCustomCategory(json, 4, mop, "configuration", first);
 
     json += ']';
     request->send(200, "application/json", json);
@@ -473,18 +565,37 @@ static void handleGetSettings(AsyncWebServerRequest *request) {
 
 static void handlePostSettings(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
+    if (!CustomSettings::ensure_loaded()) {
+        request->send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"settings_metadata_unavailable\"}");
+        return;
+    }
 
     String body = getBody(request);
-    struct { int count; String errors; } ctx = {0, ""};
+    struct { int count; String errors; bool lan_changed; } ctx = {0, "", false};
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         auto *c = (decltype(ctx)*)p;
+        if (CustomSettings::contains(key.c_str())) {
+            char *end = nullptr;
+            unsigned long raw = strtoul(val.c_str(), &end, 10);
+            if (end != val.c_str() && *end == '\0' &&
+                CustomSettings::write_raw(key.c_str(), (uint32_t)raw)) {
+                c->count++;
+            } else {
+                c->errors += key + ":fail,";
+            }
+            return;
+        }
         const var_def_t *def = var_lookup(key.c_str());
         if (!def) { c->errors += key + ":unknown,"; return; }
-        if (writeSetting(key.c_str(), atoi(val.c_str()))) c->count++;
-        else c->errors += key + ":fail,";
+        if (writeSetting(key.c_str(), atoi(val.c_str()))) {
+            c->count++;
+            if (key == "LAN") c->lan_changed = true;
+        } else c->errors += key + ":fail,";
     }, &ctx);
     int count = ctx.count;
     String errors = ctx.errors;
+    if (ctx.lan_changed) CustomSettings::invalidate("LAN write");
 
     String json = "{";
     jsonAddInt(json, "saved", count, false);

@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "debug_log.h"
 #include "live_stream.h"
+#include "custom_settings.h"
 #include <freertos/queue.h>
 
 #define ARBITER_QUEUE_DEPTH     8
@@ -387,6 +388,11 @@ static void transparent_tx_handle_frame() {
 
     transparent_tx_payload[min((size_t)transparent_tx_payload_len,
                                sizeof(transparent_tx_payload) - 1)] = '\0';
+    if (transparent_tx_payload_len >= 4 &&
+        memcmp(transparent_tx_payload, "P F ", 4) == 0) {
+        CustomSettings::invalidate("external flash");
+    }
+
     uint32_t new_baud = parse_bdd_baud(transparent_tx_payload,
                                        transparent_tx_payload_len);
     if (new_baud) {
@@ -399,6 +405,7 @@ static void transparent_tx_handle_frame() {
     const char *reboot_cmd = transparent_reboot_command(transparent_tx_payload,
                                                         transparent_tx_payload_len);
     if (reboot_cmd) {
+        CustomSettings::invalidate(reboot_cmd);
         transparent_schedule_reboot_baud(reboot_cmd);
     }
 }
@@ -906,6 +913,10 @@ uart_transaction_t *Arbiter::begin_cmd(
         const uart_response_policy_t &policy,
         uart_frame_sink_t sink, void *sink_context) {
     if (!cmd) return nullptr;
+
+    const char *reboot_cmd = transparent_reboot_command(
+        reinterpret_cast<const uint8_t *>(cmd), strlen(cmd));
+    if (reboot_cmd) CustomSettings::invalidate(reboot_cmd);
 
     uint8_t frame[QFRAME_MAX_RAW];
     int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));

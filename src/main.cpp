@@ -17,6 +17,7 @@
 #include "sd_storage.h"
 #include "edf_recorder.h"
 #include "export_sync.h"
+#include "custom_settings.h"
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -168,6 +169,7 @@ static void attempt_recovery() {
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
         Config::invalidate_device_info();
+        CustomSettings::invalidate("UART recovery");
         // AirSense may have rebooted; force re-subscribe regardless of
         // the broker's stale subscribed flags.
         LiveStream::reattach();
@@ -193,6 +195,7 @@ void setup() {
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Config loaded\n");
 
     SdStorage::init();
+    CustomSettings::init();
 
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX, Config::get().uart_baud);
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] UART arbiter started\n");

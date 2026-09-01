@@ -5,6 +5,7 @@
 #include "debug_log.h"
 #include "app_config.h"
 #include "live_stream.h"
+#include "custom_settings.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
@@ -656,6 +657,8 @@ void ResmedOta::start_flash(const char *block, size_t fw_size,
             return;
         }
     }
+
+    CustomSettings::invalidate("ResMed OTA");
 
     strncpy(flash_params.block, block, sizeof(flash_params.block) - 1);
     flash_params.block[sizeof(flash_params.block) - 1] = '\0';
