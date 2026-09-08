@@ -56,6 +56,7 @@ static uint32_t last_ap_retry = 0;
 #define CONNECT_TIMEOUT_MS      15000
 #define SMARTCONFIG_TIMEOUT_MS  60000
 #define CONNECT_RETRIES         2
+#define STA_RESTART_SETTLE_MS   100
 
 static volatile bool ntp_synced = false;
 static bool got_ip = false;
@@ -146,20 +147,45 @@ static uint8_t find_net_by_ssid(const char *ssid) {
     return 0xFF;
 }
 
-static void apply_pmf_override(bool disable) {
+static void stop_sta_attempt() {
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK) {
+        Log::logf(CAT_WIFI, LOG_DEBUG,
+                  "[WIFI] STA disconnect returned err=%d\n", err);
+    }
+    delay(STA_RESTART_SETTLE_MS);
+}
+
+static bool apply_pmf_override(bool disable) {
     wifi_config_t wcfg = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &wcfg) != ESP_OK) return;
+    if (esp_wifi_get_config(WIFI_IF_STA, &wcfg) != ESP_OK) return false;
     wcfg.sta.pmf_cfg.capable = !disable;
     wcfg.sta.pmf_cfg.required = false;
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    return esp_wifi_set_config(WIFI_IF_STA, &wcfg) == ESP_OK;
 }
 
 static void switch_to_pmf_disabled() {
-    apply_pmf_override(true);
-    pending_pmf_disable = true;
-    esp_wifi_disconnect();
-    delay(50);
-    esp_wifi_connect();
+    stop_sta_attempt();
+    pending_pmf_disable = apply_pmf_override(true);
+    if (!pending_pmf_disable) {
+        Log::logf(CAT_WIFI, LOG_WARN,
+                  "[WIFI] Failed to disable pmf_cfg\n");
+    }
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        Log::logf(CAT_WIFI, LOG_WARN,
+                  "[WIFI] PMF reconnect failed (err=%d)\n", err);
+    }
+}
+
+static void retry_current_connect() {
+    stop_sta_attempt();
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        Log::logf(CAT_WIFI, LOG_WARN,
+                  "[WIFI] STA reconnect failed (err=%d)\n", err);
+    }
+    set_state(WF_CONNECTING);
 }
 
 // Some routers (e.g. older OpenWrt builds, certain ISP-provisioned units)
@@ -452,7 +478,7 @@ void WiFiSetup::check() {
     case WF_HINT_TRY:
         if (elapsed > HINT_TIMEOUT_MS) {
             Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Hint timeout, full scan\n");
-            WiFi.disconnect();
+            stop_sta_attempt();
             WiFi.scanNetworks(true);
             set_state(WF_SCANNING);
         }
@@ -488,8 +514,11 @@ void WiFiSetup::check() {
             connect_retries++;
             if (connect_retries < CONNECT_RETRIES) {
                 Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Connect timeout, retry %d\n", connect_retries);
-                begin_connect(connect_idx, false);
+                // Keep the staged SSID/BSSID configuration. Calling WiFi.begin()
+                // while STA is still connecting makes esp_wifi_set_config fail.
+                retry_current_connect();
             } else {
+                stop_sta_attempt();
                 try_pos++;
                 if (try_pos < scan_candidate_count) {
                     Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Trying next candidate\n");
@@ -505,6 +534,7 @@ void WiFiSetup::check() {
     case WF_PMF_RETRY:
         if (elapsed > CONNECT_TIMEOUT_MS) {
             Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] PMF retry timed out, advancing\n");
+            stop_sta_attempt();
             try_pos++;
             if (try_pos < scan_candidate_count) {
                 begin_connect_candidate(try_pos);

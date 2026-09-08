@@ -336,9 +336,12 @@ void Config::save_wifi_nets() {
             snprintf(key, sizeof(key), "ena_%d", i);
             wp.putBool(key, cfg.wifi_nets[i].enabled);
         } else {
-            snprintf(key, sizeof(key), "ssid_%d", i); wp.remove(key);
-            snprintf(key, sizeof(key), "pass_%d", i); wp.remove(key);
-            snprintf(key, sizeof(key), "ena_%d", i); wp.remove(key);
+            snprintf(key, sizeof(key), "ssid_%d", i);
+            if (wp.isKey(key)) wp.remove(key);
+            snprintf(key, sizeof(key), "pass_%d", i);
+            if (wp.isKey(key)) wp.remove(key);
+            snprintf(key, sizeof(key), "ena_%d", i);
+            if (wp.isKey(key)) wp.remove(key);
         }
     }
     wp.end();
