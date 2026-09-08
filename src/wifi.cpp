@@ -7,6 +7,7 @@
 #include <esp_wifi.h>
 #include <esp_smartconfig.h>
 #include <esp_sntp.h>
+#include <esp_netif.h>
 #include <time.h>
 
 typedef enum {
@@ -685,8 +686,29 @@ bool WiFiSetup::time_synced() {
     return ntp_synced;
 }
 
-void WiFiSetup::set_fallback_time(int year, int month, int day, int hour, int min, int sec, bool force) {
-    if (ntp_synced && !force) return;
+struct FallbackTime {
+    time_t epoch;
+    bool force;
+    bool applied;
+};
+
+static esp_err_t apply_fallback_time(void *ctx) {
+    auto *fallback = static_cast<FallbackTime *>(ctx);
+    // Serialize with SNTP so a completed sync cannot be overwritten by fallback.
+    if (ntp_synced && !fallback->force) return ESP_OK;
+    struct timeval tv = { .tv_sec = fallback->epoch, .tv_usec = 0 };
+    fallback->applied = settimeofday(&tv, nullptr) == 0;
+    return ESP_OK;
+}
+
+bool WiFiSetup::set_fallback_time(int year, int month, int day, int hour, int min, int sec, bool force) {
+    if (ntp_synced && !force) return false;
+
+    auto &cfg = Config::get();
+    if (cfg.tz.length() > 0) {
+        setenv("TZ", cfg.tz.c_str(), 1);
+        tzset();
+    }
 
     struct tm t = {};
     t.tm_year = year - 1900;
@@ -698,19 +720,20 @@ void WiFiSetup::set_fallback_time(int year, int month, int day, int hour, int mi
     t.tm_isdst = -1;
 
     time_t epoch = mktime(&t);
-    if (epoch < 0) return;
+    if (epoch < 0) return false;
 
-    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
-    settimeofday(&tv, nullptr);
-
-    auto &cfg = Config::get();
-    if (cfg.tz.length() > 0) {
-        setenv("TZ", cfg.tz.c_str(), 1);
-        tzset();
+    FallbackTime fallback = {epoch, force, false};
+    // With WiFi disabled at boot there is no TCPIP task or SNTP client.
+    if (WiFi.getMode() == WIFI_OFF) {
+        apply_fallback_time(&fallback);
+    } else if (esp_netif_tcpip_exec(apply_fallback_time, &fallback) != ESP_OK) {
+        return false;
     }
+    if (!fallback.applied) return false;
 
     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Fallback time from ResMed: %04d-%02d-%02d %02d:%02d\n",
               year, month, day, hour, min);
+    return true;
 }
 
 void WiFiSetup::force_ntp_sync() {

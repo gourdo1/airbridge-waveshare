@@ -21,6 +21,72 @@ def function(source, signature):
 
 
 class ClockSyncTest(unittest.TestCase):
+    def test_fallback_timezone_and_ntp_race(self):
+        source = (ROOT / "src/wifi.cpp").read_text()
+        declarations = source[source.index("struct FallbackTime {"):
+                              source.index("static esp_err_t apply_fallback_time(")]
+        functions = declarations + function(source, "static esp_err_t apply_fallback_time(")
+        functions += function(source, "bool WiFiSetup::set_fallback_time(")
+        harness = r'''
+#include <cassert>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <sys/time.h>
+using esp_err_t = int;
+constexpr int ESP_OK = 0, WIFI_OFF = 0, CAT_WIFI = 0, LOG_INFO = 0;
+static bool ntp_synced = false, ntp_during_dispatch = false;
+static int clock_writes = 0, dispatches = 0;
+static time_t written_epoch = 0;
+struct { int mode = 1; int getMode() { return mode; } } WiFi;
+namespace Config {
+struct Settings { std::string tz = "CET-1CEST,M3.5.0,M10.5.0/3"; } cfg;
+Settings &get() { return cfg; }
+}
+namespace Log { void logf(int, int, const char *, ...) {} }
+int fake_settimeofday(const timeval *tv, const void *) {
+    clock_writes++;
+    written_epoch = tv->tv_sec;
+    return 0;
+}
+#define settimeofday fake_settimeofday
+esp_err_t esp_netif_tcpip_exec(esp_err_t (*fn)(void *), void *ctx) {
+    dispatches++;
+    if (ntp_during_dispatch) ntp_synced = true;
+    return fn(ctx);
+}
+namespace WiFiSetup {
+bool set_fallback_time(int, int, int, int, int, int, bool force = false);
+}
+''' + functions + r'''
+int main() {
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    assert(WiFiSetup::set_fallback_time(2026, 1, 15, 12, 0, 0));
+    tm utc{};
+    gmtime_r(&written_epoch, &utc);
+    assert(utc.tm_hour == 11);
+    assert(WiFiSetup::set_fallback_time(2026, 7, 15, 12, 0, 0));
+    gmtime_r(&written_epoch, &utc);
+    assert(utc.tm_hour == 10);
+    ntp_synced = true;
+    assert(!WiFiSetup::set_fallback_time(2026, 7, 15, 12, 0, 0));
+    assert(clock_writes == 2);
+    ntp_synced = false;
+    ntp_during_dispatch = true;
+    assert(!WiFiSetup::set_fallback_time(2026, 7, 15, 12, 0, 0));
+    assert(clock_writes == 2);
+    assert(WiFiSetup::set_fallback_time(2026, 7, 15, 12, 0, 0, true));
+    assert(clock_writes == 3);
+    ntp_synced = false;
+    WiFi.mode = WIFI_OFF;
+    int before = dispatches;
+    assert(WiFiSetup::set_fallback_time(2026, 7, 15, 12, 0, 0));
+    assert(dispatches == before && clock_writes == 4);
+}
+'''
+        self.compile_and_run(harness)
+
     def test_presence_retry_and_rejection(self):
         source = (ROOT / "src/main.cpp").read_text()
         functions = "\n".join(function(source, signature) for signature in (

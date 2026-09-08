@@ -167,7 +167,7 @@ static void attempt_recovery() {
     }
 }
 
-bool pull_time_from_resmed();
+bool pull_time_from_resmed(bool force = false);
 
 void setup() {
     Serial.begin(115200);
@@ -266,7 +266,7 @@ bool push_time_to_resmed() {
     return ok_dac && ok_tic;
 }
 
-bool pull_time_from_resmed() {
+bool pull_time_from_resmed(bool force) {
     char dac_resp[32] = {}, tic_resp[32] = {};
     uint16_t dac_len = sizeof(dac_resp), tic_len = sizeof(tic_resp);
     Arbiter::send_cmd("G S #DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, dac_resp, &dac_len);
@@ -277,7 +277,7 @@ bool pull_time_from_resmed() {
         int dd, mm, yyyy, hh, mn, ss;
         if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
             sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
-            WiFiSetup::set_fallback_time(yyyy, mm, dd, hh, mn, ss, true);
+            if (!WiFiSetup::set_fallback_time(yyyy, mm, dd, hh, mn, ss, force)) return false;
             Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Time from ResMed: %04d-%02d-%02d %02d:%02d:%02d\n",
                       yyyy, mm, dd, hh, mn, ss);
             return true;
