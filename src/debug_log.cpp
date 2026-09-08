@@ -2,6 +2,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <Preferences.h>
+#include "nvs_optional.h"
 #include <stdarg.h>
 
 static Preferences log_prefs;
@@ -13,10 +14,10 @@ static log_level_t cat_levels[CAT_COUNT];
 
 void Log::init() {
     log_mutex = xSemaphoreCreateMutex();
-    log_prefs.begin("log_levels", true);
+    bool stored = open_optional_preferences(log_prefs, "log_levels");
     for (int i = 0; i < CAT_COUNT; i++) {
-        cat_levels[i] = (log_level_t)log_prefs.getUChar(
-            Log::cat_name((log_cat_t)i), LOG_INFO);
+        cat_levels[i] = stored ? (log_level_t)log_prefs.getUChar(
+            Log::cat_name((log_cat_t)i), LOG_INFO) : LOG_INFO;
     }
     log_prefs.end();
 }

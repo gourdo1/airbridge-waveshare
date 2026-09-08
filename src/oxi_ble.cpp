@@ -8,6 +8,7 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include "nvs_optional.h"
 
 #define OXI_TASK_STACK      4096
 #define OXI_TASK_PRIO       4
@@ -78,7 +79,7 @@ static int known_count = 0;
 
 static void known_load() {
     Preferences p;
-    p.begin("oxi_known", true);
+    if (!open_optional_preferences(p, "oxi_known")) return;
     known_count = p.getUChar("count", 0);
     if (known_count > KNOWN_MAX) known_count = KNOWN_MAX;
     for (int i = 0; i < known_count; i++) {

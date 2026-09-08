@@ -1,6 +1,7 @@
 #include "network_hints.h"
 #include "debug_log.h"
 #include <Preferences.h>
+#include "nvs_optional.h"
 
 #define HINT_NVS_VERSION    1
 
@@ -31,7 +32,7 @@ void NetworkHints::init() {
     memset(hints, 0, sizeof(hints));
     hint_count = 0;
 
-    prefs.begin("wifi_hints", true);
+    if (!open_optional_preferences(prefs, "wifi_hints")) return;
     uint8_t ver = prefs.getUChar("version", 0);
     if (ver != HINT_NVS_VERSION) {
         prefs.end();
