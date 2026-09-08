@@ -18,6 +18,16 @@
 #include "edf_recorder.h"
 #include "export_sync.h"
 #include "custom_settings.h"
+#include "board.h"
+#if defined(AB_BOARD_WROOM_S3)
+#include "hal/usb_serial_jtag_ll.h"
+
+// Rev D senses VBUS through 100k/150k. Disconnect the self-powered USB
+// peripheral when the host removes VBUS; power conversion is independent.
+static void IRAM_ATTR usb_vbus_changed() {
+    usb_serial_jtag_ll_phy_enable_pad(digitalRead(14) == HIGH);
+}
+#endif
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -180,6 +190,11 @@ bool pull_time_from_resmed(bool force = false);
 
 void setup() {
     Serial.begin(115200);
+#if defined(AB_BOARD_WROOM_S3)
+    pinMode(14, INPUT);
+    attachInterrupt(digitalPinToInterrupt(14), usb_vbus_changed, CHANGE);
+    usb_vbus_changed();
+#endif
     delay(500);
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
