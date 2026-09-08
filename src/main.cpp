@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <atomic>
 #include "app_config.h"
 #include "debug_log.h"
 #include "uart_arbiter.h"
@@ -67,6 +68,11 @@ static void serial_poll() {
 static uint32_t last_health_poll = 0;
 static uint32_t last_mhr_poll = 0;
 static uint32_t consecutive_timeouts = 0;
+static bool airsense_present = false;
+static uint32_t airsense_seen_ms = 0;
+static std::atomic<bool> clock_sync_pending{true};
+static uint32_t clock_sync_attempt_ms = 0;
+static std::atomic<bool> clock_sync_attempted{false};
 
 static void poll_mhr() {
     char mhr_resp[32] = {};
@@ -103,7 +109,9 @@ static void poll_therapy_state() {
         consecutive_timeouts = 0;
 
         const char *rv = qframe_response_value(resp);
-        if (rv) {
+        airsense_present = rv && (strcmp(rv, "0000") == 0 || strcmp(rv, "0001") == 0);
+        if (airsense_present) {
+            airsense_seen_ms = millis();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = Arbiter::get_cached_rop();
             Arbiter::set_cached_rop(new_rop);
@@ -123,6 +131,7 @@ static void poll_therapy_state() {
             }
         }
     } else {
+        airsense_present = false;
         consecutive_timeouts++;
         Log::logf(CAT_HEALTH, consecutive_timeouts >= 2 ? LOG_WARN : LOG_DEBUG,
                   "[HEALTH] ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
@@ -209,9 +218,10 @@ void setup() {
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }
 
-static bool resmed_time_set = false;
-
-void reset_resmed_time_sync() { resmed_time_set = false; }
+void reset_resmed_time_sync() {
+    clock_sync_pending = true;
+    clock_sync_attempted = false;
+}
 
 bool push_time_to_resmed() {
     if (!WiFiSetup::time_synced()) return false;
@@ -226,11 +236,24 @@ bool push_time_to_resmed() {
     snprintf(tic_cmd, sizeof(tic_cmd), "P S #TIC %02d%02d%02d",
              t.tm_hour, t.tm_min, t.tm_sec);
 
-    char resp[16] = {};
+    char resp[64] = {};
     uint16_t resp_len = sizeof(resp);
     bool ok_dac = Arbiter::send_cmd(dac_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
+    if (!ok_dac) {
+        // A device error is terminal until TIMESYNC; a timeout can be retried.
+        if (resp[0]) clock_sync_pending = false;
+        Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed date %s: %s\n",
+                  resp[0] ? "rejected (use TIMESYNC to retry)" : "timeout", resp);
+        return false;
+    }
+    resp[0] = '\0';
     resp_len = sizeof(resp);
     bool ok_tic = Arbiter::send_cmd(tic_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
+    if (!ok_tic && resp[0]) {
+        clock_sync_pending = false;
+        Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed time rejected (use TIMESYNC to retry): %s\n", resp);
+        return false;
+    }
 
     if (ok_dac && ok_tic) {
         Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] ResMed clock set: %02d%02d%04d %02d%02d%02d\n",
@@ -264,10 +287,14 @@ bool pull_time_from_resmed() {
 }
 
 static void sync_resmed_clock() {
-    if (resmed_time_set) return;
+    if (!clock_sync_pending || !airsense_present || !WiFiSetup::time_synced()) return;
+    if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
     system_state_t st = Arbiter::get_state();
     if (st != SYS_IDLE && st != SYS_THERAPY) return;
-    if (push_time_to_resmed()) resmed_time_set = true;
+    if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
+    clock_sync_attempt_ms = millis();
+    clock_sync_attempted = true;
+    if (push_time_to_resmed()) clock_sync_pending = false;
 }
 
 void loop() {
