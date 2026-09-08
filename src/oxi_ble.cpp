@@ -47,6 +47,7 @@ static volatile bool state_dirty = false;
 static inline void set_state(oxi_state_t s) { state = s; state_dirty = true; }
 static oxi_reading_t reading = { -1, -1, false, 0 };  // local copy for callbacks
 static volatile bool scan_requested = false;
+static volatile bool active_scan_requested = false;
 typedef enum { CONN_NONE, CONN_AUTO, CONN_USER } connect_mode_t;
 static volatile connect_mode_t connect_mode = CONN_NONE;
 static volatile bool disconnect_requested = false;  // drop connection, stay enabled
@@ -650,7 +651,11 @@ static bool has_oxyii_manufacturer(const NimBLEAdvertisedDevice *dev) {
 class OxiScanCB : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
         String name = dev->getName().c_str();
+        String addr = dev->getAddress().toString().c_str();
+        // Passive advertisements need not contain a name or service UUID.
+        bool known = is_device_known(addr.c_str(), dev->getAddress().getType());
         bool is_oxi = has_oxyii_manufacturer(dev) ||
+                       known || addr.equalsIgnoreCase(Config::get().oxi_device_addr) ||
                        dev->isAdvertisingService(PLX_SERVICE_UUID) ||
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
@@ -693,7 +698,8 @@ class OxiScanCB : public NimBLEScanCallbacks {
     }
 
     void onScanEnd(const NimBLEScanResults &results, int reason) override {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Scan complete, %d oximeters found (reason=%d)\n", scan_result_count, reason);
+        Log::logf(CAT_OXI, scan_result_count || reason ? LOG_INFO : LOG_DEBUG,
+                  "[OXI] Scan complete, %d oximeters found (reason=%d)\n", scan_result_count, reason);
         scan_complete = true;
     }
 };
@@ -1017,10 +1023,11 @@ void OxiBle::task(void *param) {
 
         if (scan_complete) {
             scan_complete = false;
+            last_reconnect = millis();
             if (state == OXI_SCANNING) {
                 Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Scan done, %d results\n", scan_result_count);
                 set_state(OXI_DISCONNECTED);
-                if (scan_result_count > 0) {
+                if (scan_result_count > 0 && !active_scan_requested) {
                     String target = cfg.oxi_device_addr;
                     bool found = false;
                     if (target.length() > 0) {
@@ -1039,11 +1046,12 @@ void OxiBle::task(void *param) {
                             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] %s %s known=%d\n",
                                       scan_results[i].name.c_str(), scan_results[i].addr.c_str(), known);
                             if (cfg.oxi_require_known) {
-                                if (known) { found = true; break; }
+                                if (known) { target = scan_results[i].addr; found = true; break; }
                             } else {
                                 if (scan_results[i].name.startsWith("Nonin")) {
-                                    if (known) { found = true; break; }
+                                    if (known) { target = scan_results[i].addr; found = true; break; }
                                 } else {
+                                    target = scan_results[i].addr;
                                     found = true;
                                     break;
                                 }
@@ -1051,6 +1059,7 @@ void OxiBle::task(void *param) {
                         }
                     }
                     if (found) {
+                        target.toCharArray(target_addr, sizeof(target_addr));
                         connect_mode = CONN_AUTO;
                         Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Auto-connect triggered\n");
                     }
@@ -1062,7 +1071,12 @@ void OxiBle::task(void *param) {
             scan_requested = false;
             NimBLEScan *pScan = NimBLEDevice::getScan();
             if (pScan->isScanning()) {
-                Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] scan_requested ignored, scan already in progress\n");
+                if (active_scan_requested) {
+                    pScan->stop();
+                    scan_requested = true;
+                } else {
+                    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] scan_requested ignored, scan already in progress\n");
+                }
             } else {
                 if (scan_mutex) xSemaphoreTake(scan_mutex, portMAX_DELAY);
                 scan_result_count = 0;
@@ -1072,10 +1086,16 @@ void OxiBle::task(void *param) {
                 set_state(OXI_SCANNING);
                 Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Starting scan (%dms)\n", SCAN_DURATION_MS);
                 pScan->setScanCallbacks(&scanCB);
-                pScan->setActiveScan(true);
-                pScan->setInterval(100);
-                pScan->setWindow(99);
-                pScan->start(SCAN_DURATION_MS);
+                bool active = active_scan_requested;
+                active_scan_requested = false;
+                // AirCANnect observer timing; active discovery is user-requested.
+                pScan->setActiveScan(active);
+                pScan->setInterval(active ? 100 : 1000);
+                pScan->setWindow(active ? 99 : 20);
+                if (!pScan->start(SCAN_DURATION_MS)) {
+                    last_reconnect = millis();
+                    set_state(OXI_DISCONNECTED);
+                }
             }
         }
 
@@ -1109,10 +1129,9 @@ void OxiBle::task(void *param) {
                     }
                 }
 
-                // Nonin requires Just Works bonding; Viatom/O2Ring/generic PLX do not
-                device_needs_encryption = dev_name.startsWith("Nonin");
-
                 NimBLEAddress bleAddr(std::string(addr.c_str()), atype);
+                // Bonded Nonin may omit its name from passive advertisements.
+                device_needs_encryption = dev_name.startsWith("Nonin") || NimBLEDevice::isBonded(bleAddr);
                 bool connected = false;
 
                 for (int attempt = 1; attempt <= max_attempts; attempt++) {
@@ -1265,7 +1284,7 @@ void OxiBle::init() {
                             nullptr, OXI_TASK_PRIO, &oxi_task_handle, 0);
 }
 
-void OxiBle::start_scan()  { scan_requested = true; }
+void OxiBle::start_scan()  { active_scan_requested = true; scan_requested = true; }
 void OxiBle::stop_scan()   { NimBLEDevice::getScan()->stop(); }
 
 void OxiBle::connect(const char *addr) {
