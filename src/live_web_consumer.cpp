@@ -68,7 +68,7 @@ static void do_subscribe() {
     if (handle < 0) {
         Log::logf(CAT_GENERAL, LOG_WARN, "[LWC] subscribe to PMD failed\n");
     } else {
-        Log::logf(CAT_GENERAL, LOG_INFO, "[LWC] subscribed (clients=%d)\n",
+        Log::logf(CAT_GENERAL, LOG_INFO, "[LWC] consumer registered (clients=%d)\n",
                   client_count);
     }
 }
