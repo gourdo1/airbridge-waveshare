@@ -2,7 +2,7 @@
 
 ## What you need
 
-- M5Stamp Pico (ESP32-PICO-D4) or XIAO ESP32S3 Plus
+- Waveshare ESP32-S3-LCD-1.54 (with or without touch)
 - MP1584 buck converter (24V to 3.3V)
 - AirSense 10 with edge connector access
 - USB-to-serial adapter (3.3V) for initial flash
