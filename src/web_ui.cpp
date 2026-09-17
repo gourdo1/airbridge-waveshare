@@ -684,18 +684,80 @@ typedef enum {
 } upload_kind_t;
 
 static upload_kind_t uploadKind = UPLOAD_NONE;
+static AsyncWebServerRequest *uploadOwner = nullptr;
+static size_t uploadNextIndex = 0;
+static bool uploadComplete = false;
+static bool uploadOwnsUart = false;
+static esp_ota_handle_t esp_ota_handle = 0;
+static const esp_partition_t *esp_ota_part = nullptr;
+
+static void finishUpload(AsyncWebServerRequest *request, bool success,
+                         const char *error) {
+    if (uploadOwner != request) return;
+    if (esp_ota_handle) {
+        esp_ota_abort(esp_ota_handle);
+        esp_ota_handle = 0;
+    }
+    esp_ota_part = nullptr;
+    if (!success) {
+        uploadOk = false;
+        uploadComplete = false;
+        uploadKind = UPLOAD_NONE;
+        resmed_part = nullptr;
+    }
+    if (uploadOwnsUart && Arbiter::get_state() == SYS_OTA_ESP)
+        Arbiter::set_state(SYS_IDLE);
+    uploadOwnsUart = false;
+    uploadOwner = nullptr;
+    OtaManager::end_manual_upload(success, error);
+}
+
+static bool claimUpload(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return false;
+    if (uploadOwner) {
+        // More than one file in the owning request is not a firmware image.
+        if (uploadOwner == request) uploadOk = false;
+        return false;
+    }
+    if (!OtaManager::begin_manual_upload()) return false;
+    uploadOwner = request;
+    uploadNextIndex = 0;
+    uploadComplete = false;
+    uploadOwnsUart = false;
+    request->onDisconnect([request]() {
+        finishUpload(request, false, "upload_disconnected");
+    });
+    return true;
+}
+
+static bool acceptUploadChunk(AsyncWebServerRequest *request, size_t index,
+                               size_t len, bool final) {
+    if (uploadOwner != request) return false;
+    if (uploadComplete || index != uploadNextIndex || len > SIZE_MAX - index) {
+        uploadOk = false;
+        return false;
+    }
+    uploadNextIndex += len;
+    uploadComplete = final;
+    return true;
+}
+
+static bool ownsUpload(AsyncWebServerRequest *request) {
+    if (uploadOwner == request) return true;
+    request->send(409, "application/json",
+                  "{\"ok\":false,\"error\":\"upload_not_owned\"}");
+    return false;
+}
 
 static bool hasValidResmedUpload() {
-    return uploadKind == UPLOAD_RESMED && uploadOk && uploadSize > 0 && resmed_part;
+    return !uploadOwner && uploadComplete && uploadKind == UPLOAD_RESMED &&
+           uploadOk && uploadSize > 0 && resmed_part;
 }
 
 static void handleUploadChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
-        if (!checkAuth(request) || !OtaManager::begin_manual_upload()) {
-            uploadOk = false;
-            return;
-        }
+        if (!claimUpload(request)) return;
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Upload start: %s\n", filename.c_str());
         uploadKind = UPLOAD_RESMED;
         uploadSize = 0;
@@ -706,7 +768,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
         if (!resmed_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No staging partition found\n");
             uploadKind = UPLOAD_NONE;
-            OtaManager::end_manual_upload(false, "staging_partition_missing");
+            finishUpload(request, false, "staging_partition_missing");
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] Staging to '%s' (0x%X, %u bytes)\n",
@@ -717,12 +779,13 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Erase failed: %s\n", esp_err_to_name(err));
             resmed_part = nullptr;
             uploadKind = UPLOAD_NONE;
-            OtaManager::end_manual_upload(false, "staging_erase_failed");
+            finishUpload(request, false, "staging_erase_failed");
             return;
         }
         uploadOk = true;
     }
 
+    if (!acceptUploadChunk(request, index, len, final)) return;
     if (uploadKind == UPLOAD_RESMED && resmed_part && uploadOk && len > 0) {
         // reject ESP32 binaries uploaded to resmed slot
         if (uploadSize == 0 && len > 0 && data[0] == 0xE9) {
@@ -754,12 +817,15 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
 }
 
 static void handleUploadDone(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
+    if (!checkAuth(request)) {
+        finishUpload(request, false, "upload_unauthorized");
+        return;
+    }
+    if (!ownsUpload(request)) return;
 
     String json = "{";
-    bool validUpload = hasValidResmedUpload();
-    OtaManager::end_manual_upload(validUpload,
-                                  validUpload ? nullptr : "resmed_upload_failed");
+    bool validUpload = uploadComplete && uploadKind == UPLOAD_RESMED &&
+                       uploadOk && uploadSize > 0 && resmed_part;
     jsonAddString(json, "ok", validUpload ? "true" : "false", false);
     jsonAddInt(json, "size", uploadSize);
 
@@ -783,6 +849,8 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
         if (v.has_cdx) jsonAddString(json, "cdx_crc", v.cdx_crc_ok ? "ok" : "fail");
     }
 
+    finishUpload(request, validUpload,
+                  validUpload ? nullptr : "resmed_upload_failed");
     json += '}';
     request->send(200, "application/json", json);
 }
@@ -1227,26 +1295,22 @@ static void handleReport(AsyncWebServerRequest *request) {
 }
 
 // ESP32 OTA
-static esp_ota_handle_t esp_ota_handle = 0;
-static const esp_partition_t *esp_ota_part = nullptr;
-
-static void abortEspOtaUpload() {
+static void abortEspOtaUpload(AsyncWebServerRequest *request) {
+    if (uploadOwner != request) return;
     if (esp_ota_handle) {
         esp_ota_abort(esp_ota_handle);
         esp_ota_handle = 0;
     }
     esp_ota_part = nullptr;
     uploadKind = UPLOAD_NONE;
-    OtaManager::end_manual_upload(false, "esp_upload_aborted");
-    Arbiter::set_state(SYS_IDLE);
+    // Keep the request reservation until completion or disconnect.
 }
 
 static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
-        if (!checkAuth(request) || !OtaManager::begin_manual_upload()) {
+        if (!claimUpload(request)) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA rejected: OTA busy\n");
-            uploadOk = false;
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA start: %s\n", filename.c_str());
@@ -1260,7 +1324,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         if (!esp_ota_part) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No OTA partition found\n");
             uploadKind = UPLOAD_NONE;
-            OtaManager::end_manual_upload(false, "ota_partition_missing");
+            finishUpload(request, false, "ota_partition_missing");
             return;
         }
         Log::logf(CAT_WEB, LOG_INFO, "[WEB] OTA target: '%s' (0x%X, %u bytes)\n",
@@ -1271,28 +1335,32 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_begin failed: %s\n", esp_err_to_name(err));
             esp_ota_part = nullptr;
             uploadKind = UPLOAD_NONE;
-            OtaManager::end_manual_upload(false, "esp_ota_begin_failed");
-            Arbiter::set_state(SYS_IDLE);
+            esp_ota_handle = 0;
+            finishUpload(request, false, "esp_ota_begin_failed");
             return;
         }
         uploadOk = true;
     }
 
-    if (esp_ota_part && uploadOk && len > 0) {
+    if (!acceptUploadChunk(request, index, len, final)) return;
+    if (uploadKind == UPLOAD_ESP && esp_ota_part && uploadOk && len > 0) {
         // validate esp binary magic on first data
         if (uploadSize == 0 && len > 0 && data[0] != 0xE9) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Not an ESP32 binary (magic=0x%02X)\n", data[0]);
             uploadOk = false;
-            abortEspOtaUpload();
+            abortEspOtaUpload(request);
             return;
         }
-        if (uploadSize == 0) Arbiter::set_state(SYS_OTA_ESP);
+        if (uploadSize == 0) {
+            uploadOwnsUart = true;
+            Arbiter::set_state(SYS_OTA_ESP);
+        }
         esp_err_t err = esp_ota_write(esp_ota_handle, data, len);
         if (err != ESP_OK) {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_write failed at %u: %s\n",
                       uploadSize, esp_err_to_name(err));
             uploadOk = false;
-            abortEspOtaUpload();
+            abortEspOtaUpload(request);
             return;
         }
         uploadCrc = crc16_ccitt(data, len, uploadCrc);
@@ -1305,13 +1373,19 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
 }
 
 static void handleEspOtaDone(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
+    if (!checkAuth(request)) {
+        finishUpload(request, false, "upload_unauthorized");
+        return;
+    }
+    if (!ownsUpload(request)) return;
 
     String json = "{";
     bool ok = false;
 
-    if (uploadKind == UPLOAD_ESP && uploadOk && uploadSize > 0 && esp_ota_part) {
+    if (uploadComplete && uploadKind == UPLOAD_ESP && uploadOk &&
+        uploadSize > 0 && esp_ota_part) {
         esp_err_t err = esp_ota_end(esp_ota_handle);
+        esp_ota_handle = 0;
         if (err == ESP_OK) {
             err = esp_ota_set_boot_partition(esp_ota_part);
             if (err == ESP_OK) {
@@ -1336,11 +1410,8 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     if (esp_ota_part)
         jsonAddString(json, "partition", esp_ota_part->label);
 
-    esp_ota_handle = 0;
-    esp_ota_part = nullptr;
+    finishUpload(request, ok, ok ? nullptr : "esp_upload_failed");
     uploadKind = UPLOAD_NONE;
-    OtaManager::end_manual_upload(ok, ok ? nullptr : "esp_upload_failed");
-    Arbiter::set_state(SYS_IDLE);
 
     json += '}';
     request->send(200, "application/json", json);
