@@ -212,6 +212,9 @@ static void recover_catalog() {
 
 void init() {
     if (status.ready) return;
+    portENTER_CRITICAL(&status_mux);
+    status.error[0] = 0;
+    portEXIT_CRITICAL(&status_mux);
     storage = SdStorage::filesystem();
     if (!storage) return;
     if (!mutex) mutex = xSemaphoreCreateMutex();

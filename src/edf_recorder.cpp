@@ -74,6 +74,7 @@ struct ControlEvent {
     uint32_t epoch;
     uint32_t captured_ms;
     bool trusted_time;
+    bool confirmed_end = false;
 };
 
 struct StreamField {
@@ -133,6 +134,13 @@ static TaskHandle_t recorder_task_handle = nullptr;
 static uart_frame_listener_t frame_listener = -1;
 static volatile bool capture_active = false;
 static volatile bool therapy_start_pending = false;
+static volatile bool therapy_wanted = false;
+static uint32_t therapy_on_capture_ms = 0;
+static uint32_t recording_therapy_on_ms = 0;
+static ControlEvent latest_stop = {};
+static uint32_t next_start_ms = 0;
+static bool storage_ready = false;
+static uint32_t next_storage_ms = 0;
 
 static fs::FS *storage = nullptr;
 static SemaphoreHandle_t storage_mutex = nullptr;
@@ -156,6 +164,7 @@ static size_t record_capacity = 0;
 static uint32_t session_start_capture_ms = 0;
 static uint32_t segment_duration_ms = 0;
 static Air10Clock::Anchor session_clock;
+static int64_t session_mask_start = 0;
 static uint16_t session_native_day = 0;
 static char recording_id[81] = {};
 static char start_date[9] = {};
@@ -193,7 +202,8 @@ static void post_error(const char *message) {
 }
 
 static bool post_processing_cancelled() {
-    return __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
 }
 
 static bool post_processing_delay(uint32_t delay_ms) {
@@ -387,7 +397,7 @@ static bool wait_for_final_str_save(const EdfPending::Record &pending) {
             (pending.native_end - (int64_t(pending.native_day) * 86400 + 43200)) / 60))
         : UINT16_MAX;
     const uint16_t expected_on = static_cast<uint16_t>(
-        (session_clock.native_start + 43200) % 86400 / 60);
+        (pending.mask_start + 43200) % 86400 / 60);
 
     const uint32_t started = millis();
     uint32_t observed_generation = 0;
@@ -415,23 +425,10 @@ static bool wait_for_final_str_save(const EdfPending::Record &pending) {
                 "OFT", session_native_day, mask_off);
             uint32_t generation_after = 0;
             const bool have_after = read_u32_variable("ZEN", generation_after);
-            bool recovered_end = false;
-            if ((expected_off == UINT16_MAX || (pending.flags & EdfPending::SEGMENT_END)) &&
-                have_mask_on && have_mask_off) {
-                for (uint8_t i = 0; i < mask_on.sample_count && i < mask_off.sample_count; i++) {
-                    if (mask_on.samples[i] >= 0 && mask_off.samples[i] >= 0 &&
-                        mask_on.samples[i] <= expected_on + MASK_OFF_TOLERANCE_MINUTES &&
-                        mask_off.samples[i] >= expected_on && mask_off.samples[i] <= 1440 &&
-                        (expected_off == UINT16_MAX ||
-                         mask_off.samples[i] + MASK_OFF_TOLERANCE_MINUTES >= expected_off))
-                        recovered_end = true;
-                }
-            }
             if (have_before && have_after && generation_before == generation_after &&
                 have_mask_on && have_mask_off &&
-                (recovered_end || Air10Stored::contains_interval(
-                    mask_on, mask_off, expected_on, expected_off,
-                    MASK_OFF_TOLERANCE_MINUTES))) {
+                EdfPending::matches_interval(pending, mask_on, mask_off,
+                                              MASK_OFF_TOLERANCE_MINUTES)) {
                 Log::logf(CAT_GENERAL, LOG_INFO,
                           "[EDF] final STR ready mask=%u-%u dt=%lums\n",
                           expected_on, expected_off,
@@ -778,6 +775,7 @@ static bool save_pending(bool ended, uint32_t ended_ms, bool segment_end = false
     pending.native_day = session_native_day;
     pending.export_day = session_epoch_day;
     pending.native_start = session_clock.native_start;
+    pending.mask_start = session_mask_start;
     pending.export_start = session_clock.export_start;
     pending.mid = session_mid; pending.vid = session_vid;
     memcpy(pending.srn, session_srn, sizeof(pending.srn));
@@ -796,6 +794,11 @@ static bool save_pending(bool ended, uint32_t ended_ms, bool segment_end = false
     if (!write_pending(pending)) {
         post_error("STR pending journal write failed");
         return false;
+    }
+    if (!ended) {
+        portENTER_CRITICAL(&status_mux);
+        status.pending_str++;
+        portEXIT_CRITICAL(&status_mux);
     }
     return true;
 }
@@ -1796,8 +1799,8 @@ static bool prefix_in_snapshot(const char *prefixes, uint32_t count,
     return false;
 }
 
-static void reconcile_catalog() {
-    if (!storage->exists("/DATALOG")) return;
+static bool reconcile_catalog() {
+    if (!storage->exists("/DATALOG")) return true;
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     const uint32_t candidate_count = count_catalog_candidates();
@@ -1829,7 +1832,7 @@ static void reconcile_catalog() {
     fs::File root = storage->open("/DATALOG", FILE_READ);
     if (!root || !root.isDirectory()) {
         if (known_prefixes) heap_caps_free(known_prefixes);
-        return;
+        return false;
     }
 
     fs::File day;
@@ -1875,7 +1878,9 @@ static void reconcile_catalog() {
             entry.flags = EdfCatalog::ENTRY_LIVE_COMPLETE;
             if (status.identification_ready)
                 entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY;
-            if (str_contains_day(day_name))
+            char pending[80];
+            pending_path(prefix, pending, sizeof(pending));
+            if (!storage->exists(pending) && str_contains_day(day_name))
                 entry.flags |= EdfCatalog::ENTRY_STR_READY;
             entry.finalized_epoch = finalized_epoch
                 ? finalized_epoch : static_cast<uint32_t>(time(nullptr));
@@ -1884,7 +1889,7 @@ static void reconcile_catalog() {
                 day.close();
                 root.close();
                 if (known_prefixes) heap_caps_free(known_prefixes);
-                return;
+                return false;
             }
             if (known_prefixes && known_count < prefix_capacity) {
                 memcpy(known_prefixes + static_cast<size_t>(known_count) * 16,
@@ -1899,6 +1904,7 @@ static void reconcile_catalog() {
     }
     root.close();
     if (known_prefixes) heap_caps_free(known_prefixes);
+    return true;
 }
 
 static bool render_output_header(OutputFile &output, uint32_t records,
@@ -2007,7 +2013,7 @@ static void close_output(OutputFile &output, bool remove_partial) {
     if (output.file) output.file.close();
     if (remove_partial && output.created && storage && output.partial_path[0])
         storage->remove(output.partial_path);
-    output.open = false;
+    output = {};
 }
 
 static bool initialize_accumulator(Accumulator &accumulator,
@@ -2327,6 +2333,14 @@ static bool anchor_session_clock(const ControlEvent &event) {
         session_clock.native_start = native_now -
             static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
         session_native_day = Air10Clock::therapy_day(session_clock.native_start);
+        portENTER_CRITICAL(&status_mux);
+        const uint32_t mask_on_ms = therapy_on_capture_ms;
+        portEXIT_CRITICAL(&status_mux);
+        session_mask_start = max(int64_t(session_native_day) * 86400 + 43200,
+            session_clock.native_start - uint32_t(event.captured_ms - mask_on_ms) / 1000);
+    } else {
+        session_native_day = 0;
+        session_mask_start = 0;
     }
     const bool trusted_time = event.trusted_time && event.epoch >= CLOCK_VALID_AFTER;
     if (!trusted_time && !session_clock.native_valid && event.epoch < CLOCK_VALID_AFTER) {
@@ -2457,6 +2471,39 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
            append_annotation(csl, 0, 0, "Recording starts");
 }
 
+static void discard_pending() {
+    char path[80], part[88], backup[88];
+    pending_path(status.file_prefix, path, sizeof(path));
+    snprintf(part, sizeof(part), "%s.part", path);
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    if (storage->remove(path)) {
+        portENTER_CRITICAL(&status_mux);
+        if (status.pending_str) status.pending_str--;
+        portEXIT_CRITICAL(&status_mux);
+    }
+    storage->remove(part);
+    storage->remove(backup);
+}
+
+static bool begin_segment_files(const Air10Edf::Schema &brp_schema,
+                                 const Air10Edf::Schema &pld_schema) {
+    char path[80], part[88], backup[88];
+    pending_path(status.file_prefix, path, sizeof(path));
+    snprintf(part, sizeof(part), "%s.part", path);
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    if (storage->exists(path) || storage->exists(part) || storage->exists(backup))
+        return false;
+    // Persist intent before any EDF can be recovered and catalogued after reset.
+    if (!save_pending(false, 0)) {
+        discard_pending();
+        return false;
+    }
+    if (allocate_session_buffers(brp_schema, pld_schema)) return true;
+    clear_session_memory(true);
+    discard_pending();
+    return false;
+}
+
 static void reset_session_state(const ControlEvent &event, bool rollover = false) {
     session_start_capture_ms = event.captured_ms;
     segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.export_start);
@@ -2468,7 +2515,13 @@ static void reset_session_state(const ControlEvent &event, bool rollover = false
 
 static void start_session(const ControlEvent &event) {
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
-    if (status.active) return;
+    next_start_ms = millis() + 5000;
+    if (status.active || !storage_ready || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
+        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) return;
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t mask_on_ms = therapy_on_capture_ms;
+    portEXIT_CRITICAL(&status_mux);
+    if (int32_t(event.captured_ms - mask_on_ms) < 0) return;
     if (!acquire_storage()) {
         status_error("storage busy at recording start");
         return;
@@ -2492,7 +2545,7 @@ static void start_session(const ControlEvent &event) {
     const Air10Edf::Schema &pld_layout = Air10Edf::pld_schema();
 
     reset_session_state(event);
-    if (!allocate_session_buffers(brp_layout, pld_layout) || !save_pending(false, 0)) {
+    if (!begin_segment_files(brp_layout, pld_layout)) {
         status_error("session buffer or file initialization failed");
         clear_session_memory(true);
         recording_storage_owned = false;
@@ -2501,7 +2554,21 @@ static void start_session(const ControlEvent &event) {
     }
 
     portENTER_CRITICAL(&status_mux);
+    const bool same_therapy = mask_on_ms == therapy_on_capture_ms;
+    portEXIT_CRITICAL(&status_mux);
+    if (!same_therapy || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
+        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) {
+        clear_session_memory(true);
+        discard_pending();
+        recording_storage_owned = false;
+        release_storage();
+        return;
+    }
+
+    portENTER_CRITICAL(&status_mux);
+    recording_therapy_on_ms = mask_on_ms;
     status.active = true;
+    status.post_processing = false;
     status.started_epoch = event.epoch;
     status.raw_frames = 0;
     status.raw_dropped = 0;
@@ -2532,8 +2599,8 @@ static void update_record_status() {
     portEXIT_CRITICAL(&status_mux);
 }
 
-static void close_segment(uint32_t ended_ms, bool rollover) {
-    (void)save_pending(true, ended_ms, rollover);
+static void close_segment(uint32_t ended_ms, bool rollover, bool known_end = true) {
+    if (known_end) (void)save_pending(true, ended_ms, rollover);
     (void)write_current_record(brp);
     (void)write_current_record(pld);
     (void)write_current_record(sad);
@@ -2567,13 +2634,14 @@ static bool advance_segment(uint32_t captured_ms) {
     session_clock.export_start += seconds;
     session_clock.captured_ms = boundary;
     session_native_day = Air10Clock::therapy_day(session_clock.native_start);
+    session_mask_start = max(session_mask_start,
+        int64_t(session_native_day) * 86400 + 43200);
     ControlEvent event = {ControlKind::Start, 0, boundary, false};
     uint16_t mid = session_mid, vid = session_vid;
     const StreamSchema *schema = find_schema("TCE");
     const bool tcv = schema && schema_has_field(*schema, "TCV");
     const bool opened = make_paths_and_metadata(event, mid, vid, true) &&
-        allocate_session_buffers(Air10Edf::brp_schema(tcv), Air10Edf::pld_schema()) &&
-        save_pending(false, 0);
+        begin_segment_files(Air10Edf::brp_schema(tcv), Air10Edf::pld_schema());
     if (!opened) {
         capture_active = false;
         release_streams();
@@ -2603,17 +2671,19 @@ static void stop_session(const ControlEvent &event) {
         // Do not create an empty next-day segment for a stop exactly at noon.
         if (relative_ms(event.captured_ms) > segment_duration_ms)
             (void)advance_segment(event.captured_ms - 1);
-        if (status.active) close_segment(event.captured_ms, false);
+        if (status.active) close_segment(event.captured_ms, false, event.confirmed_end);
     }
 
     portENTER_CRITICAL(&status_mux);
     status.active = false;
-    status.post_processing = false;
+    // Keep clock synchronization out of the gap before the first STR check.
+    status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
     SdStorage::refresh_usage();
     if (recording_storage_owned) release_storage();
     recording_storage_owned = false;
     next_pending_ms = 0;
+    next_start_ms = 0;
 }
 
 static void process_pending() {
@@ -2697,42 +2767,94 @@ static void process_pending() {
     }
 }
 
+static bool prepare_storage() {
+    if (storage_ready) return true;
+    if (next_storage_ms && int32_t(millis() - next_storage_ms) < 0) return false;
+    const system_state_t state = Arbiter::get_state();
+    if (state != SYS_IDLE && state != SYS_THERAPY) return false;
+    next_storage_ms = millis() + 5000;
+    if (!acquire_storage()) return false;
+    SdStorage::init();
+    storage = SdStorage::filesystem();
+    if (storage) {
+        recover_partial_outputs();
+        recover_identification_files();
+        recover_str_file();
+        recover_pending();
+        EdfCatalog::init();
+        EdfCatalog::Status catalog;
+        EdfCatalog::get_status(catalog);
+        if (catalog.ready) {
+            storage_ready = reconcile_catalog();
+        }
+    }
+    release_storage();
+    if (storage_ready) ExportSync::init();
+    return storage_ready;
+}
+
+static void retry_recording() {
+    if (status.active || !storage_ready ||
+        !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
+        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1 ||
+        (next_start_ms && int32_t(millis() - next_start_ms) < 0)) return;
+    const ControlEvent event = {ControlKind::Start,
+        static_cast<uint32_t>(time(nullptr)), millis(), WiFiSetup::time_synced()};
+    start_session(event);
+}
+
 static void recorder_task(void *) {
     while (true) {
+        const bool have_storage = prepare_storage();
         ControlEvent control;
         while (xQueueReceive(control_queue, &control, 0) == pdTRUE) {
-            if (control.kind == ControlKind::Start) start_session(control);
+            if (control.kind == ControlKind::Start) {
+                if (have_storage) start_session(control);
+            }
             else stop_session(control);
         }
 
+        // The latest desired state survives a full control queue.
+        if (status.active && !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE)) {
+            portENTER_CRITICAL(&status_mux);
+            control = latest_stop;
+            portEXIT_CRITICAL(&status_mux);
+            stop_session(control);
+        }
+        if (status.active) {
+            portENTER_CRITICAL(&status_mux);
+            const bool restarted = recording_therapy_on_ms != therapy_on_capture_ms;
+            control = latest_stop;
+            portEXIT_CRITICAL(&status_mux);
+            if (restarted) stop_session(control);
+        }
+        retry_recording();
+
         RawFrame raw;
         if (xQueueReceive(raw_queue, &raw, pdMS_TO_TICKS(20)) == pdTRUE) {
+            uint16_t processed = 0;
             do {
                 if (status.active) process_raw_frame(raw);
-            } while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE);
+            } while (++processed < raw_queue_capacity &&
+                     __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) &&
+                     xQueueReceive(raw_queue, &raw, 0) == pdTRUE);
         }
-        if (status.active) (void)advance_segment(millis());
-        sample_pld();
-        sample_oximetry();
+        if (uxQueueMessagesWaiting(raw_queue) == 0) {
+            if (status.active) (void)advance_segment(millis());
+            sample_pld();
+            sample_oximetry();
+        }
         if (status.active) update_record_status();
-        else process_pending();
+        else if (have_storage) process_pending();
     }
 }
 
 }  // namespace
 
 void init() {
-    if (status.ready || !SdStorage::mounted()) return;
-    storage = SdStorage::filesystem();
-    if (!storage) return;
+    if (status.ready) return;
     if (!storage_mutex) storage_mutex = xSemaphoreCreateMutex();
     if (!storage_mutex) { status_error("storage mutex allocation failed"); return; }
-    recover_partial_outputs();
-    recover_identification_files();
-    recover_str_file();
-    recover_pending();
-    EdfCatalog::init();
-    reconcile_catalog();
 
     raw_queue_capacity = RAW_QUEUE_CAPACITY_PSRAM;
     raw_queue_storage = static_cast<uint8_t *>(heap_caps_malloc(
@@ -2753,6 +2875,11 @@ void init() {
     control_queue = xQueueCreate(4, sizeof(ControlEvent));
     if (!raw_queue || !control_queue) {
         status_error("queue initialization failed");
+        if (raw_queue) vQueueDelete(raw_queue);
+        if (control_queue) vQueueDelete(control_queue);
+        raw_queue = control_queue = nullptr;
+        heap_caps_free(raw_queue_storage);
+        raw_queue_storage = nullptr;
         return;
     }
     for (LiveStream::internal_handle_t &lease : stream_leases) lease = -1;
@@ -2760,13 +2887,26 @@ void init() {
                                                   frame_sink, nullptr);
     if (frame_listener < 0) {
         status_error("UART listener allocation failed");
+        vQueueDelete(raw_queue); vQueueDelete(control_queue);
+        raw_queue = control_queue = nullptr;
+        heap_caps_free(raw_queue_storage);
+        raw_queue_storage = nullptr;
         return;
     }
-    if (xTaskCreatePinnedToCore(recorder_task, "edf_rec", RECORDER_STACK,
-                                nullptr, 2, &recorder_task_handle, 1) != pdPASS) {
+    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+        recorder_task, "edf_rec", RECORDER_STACK, nullptr, 2,
+        &recorder_task_handle, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS)
+        created = xTaskCreatePinnedToCore(recorder_task, "edf_rec", RECORDER_STACK,
+                                         nullptr, 2, &recorder_task_handle, 1);
+    if (created != pdPASS) {
         Arbiter::remove_frame_listener(frame_listener);
         frame_listener = -1;
         status_error("task creation failed");
+        vQueueDelete(raw_queue); vQueueDelete(control_queue);
+        raw_queue = control_queue = nullptr;
+        heap_caps_free(raw_queue_storage);
+        raw_queue_storage = nullptr;
         return;
     }
 
@@ -2780,24 +2920,34 @@ void init() {
 }
 
 void therapy_started() {
-    if (!status.ready || !control_queue) return;
+    const uint32_t captured_ms = millis();
+    portENTER_CRITICAL(&status_mux);
+    therapy_on_capture_ms = captured_ms;
+    portEXIT_CRITICAL(&status_mux);
+    __atomic_store_n(&therapy_wanted, true, __ATOMIC_RELEASE);
     __atomic_store_n(&therapy_start_pending, true, __ATOMIC_RELEASE);
+    if (!status.ready || !control_queue) return;
     const bool trusted_time = WiFiSetup::time_synced();
     ControlEvent event = {ControlKind::Start,
-                          static_cast<uint32_t>(time(nullptr)), millis(),
+                          static_cast<uint32_t>(time(nullptr)), captured_ms,
                           trusted_time};
     if (xQueueSend(control_queue, &event, 0) != pdTRUE) {
-        __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
         status_error("control queue full at therapy start");
     }
 }
 
 void therapy_ended() {
-    if (!status.ready || !control_queue) return;
     const bool trusted_time = WiFiSetup::time_synced();
     ControlEvent event = {ControlKind::Stop,
                           static_cast<uint32_t>(time(nullptr)), millis(),
-                          trusted_time};
+                          trusted_time,
+                          Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0};
+    portENTER_CRITICAL(&status_mux);
+    latest_stop = event;
+    portEXIT_CRITICAL(&status_mux);
+    __atomic_store_n(&therapy_wanted, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
+    if (!status.ready || !control_queue) return;
     if (xQueueSend(control_queue, &event, 0) != pdTRUE)
         status_error("control queue full at therapy stop");
 }

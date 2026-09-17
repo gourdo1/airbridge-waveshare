@@ -267,7 +267,6 @@ void setup() {
     LiveStream::init();
     LiveWebConsumer::init();
     EdfRecorder::init();
-    ExportSync::init();
 
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }
@@ -360,6 +359,14 @@ static void sync_resmed_clock() {
 
 void loop() {
     serial_poll();
+
+#if AB_STORAGE_HAS_SDCARD
+    static uint32_t recorder_retry_ms = 0;
+    if (millis() - recorder_retry_ms >= 5000) {
+        recorder_retry_ms = millis();
+        EdfRecorder::init();
+    }
+#endif
 
     OtaManager::handle();
     WiFiSetup::check();

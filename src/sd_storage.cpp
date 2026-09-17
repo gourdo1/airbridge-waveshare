@@ -21,9 +21,18 @@ static Status status = {
 };
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 
+#if AB_STORAGE_HAS_SDCARD
+static void mount_error(const char *message) {
+    portENTER_CRITICAL(&status_mux);
+    strncpy(status.error, message, sizeof(status.error) - 1);
+    status.error[sizeof(status.error) - 1] = 0;
+    portEXIT_CRITICAL(&status_mux);
+}
+#endif
+
 void init() {
 #if AB_STORAGE_HAS_SDCARD
-    if (status.mounted) return;
+    if (mounted()) return;
 
     bool pins_ok;
     if (AB_SDMMC_WIDTH == 1) {
@@ -35,32 +44,36 @@ void init() {
                                  AB_SDMMC_D2_GPIO, AB_SDMMC_D3_GPIO);
     }
     if (!pins_ok) {
-        strncpy(status.error, "pin configuration failed", sizeof(status.error) - 1);
+        mount_error("pin configuration failed");
         Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] pin configuration failed\n");
         return;
     }
 
     const bool one_bit = AB_SDMMC_WIDTH == 1;
     if (!SD_MMC.begin("/sdcard", one_bit, false, AB_SDMMC_FREQ_KHZ, 8)) {
-        strncpy(status.error, "mount failed", sizeof(status.error) - 1);
+        mount_error("mount failed");
         Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] mount failed\n");
         return;
     }
     if (SD_MMC.cardType() == CARD_NONE) {
         SD_MMC.end();
-        strncpy(status.error, "no card", sizeof(status.error) - 1);
+        mount_error("no card");
         Log::logf(CAT_GENERAL, LOG_WARN, "[SD] no card detected\n");
         return;
     }
 
+    const uint64_t card_bytes = SD_MMC.cardSize();
+    const uint64_t used_bytes = SD_MMC.usedBytes();
+    portENTER_CRITICAL(&status_mux);
     status.mounted = true;
-    status.card_bytes = SD_MMC.cardSize();
-    status.used_bytes = SD_MMC.usedBytes();
+    status.card_bytes = card_bytes;
+    status.used_bytes = used_bytes;
     status.error[0] = 0;
+    portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_GENERAL, LOG_INFO,
               "[SD] mounted width=%u freq=%ukHz size=%lluMB\n",
               AB_SDMMC_WIDTH, AB_SDMMC_FREQ_KHZ,
-              static_cast<unsigned long long>(status.card_bytes / (1024 * 1024)));
+              static_cast<unsigned long long>(card_bytes / (1024 * 1024)));
 #endif
 }
 

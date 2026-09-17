@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "crc.h"
+#include "air10_stored.h"
 
 namespace EdfPending {
 constexpr size_t WIRE_SIZE = 112;
@@ -13,8 +14,28 @@ struct Record {
     uint8_t flags = 0;
     uint16_t native_day = 0, export_day = 0, mid = 0, vid = 0;
     int64_t native_start = 0, export_start = 0, native_end = 0;
+    int64_t mask_start = 0;
     char srn[24] = {}, prefix[16] = {}, day[9] = {};
 };
+
+inline bool matches_interval(const Record &r, const Air10Stored::Value &on,
+                             const Air10Stored::Value &off, uint16_t tolerance) {
+    if (!on.present || !off.present || !(r.flags & NATIVE_VALID)) return false;
+    const int64_t noon = int64_t(r.native_day) * 86400 + 43200;
+    const int64_t start = ((r.mask_start ? r.mask_start : r.native_start) - noon) / 60;
+    const int64_t end = (r.native_end - noon) / 60;
+    if (start < 0 || start >= 1440) return false;
+    if ((r.flags & END_KNOWN) && (end < start || end > 1440)) return false;
+    for (uint8_t i = 0; i < on.sample_count && i < off.sample_count &&
+                        i < Air10Stored::MAX_SAMPLES; i++) {
+        const int16_t a = on.samples[i], b = off.samples[i];
+        if (a < 0 || b < a || b > 1440 || a > start + tolerance || b < start) continue;
+        if (!(r.flags & END_KNOWN)) return true;
+        if (b + tolerance < end) continue;
+        if ((r.flags & SEGMENT_END) || b <= end + tolerance) return true;
+    }
+    return false;
+}
 inline void put(uint8_t *out, uint64_t value, size_t count) {
     for (size_t i = 0; i < count; i++) out[i] = value >> (8 * i);
 }
@@ -40,6 +61,7 @@ inline void encode(const Record &r, uint8_t out[WIRE_SIZE]) {
     put(out + 32, r.native_end, 8);
     memcpy(out + 40, r.srn, 24); memcpy(out + 64, r.prefix, 16);
     memcpy(out + 80, r.day, 9);
+    put(out + 90, r.mask_start, 8);
     put(out + 110, crc16_ccitt(out, 110), 2);
 }
 inline bool decode(const uint8_t *in, size_t length, Record &r) {
@@ -52,11 +74,15 @@ inline bool decode(const uint8_t *in, size_t length, Record &r) {
     r.native_end = get(in + 32, 8);
     memcpy(r.srn, in + 40, 24); memcpy(r.prefix, in + 64, 16);
     memcpy(r.day, in + 80, 9);
+    r.mask_start = get(in + 90, 8);
+    if (!r.mask_start) r.mask_start = r.native_start;
     return !(r.flags & ~15u) && r.srn[23] == 0 && r.srn[0] &&
            (!(r.flags & NATIVE_VALID) ||
             (r.native_day >= 0x1000 && r.native_day < 0xffff &&
              r.native_start >= int64_t(r.native_day) * 86400 + 43200 &&
-             r.native_start < int64_t(r.native_day + 1) * 86400 + 43200)) &&
+             r.native_start < int64_t(r.native_day + 1) * 86400 + 43200 &&
+             r.mask_start >= int64_t(r.native_day) * 86400 + 43200 &&
+             r.mask_start <= r.native_start)) &&
            r.export_day >= 0x1000 && r.export_day < 0xffff &&
            (!(r.flags & END_KNOWN) || r.native_end >= r.native_start) &&
            valid_name(r.prefix, sizeof(r.prefix), true) &&
