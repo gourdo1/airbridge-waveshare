@@ -19,6 +19,7 @@
 #include "air10_edf.h"
 #include "air10_stored.h"
 #include "air10_str_timeline.h"
+#include "air10_clock.h"
 #include "crc.h"
 #include "debug_log.h"
 #include "edf_catalog.h"
@@ -28,6 +29,7 @@
 #include "qframe.h"
 #include "sd_storage.h"
 #include "uart_arbiter.h"
+#include "wifi.h"
 
 namespace EdfRecorder {
 namespace {
@@ -70,6 +72,7 @@ struct ControlEvent {
     ControlKind kind;
     uint32_t epoch;
     uint32_t captured_ms;
+    bool trusted_time;
 };
 
 struct StreamField {
@@ -146,7 +149,8 @@ static uint8_t *record_buffer = nullptr;
 static size_t record_capacity = 0;
 
 static uint32_t session_start_capture_ms = 0;
-static uint32_t session_start_seconds_of_day = 0;
+static Air10Clock::Anchor session_clock;
+static uint16_t session_native_day = 0;
 static char recording_id[81] = {};
 static char start_date[9] = {};
 static char start_time[9] = {};
@@ -303,7 +307,7 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
         uart_transaction_result_t result = {};
         if (Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
                                   policy, stored_value_sink, &capture,
-                                  &result) &&
+                                  &result, sizeof(capture)) &&
             result.success && capture.received &&
             Air10Stored::parse_value(capture.payload, capture.payload_len,
                                      value)) {
@@ -346,39 +350,50 @@ static int32_t civil_epoch_day(int year, unsigned month, unsigned day) {
     return era * 146097 + static_cast<int>(day_of_era) - 719468;
 }
 
-static bool expected_mask_off_minute(uint32_t ended_epoch,
-                                     uint16_t &minute) {
-    if (ended_epoch < CLOCK_VALID_AFTER) return false;
-    time_t ended = ended_epoch;
-    struct tm ended_tm;
-    localtime_r(&ended, &ended_tm);
-    int32_t ended_day = civil_epoch_day(ended_tm.tm_year + 1900,
-                                        ended_tm.tm_mon + 1,
-                                        ended_tm.tm_mday);
-    if (ended_tm.tm_hour < 12) ended_day--;
-    if (ended_day < session_epoch_day ||
-        ended_day > static_cast<int32_t>(session_epoch_day) + 1) {
-        return false;
+static bool read_native_clock(int64_t &civil, uint32_t &captured_ms) {
+    for (uint8_t attempt = 0; attempt < 2; attempt++) {
+        uint32_t day_before = 0, day_after = 0, uti = 0;
+        if (!read_u32_variable("UDT", day_before)) return false;
+        const uint32_t started = millis();
+        if (!read_u32_variable("UTI", uti)) return false;
+        captured_ms = started + static_cast<uint32_t>(millis() - started) / 2;
+        if (!read_u32_variable("UDT", day_after)) return false;
+        if (day_before == day_after)
+            return Air10Clock::decode(day_before, uti, civil);
     }
-    if (ended_day != session_epoch_day) {
+    return false;
+}
+
+static bool expected_mask_off_minute(uint32_t ended_ms,
+                                     uint16_t &minute) {
+    if (!session_clock.native_valid) return false;
+    const int64_t ended = session_clock.native_at(ended_ms);
+    const uint16_t ended_day = Air10Clock::therapy_day(ended);
+    if (ended_day < session_native_day || ended_day > session_native_day + 1)
+        return false;
+    if (ended_day != session_native_day) {
         minute = 1440;
         return true;
     }
-    minute = static_cast<uint16_t>(
-        (ended_tm.tm_hour >= 12 ? ended_tm.tm_hour - 12
-                                : ended_tm.tm_hour + 12) * 60 +
-        ended_tm.tm_min);
+    minute = static_cast<uint16_t>((ended + 43200) % 86400 / 60);
     return true;
 }
 
-static bool wait_for_final_str_save(uint32_t ended_epoch) {
+static bool wait_for_final_str_save(uint32_t ended_ms) {
+    int64_t native_now = 0;
+    uint32_t clock_ms = 0;
+    if (!read_native_clock(native_now, clock_ms) ||
+        !session_clock.stable(native_now, clock_ms)) {
+        post_error("STR native clock unavailable or changed during session");
+        return false;
+    }
     uint16_t expected_off = 0;
-    if (!expected_mask_off_minute(ended_epoch, expected_off)) {
+    if (!expected_mask_off_minute(ended_ms, expected_off)) {
         post_error("STR end time invalid");
         return false;
     }
     const uint16_t expected_on = static_cast<uint16_t>(
-        (session_start_seconds_of_day / 60 + 12 * 60) % (24 * 60));
+        (session_clock.native_start + 43200) % 86400 / 60);
 
     const uint32_t started = millis();
     uint32_t observed_generation = 0;
@@ -401,9 +416,9 @@ static bool wait_for_final_str_save(uint32_t ended_epoch) {
             Air10Stored::Value mask_on = {};
             Air10Stored::Value mask_off = {};
             const bool have_mask_on = read_stored_value(
-                "ONT", session_epoch_day, mask_on);
+                "ONT", session_native_day, mask_on);
             const bool have_mask_off = read_stored_value(
-                "OFT", session_epoch_day, mask_off);
+                "OFT", session_native_day, mask_off);
             if (have_mask_on && have_mask_off &&
                 Air10Stored::contains_interval(
                     mask_on, mask_off, expected_on, expected_off,
@@ -940,7 +955,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
     memset(samples, 0xFF, sample_count * sizeof(int16_t));
 
     Air10Stored::Value therapy_duration = {};
-    if (!read_stored_value("THD", session_epoch_day, therapy_duration) ||
+    if (!read_stored_value("THD", session_native_day, therapy_duration) ||
         !therapy_duration.present || therapy_duration.sample_count != 1 ||
         therapy_duration.samples[0] <= 0) {
         heap_caps_free(samples);
@@ -959,10 +974,10 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         Air10Stored::Value value = {};
         if (strcmp(tag, "THD") == 0) {
             value = therapy_duration;
-        } else if (!read_stored_value(tag, session_epoch_day, value)) {
+        } else if (!read_stored_value(tag, session_native_day, value)) {
             Log::logf(CAT_GENERAL, LOG_WARN,
                       "[EDF] STR read failed for %s day=%04X\n",
-                      tag, session_epoch_day);
+                      tag, session_native_day);
             complete = false;
             break;
         }
@@ -975,7 +990,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
             if (strcmp(tag, "LSD") == 0 || strcmp(tag, "THD") == 0) {
                 Log::logf(CAT_GENERAL, LOG_WARN,
                           "[EDF] required STR value missing for %s day=%04X\n",
-                          tag, session_epoch_day);
+                          tag, session_native_day);
                 complete = false;
                 break;
             }
@@ -985,21 +1000,36 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         if (value.sample_count != expected) {
             Log::logf(CAT_GENERAL, LOG_WARN,
                       "[EDF] STR value invalid for %s day=%04X count=%u\n",
-                      tag, session_epoch_day, value.sample_count);
+                      tag, session_native_day, value.sample_count);
             complete = false;
             break;
         }
         if (strcmp(tag, "LSD") == 0 &&
-            static_cast<uint16_t>(value.samples[0]) != session_epoch_day) {
+            static_cast<uint16_t>(value.samples[0]) != session_native_day) {
             Log::logf(CAT_GENERAL, LOG_WARN,
                       "[EDF] STR date mismatch wanted=%04X got=%04X\n",
-                      session_epoch_day,
+                      session_native_day,
                       static_cast<uint16_t>(value.samples[0]));
             complete = false;
             break;
         }
         memcpy(samples + offset, value.samples,
                expected * sizeof(int16_t));
+        if (strcmp(tag, "LSD") == 0) {
+            samples[offset] = static_cast<int16_t>(session_epoch_day);
+        } else if (strcmp(tag, "ONT") == 0 || strcmp(tag, "OFT") == 0) {
+            for (uint16_t i = 0; i < expected; i++) {
+                uint16_t corrected = 0;
+                if (!session_clock.mask_minute(
+                        static_cast<uint16_t>(samples[offset + i]), corrected)) {
+                    post_error("STR clock correction crosses therapy-day boundary");
+                    complete = false;
+                    break;
+                }
+                samples[offset + i] = static_cast<int16_t>(corrected);
+            }
+            if (!complete) break;
+        }
         offset += expected;
     }
 
@@ -2069,9 +2099,10 @@ static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
 
 static uint32_t csr_onset(const RawFrame &raw, int32_t event_time) {
     const uint32_t arrival = relative_ms(raw.captured_ms) / 1000;
-    if (event_time < 0 || event_time >= 86400) return arrival;
+    if (!session_clock.native_valid || event_time < 0 || event_time >= 86400)
+        return arrival;
     int32_t candidate = static_cast<int32_t>(event_time) -
-                        static_cast<int32_t>(session_start_seconds_of_day);
+                        static_cast<int32_t>(session_clock.native_start % 86400);
     while (candidate < 0) candidate += 86400;
     while (candidate + 43200 < static_cast<int32_t>(arrival)) candidate += 86400;
     while (candidate > static_cast<int32_t>(arrival) + 43200) candidate -= 86400;
@@ -2194,20 +2225,42 @@ static void clear_session_memory(bool remove_partial) {
 
 static bool make_paths_and_metadata(const ControlEvent &event,
                                     uint16_t &mid, uint16_t &vid) {
-    if (event.epoch < CLOCK_VALID_AFTER) {
+    session_clock = {};
+    session_clock.captured_ms = event.captured_ms;
+    int64_t native_now = 0;
+    uint32_t clock_ms = 0;
+    session_clock.native_valid = read_native_clock(native_now, clock_ms);
+    if (session_clock.native_valid) {
+        session_clock.native_start = native_now -
+            static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
+        session_native_day = Air10Clock::therapy_day(session_clock.native_start);
+    }
+    const bool trusted_time = event.trusted_time && event.epoch >= CLOCK_VALID_AFTER;
+    if (!trusted_time && !session_clock.native_valid && event.epoch < CLOCK_VALID_AFTER) {
         status_error("clock is not set");
         return false;
     }
     time_t start_epoch = event.epoch;
     struct tm start_tm;
     localtime_r(&start_epoch, &start_tm);
+    if (!trusted_time && session_clock.native_valid) {
+        start_epoch = static_cast<time_t>(session_clock.native_start);
+        gmtime_r(&start_epoch, &start_tm);
+    }
+    session_clock.export_start = static_cast<int64_t>(civil_epoch_day(
+        start_tm.tm_year + 1900, start_tm.tm_mon + 1, start_tm.tm_mday)) * 86400 +
+        start_tm.tm_hour * 3600 + start_tm.tm_min * 60 + start_tm.tm_sec;
+    Log::logf(CAT_GENERAL, LOG_INFO,
+              "[EDF] clock=%s native=%u correction=%llds\n",
+              trusted_time ? "NTP" : session_clock.native_valid ? "ResMed" : "ESP fallback",
+              session_clock.native_valid,
+              session_clock.native_valid
+                  ? session_clock.export_start - session_clock.native_start : 0LL);
     snprintf(start_date, sizeof(start_date), "%02d.%02d.%02d",
              start_tm.tm_mday, start_tm.tm_mon + 1,
              (start_tm.tm_year + 1900) % 100);
     snprintf(start_time, sizeof(start_time), "%02d.%02d.%02d",
              start_tm.tm_hour, start_tm.tm_min, start_tm.tm_sec);
-    session_start_seconds_of_day = start_tm.tm_hour * 3600 +
-                                   start_tm.tm_min * 60 + start_tm.tm_sec;
 
     struct tm therapy_tm = start_tm;
     if (therapy_tm.tm_hour < 12) {
@@ -2393,7 +2446,7 @@ static void stop_session(const ControlEvent &event) {
     const bool identification_ready = !post_processing_cancelled() &&
                                       write_identification();
     const bool str_ready = !post_processing_cancelled() &&
-                           wait_for_final_str_save(event.epoch) &&
+                           wait_for_final_str_save(event.captured_ms) &&
                            update_str_summary();
     const bool interrupted = post_processing_cancelled();
     EdfCatalog::Entry catalog_entry;
@@ -2494,8 +2547,10 @@ void init() {
 void therapy_started() {
     if (!status.ready || !control_queue) return;
     __atomic_store_n(&therapy_start_pending, true, __ATOMIC_RELEASE);
+    const bool trusted_time = WiFiSetup::time_synced();
     ControlEvent event = {ControlKind::Start,
-                          static_cast<uint32_t>(time(nullptr)), millis()};
+                          static_cast<uint32_t>(time(nullptr)), millis(),
+                          trusted_time};
     if (xQueueSend(control_queue, &event, 0) != pdTRUE) {
         __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
         status_error("control queue full at therapy start");
@@ -2504,8 +2559,10 @@ void therapy_started() {
 
 void therapy_ended() {
     if (!status.ready || !control_queue) return;
+    const bool trusted_time = WiFiSetup::time_synced();
     ControlEvent event = {ControlKind::Stop,
-                          static_cast<uint32_t>(time(nullptr)), millis()};
+                          static_cast<uint32_t>(time(nullptr)), millis(),
+                          trusted_time};
     if (xQueueSend(control_queue, &event, 0) != pdTRUE)
         status_error("control queue full at therapy stop");
 }

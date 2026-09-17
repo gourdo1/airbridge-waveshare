@@ -33,6 +33,8 @@ static uint8_t *framed_tx_storage = nullptr;
 static bool framed_accepting = false;
 static bool framed_queue_failed = false;
 static uint32_t framed_sink_inflight = 0;
+static uint32_t framed_generation = 0;
+static portMUX_TYPE framed_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     char tag[4];
@@ -60,21 +62,30 @@ static bool framed_queue_init() {
         framed_tx_storage = nullptr;
         return false;
     }
-    __atomic_store_n(&framed_accepting, true, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&framed_mux);
+    framed_generation++;
+    framed_accepting = true;
+    portEXIT_CRITICAL(&framed_mux);
     __atomic_store_n(&framed_queue_failed, false, __ATOMIC_RELEASE);
     return true;
 }
 
-static bool framed_enqueue(const qframe_t *frame, void *) {
-    __atomic_fetch_add(&framed_sink_inflight, 1, __ATOMIC_ACQ_REL);
-    QueueHandle_t queue = framed_tx_queue;
-    bool accepting = __atomic_load_n(&framed_accepting, __ATOMIC_ACQUIRE) &&
-                     queue;
-    bool queued = accepting && xQueueSend(queue, frame, 0) == pdTRUE;
-    if (accepting && !queued) {
+static bool framed_enqueue(const qframe_t *frame, void *context) {
+    portENTER_CRITICAL(&framed_mux);
+    bool accepting = framed_accepting &&
+        (!context || *static_cast<const uint32_t *>(context) == framed_generation);
+    QueueHandle_t queue = accepting ? framed_tx_queue : nullptr;
+    if (queue) framed_sink_inflight++;
+    portEXIT_CRITICAL(&framed_mux);
+    if (!queue) return false;
+
+    bool queued = xQueueSend(queue, frame, 0) == pdTRUE;
+    if (!queued) {
         __atomic_store_n(&framed_queue_failed, true, __ATOMIC_RELEASE);
     }
-    __atomic_fetch_sub(&framed_sink_inflight, 1, __ATOMIC_ACQ_REL);
+    portENTER_CRITICAL(&framed_mux);
+    framed_sink_inflight--;
+    portEXIT_CRITICAL(&framed_mux);
     return queued;
 }
 
@@ -108,8 +119,12 @@ static bool framed_flush() {
 }
 
 static void framed_queue_shutdown() {
-    __atomic_store_n(&framed_accepting, false, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&framed_sink_inflight, __ATOMIC_ACQUIRE) != 0) {
+    while (true) {
+        portENTER_CRITICAL(&framed_mux);
+        framed_accepting = false;
+        bool busy = framed_sink_inflight != 0;
+        portEXIT_CRITICAL(&framed_mux);
+        if (!busy) break;
         vTaskDelay(1);
     }
     if (framed_tx_queue) vQueueDelete(framed_tx_queue);
@@ -343,6 +358,12 @@ static void handle_framed() {
 
         if (active) {
             if (!Arbiter::transaction_done(active)) {
+                if (Arbiter::transaction_expired(active)) {
+                    Arbiter::cancel_transaction(active);
+                    active = nullptr;
+                    framed_enqueue_text(QFRAME_TYPE_E, "AIRBRIDGE TIMEOUT");
+                    continue;
+                }
                 vTaskDelay(1);
                 continue;
             }
@@ -413,7 +434,9 @@ static void handle_framed() {
                     framed_response_policy(request);
                 active = Arbiter::begin_frame(raw, (uint16_t)raw_len,
                                               CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                              policy, framed_enqueue, nullptr);
+                                              policy, framed_enqueue,
+                                              &framed_generation,
+                                              sizeof(framed_generation));
                 if (!active) {
                     framed_enqueue_text(QFRAME_TYPE_E,
                                         "AIRBRIDGE UART BUSY");
@@ -434,7 +457,9 @@ static void handle_framed() {
         vTaskDelay(1);
     }
 
-    __atomic_store_n(&framed_accepting, false, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&framed_mux);
+    framed_accepting = false;
+    portEXIT_CRITICAL(&framed_mux);
     if (active) {
         Arbiter::cancel_transaction(active);
     }

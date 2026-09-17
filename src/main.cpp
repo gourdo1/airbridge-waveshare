@@ -18,6 +18,7 @@
 #include "edf_recorder.h"
 #include "export_sync.h"
 #include "custom_settings.h"
+#include "device_uptime.h"
 #include "board.h"
 #if defined(AB_BOARD_WROOM_S3)
 #include "hal/usb_serial_jtag_ll.h"
@@ -73,7 +74,7 @@ static void serial_poll() {
 }
 
 // Health monitoring:
-//   ROP every 10s to detect therapy state
+//   ROP/STK every 10s to detect therapy state and device restarts
 //   MHR every 30 min and once on therapy stop
 #define HEALTH_POLL_INTERVAL_MS     10000
 #define HEALTH_TIMEOUT_MS           500
@@ -87,6 +88,29 @@ static uint32_t airsense_seen_ms = 0;
 static std::atomic<bool> clock_sync_pending{true};
 static uint32_t clock_sync_attempt_ms = 0;
 static std::atomic<bool> clock_sync_attempted{false};
+static DeviceUptime::Tracker device_uptime;
+
+static void poll_device_uptime() {
+    char response[48] = {};
+    uint16_t length = sizeof(response);
+    if (!Arbiter::send_cmd("G S #STK", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
+                           response, &length, HEALTH_TIMEOUT_MS)) return;
+    uint32_t ticks = 0;
+    if (!DeviceUptime::parse(qframe_response_value(response), ticks) ||
+        !device_uptime.observe(ticks, millis())) return;
+
+    Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] AirSense restart detected by STK\n");
+    Config::invalidate_device_info();
+    CustomSettings::invalidate("STK reset");
+    LiveStream::reattach();
+    clock_sync_pending = true;
+    clock_sync_attempted = false;
+    Arbiter::set_cached_mhr(-1);
+    if (Arbiter::get_state() == SYS_THERAPY) {
+        EdfRecorder::therapy_ended();
+        Arbiter::set_state(SYS_IDLE);
+    }
+}
 
 static void poll_mhr() {
     char mhr_resp[32] = {};
@@ -126,6 +150,7 @@ static void poll_therapy_state() {
         airsense_present = rv && (strcmp(rv, "0000") == 0 || strcmp(rv, "0001") == 0);
         if (airsense_present) {
             airsense_seen_ms = millis();
+            poll_device_uptime();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = Arbiter::get_cached_rop();
             Arbiter::set_cached_rop(new_rop);
@@ -320,6 +345,13 @@ static void sync_resmed_clock() {
     if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
     system_state_t st = Arbiter::get_state();
     if (st != SYS_IDLE && st != SYS_THERAPY) return;
+#if AB_STORAGE_HAS_SDCARD
+    EdfRecorder::Status recorder;
+    EdfRecorder::get_status(recorder);
+    // Keep the native STR clock stable until the session summary is collected.
+    if (recorder.ready && (st == SYS_THERAPY || recorder.active ||
+                           recorder.post_processing)) return;
+#endif
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;

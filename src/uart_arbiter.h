@@ -74,7 +74,8 @@ namespace Arbiter {
                                   cmd_priority_t prio,
                                   const uart_response_policy_t &policy,
                                   uart_frame_sink_t sink = nullptr,
-                                  void *sink_context = nullptr);
+                                  const void *sink_context = nullptr,
+                                  size_t context_size = 0);
 
     uart_transaction_t *begin_frame(const uint8_t *frame,
                                     uint16_t frame_len,
@@ -82,15 +83,20 @@ namespace Arbiter {
                                     cmd_priority_t prio,
                                     const uart_response_policy_t &policy,
                                     uart_frame_sink_t sink = nullptr,
-                                    void *sink_context = nullptr);
+                                    const void *sink_context = nullptr,
+                                    size_t context_size = 0);
 
     // The caller owns a returned transaction until exactly one successful
-    // finish_transaction() or cancel_transaction() call. Cancellation waits
-    // until the arbiter can no longer invoke the transaction sink.
+    // finish_transaction() or cancel_transaction() call. Context is a copied
+    // POD value owned by the transaction; it must not reference caller storage.
+    // Cancellation detaches immediately, including from an active transaction.
     bool transaction_done(const uart_transaction_t *transaction);
+    bool transaction_expired(const uart_transaction_t *transaction);
     bool finish_transaction(uart_transaction_t *transaction,
                             uart_transaction_result_t *result,
-                            uint32_t wait_ms = 0);
+                            uint32_t wait_ms = 0,
+                            void *context_out = nullptr,
+                            size_t context_size = 0);
     void cancel_transaction(uart_transaction_t *transaction);
 
     bool transact_cmd(const char *cmd,
@@ -99,7 +105,8 @@ namespace Arbiter {
                       const uart_response_policy_t &policy,
                       uart_frame_sink_t sink,
                       void *sink_context,
-                      uart_transaction_result_t *result);
+                      uart_transaction_result_t *result,
+                      size_t context_size);
 
     uart_frame_listener_t add_frame_listener(qframe_type_mask_t types,
                                              uart_frame_sink_t sink,

@@ -86,3 +86,5 @@ int         hex_nibble(uint8_t c);
 uint8_t     nibble_hex(uint8_t n);
 
 const char *qframe_response_value(const char *resp);
+bool qframe_response_matches(const uint8_t *request, size_t request_len,
+                              const qframe_t &response);

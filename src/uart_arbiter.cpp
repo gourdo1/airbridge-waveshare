@@ -4,6 +4,7 @@
 #include "live_stream.h"
 #include "custom_settings.h"
 #include <freertos/queue.h>
+#include <atomic>
 
 #define ARBITER_QUEUE_DEPTH     8
 #define ARBITER_TASK_STACK      4096
@@ -18,7 +19,6 @@ static HardwareSerial *uart = nullptr;
 static TaskHandle_t arbiter_task_handle = nullptr;
 static TaskHandle_t rx_task_handle = nullptr;
 
-static SemaphoreHandle_t cleanup_mutex = nullptr;
 static SemaphoreHandle_t rx_ready = nullptr;
 
 static volatile system_state_t sys_state = SYS_IDLE;
@@ -82,16 +82,18 @@ struct uart_transaction_t {
     uart_response_policy_t policy;
     uart_frame_sink_t sink;
     void *sink_context;
+    size_t context_size;
+    uint32_t queued_ms;
+    unsigned references;
 
     uart_transaction_result_t result;
 
     bool completed;
     bool cancelled;
-    bool auto_release;
     SemaphoreHandle_t done;
 };
 
-static volatile uart_transaction_t *current_ticket = nullptr;
+static std::atomic<uart_transaction_t *> current_ticket{nullptr};
 
 
 typedef struct {
@@ -102,6 +104,28 @@ typedef struct {
 } prio_queue_t;
 
 static prio_queue_t pq;
+
+static void release_ticket(uart_transaction_t *t) {
+    if (__atomic_sub_fetch(&t->references, 1, __ATOMIC_ACQ_REL) == 0) {
+        if (t->done) vSemaphoreDelete(t->done);
+        free(t);
+    }
+}
+
+static bool pq_remove(uart_transaction_t *t) {
+    bool removed = false;
+    xSemaphoreTake(pq.mutex, portMAX_DELAY);
+    for (int i = 0; i < pq.count; i++) {
+        if (pq.tickets[i] != t) continue;
+        for (int j = i; j + 1 < pq.count; j++) pq.tickets[j] = pq.tickets[j + 1];
+        pq.count--;
+        xSemaphoreTake(pq.available, 0);
+        removed = true;
+        break;
+    }
+    xSemaphoreGive(pq.mutex);
+    return removed;
+}
 
 static void pq_init() {
     pq.count = 0;
@@ -127,6 +151,11 @@ static uart_transaction_t* pq_pop(TickType_t wait) {
     }
     xSemaphoreTake(pq.mutex, portMAX_DELAY);
 
+    // Cancellation may remove a ticket after this task took its wake token.
+    if (pq.count == 0) {
+        xSemaphoreGive(pq.mutex);
+        return nullptr;
+    }
     // highest prio value wins, then FIFO by ticket_id
     int best = 0;
     for (int i = 1; i < pq.count; i++) {
@@ -637,16 +666,9 @@ static void rx_task(void *param) {
 static void lcd_check();
 
 static void finish_ticket(uart_transaction_t *t) {
-    xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
     __atomic_store_n(&t->completed, true, __ATOMIC_RELEASE);
-    if (t->auto_release) {
-        xSemaphoreGive(cleanup_mutex);
-        if (t->done) vSemaphoreDelete(t->done);
-        free(t);
-    } else {
-        xSemaphoreGive(t->done);
-        xSemaphoreGive(cleanup_mutex);
-    }
+    if (t->done) xSemaphoreGive(t->done);
+    release_ticket(t);
 }
 
 static uint32_t transaction_wait_ms(const uart_transaction_t *t,
@@ -656,8 +678,9 @@ static uint32_t transaction_wait_ms(const uart_transaction_t *t,
                                     bool *idle_wait) {
     uint32_t now = millis();
     uint32_t elapsed = (uint32_t)(now - started_ms);
-    uint32_t overall_left = elapsed < t->policy.overall_timeout_ms
-                          ? t->policy.overall_timeout_ms - elapsed : 0;
+    uint32_t total_elapsed = (uint32_t)(now - t->queued_ms);
+    uint32_t overall_left = total_elapsed < t->policy.overall_timeout_ms
+                          ? t->policy.overall_timeout_ms - total_elapsed : 0;
     *idle_wait = false;
     if (!overall_left) return 0;
 
@@ -670,7 +693,7 @@ static uint32_t transaction_wait_ms(const uart_transaction_t *t,
         uint32_t idle_elapsed = (uint32_t)(now - last_accepted_ms);
         uint32_t idle_left = idle_elapsed < t->policy.interframe_timeout_ms
                            ? t->policy.interframe_timeout_ms - idle_elapsed : 0;
-        *idle_wait = true;
+        *idle_wait = idle_left <= overall_left;
         return min(overall_left, idle_left);
     }
     return overall_left;
@@ -685,6 +708,12 @@ static void arbiter_task(void *param) {
         }
 
         if (__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE)) {
+            finish_ticket(t);
+            continue;
+        }
+        if ((uint32_t)(millis() - t->queued_ms) >= t->policy.overall_timeout_ms) {
+            t->result.timed_out = true;
+            stat_timeout++;
             finish_ticket(t);
             continue;
         }
@@ -757,7 +786,8 @@ static void arbiter_task(void *param) {
                 qframe_t rx;
                 uint32_t wait_slice_ms = min(wait_ms, (uint32_t)50);
                 if (!Arbiter::wait_frame(&rx, wait_slice_ms)) {
-                    if (__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE)) break;
+                    // Keep draining a sent command after caller cancellation.
+                    // Its late response must not complete the next ticket.
                     if (wait_slice_ms < wait_ms) continue;
                     if (idle_wait && accepted_any) {
                         t->result.success = saw_success;
@@ -768,12 +798,11 @@ static void arbiter_task(void *param) {
                     break;
                 }
 
-                if (__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE)) break;
-
                 qframe_type_mask_t mask = qframe_type_mask(rx.type);
                 qframe_type_mask_t accepted = t->policy.accepted_types |
                                                QFRAME_MASK_E;
-                if (!mask || !(accepted & mask)) {
+                if (!mask || !(accepted & mask) ||
+                    !qframe_response_matches(t->frame, t->frame_len, rx)) {
                     Log::logf(CAT_ARB, LOG_WARN,
                               "[ARB] Ignored unexpected RX type=%c (%s) ticket=%lu\n",
                               (char)rx.type, qframe_type_name(rx.type),
@@ -785,7 +814,8 @@ static void arbiter_task(void *param) {
                 last_accepted_ms = millis();
                 t->result.frame_count++;
 
-                if (t->sink && !t->sink(&rx, t->sink_context)) {
+                if (t->sink && !__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE) &&
+                    !t->sink(&rx, t->sink_context)) {
                     t->result.sink_failed = true;
                     stat_error++;
                     break;
@@ -818,6 +848,19 @@ static void arbiter_task(void *param) {
             }
         }
 
+        if (t->result.timed_out || t->result.sink_failed) {
+            // Drain trailing frames without holding up the caller. Live frames
+            // bypass this queue and cannot keep recovery waiting indefinitely.
+            uint32_t quiet = millis();
+            uint32_t started = quiet;
+            qframe_t discarded;
+            __atomic_store_n(&t->completed, true, __ATOMIC_RELEASE);
+            if (t->done) xSemaphoreGive(t->done);
+            while ((uint32_t)(millis() - quiet) < 200 &&
+                   (uint32_t)(millis() - started) < 1000) {
+                if (Arbiter::wait_frame(&discarded, 20)) quiet = millis();
+            }
+        }
         current_ticket = nullptr;
         finish_ticket(t);
     }
@@ -831,7 +874,6 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
     current_baud = baud;
 
     rx_ready = xSemaphoreCreateBinary();
-    cleanup_mutex = xSemaphoreCreateMutex();
     qframe_parser_init(&transparent_parser);
     pq_init();
 
@@ -842,7 +884,11 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
 }
 
 static uart_response_policy_t normalize_policy(uart_response_policy_t policy) {
-    if (!policy.accepted_types) return policy;
+    if (!policy.accepted_types) {
+        if (!policy.overall_timeout_ms)
+            policy.overall_timeout_ms = Config::get().uart_cmd_timeout_ms;
+        return policy;
+    }
 
     if (!policy.first_timeout_ms) {
         policy.first_timeout_ms = Config::get().uart_cmd_timeout_ms;
@@ -866,23 +912,30 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
                                              cmd_priority_t prio,
                                              const uart_response_policy_t &policy,
                                              uart_frame_sink_t sink,
-                                             void *sink_context,
-                                             bool auto_release) {
+                                             const void *sink_context,
+                                             bool auto_release,
+                                             size_t context_size = 0) {
     if (!frame || !frame_len || frame_len > QFRAME_MAX_RAW ||
-        !uart_source_allowed(src)) {
+        !uart_source_allowed(src) || (context_size && !sink_context) ||
+        (sink_context && !context_size) || context_size > 4096) {
         return nullptr;
     }
 
     uart_transaction_t *t =
-        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t));
+        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t) + context_size);
     if (!t) return nullptr;
 
     t->source = src;
     t->priority = prio;
     t->policy = normalize_policy(policy);
     t->sink = sink;
-    t->sink_context = sink_context;
-    t->auto_release = auto_release;
+    t->references = auto_release ? 1 : 2;
+    t->queued_ms = millis();
+    t->context_size = context_size;
+    if (context_size) {
+        t->sink_context = t + 1;
+        memcpy(t->sink_context, sink_context, context_size);
+    }
     t->ticket_id = __atomic_fetch_add(&next_ticket_id, 1, __ATOMIC_RELAXED);
     memcpy(t->frame, frame, frame_len);
     t->frame_len = frame_len;
@@ -907,15 +960,15 @@ uart_transaction_t *Arbiter::begin_frame(
         const uint8_t *frame, uint16_t frame_len,
         cmd_source_t src, cmd_priority_t prio,
         const uart_response_policy_t &policy,
-        uart_frame_sink_t sink, void *sink_context) {
+        uart_frame_sink_t sink, const void *sink_context, size_t context_size) {
     return queue_transaction(frame, frame_len, src, prio, policy,
-                             sink, sink_context, false);
+                             sink, sink_context, false, context_size);
 }
 
 uart_transaction_t *Arbiter::begin_cmd(
         const char *cmd, cmd_source_t src, cmd_priority_t prio,
         const uart_response_policy_t &policy,
-        uart_frame_sink_t sink, void *sink_context) {
+        uart_frame_sink_t sink, const void *sink_context, size_t context_size) {
     if (!cmd) return nullptr;
 
 #ifndef FIRMWARE_MIGRATE
@@ -928,7 +981,7 @@ uart_transaction_t *Arbiter::begin_cmd(
     int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
     if (frame_len < 0) return nullptr;
     return begin_frame(frame, (uint16_t)frame_len, src, prio, policy,
-                       sink, sink_context);
+                       sink, sink_context, context_size);
 }
 
 bool Arbiter::transaction_done(const uart_transaction_t *transaction) {
@@ -936,9 +989,15 @@ bool Arbiter::transaction_done(const uart_transaction_t *transaction) {
            __atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE);
 }
 
+bool Arbiter::transaction_expired(const uart_transaction_t *transaction) {
+    return transaction && static_cast<uint32_t>(millis() - transaction->queued_ms) >=
+                          transaction->policy.overall_timeout_ms;
+}
+
 bool Arbiter::finish_transaction(uart_transaction_t *transaction,
                                  uart_transaction_result_t *result,
-                                 uint32_t wait_ms) {
+                                 uint32_t wait_ms, void *context_out,
+                                 size_t context_size) {
     if (!transaction) return false;
 
     if (!__atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE)) {
@@ -948,38 +1007,19 @@ bool Arbiter::finish_transaction(uart_transaction_t *transaction,
         }
     }
 
-    // finish_ticket publishes completion while holding cleanup_mutex. Taking
-    // it here guarantees the arbiter has finished its final access to t.
-    xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
-    xSemaphoreGive(cleanup_mutex);
-
     if (result) *result = transaction->result;
-    vSemaphoreDelete(transaction->done);
-    free(transaction);
+    if (context_out && context_size == transaction->context_size)
+        memcpy(context_out, transaction->sink_context, context_size);
+    release_ticket(transaction);
     return true;
 }
 
 void Arbiter::cancel_transaction(uart_transaction_t *transaction) {
     if (!transaction) return;
 
-    xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
-    bool completed =
-        __atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE);
-    if (!completed) {
-        __atomic_store_n(&transaction->cancelled, true, __ATOMIC_RELEASE);
-    }
-    xSemaphoreGive(cleanup_mutex);
-
-    if (!completed) {
-        xSemaphoreTake(transaction->done, portMAX_DELAY);
-    }
-
-    // The completion store and semaphore give happen while cleanup_mutex is
-    // held. This barrier also covers the case where completion raced cancel.
-    xSemaphoreTake(cleanup_mutex, portMAX_DELAY);
-    xSemaphoreGive(cleanup_mutex);
-    vSemaphoreDelete(transaction->done);
-    free(transaction);
+    __atomic_store_n(&transaction->cancelled, true, __ATOMIC_RELEASE);
+    if (pq_remove(transaction)) release_ticket(transaction);
+    release_ticket(transaction);
 }
 
 bool Arbiter::transact_cmd(const char *cmd,
@@ -988,15 +1028,18 @@ bool Arbiter::transact_cmd(const char *cmd,
                            const uart_response_policy_t &policy,
                            uart_frame_sink_t sink,
                            void *sink_context,
-                           uart_transaction_result_t *result) {
+                           uart_transaction_result_t *result, size_t context_size) {
     uart_response_policy_t normalized = normalize_policy(policy);
     uart_transaction_t *transaction = begin_cmd(cmd, src, prio, normalized,
-                                                sink, sink_context);
+                                                sink, sink_context, context_size);
     if (!transaction) return false;
 
-    uint32_t wait_ms = normalized.overall_timeout_ms + 100;
-    if (!finish_transaction(transaction, result, wait_ms)) {
+    uint32_t elapsed = (uint32_t)(millis() - transaction->queued_ms);
+    uint32_t wait_ms = elapsed < normalized.overall_timeout_ms
+        ? normalized.overall_timeout_ms - elapsed : 0;
+    if (!finish_transaction(transaction, result, wait_ms, sink_context, context_size)) {
         cancel_transaction(transaction);
+        if (result) { *result = {}; result->timed_out = true; }
         return false;
     }
     return true;
@@ -1029,7 +1072,8 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     single_response_capture_t capture = {};
     uart_transaction_result_t result = {};
     bool completed = transact_cmd(cmd, src, prio, policy,
-                                  capture_single_response, &capture, &result);
+                                  capture_single_response, &capture, &result,
+                                  sizeof(capture));
     bool ok = completed && result.success;
 
     if (!capture.received) {

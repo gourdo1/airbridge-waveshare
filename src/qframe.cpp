@@ -228,3 +228,32 @@ const char *qframe_response_value(const char *resp) {
     const char *eq = strstr(resp, "= ");
     return eq ? eq + 2 : NULL;
 }
+
+bool qframe_response_matches(const uint8_t *request, size_t request_len,
+                              const qframe_t &response) {
+    if (!request || request_len < 9 || request[1] != QFRAME_TYPE_Q)
+        return true;
+    if (response.type != QFRAME_TYPE_R && response.type != QFRAME_TYPE_E)
+        return true;
+
+    size_t echo_len = 0;
+    while (echo_len < response.payload_len && response.payload[echo_len] != '=')
+        echo_len++;
+    // Bare errors and stored frames carry no command identity.
+    if (echo_len == response.payload_len) return true;
+    while (echo_len && response.payload[echo_len - 1] == ' ') echo_len--;
+    if (!echo_len) return false;
+
+    size_t pos = 5;
+    const size_t end = request_len - 4;
+    for (size_t i = 0; i < echo_len; i++) {
+        if (pos >= end || request[pos++] != response.payload[i]) return false;
+        if (response.payload[i] == QFRAME_SYNC) {
+            if (pos >= end || request[pos++] != QFRAME_SYNC) return false;
+        }
+    }
+    // CDX setters echo the command and variable, but omit the input value.
+    // Some capability replies omit their index too. Match any echoed args,
+    // without requiring firmware to echo arguments it never sends.
+    return pos == end || request[pos] == ' ';
+}
