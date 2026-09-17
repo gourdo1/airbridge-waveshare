@@ -1,13 +1,5 @@
 # Configuration
 
-Clinical reads and writes use background jobs: `/api/settings` returns HTTP
-202 with a `job` id; poll `GET /api/settings?job=ID` for the final array or save
-result. Concurrent reads share pending work. UART work has a 30-second total
-budget, including queue waits; writes are never automatically resubmitted after
-a timeout. A timeout can mean a partially applied multi-setting write, so read
-back values before retrying. Unread results expire after 30 seconds; delivered
-results can be reclaimed after a short grace period.
-
 Settings are stored in NVS (non-volatile storage) and persist across reboots.
 
 ## How to configure
