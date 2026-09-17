@@ -329,6 +329,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddInt(json, "edf_errors", edf.write_errors);
     fixedJsonAddInt(json, "edf_post_errors", edf.post_errors);
     fixedJsonAddInt(json, "edf_str_records", edf.str_records);
+    fixedJsonAddInt(json, "edf_pending_str", edf.pending_str);
     fixedJsonAddString(json, "edf_identification",
                        edf.identification_ready ? "ready" : "missing");
     fixedJsonAddInt(json, "edf_catalog_entries", catalog.entries);

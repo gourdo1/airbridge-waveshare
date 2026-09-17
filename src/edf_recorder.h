@@ -22,6 +22,7 @@ struct Status {
     uint32_t str_records;
     uint32_t post_errors;
     uint32_t recovered_files;
+    uint32_t pending_str;
     char therapy_day[9];
     char file_prefix[16];
     char last_error[64];
@@ -31,5 +32,8 @@ void init();
 void therapy_started();
 void therapy_ended();
 void get_status(Status &out);
+// Serialize background export with recording, metadata updates and SD recovery.
+bool acquire_storage();
+void release_storage();
 
 }  // namespace EdfRecorder

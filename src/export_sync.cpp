@@ -19,6 +19,7 @@
 #include "background_operation_control.h"
 #include "crc.h"
 #include "debug_log.h"
+#include "edf_recorder.h"
 #include "memory_manager.h"
 #include "sd_storage.h"
 #include "sleephq_sync.h"
@@ -78,6 +79,12 @@ static bool generation_aborted(uint32_t generation) {
     return generation !=
                __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE) ||
            Arbiter::get_cached_rop() == 1;
+}
+
+static bool export_ready(const EdfCatalog::Entry &entry) {
+    constexpr uint8_t required = EdfCatalog::ENTRY_LIVE_COMPLETE |
+        EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
+    return (entry.flags & required) == required;
 }
 
 static void copy_text(char *dst, size_t capacity, const char *src) {
@@ -538,7 +545,7 @@ static bool run_smb(const Request &request) {
                 success = false;
                 break;
             }
-            if (state_marker_exists(config, entry)) continue;
+            if (!export_ready(entry) || state_marker_exists(config, entry)) continue;
             portENTER_CRITICAL(&status_mux);
             copy_text(status.current_day, sizeof(status.current_day),
                       entry.therapy_day);
@@ -655,6 +662,7 @@ static bool run_sleephq(const Request &request) {
             success = false;
             break;
         }
+        if (!export_ready(entry)) continue;
         success = SleepHqSync::sync_session(
             *storage, config, entry, run.operation, progress,
             publish_sleephq_progress, nullptr, error, sizeof(error));
@@ -694,23 +702,34 @@ static void export_task(void *) {
         }
         if (generation_aborted(request.generation)) continue;
 
-        if (request.kind == RequestKind::ManualSmb) {
-            (void)run_smb(request);
-            continue;
+        bool leased = false;
+        while (!generation_aborted(request.generation)) {
+            if (Arbiter::get_state() == SYS_IDLE &&
+                Arbiter::get_cached_rop() == 0 && EdfRecorder::acquire_storage()) {
+                leased = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (request.kind == RequestKind::ManualSleepHq) {
-            (void)run_sleephq(request);
+        if (!leased) continue;
+        if (generation_aborted(request.generation)) {
+            EdfRecorder::release_storage();
             continue;
         }
 
-        const AirBridgeConfig &config = Config::get();
-        if (config.smb_enabled && config.smb_auto_after_therapy)
+        if (request.kind == RequestKind::ManualSmb) {
             (void)run_smb(request);
-        if (!generation_aborted(request.generation) &&
-            config.sleephq_enabled &&
-            config.sleephq_auto_after_therapy) {
+        } else if (request.kind == RequestKind::ManualSleepHq) {
             (void)run_sleephq(request);
+        } else {
+            const AirBridgeConfig &config = Config::get();
+            if (config.smb_enabled && config.smb_auto_after_therapy)
+                (void)run_smb(request);
+            if (!generation_aborted(request.generation) &&
+                config.sleephq_enabled && config.sleephq_auto_after_therapy)
+                (void)run_sleephq(request);
         }
+        EdfRecorder::release_storage();
     }
 }
 

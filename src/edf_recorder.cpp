@@ -20,6 +20,7 @@
 #include "air10_stored.h"
 #include "air10_str_timeline.h"
 #include "air10_clock.h"
+#include "edf_pending.h"
 #include "crc.h"
 #include "debug_log.h"
 #include "edf_catalog.h"
@@ -134,6 +135,10 @@ static volatile bool capture_active = false;
 static volatile bool therapy_start_pending = false;
 
 static fs::FS *storage = nullptr;
+static SemaphoreHandle_t storage_mutex = nullptr;
+static bool recording_storage_owned = false;
+static uint32_t next_pending_ms = 0;
+static char pending_cursor[16] = {};
 static StreamSchema stream_schemas[STREAM_COUNT];
 static LiveStream::internal_handle_t stream_leases[STREAM_COUNT];
 static char wave_tag[4] = "TCE";
@@ -373,34 +378,13 @@ static bool read_native_clock(int64_t &civil, uint32_t &captured_ms) {
     return false;
 }
 
-static bool expected_mask_off_minute(uint32_t ended_ms,
-                                     uint16_t &minute) {
-    if (!session_clock.native_valid) return false;
-    const int64_t ended = session_clock.native_at(ended_ms);
-    const uint16_t ended_day = Air10Clock::therapy_day(ended);
-    if (ended_day < session_native_day || ended_day > session_native_day + 1)
-        return false;
-    if (ended_day != session_native_day) {
-        minute = 1440;
-        return true;
-    }
-    minute = static_cast<uint16_t>((ended + 43200) % 86400 / 60);
-    return true;
-}
-
-static bool wait_for_final_str_save(uint32_t ended_ms) {
-    int64_t native_now = 0;
-    uint32_t clock_ms = 0;
-    if (!read_native_clock(native_now, clock_ms) ||
-        !session_clock.stable(native_now, clock_ms)) {
-        post_error("STR native clock unavailable or changed during session");
-        return false;
-    }
-    uint16_t expected_off = 0;
-    if (!expected_mask_off_minute(ended_ms, expected_off)) {
-        post_error("STR end time invalid");
-        return false;
-    }
+static bool wait_for_final_str_save(const EdfPending::Record &pending) {
+    if ((pending.flags & EdfPending::END_KNOWN) &&
+        pending.native_end < pending.native_start) return false;
+    const uint16_t expected_off = pending.flags & EdfPending::END_KNOWN
+        ? static_cast<uint16_t>(min(int64_t(1440),
+            (pending.native_end - (int64_t(pending.native_day) * 86400 + 43200)) / 60))
+        : UINT16_MAX;
     const uint16_t expected_on = static_cast<uint16_t>(
         (session_clock.native_start + 43200) % 86400 / 60);
 
@@ -428,10 +412,22 @@ static bool wait_for_final_str_save(uint32_t ended_ms) {
                 "ONT", session_native_day, mask_on);
             const bool have_mask_off = read_stored_value(
                 "OFT", session_native_day, mask_off);
-            if (have_mask_on && have_mask_off &&
-                Air10Stored::contains_interval(
+            uint32_t generation_after = 0;
+            const bool have_after = read_u32_variable("ZEN", generation_after);
+            bool recovered_end = false;
+            if (expected_off == UINT16_MAX && have_mask_on && have_mask_off) {
+                for (uint8_t i = 0; i < mask_on.sample_count && i < mask_off.sample_count; i++) {
+                    if (mask_on.samples[i] >= 0 && mask_off.samples[i] >= 0 &&
+                        abs(int(mask_on.samples[i]) - expected_on) <= MASK_OFF_TOLERANCE_MINUTES &&
+                        mask_off.samples[i] >= mask_on.samples[i] && mask_off.samples[i] <= 1440)
+                        recovered_end = true;
+                }
+            }
+            if (have_before && have_after && generation_before == generation_after &&
+                have_mask_on && have_mask_off &&
+                (recovered_end || Air10Stored::contains_interval(
                     mask_on, mask_off, expected_on, expected_off,
-                    MASK_OFF_TOLERANCE_MINUTES)) {
+                    MASK_OFF_TOLERANCE_MINUTES))) {
                 Log::logf(CAT_GENERAL, LOG_INFO,
                           "[EDF] final STR ready mask=%u-%u dt=%lums\n",
                           expected_on, expected_off,
@@ -439,9 +435,6 @@ static bool wait_for_final_str_save(uint32_t ended_ms) {
                 return true;
             }
 
-            uint32_t generation_after = 0;
-            const bool have_after =
-                read_u32_variable("ZEN", generation_after);
             if (have_after) {
                 observed_generation = generation_after;
                 have_generation = true;
@@ -744,6 +737,80 @@ static bool publish_single_file(const char *partial_path,
                   "[EDF] could not remove metadata backup %s\n", backup_path);
     }
     return true;
+}
+
+static void pending_path(const char *prefix, char *path, size_t size) {
+    snprintf(path, size, "/airbridge/pending/%s.str", prefix);
+}
+
+static bool read_pending(const char *path, EdfPending::Record &record) {
+    fs::File file = storage->open(path, FILE_READ);
+    uint8_t bytes[EdfPending::WIRE_SIZE];
+    return file && file.size() == sizeof(bytes) &&
+           file.read(bytes, sizeof(bytes)) == sizeof(bytes) &&
+           EdfPending::decode(bytes, sizeof(bytes), record);
+}
+
+static bool write_pending(const EdfPending::Record &record) {
+    if ((!storage->exists("/airbridge") && !storage->mkdir("/airbridge")) ||
+        (!storage->exists("/airbridge/pending") && !storage->mkdir("/airbridge/pending")))
+        return false;
+    char path[80], part[88], backup[88];
+    pending_path(record.prefix, path, sizeof(path));
+    snprintf(part, sizeof(part), "%s.part", path);
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    uint8_t bytes[EdfPending::WIRE_SIZE];
+    EdfPending::encode(record, bytes);
+    storage->remove(part);
+    fs::File file = storage->open(part, FILE_WRITE);
+    if (!file || !write_exact(file, bytes, sizeof(bytes))) return false;
+    file.flush(); file.close();
+    return publish_single_file(part, path, backup);
+}
+
+static bool save_pending(bool ended, uint32_t ended_ms) {
+    EdfPending::Record pending;
+    pending.flags = session_clock.native_valid ? EdfPending::NATIVE_VALID : 0;
+    pending.native_day = session_native_day;
+    pending.export_day = session_epoch_day;
+    pending.native_start = session_clock.native_start;
+    pending.export_start = session_clock.export_start;
+    pending.mid = session_mid; pending.vid = session_vid;
+    memcpy(pending.srn, session_srn, sizeof(pending.srn));
+    memcpy(pending.prefix, status.file_prefix, sizeof(pending.prefix));
+    memcpy(pending.day, status.therapy_day, sizeof(pending.day));
+    if (ended) {
+        pending.flags |= EdfPending::END_KNOWN;
+        pending.native_end = session_clock.native_at(ended_ms);
+        int64_t native_now = 0;
+        uint32_t clock_ms = 0;
+        if (read_native_clock(native_now, clock_ms) &&
+            !session_clock.stable(native_now, clock_ms))
+            pending.flags |= EdfPending::CLOCK_CHANGED;
+    }
+    if (!write_pending(pending)) {
+        post_error("STR pending journal write failed");
+        return false;
+    }
+    return true;
+}
+
+static void recover_pending() {
+    fs::File dir = storage->open("/airbridge/pending");
+    if (!dir || !dir.isDirectory()) return;
+    fs::File item;
+    while ((item = dir.openNextFile())) {
+        String path = item.path();
+        item.close();
+        if (!path.endsWith(".part") && !path.endsWith(".bak")) continue;
+        String target = path.substring(0, path.lastIndexOf('.'));
+        EdfPending::Record record;
+        if (read_pending(target.c_str(), record)) storage->remove(path);
+        else if (read_pending(path.c_str(), record)) {
+            storage->remove(target);
+            if (!storage->rename(path, target)) post_error("STR journal recovery failed");
+        } else post_error("invalid STR pending journal");
+    }
 }
 
 static void recover_identification_files() {
@@ -1414,7 +1481,10 @@ static bool update_str_summary() {
         post_error("STR record allocation failed");
         return false;
     }
-    const bool success = fetch_str_record(record, record_size) &&
+    uint32_t before = 0, after = 0;
+    const bool success = read_u32_variable("ZEN", before) &&
+                         fetch_str_record(record, record_size) &&
+                         read_u32_variable("ZEN", after) && before == after &&
                          !post_processing_cancelled() &&
                          update_str_file(record);
     heap_caps_free(record);
@@ -2368,12 +2438,21 @@ static void reset_session_state(const ControlEvent &event) {
 static void start_session(const ControlEvent &event) {
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
     if (status.active) return;
+    if (!acquire_storage()) {
+        status_error("storage busy at recording start");
+        return;
+    }
+    recording_storage_owned = true;
     uint16_t mid = 0;
     uint16_t vid = 0;
     portENTER_CRITICAL(&status_mux);
     status.last_error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
-    if (!make_paths_and_metadata(event, mid, vid)) return;
+    if (!make_paths_and_metadata(event, mid, vid)) {
+        recording_storage_owned = false;
+        release_storage();
+        return;
+    }
     resolve_schemas(mid, vid);
 
     const StreamSchema *tce_schema = find_schema("TCE");
@@ -2382,9 +2461,11 @@ static void start_session(const ControlEvent &event) {
     const Air10Edf::Schema &pld_layout = Air10Edf::pld_schema();
 
     reset_session_state(event);
-    if (!allocate_session_buffers(brp_layout, pld_layout)) {
+    if (!allocate_session_buffers(brp_layout, pld_layout) || !save_pending(false, 0)) {
         status_error("session buffer or file initialization failed");
         clear_session_memory(true);
+        recording_storage_owned = false;
+        release_storage();
         return;
     }
 
@@ -2424,6 +2505,7 @@ static void stop_session(const ControlEvent &event) {
     if (!status.active) return;
     capture_active = false;
     release_streams();
+    (void)save_pending(true, event.captured_ms);
 
     RawFrame raw;
     while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE)
@@ -2452,29 +2534,97 @@ static void stop_session(const ControlEvent &event) {
     status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
 
-    const bool identification_ready = !post_processing_cancelled() &&
-                                      write_identification();
-    const bool str_ready = !post_processing_cancelled() &&
-                           wait_for_final_str_save(event.captured_ms) &&
-                           update_str_summary();
-    const bool interrupted = post_processing_cancelled();
     EdfCatalog::Entry catalog_entry;
-    const bool catalog_ready = commit_session_catalog(
-        identification_ready, str_ready, catalog_entry);
+    (void)commit_session_catalog(false, false, catalog_entry);
     SdStorage::refresh_usage();
 
     portENTER_CRITICAL(&status_mux);
     status.post_processing = false;
     portEXIT_CRITICAL(&status_mux);
-    if (catalog_ready && !interrupted)
-        (void)ExportSync::request_post_therapy(catalog_entry);
-    if (interrupted) {
-        Log::logf(CAT_GENERAL, LOG_INFO,
-                  "[EDF] post-processing preempted by therapy start\n");
+    if (recording_storage_owned) release_storage();
+    recording_storage_owned = false;
+    next_pending_ms = 0;
+}
+
+static void process_pending() {
+    if (status.active || post_processing_cancelled() ||
+        Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0 ||
+        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0) ||
+        !acquire_storage()) return;
+    next_pending_ms = millis() + 30000;
+    EdfPending::Record selected;
+    char selected_path[80] = {};
+    uint32_t count = 0;
+    fs::File dir = storage->open("/airbridge/pending");
+    if (dir && dir.isDirectory()) {
+        fs::File item;
+        while ((item = dir.openNextFile())) {
+            String path = item.path();
+            item.close();
+            if (!path.endsWith(".str")) continue;
+            count++;
+            EdfPending::Record candidate;
+            if (!read_pending(path.c_str(), candidate)) {
+                post_error("invalid STR pending journal");
+                continue;
+            }
+            if (strcmp(candidate.prefix, pending_cursor) <= 0) continue;
+            if (!selected_path[0] || strcmp(candidate.prefix, selected.prefix) < 0) {
+                selected = candidate;
+                snprintf(selected_path, sizeof(selected_path), "%s", path.c_str());
+            }
+        }
     }
-    Log::logf(CAT_GENERAL, LOG_INFO,
-              "[EDF] post-processing complete STR=%u errors=%u\n",
-              status.str_records, status.post_errors);
+    dir.close();
+    portENTER_CRITICAL(&status_mux);
+    status.pending_str = count;
+    status.post_processing = selected_path[0] != 0;
+    portEXIT_CRITICAL(&status_mux);
+    bool success = false;
+    EdfCatalog::Entry entry;
+    if (selected_path[0]) {
+        memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
+        char srn[24] = {};
+        if (!(selected.flags & EdfPending::NATIVE_VALID) ||
+            (selected.flags & EdfPending::CLOCK_CHANGED)) {
+            post_error("STR pending clock requires review");
+        } else if (!read_variable("SRN", srn, sizeof(srn)) || strcmp(srn, selected.srn)) {
+            post_error("STR pending device unavailable or different");
+        } else if (EdfCatalog::find(selected.prefix, entry)) {
+            session_clock = {};
+            session_clock.native_valid = true;
+            session_clock.native_start = selected.native_start;
+            session_clock.export_start = selected.export_start;
+            session_native_day = selected.native_day; session_epoch_day = selected.export_day;
+            session_mid = selected.mid; session_vid = selected.vid;
+            memcpy(session_srn, selected.srn, sizeof(session_srn));
+            success = wait_for_final_str_save(selected) &&
+                      !post_processing_cancelled() && write_identification() &&
+                      update_str_summary();
+            if (success) {
+                entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
+                success = EdfCatalog::commit(entry);
+            }
+            if (success && !storage->remove(selected_path)) {
+                post_error("STR pending completion cleanup failed");
+                success = false;
+            }
+        } else {
+            post_error("STR pending session files incomplete");
+        }
+    } else if (count) {
+        pending_cursor[0] = 0;
+        next_pending_ms = millis() + 1000;
+    }
+    portENTER_CRITICAL(&status_mux);
+    status.post_processing = false;
+    if (success && status.pending_str) status.pending_str--;
+    portEXIT_CRITICAL(&status_mux);
+    release_storage();
+    if (success) {
+        next_pending_ms = 0;
+        (void)ExportSync::request_post_therapy(entry);
+    }
 }
 
 static void recorder_task(void *) {
@@ -2493,6 +2643,7 @@ static void recorder_task(void *) {
         sample_pld();
         sample_oximetry();
         if (status.active) update_record_status();
+        else process_pending();
     }
 }
 
@@ -2502,9 +2653,12 @@ void init() {
     if (status.ready || !SdStorage::mounted()) return;
     storage = SdStorage::filesystem();
     if (!storage) return;
+    if (!storage_mutex) storage_mutex = xSemaphoreCreateMutex();
+    if (!storage_mutex) { status_error("storage mutex allocation failed"); return; }
     recover_partial_outputs();
     recover_identification_files();
     recover_str_file();
+    recover_pending();
     EdfCatalog::init();
     reconcile_catalog();
 
@@ -2582,6 +2736,12 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
+bool acquire_storage() {
+    return storage_mutex && xSemaphoreTake(storage_mutex, 0) == pdTRUE;
+}
+
+void release_storage() { xSemaphoreGive(storage_mutex); }
+
 }  // namespace EdfRecorder
 
 #else
@@ -2589,6 +2749,8 @@ void get_status(Status &out) {
 namespace EdfRecorder {
 
 void init() {}
+bool acquire_storage() { return true; }
+void release_storage() {}
 void therapy_started() {}
 void therapy_ended() {}
 
