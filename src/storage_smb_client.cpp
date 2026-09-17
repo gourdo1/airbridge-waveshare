@@ -39,6 +39,19 @@ struct StorageSmbPendingOperation {
     uint32_t started_ms = 0;
 };
 
+struct StorageSmbDnsResult {
+    // The client and lwIP each own a reference until detach/completion.
+    std::atomic<unsigned> references{2};
+    std::atomic<bool> finished{false};
+    ip_addr_t address = {};
+    int error = ERR_OK;
+
+    void release() {
+        if (references.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            delete this;
+    }
+};
+
 namespace {
 
 static constexpr int SMB_COMMAND_TIMEOUT_SECONDS = 15;
@@ -180,11 +193,11 @@ struct StorageSmbDnsCallback {
     static void complete(const char *,
                          const ip_addr_t *address,
                          void *context) {
-        StorageSmbClient *client =
-            static_cast<StorageSmbClient *>(context);
-        if (!client) return;
-        client->publish_host_resolution(address,
-                                        address ? ERR_OK : ERR_TIMEOUT);
+        auto *result = static_cast<StorageSmbDnsResult *>(context);
+        if (address) result->address = *address;
+        result->error = address ? ERR_OK : ERR_TIMEOUT;
+        result->finished.store(true, std::memory_order_release);
+        result->release();
     }
 };
 
@@ -324,10 +337,6 @@ bool StorageSmbClient::configure(const char *endpoint,
     copy_cstr(user_, sizeof(user_), user);
     copy_cstr(password_, sizeof(password_), password);
 
-    const HostResolutionState state = static_cast<HostResolutionState>(
-        host_resolution_state_.load(std::memory_order_acquire));
-    if (state != HostResolutionState::Pending) reset_host_resolution();
-
     set_error(error_out, error_out_size, "");
     return true;
 }
@@ -370,6 +379,10 @@ void StorageSmbClient::publish_host_resolution(const void *address,
 }
 
 void StorageSmbClient::reset_host_resolution() {
+    if (dns_result_) {
+        dns_result_->release();
+        dns_result_ = nullptr;
+    }
     resolving_server_[0] = '\0';
     resolved_address_[0] = '\0';
     resolved_server_[0] = '\0';
@@ -391,7 +404,15 @@ StorageSmbOperationResult StorageSmbClient::resolve_host(
     HostResolutionState state = static_cast<HostResolutionState>(
         host_resolution_state_.load(std::memory_order_acquire));
     if (state == HostResolutionState::Pending) {
-        return StorageSmbOperationResult::Waiting;
+        if (!dns_result_->finished.load(std::memory_order_acquire))
+            return StorageSmbOperationResult::Waiting;
+        publish_host_resolution(dns_result_->error == ERR_OK
+                                    ? &dns_result_->address : nullptr,
+                                dns_result_->error);
+        dns_result_->release();
+        dns_result_ = nullptr;
+        state = static_cast<HostResolutionState>(
+            host_resolution_state_.load(std::memory_order_acquire));
     }
 
     if (state != HostResolutionState::Idle &&
@@ -453,6 +474,11 @@ StorageSmbOperationResult StorageSmbClient::resolve_host(
         return StorageSmbOperationResult::Error;
     }
 
+    dns_result_ = new (std::nothrow) StorageSmbDnsResult();
+    if (!dns_result_) {
+        set_error(error_out, error_out_size, "dns_out_of_memory");
+        return StorageSmbOperationResult::Error;
+    }
     copy_cstr(resolving_server_, sizeof(resolving_server_), server_);
     host_resolution_started_ms_ = millis();
     host_resolution_state_.store(
@@ -468,16 +494,20 @@ StorageSmbOperationResult StorageSmbClient::resolve_host(
             host,
             &address,
             StorageSmbDnsCallback::complete,
-            this,
+            dns_result_,
             LWIP_DNS_ADDRTYPE_IPV4_IPV6);
     }
 
+    if (rc == ERR_INPROGRESS) return StorageSmbOperationResult::Waiting;
+
+    // Synchronous completion does not invoke the lwIP callback.
+    dns_result_->release();
+    dns_result_->release();
+    dns_result_ = nullptr;
     if (rc == ERR_OK) {
         publish_host_resolution(&address, ERR_OK);
         return resolve_host(error_out, error_out_size);
     }
-    if (rc == ERR_INPROGRESS) return StorageSmbOperationResult::Waiting;
-
     publish_host_resolution(nullptr, rc);
     return resolve_host(error_out, error_out_size);
 }
@@ -1199,6 +1229,7 @@ StorageSmbOperationResult StorageSmbClient::step_close_writer(
 }
 
 void StorageSmbClient::abort_connection() {
+    reset_host_resolution();
     if (!ctx_) {
         clear_operation();
         reset_ensure_directory();

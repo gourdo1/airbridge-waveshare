@@ -13,6 +13,7 @@ struct smb2fh;
 namespace aircannect {
 
 struct StorageSmbPendingOperation;
+struct StorageSmbDnsResult;
 
 static constexpr size_t AC_STORAGE_SMB_REMOTE_PATH_MAX = 256;
 static constexpr size_t AC_STORAGE_SMB_ENDPOINT_HOST_MAX = 96;
@@ -89,8 +90,6 @@ public:
     void abort_connection();
 
 private:
-    friend struct StorageSmbDnsCallback;
-
     enum class HostResolutionState : uint8_t {
         Idle,
         Pending,
@@ -166,6 +165,7 @@ private:
     char resolved_server_[AC_STORAGE_SMB_ENDPOINT_HOST_MAX] = {};
     uint32_t host_resolution_started_ms_ = 0;
     int host_resolution_error_ = 0;
+    StorageSmbDnsResult *dns_result_ = nullptr;
 
     smb2_context *ctx_ = nullptr;
     struct smb2fh *writer_ = nullptr;
