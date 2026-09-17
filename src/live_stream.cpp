@@ -16,6 +16,7 @@ struct Stream {
     uint16_t    sample_size;
     uint8_t     ref_count;
     bool        subscribed;
+    bool        sync_pending;
     bool        in_use;
 };
 
@@ -76,8 +77,12 @@ static bool device_subscribe(int sidx, bool on, cmd_source_t src = CMD_SRC_INTER
     snprintf(cmd, sizeof(cmd), "P S &%s %d", streams[sidx].tag, on ? 1 : 0);
     char resp[32] = {};
     uint16_t resp_len = sizeof(resp);
-    return Arbiter::send_cmd(cmd, src, CMD_PRIO_NORMAL,
-                             resp, &resp_len, LS_DEVICE_CMD_TIMEOUT);
+    bool ok = Arbiter::send_cmd(cmd, src, CMD_PRIO_NORMAL,
+                                resp, &resp_len, LS_DEVICE_CMD_TIMEOUT);
+    // A lost ACK leaves the device state unknown, even if the command ran.
+    streams[sidx].sync_pending = !ok;
+    if (ok) streams[sidx].subscribed = on;
+    return ok;
 }
 
 void init() {
@@ -146,7 +151,8 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
 
     streams[sidx].ref_count++;
     portEXIT_CRITICAL(&data_mux);
-    if (streams[sidx].ref_count == 1 && !streams[sidx].subscribed) {
+    if (streams[sidx].ref_count == 1 &&
+        (!streams[sidx].subscribed || streams[sidx].sync_pending)) {
         if (device_subscribe(sidx, true)) {
             streams[sidx].subscribed = true;
             Log::logf(CAT_GENERAL, LOG_INFO,
@@ -187,7 +193,8 @@ void unsubscribe(consumer_handle_t h) {
         portENTER_CRITICAL(&data_mux);
         if (streams[sidx].ref_count > 0) streams[sidx].ref_count--;
         portEXIT_CRITICAL(&data_mux);
-        if (streams[sidx].ref_count == 0 && streams[sidx].subscribed) {
+        if (streams[sidx].ref_count == 0 &&
+            (streams[sidx].subscribed || streams[sidx].sync_pending)) {
             if (device_subscribe(sidx, false)) {
                 streams[sidx].subscribed = false;
                 Log::logf(CAT_GENERAL, LOG_INFO,
@@ -208,20 +215,15 @@ static int8_t acquire_raw(const char *tag, cmd_source_t source,
     if (!tag || !tag[0] || !tag[1] || !tag[2]) return -1;
 
     int sidx = find_stream_idx(tag);
-    bool created = sidx < 0;
-    if (created) sidx = create_stream(tag, nullptr, 0);
+    if (sidx < 0) sidx = create_stream(tag, nullptr, 0);
     if (sidx < 0 || streams[sidx].ref_count == UINT8_MAX) return -1;
 
-    if (streams[sidx].ref_count == 0 && !streams[sidx].subscribed) {
+    if (!streams[sidx].subscribed || streams[sidx].sync_pending) {
         if (!device_subscribe(sidx, true, source)) {
             Log::logf(CAT_GENERAL, LOG_WARN,
                       "[LS] %s subscribe to %s failed\n",
                       owner, streams[sidx].tag);
-            if (created) {
-                portENTER_CRITICAL(&data_mux);
-                memset(&streams[sidx], 0, sizeof(streams[sidx]));
-                portEXIT_CRITICAL(&data_mux);
-            }
+            // Keep the slot so resync can stop a stream whose ACK was lost.
             return -1;
         }
         streams[sidx].subscribed = true;
@@ -242,7 +244,8 @@ static void release_raw(int8_t h, cmd_source_t source, const char *owner) {
     }
 
     streams[h].ref_count--;
-    if (streams[h].ref_count == 0 && streams[h].subscribed) {
+    if (streams[h].ref_count == 0 &&
+        (streams[h].subscribed || streams[h].sync_pending)) {
         if (device_subscribe(h, false, source)) {
             streams[h].subscribed = false;
         } else {
@@ -255,6 +258,7 @@ static void release_raw(int8_t h, cmd_source_t source, const char *owner) {
               "[LS] %s %s lease released (refs=%u)\n",
               streams[h].tag, owner, streams[h].ref_count);
     if (streams[h].ref_count == 0 && !streams[h].subscribed &&
+        !streams[h].sync_pending &&
         !streams[h].decode_fn) {
         portENTER_CRITICAL(&data_mux);
         memset(&streams[h], 0, sizeof(streams[h]));
@@ -283,7 +287,8 @@ static bool suspend_with_source(cmd_source_t src) {
     ControlGuard guard;
     bool ok = true;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
-        if (!streams[i].in_use || !streams[i].subscribed) continue;
+        if (!streams[i].in_use ||
+            (!streams[i].subscribed && !streams[i].sync_pending)) continue;
         if (device_subscribe(i, false, src)) {
             streams[i].subscribed = false;
             Log::logf(CAT_GENERAL, LOG_INFO, "[LS] %s suspended\n", streams[i].tag);
@@ -309,7 +314,8 @@ void resume() {
     ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use) continue;
-        if (streams[i].ref_count > 0 && !streams[i].subscribed) {
+        if (streams[i].ref_count > 0 &&
+            (!streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, true)) {
                 streams[i].subscribed = true;
                 Log::logf(CAT_GENERAL, LOG_INFO,
@@ -324,12 +330,26 @@ void resync() {
     ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use) continue;
-        if (streams[i].ref_count > 0 && !streams[i].subscribed) {
+        if (streams[i].ref_count > 0 &&
+            (!streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, true)) {
                 streams[i].subscribed = true;
                 Log::logf(CAT_GENERAL, LOG_INFO,
                           "[LS] %s re-subscribed\n", streams[i].tag);
             }
+        } else if (streams[i].ref_count == 0 &&
+                   (streams[i].subscribed || streams[i].sync_pending)) {
+            if (device_subscribe(i, false)) {
+                streams[i].subscribed = false;
+                Log::logf(CAT_GENERAL, LOG_INFO,
+                          "[LS] %s unsubscribed (retry)\n", streams[i].tag);
+            }
+        }
+        if (streams[i].ref_count == 0 && !streams[i].subscribed &&
+            !streams[i].sync_pending && !streams[i].decode_fn) {
+            portENTER_CRITICAL(&data_mux);
+            memset(&streams[i], 0, sizeof(streams[i]));
+            portEXIT_CRITICAL(&data_mux);
         }
     }
 }
