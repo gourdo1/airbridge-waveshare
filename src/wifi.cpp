@@ -9,6 +9,7 @@
 #include <esp_sntp.h>
 #include <esp_netif.h>
 #include <time.h>
+#include <atomic>
 
 typedef enum {
     WF_OFF,
@@ -37,6 +38,13 @@ struct ScanCandidate {
 };
 static ScanCandidate scan_candidates[SCAN_CANDIDATES_MAX];
 static uint8_t scan_candidate_count = 0;
+static std::atomic<bool> scan_pending{false};
+static std::atomic<bool> scan_done{false};
+static std::atomic<uint32_t> scan_status{1};
+static uint32_t scan_started_ms = 0;
+#define SCAN_TIMEOUT_MS          15000
+#define SCAN_ACTIVE_MAX_MS      120
+#define SCAN_HOME_DWELL_MS       30
 
 static uint8_t connect_idx = 0xFF;
 static uint8_t try_pos = 0;
@@ -109,6 +117,12 @@ static void sync_ntp() {
 
 static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:
+        if (scan_pending.load(std::memory_order_acquire)) {
+            scan_status.store(info.wifi_scan_done.status, std::memory_order_relaxed);
+            scan_done.store(true, std::memory_order_release);
+        }
+        break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         got_ip = true;
         hint_refresh_pending = true;
@@ -271,25 +285,77 @@ static void begin_connect_candidate(uint8_t cand_idx) {
     }
 }
 
+static void clear_scan() {
+    scan_pending.store(false, std::memory_order_release);
+    scan_done.store(false, std::memory_order_relaxed);
+    esp_wifi_clear_ap_list();
+}
+
+static void start_scan() {
+    if (scan_pending.load(std::memory_order_acquire)) return;
+    scan_candidate_count = 0;
+    scan_status.store(1, std::memory_order_relaxed);
+    scan_done.store(false, std::memory_order_relaxed);
+    scan_started_ms = millis();
+
+    // Return to the home channel between channels, including under BLE
+    // coexistence. Keep AP service alive while retrying STA in the background.
+    wifi_scan_config_t scan = {};
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan.scan_time.active.max = SCAN_ACTIVE_MAX_MS;
+    scan.home_chan_dwell_time = SCAN_HOME_DWELL_MS;
+    scan.coex_background_scan = true;
+    scan_pending.store(true, std::memory_order_release);
+
+    esp_err_t err = esp_wifi_scan_start(&scan, false);
+    if (err != ESP_OK) {
+        clear_scan();
+        Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] Scan start failed (err=%d)\n", err);
+    }
+}
+
+static int16_t scan_complete() {
+    if (!scan_pending.load(std::memory_order_acquire)) return WIFI_SCAN_FAILED;
+    if (scan_done.load(std::memory_order_acquire)) {
+        if (scan_status.load(std::memory_order_relaxed) == 0) return 0;
+        clear_scan();
+        return WIFI_SCAN_FAILED;
+    }
+    if (millis() - scan_started_ms >= SCAN_TIMEOUT_MS) {
+        scan_pending.store(false, std::memory_order_release);
+        esp_wifi_scan_stop();
+        clear_scan();
+        Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] Scan timed out\n");
+        return WIFI_SCAN_FAILED;
+    }
+    return WIFI_SCAN_RUNNING;
+}
+
 static void process_scan_results() {
     auto &cfg = Config::get();
-    int16_t n = WiFi.scanComplete();
-    if (n < 0) return;
+    uint16_t n = 0;
+    esp_err_t err = esp_wifi_scan_get_ap_num(&n);
+    if (err != ESP_OK) {
+        clear_scan();
+        scan_candidate_count = 0;
+        Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] Scan results unavailable (err=%d)\n", err);
+        return;
+    }
 
     // Match visible APs against configured slots. No SSID dedup: each
     // visible BSSID becomes its own candidate so roaming can target a
     // specific AP under a same-SSID setup.
     scan_candidate_count = 0;
     for (int i = 0; i < n && scan_candidate_count < SCAN_CANDIDATES_MAX; i++) {
-        uint8_t idx = find_net_by_ssid(WiFi.SSID(i).c_str());
+        wifi_ap_record_t ap = {};
+        if (esp_wifi_scan_get_ap_record(&ap) != ESP_OK) break;
+        uint8_t idx = find_net_by_ssid(reinterpret_cast<const char *>(ap.ssid));
         if (idx == 0xFF) continue;
         ScanCandidate &c = scan_candidates[scan_candidate_count++];
         c.net_idx = idx;
-        uint8_t *bssid = WiFi.BSSID(i);
-        if (bssid) memcpy(c.bssid, bssid, 6);
-        else memset(c.bssid, 0, 6);
-        c.channel = (uint8_t)WiFi.channel(i);
-        c.rssi = (int8_t)WiFi.RSSI(i);
+        memcpy(c.bssid, ap.bssid, sizeof(c.bssid));
+        c.channel = ap.primary;
+        c.rssi = ap.rssi;
     }
 
     // Sort by RSSI descending (selection sort, max 16 entries).
@@ -304,7 +370,7 @@ static void process_scan_results() {
     }
 
     try_pos = 0;
-    WiFi.scanDelete();
+    clear_scan();
 
     if (scan_candidate_count > 0) {
         const ScanCandidate &best = scan_candidates[0];
@@ -320,6 +386,7 @@ static void process_scan_results() {
 }
 
 static void on_connected() {
+    auto &cfg = Config::get();
     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Connected to '%s' (%s)\n",
               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 
@@ -336,6 +403,10 @@ static void on_connected() {
     pending_pmf_disable = false;
 
     set_state(WF_CONNECTED);
+    if (cfg.wifi_mode == WIFI_MODE_AUTO && (WiFi.getMode() & WIFI_AP)) {
+        pending_ap_teardown = true;
+        ap_quiet_since_ms = 0;
+    }
     low_rssi_count = 0;
     last_roam_check = millis();
     // hint_refresh_pending was set by the same STA_GOT_IP that drove us here;
@@ -360,9 +431,11 @@ static void enter_ap_fallback() {
         return;
     }
     // AUTO / STA_AP: bring AP up (no-op if already up under STA_AP).
-    WiFi.mode(WIFI_AP_STA);
     String ap = ap_ssid_str();
-    WiFi.softAP(ap.c_str(), "airbridge");
+    if (!(WiFi.getMode() & WIFI_AP)) {
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP(ap.c_str(), "airbridge");
+    }
     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] AP+STA fallback: %s (%s)\n",
               ap.c_str(), WiFi.softAPIP().toString().c_str());
     set_state(WF_AP_FALLBACK);
@@ -396,6 +469,9 @@ bool WiFiSetup::init() {
     auto &cfg = Config::get();
 
     WiFi.onEvent(wifi_event_cb);
+    // This state machine owns recovery; do not race driver auto-association
+    // against scans and the explicit BSSID/PMF retry paths.
+    WiFi.setAutoReconnect(false);
 
     if (cfg.wifi_mode == WIFI_MODE_OFF) {
         WiFi.mode(WIFI_OFF);
@@ -453,20 +529,16 @@ void WiFiSetup::check() {
             on_connected();
         } else if (wf_state == WF_AP_FALLBACK) {
             on_connected();
-
-            // Don't tear AP down immediately
-            if (cfg.wifi_mode == WIFI_MODE_AUTO) {
-                pending_ap_teardown = true;
-                ap_quiet_since_ms = 0;
-            }
         }
         return;
     }
 
+    if (roaming_suspended) return;
+
     if (sta_disconnected && wf_state == WF_CONNECTED) {
         sta_disconnected = false;
         Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Disconnected, scanning...\n");
-        WiFi.scanNetworks(true);  // async
+        start_scan();
         set_state(WF_SCANNING);
         return;
     }
@@ -480,13 +552,13 @@ void WiFiSetup::check() {
         if (elapsed > HINT_TIMEOUT_MS) {
             Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Hint timeout, full scan\n");
             stop_sta_attempt();
-            WiFi.scanNetworks(true);
+            start_scan();
             set_state(WF_SCANNING);
         }
         break;
 
     case WF_SCANNING: {
-        int16_t result = WiFi.scanComplete();
+        int16_t result = scan_complete();
         if (result >= 0) {
             process_scan_results();
             if (scan_candidate_count > 0) {
@@ -557,16 +629,12 @@ void WiFiSetup::check() {
                           rssi, low_rssi_count, ROAM_CONSECUTIVE_LOW);
                 if (low_rssi_count >= ROAM_CONSECUTIVE_LOW) {
                     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Roaming: scanning for better AP\n");
-                    WiFi.scanNetworks(true);
+                    start_scan();
                     set_state(WF_ROAM_SCAN);
                 }
             } else {
                 low_rssi_count = 0;
             }
-        }
-        // Check if a background scan completed
-        if (WiFi.scanComplete() >= 0) {
-            process_scan_results();
         }
         // Refresh the hint on any (re)association we caught via STA_GOT_IP,
         // including supplicant-driven reconnects we didn't initiate.
@@ -600,7 +668,7 @@ void WiFiSetup::check() {
         break;
 
     case WF_ROAM_SCAN: {
-        int16_t result = WiFi.scanComplete();
+        int16_t result = scan_complete();
         if (result >= 0) {
             process_scan_results();
             // Compare best candidate to the current connection by BSSID,
@@ -647,7 +715,7 @@ void WiFiSetup::check() {
         if (millis() - last_ap_retry >= AP_RETRY_INTERVAL_MS) {
             last_ap_retry = millis();
             Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] AP fallback: retrying scan\n");
-            WiFi.scanNetworks(true);
+            start_scan();
             set_state(WF_SCANNING);
         }
         break;

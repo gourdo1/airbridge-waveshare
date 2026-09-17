@@ -23,6 +23,7 @@
 #include <ESPAsyncWebServer.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
+#include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <time.h>
 
@@ -34,6 +35,7 @@ static AsyncEventSource *events = nullptr;
 static AsyncEventSource *live_events = nullptr;
 
 static bool checkAuth(AsyncWebServerRequest *request) {
+    if (request->getResponse()) return false;
     auto &cfg = Config::get();
     if (cfg.http_user.isEmpty() && cfg.http_pass.isEmpty()) return true;
     if (!request->authenticate(cfg.http_user.c_str(), cfg.http_pass.c_str())) {
@@ -143,29 +145,63 @@ static void jsonAddBool(String &out, const char *key, bool val,
 }
 
 
-static String pending_body;
-static bool pending_body_ready = false;
+static constexpr size_t JSON_BODY_MAX = 4096;
+struct JsonBody {
+    size_t total;
+    size_t received;
+    // Bytes follow this POD header; the request destructor frees _tempObject.
+};
 
 static void handleJsonBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    if (index == 0) {
-        pending_body = "";
-        pending_body.reserve(total);
-        pending_body_ready = false;
+    if (request->getResponse()) return;
+    if (!checkAuth(request)) return;
+    if (total > JSON_BODY_MAX) {
+        request->send(413, "application/json", "{\"error\":\"body_too_large\"}");
+        return;
     }
-    pending_body.concat((char *)data, len);
-    if (index + len == total) {
-        pending_body_ready = true;
+    if (!total || index > total || len > total - index || !len || !data) {
+        request->send(400, "application/json", "{\"error\":\"invalid_body_chunk\"}");
+        return;
     }
+
+    auto *body = static_cast<JsonBody *>(request->_tempObject);
+    if (!body && index == 0) {
+        size_t bytes = sizeof(JsonBody) + total + 1;
+        body = static_cast<JsonBody *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!body) body = static_cast<JsonBody *>(malloc(bytes));
+        if (!body) {
+            request->send(503, "application/json", "{\"error\":\"body_allocation_failed\"}");
+            return;
+        }
+        *body = {total, 0};
+        request->_tempObject = body;
+    }
+    if (!body || body->total != total || body->received != index ||
+        memchr(data, '\0', len)) {
+        request->send(400, "application/json", "{\"error\":\"invalid_body_chunk\"}");
+        return;
+    }
+
+    char *bytes = reinterpret_cast<char *>(body + 1);
+    memcpy(bytes + index, data, len);
+    body->received += len;
+    bytes[body->received] = '\0';
 }
 
-static String getBody(AsyncWebServerRequest *request) {
-    if (pending_body_ready) {
-        pending_body_ready = false;
-        String result = pending_body;
-        pending_body = "";
-        return result;
+static bool getBody(AsyncWebServerRequest *request, String &out) {
+    if (request->getResponse()) return false;
+    auto *body = static_cast<JsonBody *>(request->_tempObject);
+    if (!body || body->received != body->total) {
+        request->send(400, "application/json", "{\"error\":\"incomplete_body\"}");
+        return false;
     }
-    return "";
+
+    bool ok = out.concat(reinterpret_cast<const char *>(body + 1), body->total);
+    free(body);
+    request->_tempObject = nullptr;
+    if (!ok)
+        request->send(503, "application/json", "{\"error\":\"body_allocation_failed\"}");
+    return ok;
 }
 
 static void handleRoot(AsyncWebServerRequest *request) {
@@ -631,7 +667,9 @@ static void handleSettingsJob(AsyncWebServerRequest *request, bool write) {
         return;
     }
     uint32_t id = 0;
-    if (!ClinicalJobs::submit(write, write ? getBody(request) : String(), id)) {
+    String body;
+    if (write && !getBody(request, body)) return;
+    if (!ClinicalJobs::submit(write, body, id)) {
         request->send(503, "application/json", "{\"error\":\"settings_busy\"}");
         return;
     }
@@ -662,7 +700,8 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
 static void handlePostConfig(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
-    String body = getBody(request);
+    String body;
+    if (!getBody(request, body)) return;
     String previous_update_url = Config::get().update_url;
     int count = 0;
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
@@ -975,7 +1014,8 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
 static void handleBleAction(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
-    String body = getBody(request);
+    String body;
+    if (!getBody(request, body)) return;
     String action, addr;
     struct { String *action; String *addr; } ctx = {&action, &addr};
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
@@ -1060,7 +1100,8 @@ extern void dispatch_command(const char *line, String &response);
 static void handleCmd(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
-    String body = getBody(request);
+    String body;
+    if (!getBody(request, body)) return;
     int valStart = body.indexOf("\"cmd\"");
     if (valStart < 0) {
         request->send(400, "application/json", "{\"ok\":false,\"error\":\"missing cmd\"}");
@@ -1130,6 +1171,8 @@ static void handleFlashStatus(AsyncWebServerRequest *request) {
 
 static void handleFlashStart(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
+    String body;
+    if (!getBody(request, body)) return;
 
     if (ResmedOta::is_active()) {
         request->send(409, "application/json", "{\"ok\":false,\"error\":\"flash already active\"}");
@@ -1148,7 +1191,6 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
         return;
     }
 
-    String body = getBody(request);
     String block = "";
     bool flash_blx = false;
     bool force_blx = false;
@@ -1523,7 +1565,8 @@ static void handleWifiGet(AsyncWebServerRequest *request) {
 
 static void handleWifiPost(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
-    String body = getBody(request);
+    String body;
+    if (!getBody(request, body)) return;
     String action, ssid, pass;
     int idx = -1;
 
@@ -1596,7 +1639,8 @@ extern bool pull_time_from_resmed(bool force);
 
 static void handleTimeAction(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
-    String body = getBody(request);
+    String body;
+    if (!getBody(request, body)) return;
     String action;
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         if (key == "action") *(String*)p = val;
@@ -1685,7 +1729,9 @@ static String build_status_payload() {
     jsonAddInt(sj, "rop", Arbiter::get_cached_rop());
     jsonAddInt(sj, "mhr", Arbiter::get_cached_mhr());
     jsonAddString(sj, "oxi", oxi_state_name(oxi));
-    jsonAddString(sj, "oxi_addr", OxiArbiter::get_source_id());
+    char oxi_addr[32];
+    OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
+    jsonAddString(sj, "oxi_addr", oxi_addr);
     jsonAddString(sj, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
     jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
     jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);

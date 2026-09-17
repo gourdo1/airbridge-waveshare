@@ -719,7 +719,7 @@ class OxiClientCB : public NimBLEClientCallbacks {
         oxyii_reset();
         ws20a_write_chr = nullptr;
         ws20a_rx_len = 0;
-        OxiArbiter::stop_feed();
+        OxiArbiter::stop_feed(OXI_SRC_BLE);
         if (state == OXI_STREAMING || state == OXI_BONDING) {
             set_state(OXI_DISCONNECTED);
         }
@@ -977,7 +977,7 @@ void OxiBle::task(void *param) {
             disconnect_requested = false;
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Disable requested\n");
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed();
+            OxiArbiter::stop_feed(OXI_SRC_BLE);
             set_state(OXI_DISABLED);
         }
 
@@ -985,7 +985,7 @@ void OxiBle::task(void *param) {
             disconnect_requested = false;
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Disconnect requested\n");
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed();
+            OxiArbiter::stop_feed(OXI_SRC_BLE);
             set_state(OXI_DISCONNECTED);
         }
 
@@ -994,7 +994,7 @@ void OxiBle::task(void *param) {
             Log::logf(CAT_OXI, LOG_INFO, "[OXI] Suspend: stopping scan and dropping connection\n");
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed();
+            OxiArbiter::stop_feed(OXI_SRC_BLE);
             scan_requested = false;
             connect_mode = CONN_NONE;
             if (state != OXI_DISABLED) set_state(OXI_DISCONNECTED);

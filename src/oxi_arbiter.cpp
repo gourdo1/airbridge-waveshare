@@ -38,7 +38,7 @@ int16_t parse_sfloat(uint16_t raw) {
 }
 
 static oxi_reading_t reading = { -1, -1, false, 0 };
-static volatile bool feeding = false;
+static bool feeding = false;
 static oxi_source_t src_active = OXI_SRC_NONE;
 static uint32_t src_last_time = 0;
 static char source_id[32] = "";
@@ -119,6 +119,8 @@ void OxiArbiter::init() {
     reading = { -1, -1, false, 0 };
     feeding = false;
     src_active = OXI_SRC_NONE;
+    src_last_time = 0;
+    source_id[0] = '\0';
     oxh_seq = 0;
     oxh_toggle = 0;
     last_valid = false;
@@ -127,7 +129,13 @@ void OxiArbiter::init() {
 
 void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool valid) {
     bool source_claimed = false;
+    bool feed_started = false;
+    const bool auto_start = Config::get().oxi_auto_start;
     portENTER_CRITICAL(&reading_mux);
+    if (src == OXI_SRC_NONE) {
+        portEXIT_CRITICAL(&reading_mux);
+        return;
+    }
     if (src_active != OXI_SRC_NONE && src_active != src) {
         portEXIT_CRITICAL(&reading_mux);
         return;
@@ -136,6 +144,10 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
     // Only claim source on valid data
     if (src_active == OXI_SRC_NONE && valid) {
         source_claimed = true;
+        if (auto_start && !feeding) {
+            feeding = true;
+            feed_started = true;
+        }
     }
     if (!valid && src_active == OXI_SRC_NONE) {
         portEXIT_CRITICAL(&reading_mux);
@@ -152,22 +164,36 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
 
     if (source_claimed) {
         Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source active: %s\n", src_name(src));
+        if (feed_started)
+            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding started\n");
         Arbiter::lcd_message("Oximeter Connected", 15000);
-        if (Config::get().oxi_auto_start && !feeding) start_feed();
     }
 }
 
 void OxiArbiter::start_feed() {
+    portENTER_CRITICAL(&reading_mux);
     feeding = true;
+    portEXIT_CRITICAL(&reading_mux);
     Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding started\n");
 }
 
-void OxiArbiter::stop_feed() {
+void OxiArbiter::stop_feed(oxi_source_t source) {
+    portENTER_CRITICAL(&reading_mux);
+    if (source != OXI_SRC_NONE && source != src_active) {
+        portEXIT_CRITICAL(&reading_mux);
+        return;
+    }
     feeding = false;
+    portEXIT_CRITICAL(&reading_mux);
     Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding stopped\n");
 }
 
-bool OxiArbiter::is_feeding() { return feeding; }
+bool OxiArbiter::is_feeding() {
+    portENTER_CRITICAL(&reading_mux);
+    bool active = feeding;
+    portEXIT_CRITICAL(&reading_mux);
+    return active;
+}
 
 void OxiArbiter::snapshot(oxi_reading_t &out, oxi_source_t *source) {
     portENTER_CRITICAL(&reading_mux);
@@ -185,32 +211,44 @@ oxi_source_t OxiArbiter::active_source() {
 }
 
 void OxiArbiter::set_source_id(const char *id) {
+    portENTER_CRITICAL(&reading_mux);
     strncpy(source_id, id ? id : "", sizeof(source_id) - 1);
     source_id[sizeof(source_id) - 1] = '\0';
+    portEXIT_CRITICAL(&reading_mux);
 }
 
-const char *OxiArbiter::get_source_id() { return source_id; }
+void OxiArbiter::get_source_id(char *out, size_t size) {
+    if (!out || !size) return;
+    portENTER_CRITICAL(&reading_mux);
+    strncpy(out, source_id, size - 1);
+    out[size - 1] = '\0';
+    portEXIT_CRITICAL(&reading_mux);
+}
 
 void OxiArbiter::poll() {
     // release source after timeout
     oxi_source_t timed_out_source = OXI_SRC_NONE;
+    bool feed_stopped = false;
     portENTER_CRITICAL(&reading_mux);
     if (src_active != OXI_SRC_NONE && millis() - src_last_time > SOURCE_TIMEOUT_MS) {
         timed_out_source = src_active;
         src_active = OXI_SRC_NONE;
         reading.valid = false;
+        source_id[0] = '\0';
+        feed_stopped = feeding;
+        feeding = false;
     }
     portEXIT_CRITICAL(&reading_mux);
     if (timed_out_source != OXI_SRC_NONE) {
         Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source %s timed out\n",
                   src_name(timed_out_source));
-        source_id[0] = '\0';
-        if (feeding) stop_feed();
+        if (feed_stopped)
+            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding stopped after source timeout\n");
     }
 
     // inject at configured interval
     auto &cfg = Config::get();
-    if (feeding && active_source() != OXI_SRC_NONE &&
+    if (is_feeding() && active_source() != OXI_SRC_NONE &&
         millis() - last_inject >= cfg.oxi_interval_ms) {
         last_inject = millis();
         inject_lframe();
