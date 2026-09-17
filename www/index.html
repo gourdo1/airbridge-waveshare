@@ -522,14 +522,27 @@ let settings = [], curMode = 0;
 
 // SSE
 let evtSrc = null;
+let liveEvtSrc = null;
+function updateLiveSubscription() {
+  const wanted = !document.hidden && document.getElementById('p-status').classList.contains('active');
+  if (!wanted) {
+    if (liveEvtSrc) liveEvtSrc.close();
+    liveEvtSrc = null;
+    return;
+  }
+  if (liveEvtSrc) return;
+  liveEvtSrc = new EventSource('/events/live');
+  liveEvtSrc.addEventListener('live', e => {
+    try { updateChartsFromPush(JSON.parse(e.data)); } catch(ex) {}
+  });
+  liveEvtSrc.onopen = () => backfillLive();
+}
+document.addEventListener('visibilitychange', updateLiveSubscription);
 function initSSE() {
   if (evtSrc) evtSrc.close();
   evtSrc = new EventSource('/events');
   evtSrc.addEventListener('status', e => {
     try { updateStatusFromPush(JSON.parse(e.data)); } catch(ex) {}
-  });
-  evtSrc.addEventListener('live', e => {
-    try { updateChartsFromPush(JSON.parse(e.data)); } catch(ex) {}
   });
   evtSrc.addEventListener('flash', e => {
     try { updateFlashFromPush(JSON.parse(e.data)); } catch(ex) {}
@@ -542,13 +555,10 @@ function initSSE() {
   evtSrc.onerror = () => {
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '#555';
-    setTimeout(initSSE, 3000);
   };
   evtSrc.onopen = () => {
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
-    // Reconnected: pull whatever we missed during the disconnect.
-    if (typeof backfillLive === 'function') backfillLive();
   };
 }
 
@@ -646,16 +656,28 @@ function updateFlashFromPush(d) {
   }
 }
 
-function updateChartsFromPush(d) {
-  // SSE "live" event: { seq, samples:[[mkp,rfl,lyk],...], spo2, pulse }
-  if (d.samples && d.samples.length) {
-    d.samples.forEach(s => {
+function appendLiveSamples(d, reset = false) {
+  if (!Number.isInteger(d.seq)) return false;
+  const samples = d.samples || [];
+  const delta = liveSeq === null || reset ? samples.length : (d.seq - liveSeq) & 0xffff;
+  if (liveSeq !== null && !reset && (delta === 0 || delta >= 0x8000)) return false;
+  if (reset) for (const k in waveData) waveData[k].length = 0;
+  const count = Math.min(delta, samples.length);
+  if (count) {
+    samples.slice(-count).forEach(s => {
       waveData.press.push(s[0]);
       waveData.flow.push(s[1]);
       waveData.leak.push(s[2]);
     });
     for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
   }
+  liveSeq = d.seq;
+  return true;
+}
+
+function updateChartsFromPush(d) {
+  // SSE and HTTP backfill can overlap. Append only samples newer than liveSeq.
+  if (!appendLiveSamples(d)) return;
   // Slow charts: ~0.5 Hz (every 10 SSE events at 5 Hz fire rate).
   slowTick++;
   if (slowTick >= 10) {
@@ -665,7 +687,6 @@ function updateChartsFromPush(d) {
     while (slowData.pulse.length > SLOW_PTS) slowData.pulse.shift();
     slowTick = 0;
   }
-  liveSeq = d.seq;
   updateCharts();
 }
 
@@ -680,6 +701,7 @@ function showTab(id) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   document.querySelectorAll('.bnav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   window.location.hash = id;
+  updateLiveSubscription();
   if (id === 'status') {
     loadStatus();
     if (!window._statusTimer) {
@@ -1514,7 +1536,7 @@ const WAVE_PTS = 500;     // ~20 s @ 25 Hz; covers 4-5 breath cycles
 const waveData = {press:[],flow:[],leak:[]};
 const slowData = {spo2:[],pulse:[]};
 const SLOW_PTS = 150;
-let liveSeq = 0, slowTick = 0;
+let liveSeq = null, slowTick = 0;
 
 // Auto-rescaling. Values stored are raw; min/max grow on overshoot
 const chartScales = {
@@ -1630,33 +1652,28 @@ function updateCharts() {
   el = document.getElementById('chartPulseVal'); if (el) { var v = lastValid(hr, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
 }
 
-let liveBusy = false;
+let liveBackfill = 0;
 async function backfillLive() {
-  if (liveBusy) return;
-  liveBusy = true;
+  const generation = ++liveBackfill;
+  const connection = liveEvtSrc;
+  const requestedSeq = liveSeq;
   try {
-    const r = await api('/api/live?since='+liveSeq);
-    if (!r) { liveBusy=false; return; }
+    const r = await api('/api/live?since='+(requestedSeq === null ? 0 : requestedSeq));
+    if (!r) return;
     const d = await r.json();
-    if (d.samples && d.samples.length) {
-      d.samples.forEach(s => {
-        waveData.press.push(s[0]);
-        waveData.flow.push(s[1]);
-        waveData.leak.push(s[2]);
-      });
-      for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
-    }
-    liveSeq = d.seq;
+    if (!connection || connection !== liveEvtSrc || generation !== liveBackfill) return;
+    // A response older than the requested sequence indicates a device restart
+    // or an absence longer than the sequence comparison window.
+    const reset = requestedSeq !== null && ((d.seq - requestedSeq) & 0xffff) >= 0x8000;
+    appendLiveSamples(d, reset);
     updateCharts();
   } catch(e) { console.error(e); }
-  liveBusy = false;
 }
 
 // Init
 const ht = window.location.hash.slice(1);
 showTab(tabNames.includes(ht) ? ht : 'status');
 initSSE();
-backfillLive();
 </script>
 </body>
 </html>

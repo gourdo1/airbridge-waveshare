@@ -30,6 +30,7 @@ extern const char *airbridge_build_date();
 
 static AsyncWebServer *http = nullptr;
 static AsyncEventSource *events = nullptr;
+static AsyncEventSource *live_events = nullptr;
 
 static bool checkAuth(AsyncWebServerRequest *request) {
     auto &cfg = Config::get();
@@ -1549,11 +1550,12 @@ static void handleReboot(AsyncWebServerRequest *request) {
 
 
 void WebUI::push_event(const char *event, const char *json) {
-    if (events) events->send(json, event, millis());
+    AsyncEventSource *target = strcmp(event, "live") == 0 ? live_events : events;
+    if (target) target->send(json, event, millis());
 }
 
 void WebUI::push_event(const char *event, const String &json) {
-    if (events) events->send(json.c_str(), event, millis());
+    push_event(event, json.c_str());
 }
 
 extern bool push_time_to_resmed();
@@ -1594,14 +1596,15 @@ void WebUI::init(uint16_t port) {
 
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");
-    // Tie LiveWebConsumer PMD subscription to SSE client presence 
-    events->onConnect([](AsyncEventSourceClient *) {
+    live_events = new AsyncEventSource("/events/live");
+    live_events->onConnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::acquire();
     });
-    events->onDisconnect([](AsyncEventSourceClient *) {
+    live_events->onDisconnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::release();
     });
     http->addHandler(events);
+    http->addHandler(live_events);
 
     http->on("/", HTTP_GET, handleRoot);
     http->on("/api/status", HTTP_GET, handleStatus);

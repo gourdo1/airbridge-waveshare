@@ -7,32 +7,43 @@
 
 #define LWC_BUF             128         // ~5 s @ 25 Hz
 #define LWC_BATCH           5           // samples per SSE event (~5 Hz fire @ 25 Hz)
-#define LWC_GRACE_MS        10000       // hold subscription for 10 s after last client leaves
 
 namespace LiveWebConsumer {
 
 static LivePmd::Sample buf[LWC_BUF];
-static volatile uint16_t head = 0;
+static uint16_t head = 0;
+static uint16_t ring_count = 0;
+static uint16_t sent_seq = 0;
+static portMUX_TYPE ring_mux = portMUX_INITIALIZER_UNLOCKED;
 static LiveStream::consumer_handle_t handle = -1;
 
 // Refcounted SSE client tracking
 static int      client_count = 0;
-static uint32_t release_ms   = 0;
 
 // Coalesce N samples per SSE event so the wire format mirrors /api/live and
 // each event amortizes the SSE framing overhead across the batch.
-static LivePmd::Sample batch[LWC_BATCH];
-static uint8_t batch_n = 0;
-
 static void flush_batch() {
-    if (batch_n == 0) return;
+    LivePmd::Sample batch[LWC_BATCH];
+    portENTER_CRITICAL(&ring_mux);
+    uint16_t available = (uint16_t)(head - sent_seq);
+    if (available > ring_count) available = ring_count;
+    if (available < LWC_BATCH || client_count == 0) {
+        portEXIT_CRITICAL(&ring_mux);
+        return;
+    }
+    uint16_t begin = (uint16_t)(head - available);
+    for (uint8_t i = 0; i < LWC_BATCH; i++)
+        batch[i] = buf[(uint16_t)(begin + i) % LWC_BUF];
+    sent_seq = (uint16_t)(begin + LWC_BATCH);
+    uint16_t sequence = sent_seq;
+    portEXIT_CRITICAL(&ring_mux);
 
     oxi_reading_t r;
     OxiArbiter::snapshot(r);
     char json[256];
     int n = snprintf(json, sizeof(json),
-                     "{\"seq\":%u,\"samples\":[", head);
-    for (int i = 0; i < batch_n && n < (int)sizeof(json); i++) {
+                     "{\"seq\":%u,\"samples\":[", sequence);
+    for (int i = 0; i < LWC_BATCH && n < (int)sizeof(json); i++) {
         n += snprintf(json + n, sizeof(json) - n,
                       "%s[%d,%d,%d]", i ? "," : "",
                       batch[i].mkp, batch[i].rfl, batch[i].lyk);
@@ -44,7 +55,6 @@ static void flush_batch() {
                       r.valid ? r.pulse_bpm : -1);
     }
     WebUI::push_event("live", json);
-    batch_n = 0;
 }
 
 static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
@@ -54,13 +64,13 @@ static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
 
     // Always store every frame (25 Hz) into the ring; the GET /api/live
     // backfill endpoint walks since_seq -> head at full resolution.
+    portENTER_CRITICAL(&ring_mux);
     uint16_t idx = head % LWC_BUF;
     buf[idx] = *s;
     head = (uint16_t)(head + 1);
 
-    // Accumulate into batch; flush when full.
-    batch[batch_n++] = *s;
-    if (batch_n >= LWC_BATCH) flush_batch();
+    if (ring_count < LWC_BUF) ring_count++;
+    portEXIT_CRITICAL(&ring_mux);
 }
 
 static void do_subscribe() {
@@ -69,8 +79,11 @@ static void do_subscribe() {
     if (handle < 0) {
         Log::logf(CAT_GENERAL, LOG_WARN, "[LWC] subscribe to PMD failed\n");
     } else {
+        portENTER_CRITICAL(&ring_mux);
+        int clients = client_count;
+        portEXIT_CRITICAL(&ring_mux);
         Log::logf(CAT_GENERAL, LOG_INFO, "[LWC] consumer registered (clients=%d)\n",
-                  client_count);
+                  clients);
     }
 }
 
@@ -78,8 +91,10 @@ static void do_unsubscribe() {
     if (handle < 0) return;
     LiveStream::unsubscribe(handle);
     handle = -1;
-    head = 0;       // drop stale ring; next subscribe starts fresh
-    batch_n = 0;
+    portENTER_CRITICAL(&ring_mux);
+    ring_count = 0;
+    sent_seq = head;
+    portEXIT_CRITICAL(&ring_mux);
     Log::logf(CAT_GENERAL, LOG_INFO, "[LWC] unsubscribed (idle)\n");
 }
 
@@ -90,49 +105,57 @@ void init() {
 
 void shutdown() {
     do_unsubscribe();
+    portENTER_CRITICAL(&ring_mux);
     client_count = 0;
-    release_ms = 0;
+    portEXIT_CRITICAL(&ring_mux);
 }
 
 void acquire() {
-    if (client_count == 0) release_ms = 0;
+    portENTER_CRITICAL(&ring_mux);
     client_count++;
+    portEXIT_CRITICAL(&ring_mux);
     // subscribe/unsubscribe is deferred to tick()
 }
 
 void release() {
+    portENTER_CRITICAL(&ring_mux);
     if (client_count > 0) client_count--;
-    if (client_count == 0) {
-        release_ms = millis();
-        if (release_ms == 0) release_ms = 1;
-    }
+    portEXIT_CRITICAL(&ring_mux);
 }
 
 void tick() {
-    if (client_count > 0 && handle < 0) {
+    portENTER_CRITICAL(&ring_mux);
+    bool wanted = client_count > 0;
+    portEXIT_CRITICAL(&ring_mux);
+    if (wanted && handle < 0) {
         do_subscribe();
     }
-    if (release_ms != 0 && client_count == 0 &&
-        millis() - release_ms >= LWC_GRACE_MS) {
+    if (!wanted && handle >= 0) {
         do_unsubscribe();
-        release_ms = 0;
     }
+    // Bounded work on the main task; the UART callback only stores samples.
+    if (wanted) for (uint8_t i = 0; i < 4; i++) flush_batch();
 }
 
 int get_samples(LivePmd::Sample *out, int max,
                 uint16_t since_seq, uint16_t *cur_seq) {
+    portENTER_CRITICAL(&ring_mux);
     uint16_t seq = head;
     if (cur_seq) *cur_seq = seq;
-    if (!out || max <= 0) return 0;
+    if (!out || max <= 0) {
+        portEXIT_CRITICAL(&ring_mux);
+        return 0;
+    }
 
     uint16_t available = (uint16_t)(seq - since_seq);
-    if (available > LWC_BUF) available = LWC_BUF;
+    if (available > ring_count) available = ring_count;
     if (available > (uint16_t)max) available = (uint16_t)max;
 
     for (uint16_t i = 0; i < available; i++) {
         uint16_t idx = (uint16_t)(seq - available + i) % LWC_BUF;
         out[i] = buf[idx];
     }
+    portEXIT_CRITICAL(&ring_mux);
     return available;
 }
 
@@ -141,7 +164,9 @@ bool is_active() {
 }
 
 uint16_t current_seq() {
-    return head;
+    uint16_t seq;
+    get_samples(nullptr, 0, 0, &seq);
+    return seq;
 }
 
 }

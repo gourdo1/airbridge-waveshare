@@ -7,10 +7,10 @@
 
 namespace LiveWebConsumer {
 
-// Lifecycle is driven by SSE client presence: web_ui calls acquire() on
+// Lifecycle is driven by /events/live presence: web_ui calls acquire() on
 // AsyncEventSource onConnect and release() on onDisconnect. The PMD device
-// subscription is held only while at least one SSE client is connected, with
-// a small grace period to absorb page reloads / brief network blips.
+// subscription is held only while at least one live-chart client is connected.
+// The RX callback only stores samples; tick() publishes from the main task.
 
 void init();
 void shutdown();
