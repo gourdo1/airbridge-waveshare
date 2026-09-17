@@ -158,9 +158,6 @@ static uart_response_policy_t framed_response_policy(const qframe_t *request) {
     policy.overall_timeout_ms = normal_timeout;
 
     if (payload_starts_with(request, "G V ")) {
-        policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_K | QFRAME_MASK_E;
-        policy.terminal_types = QFRAME_MASK_K | QFRAME_MASK_E;
-        policy.success_types = QFRAME_MASK_K;
         policy.first_timeout_ms = max(normal_timeout, (uint16_t)1500);
         policy.overall_timeout_ms = policy.first_timeout_ms;
     } else if (payload_starts_with(request, "G F ")) {

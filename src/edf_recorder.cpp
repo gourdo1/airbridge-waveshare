@@ -270,21 +270,25 @@ static bool read_variable(const char *name, char *out, size_t capacity,
 }
 
 struct StoredCapture {
-    uint8_t payload[64];
-    uint16_t payload_len;
+    char tag[4];
+    uint16_t day;
+    Air10Stored::Value value;
     bool received;
+    bool unsupported;
 };
 
 static bool stored_value_sink(const qframe_t *frame, void *context) {
     StoredCapture *capture = static_cast<StoredCapture *>(context);
-    if (!frame || !capture || frame->type != QFRAME_TYPE_K ||
-        frame->payload_len > sizeof(capture->payload)) {
-        return frame && frame->type != QFRAME_TYPE_K;
+    if (!frame || !capture) return false;
+    if (frame->type == QFRAME_TYPE_E) {
+        capture->unsupported = frame->payload_len == 4 &&
+                              memcmp(frame->payload, "6009", 4) == 0;
+        return true;
     }
-    memcpy(capture->payload, frame->payload, frame->payload_len);
-    capture->payload_len = frame->payload_len;
-    capture->received = true;
-    return true;
+    capture->received = frame->type == QFRAME_TYPE_R &&
+        Air10Stored::parse_response(frame->payload, frame->payload_len,
+                                    capture->tag, capture->day, capture->value);
+    return capture->received;
 }
 
 static bool read_stored_value(const char *tag, uint16_t epoch_day,
@@ -295,22 +299,27 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
     snprintf(command, sizeof(command), "G V #%s %04X 0", tag, epoch_day);
 
     uart_response_policy_t policy = {};
-    policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_K | QFRAME_MASK_E;
-    policy.terminal_types = QFRAME_MASK_K | QFRAME_MASK_E;
-    policy.success_types = QFRAME_MASK_K;
+    policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_E;
+    policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
+    policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = STORED_TIMEOUT_MS;
     policy.overall_timeout_ms = STORED_TIMEOUT_MS;
 
     for (uint8_t attempt = 0; attempt < attempts; attempt++) {
         if (post_processing_cancelled()) return false;
         StoredCapture capture = {};
+        memcpy(capture.tag, tag, 3);
+        capture.day = epoch_day;
         uart_transaction_result_t result = {};
-        if (Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+        bool completed = Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
                                   policy, stored_value_sink, &capture,
-                                  &result, sizeof(capture)) &&
-            result.success && capture.received &&
-            Air10Stored::parse_value(capture.payload, capture.payload_len,
-                                     value)) {
+                                  &result, sizeof(capture));
+        if (completed && result.protocol_error && capture.unsupported) {
+            value = {};
+            return true;
+        }
+        if (completed && result.success && capture.received) {
+            value = capture.value;
             return true;
         }
         if (attempt + 1 < attempts) {
