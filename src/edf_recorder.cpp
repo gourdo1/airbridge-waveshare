@@ -281,8 +281,8 @@ static bool stored_value_sink(const qframe_t *frame, void *context) {
     StoredCapture *capture = static_cast<StoredCapture *>(context);
     if (!frame || !capture) return false;
     if (frame->type == QFRAME_TYPE_E) {
-        capture->unsupported = frame->payload_len == 4 &&
-                              memcmp(frame->payload, "6009", 4) == 0;
+        capture->unsupported = Air10Stored::unsupported_response(
+            frame->payload, frame->payload_len, capture->tag, capture->day);
         return true;
     }
     capture->received = frame->type == QFRAME_TYPE_R &&

@@ -73,6 +73,16 @@ bool parse_response(const uint8_t *payload, size_t payload_len,
     return parse_value(payload + length, payload_len - length, out);
 }
 
+bool unsupported_response(const uint8_t *payload, size_t payload_len,
+                          const char *tag, uint16_t day) {
+    if (!payload || !tag || strlen(tag) != 3) return false;
+    if (payload_len == 4 && memcmp(payload, "6009", 4) == 0) return true;
+    char expected[40];
+    int length = snprintf(expected, sizeof(expected), "G V #%s %04X 0 = 6009", tag, day);
+    return length > 0 && size_t(length) == payload_len &&
+           memcmp(payload, expected, payload_len) == 0;
+}
+
 bool contains_minute(const Value &value, uint16_t expected,
                      uint16_t tolerance) {
     if (!value.present || expected > 1440) return false;

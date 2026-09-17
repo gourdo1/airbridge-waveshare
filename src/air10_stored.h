@@ -17,6 +17,8 @@ struct Value {
 bool parse_value(const uint8_t *payload, size_t payload_len, Value &out);
 bool parse_response(const uint8_t *payload, size_t payload_len,
                     const char *tag, uint16_t day, Value &out);
+bool unsupported_response(const uint8_t *payload, size_t payload_len,
+                          const char *tag, uint16_t day);
 bool contains_minute(const Value &value, uint16_t expected,
                      uint16_t tolerance);
 bool contains_interval(const Value &starts, const Value &ends,
