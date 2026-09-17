@@ -154,6 +154,7 @@ static uint8_t *record_buffer = nullptr;
 static size_t record_capacity = 0;
 
 static uint32_t session_start_capture_ms = 0;
+static uint32_t segment_duration_ms = 0;
 static Air10Clock::Anchor session_clock;
 static uint16_t session_native_day = 0;
 static char recording_id[81] = {};
@@ -415,11 +416,14 @@ static bool wait_for_final_str_save(const EdfPending::Record &pending) {
             uint32_t generation_after = 0;
             const bool have_after = read_u32_variable("ZEN", generation_after);
             bool recovered_end = false;
-            if (expected_off == UINT16_MAX && have_mask_on && have_mask_off) {
+            if ((expected_off == UINT16_MAX || (pending.flags & EdfPending::SEGMENT_END)) &&
+                have_mask_on && have_mask_off) {
                 for (uint8_t i = 0; i < mask_on.sample_count && i < mask_off.sample_count; i++) {
                     if (mask_on.samples[i] >= 0 && mask_off.samples[i] >= 0 &&
-                        abs(int(mask_on.samples[i]) - expected_on) <= MASK_OFF_TOLERANCE_MINUTES &&
-                        mask_off.samples[i] >= mask_on.samples[i] && mask_off.samples[i] <= 1440)
+                        mask_on.samples[i] <= expected_on + MASK_OFF_TOLERANCE_MINUTES &&
+                        mask_off.samples[i] >= expected_on && mask_off.samples[i] <= 1440 &&
+                        (expected_off == UINT16_MAX ||
+                         mask_off.samples[i] + MASK_OFF_TOLERANCE_MINUTES >= expected_off))
                         recovered_end = true;
                 }
             }
@@ -768,7 +772,7 @@ static bool write_pending(const EdfPending::Record &record) {
     return publish_single_file(part, path, backup);
 }
 
-static bool save_pending(bool ended, uint32_t ended_ms) {
+static bool save_pending(bool ended, uint32_t ended_ms, bool segment_end = false) {
     EdfPending::Record pending;
     pending.flags = session_clock.native_valid ? EdfPending::NATIVE_VALID : 0;
     pending.native_day = session_native_day;
@@ -781,10 +785,11 @@ static bool save_pending(bool ended, uint32_t ended_ms) {
     memcpy(pending.day, status.therapy_day, sizeof(pending.day));
     if (ended) {
         pending.flags |= EdfPending::END_KNOWN;
+        if (segment_end) pending.flags |= EdfPending::SEGMENT_END;
         pending.native_end = session_clock.native_at(ended_ms);
         int64_t native_now = 0;
         uint32_t clock_ms = 0;
-        if (read_native_clock(native_now, clock_ms) &&
+        if (!segment_end && read_native_clock(native_now, clock_ms) &&
             !session_clock.stable(native_now, clock_ms))
             pending.flags |= EdfPending::CLOCK_CHANGED;
     }
@@ -2081,6 +2086,8 @@ static uint32_t relative_ms(uint32_t captured_ms) {
     return static_cast<uint32_t>(captured_ms - session_start_capture_ms);
 }
 
+static bool advance_segment(uint32_t captured_ms);
+
 static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                          const DecodedFrame &decoded) {
     uint32_t sample_ms = relative_ms(raw.captured_ms);
@@ -2100,6 +2107,8 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
             wave_clock.relative_ms = predicted;
     }
     wave_clock.last_sequence = decoded.sequence;
+    if (wave_clock.relative_ms >= segment_duration_ms)
+        wave_clock.relative_ms = sample_ms;
 
     const uint32_t record = wave_clock.relative_ms / 60000;
     const uint16_t slot = (wave_clock.relative_ms % 60000) / 40;
@@ -2200,7 +2209,13 @@ static void process_csr(const RawFrame &raw, const StreamSchema &schema,
 }
 
 static void process_raw_frame(const RawFrame &raw) {
-    if (raw.len < 5) return;
+    if (raw.len < 5 || !status.active || !advance_segment(raw.captured_ms)) return;
+    if (int32_t(raw.captured_ms - session_start_capture_ms) < 0) {
+        portENTER_CRITICAL(&status_mux);
+        status.raw_dropped++;
+        portEXIT_CRITICAL(&status_mux);
+        return;
+    }
     char tag[4] = {
         static_cast<char>(raw.payload[0]),
         static_cast<char>(raw.payload[1]),
@@ -2302,8 +2317,7 @@ static void clear_session_memory(bool remove_partial) {
     record_capacity = 0;
 }
 
-static bool make_paths_and_metadata(const ControlEvent &event,
-                                    uint16_t &mid, uint16_t &vid) {
+static bool anchor_session_clock(const ControlEvent &event) {
     session_clock = {};
     session_clock.captured_ms = event.captured_ms;
     int64_t native_now = 0;
@@ -2335,18 +2349,25 @@ static bool make_paths_and_metadata(const ControlEvent &event,
               session_clock.native_valid,
               session_clock.native_valid
                   ? session_clock.export_start - session_clock.native_start : 0LL);
+    return true;
+}
+
+static bool make_paths_and_metadata(const ControlEvent &event,
+                                    uint16_t &mid, uint16_t &vid,
+                                    bool rollover = false) {
+    if (!rollover && !anchor_session_clock(event)) return false;
+    const time_t civil = static_cast<time_t>(session_clock.export_start);
+    struct tm start_tm;
+    gmtime_r(&civil, &start_tm);
     snprintf(start_date, sizeof(start_date), "%02d.%02d.%02d",
              start_tm.tm_mday, start_tm.tm_mon + 1,
              (start_tm.tm_year + 1900) % 100);
     snprintf(start_time, sizeof(start_time), "%02d.%02d.%02d",
              start_tm.tm_hour, start_tm.tm_min, start_tm.tm_sec);
 
-    struct tm therapy_tm = start_tm;
-    if (therapy_tm.tm_hour < 12) {
-        therapy_tm.tm_mday--;
-        therapy_tm.tm_isdst = -1;
-        (void)mktime(&therapy_tm);
-    }
+    const time_t day_civil = int64_t(Air10Clock::therapy_day(civil)) * 86400;
+    struct tm therapy_tm;
+    gmtime_r(&day_civil, &therapy_tm);
     char therapy_day[9];
     snprintf(therapy_day, sizeof(therapy_day), "%04d%02d%02d",
              therapy_tm.tm_year + 1900, therapy_tm.tm_mon + 1,
@@ -2376,14 +2397,23 @@ static bool make_paths_and_metadata(const ControlEvent &event,
     char srn[24] = "0";
     char mid_text[16] = "0";
     char vid_text[16] = "0";
-    (void)read_variable("SRN", srn, sizeof(srn));
-    (void)read_variable("MID", mid_text, sizeof(mid_text));
-    (void)read_variable("VID", vid_text, sizeof(vid_text));
-    uint32_t parsed = 0;
-    mid = parse_hex_value(mid_text, strlen(mid_text), parsed)
-              ? static_cast<uint16_t>(parsed) : 0;
-    vid = parse_hex_value(vid_text, strlen(vid_text), parsed)
-              ? static_cast<uint16_t>(parsed) : 0;
+    if (rollover) {
+        memcpy(srn, session_srn, sizeof(srn));
+        mid = session_mid;
+        vid = session_vid;
+    } else {
+        if (!read_variable("SRN", srn, sizeof(srn)) ||
+            !read_variable("MID", mid_text, sizeof(mid_text)) ||
+            !read_variable("VID", vid_text, sizeof(vid_text))) {
+            status_error("device identity unavailable");
+            return false;
+        }
+        uint32_t parsed = 0;
+        mid = parse_hex_value(mid_text, strlen(mid_text), parsed)
+                  ? static_cast<uint16_t>(parsed) : 0;
+        vid = parse_hex_value(vid_text, strlen(vid_text), parsed)
+                  ? static_cast<uint16_t>(parsed) : 0;
+    }
     const int32_t epoch_day = civil_epoch_day(therapy_tm.tm_year + 1900,
                                                therapy_tm.tm_mon + 1,
                                                therapy_tm.tm_mday);
@@ -2427,12 +2457,13 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
            append_annotation(csl, 0, 0, "Recording starts");
 }
 
-static void reset_session_state(const ControlEvent &event) {
+static void reset_session_state(const ControlEvent &event, bool rollover = false) {
     session_start_capture_ms = event.captured_ms;
+    segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.export_start);
     wave_clock = {};
     last_pld_slot = UINT32_MAX;
     last_oxi_slot = UINT32_MAX;
-    xQueueReset(raw_queue);
+    if (!rollover) xQueueReset(raw_queue);
 }
 
 static void start_session(const ControlEvent &event) {
@@ -2501,17 +2532,8 @@ static void update_record_status() {
     portEXIT_CRITICAL(&status_mux);
 }
 
-static void stop_session(const ControlEvent &event) {
-    if (!status.active) return;
-    capture_active = false;
-    release_streams();
-    (void)save_pending(true, event.captured_ms);
-
-    RawFrame raw;
-    while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE)
-        process_raw_frame(raw);
-    sample_oximetry();
-
+static void close_segment(uint32_t ended_ms, bool rollover) {
+    (void)save_pending(true, ended_ms, rollover);
     (void)write_current_record(brp);
     (void)write_current_record(pld);
     (void)write_current_record(sad);
@@ -2529,18 +2551,66 @@ static void stop_session(const ControlEvent &event) {
               status.sad_records, status.eve_records, status.csl_records,
               status.raw_dropped);
     clear_session_memory(false);
-    portENTER_CRITICAL(&status_mux);
-    status.active = false;
-    status.post_processing = true;
-    portEXIT_CRITICAL(&status_mux);
 
     EdfCatalog::Entry catalog_entry;
     (void)commit_session_catalog(false, false, catalog_entry);
-    SdStorage::refresh_usage();
+}
+
+static bool advance_segment(uint32_t captured_ms) {
+    if (int32_t(captured_ms - session_start_capture_ms) < 0) return true;
+    if (relative_ms(captured_ms) < segment_duration_ms) return true;
+
+    const uint32_t boundary = session_start_capture_ms + segment_duration_ms;
+    const uint32_t seconds = segment_duration_ms / 1000;
+    close_segment(boundary, true);
+    session_clock.native_start += seconds;
+    session_clock.export_start += seconds;
+    session_clock.captured_ms = boundary;
+    session_native_day = Air10Clock::therapy_day(session_clock.native_start);
+    ControlEvent event = {ControlKind::Start, 0, boundary, false};
+    uint16_t mid = session_mid, vid = session_vid;
+    const StreamSchema *schema = find_schema("TCE");
+    const bool tcv = schema && schema_has_field(*schema, "TCV");
+    const bool opened = make_paths_and_metadata(event, mid, vid, true) &&
+        allocate_session_buffers(Air10Edf::brp_schema(tcv), Air10Edf::pld_schema()) &&
+        save_pending(false, 0);
+    if (!opened) {
+        capture_active = false;
+        release_streams();
+        clear_session_memory(true);
+        portENTER_CRITICAL(&status_mux);
+        status.active = false;
+        portEXIT_CRITICAL(&status_mux);
+        if (recording_storage_owned) release_storage();
+        recording_storage_owned = false;
+        status_error("noon segment initialization failed");
+        return false;
+    }
+    reset_session_state(event, true);
+    Log::logf(CAT_GENERAL, LOG_INFO, "[EDF] noon rollover %s/%s\n",
+              status.therapy_day, status.file_prefix);
+    return true;
+}
+
+static void stop_session(const ControlEvent &event) {
+    if (!status.active) return;
+    capture_active = false;
+    release_streams();
+    RawFrame raw;
+    while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE)
+        process_raw_frame(raw);
+    if (status.active) {
+        // Do not create an empty next-day segment for a stop exactly at noon.
+        if (relative_ms(event.captured_ms) > segment_duration_ms)
+            (void)advance_segment(event.captured_ms - 1);
+        if (status.active) close_segment(event.captured_ms, false);
+    }
 
     portENTER_CRITICAL(&status_mux);
+    status.active = false;
     status.post_processing = false;
     portEXIT_CRITICAL(&status_mux);
+    SdStorage::refresh_usage();
     if (recording_storage_owned) release_storage();
     recording_storage_owned = false;
     next_pending_ms = 0;
@@ -2636,10 +2706,12 @@ static void recorder_task(void *) {
         }
 
         RawFrame raw;
-        if (xQueueReceive(raw_queue, &raw, pdMS_TO_TICKS(20)) == pdTRUE &&
-            status.active) {
-            process_raw_frame(raw);
+        if (xQueueReceive(raw_queue, &raw, pdMS_TO_TICKS(20)) == pdTRUE) {
+            do {
+                if (status.active) process_raw_frame(raw);
+            } while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE);
         }
+        if (status.active) (void)advance_segment(millis());
         sample_pld();
         sample_oximetry();
         if (status.active) update_record_status();

@@ -19,6 +19,11 @@ inline uint16_t therapy_day(int64_t civil) {
     return static_cast<uint16_t>((civil - 43200) / 86400);
 }
 
+inline uint32_t milliseconds_to_noon(int64_t civil) {
+    const int64_t next = (int64_t(therapy_day(civil)) + 1) * 86400 + 43200;
+    return static_cast<uint32_t>((next - civil) * 1000);
+}
+
 struct Anchor {
     bool native_valid = false;
     int64_t native_start = 0;

@@ -7,7 +7,8 @@
 
 namespace EdfPending {
 constexpr size_t WIRE_SIZE = 112;
-constexpr uint8_t NATIVE_VALID = 1, END_KNOWN = 2, CLOCK_CHANGED = 4;
+constexpr uint8_t NATIVE_VALID = 1, END_KNOWN = 2, CLOCK_CHANGED = 4,
+                  SEGMENT_END = 8;
 struct Record {
     uint8_t flags = 0;
     uint16_t native_day = 0, export_day = 0, mid = 0, vid = 0;
@@ -51,7 +52,7 @@ inline bool decode(const uint8_t *in, size_t length, Record &r) {
     r.native_end = get(in + 32, 8);
     memcpy(r.srn, in + 40, 24); memcpy(r.prefix, in + 64, 16);
     memcpy(r.day, in + 80, 9);
-    return !(r.flags & ~7u) && r.srn[23] == 0 && r.srn[0] &&
+    return !(r.flags & ~15u) && r.srn[23] == 0 && r.srn[0] &&
            (!(r.flags & NATIVE_VALID) ||
             (r.native_day >= 0x1000 && r.native_day < 0xffff &&
              r.native_start >= int64_t(r.native_day) * 86400 + 43200 &&
