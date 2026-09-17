@@ -4,6 +4,7 @@
 #include "debug_log.h"
 #include "qframe.h"
 #include "uart_arbiter.h"
+#include "clinical_jobs.h"
 
 #include <Arduino.h>
 #include <esp_heap_caps.h>
@@ -70,6 +71,8 @@ uint16_t text_capacity = 0;
 uint32_t retry_at_ms = 0;
 uint32_t cached_language = 0;
 bool language_known = false;
+uint32_t invalidation_generation = 1;
+uint32_t loaded_generation = 0;
 
 void *cache_alloc(size_t bytes, bool zero = false) {
     if (bytes == 0) return nullptr;
@@ -158,10 +161,12 @@ const char *cached_text(uint16_t offset) {
 query_result_t query_value(const char *command, char *response,
                            uint16_t response_size, const char *&value) {
     if (!command || !response || response_size < 2) return QUERY_TIMEOUT;
+    uint16_t timeout = ClinicalJobs::timeout_ms();
+    if (!timeout || loaded_generation != generation()) return QUERY_TIMEOUT;
     response[0] = '\0';
     uint16_t response_len = response_size;
     bool ok = Arbiter::send_cmd(command, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                response, &response_len);
+                                response, &response_len, timeout);
     value = qframe_response_value(response);
     if (ok && value) return QUERY_OK;
     return value ? QUERY_ERROR : QUERY_TIMEOUT;
@@ -377,6 +382,12 @@ cached_entry_t *find_entry_locked(const char *name) {
 }
 
 bool ensure_loaded_locked() {
+    uint32_t current = generation();
+    if (loaded_generation != current) {
+        reset_cache_locked(CACHE_UNKNOWN);
+        language_known = false;
+        loaded_generation = current;
+    }
     if (cache_state == CACHE_READY) {
         uint32_t language = 0;
         if (read_language(language)) {
@@ -517,17 +528,13 @@ bool write_raw(const char *name, uint32_t value) {
 }
 
 void invalidate(const char *reason) {
-    if (!cache_mutex) return;
-    xSemaphoreTake(cache_mutex, portMAX_DELAY);
-    bool changed = cache_state != CACHE_UNKNOWN || entries || options ||
-                   text_pool || language_known;
-    reset_cache_locked(CACHE_UNKNOWN);
-    language_known = false;
-    if (changed) {
-        Log::logf(CAT_WEB, LOG_INFO, "[SETTINGS] Cache invalidated (%s)\n",
-                  reason ? reason : "unknown");
-    }
-    xSemaphoreGive(cache_mutex);
+    __atomic_add_fetch(&invalidation_generation, 1, __ATOMIC_ACQ_REL);
+    Log::logf(CAT_WEB, LOG_INFO, "[SETTINGS] Cache invalidated (%s)\n",
+              reason ? reason : "unknown");
+}
+
+uint32_t generation() {
+    return __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE);
 }
 
 }  // namespace CustomSettings

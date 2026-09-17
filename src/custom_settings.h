@@ -45,5 +45,6 @@ bool write_raw(const char *name, uint32_t value);
 
 // Invalidate metadata after a device reboot, firmware replacement, or LAN change.
 void invalidate(const char *reason);
+uint32_t generation();
 
 }  // namespace CustomSettings

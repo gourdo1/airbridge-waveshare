@@ -17,6 +17,7 @@
 #include "export_sync.h"
 #include "airbridge_ota.h"
 #include "custom_settings.h"
+#include "clinical_jobs.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -69,24 +70,28 @@ static int parseResponseValue(const char *resp) {
 }
 
 static bool readSetting(const char *cmd, int &value) {
+    uint16_t timeout = ClinicalJobs::timeout_ms();
+    if (!timeout) return false;
     char req[16];
     snprintf(req, sizeof(req), "G S #%s", cmd);
     char resp[64] = {};
     uint16_t resp_len = sizeof(resp);
     bool ok = Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                 resp, &resp_len);
+                                 resp, &resp_len, timeout);
     if (!ok) return false;
     value = parseResponseValue(resp);
     return value >= 0;
 }
 
 static bool writeSetting(const char *cmd, int value) {
+    uint16_t timeout = ClinicalJobs::timeout_ms();
+    if (!timeout) return false;
     char req[32];
     snprintf(req, sizeof(req), "P S #%s %04X", cmd, (uint16_t)value);
     char resp[64] = {};
     uint16_t resp_len = sizeof(resp);
     return Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                              resp, &resp_len);
+                              resp, &resp_len, timeout);
 }
 
 static void jsonAddString(String &out, const char *key, const char *val, bool comma = true) {
@@ -521,19 +526,20 @@ static void emitCustomCategory(String &json, uint8_t category, uint8_t mop,
     CustomSettings::visit_category(category, mop, emitCustomVar, &context);
 }
 
-static void handleGetSettings(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
+static int buildSettings(String &json) {
+    uint32_t generation = CustomSettings::generation();
     if (!CustomSettings::ensure_loaded()) {
-        request->send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"settings_metadata_unavailable\"}");
-        return;
+        json = "{\"error\":\"settings_metadata_unavailable\"}";
+        return 503;
     }
 
     int mop = 0;
-    readSetting("MOP", mop);
+    if (!readSetting("MOP", mop)) {
+        json = "{\"error\":\"settings_mode_unavailable\"}";
+        return 503;
+    }
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
-    String json;
     json.reserve(4096);
     json = '[';
     bool first = true;
@@ -560,19 +566,20 @@ static void handleGetSettings(AsyncWebServerRequest *request) {
     emitCustomCategory(json, 4, mop, "configuration", first);
 
     json += ']';
-    request->send(200, "application/json", json);
+    if (generation != CustomSettings::generation()) {
+        json = "{\"error\":\"settings_invalidated\"}";
+        return 503;
+    }
+    return 200;
 }
 
 
-static void handlePostSettings(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
+static int saveSettings(const String &body, String &json) {
     if (!CustomSettings::ensure_loaded()) {
-        request->send(503, "application/json",
-                      "{\"ok\":false,\"error\":\"settings_metadata_unavailable\"}");
-        return;
+        json = "{\"error\":\"settings_metadata_unavailable\"}";
+        return 503;
     }
 
-    String body = getBody(request);
     struct { int count; String errors; bool lan_changed; } ctx = {0, "", false};
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         auto *c = (decltype(ctx)*)p;
@@ -598,15 +605,40 @@ static void handlePostSettings(AsyncWebServerRequest *request) {
     String errors = ctx.errors;
     if (ctx.lan_changed) CustomSettings::invalidate("LAN write");
 
-    String json = "{";
+    json = "{";
     jsonAddInt(json, "saved", count, false);
     if (errors.length() > 0) {
         errors.remove(errors.length() - 1);  // trailing comma
         json += ",\"errors\":[\"" + errors + "\"]";
     }
     json += '}';
-    request->send(200, "application/json", json);
+    return 200;
 }
+
+static int processSettings(bool write, const String &body, String &result) {
+    return write ? saveSettings(body, result) : buildSettings(result);
+}
+
+static void handleSettingsJob(AsyncWebServerRequest *request, bool write) {
+    if (!checkAuth(request)) return;
+    if (!write && request->hasArg("job")) {
+        String result;
+        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), result);
+        if (result.isEmpty()) result = code == 202 ? "{\"pending\":true}"
+            : "{\"error\":\"settings_job_unavailable\"}";
+        request->send(code, "application/json", result);
+        return;
+    }
+    uint32_t id = 0;
+    if (!ClinicalJobs::submit(write, write ? getBody(request) : String(), id)) {
+        request->send(503, "application/json", "{\"error\":\"settings_busy\"}");
+        return;
+    }
+    request->send(202, "application/json", "{\"job\":" + String(id) + "}");
+}
+
+static void handleGetSettings(AsyncWebServerRequest *request) { handleSettingsJob(request, false); }
+static void handlePostSettings(AsyncWebServerRequest *request) { handleSettingsJob(request, true); }
 
 
 static void handleGetConfig(AsyncWebServerRequest *request) {
@@ -1593,6 +1625,7 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
 
 void WebUI::init(uint16_t port) {
     if (port == 0) return;
+    ClinicalJobs::init(processSettings);
 
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");
