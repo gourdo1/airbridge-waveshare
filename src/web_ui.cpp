@@ -1492,7 +1492,7 @@ static void handleReboot(AsyncWebServerRequest *request) {
 
 void WebUI::push_event(const char *event, const char *json) {
     AsyncEventSource *target = strcmp(event, "live") == 0 ? live_events : events;
-    if (target) target->send(json, event, millis());
+    if (target && target->count()) target->send(json, event, millis());
 }
 
 void WebUI::push_event(const char *event, const String &json) {
