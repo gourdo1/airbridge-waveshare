@@ -109,6 +109,12 @@ void clear_allocations(Metadata &data) {
     data.text_capacity = 0;
 }
 
+void *cache_resize(void *ptr, size_t bytes) {
+    void *resized = heap_caps_realloc(ptr, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return resized ? resized
+        : heap_caps_realloc(ptr, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
 bool reset_cache_locked(cache_state_t state) {
     if (__atomic_load_n(&current->readers, __ATOMIC_ACQUIRE)) {
         Metadata *other = current == &metadata_slots[0] ? &metadata_slots[1] : &metadata_slots[0];
@@ -128,10 +134,8 @@ bool reserve_text_locked(uint16_t required) {
     if (next > UINT16_MAX) next = UINT16_MAX;
     if (next < required) return false;
 
-    char *replacement = static_cast<char *>(cache_alloc(next));
+    char *replacement = static_cast<char *>(cache_resize(current->text_pool, next));
     if (!replacement) return false;
-    if (current->text_pool && current->text_size) memcpy(replacement, current->text_pool, current->text_size);
-    if (current->text_pool) heap_caps_free(current->text_pool);
     current->text_pool = replacement;
     current->text_capacity = (uint16_t)next;
     return true;
@@ -157,12 +161,8 @@ bool reserve_options_locked(uint16_t required) {
     if (next > UINT16_MAX) return false;
 
     cached_option_t *replacement = static_cast<cached_option_t *>(
-        cache_alloc(next * sizeof(cached_option_t)));
+        cache_resize(current->options, next * sizeof(cached_option_t)));
     if (!replacement) return false;
-    if (current->options && current->option_count) {
-        memcpy(replacement, current->options, current->option_count * sizeof(cached_option_t));
-    }
-    if (current->options) heap_caps_free(current->options);
     current->options = replacement;
     current->option_capacity = (uint16_t)next;
     return true;
@@ -376,6 +376,21 @@ bool discover_locked() {
         }
     }
 
+    if (current->text_size < current->text_capacity) {
+        char *text = static_cast<char *>(cache_resize(current->text_pool, current->text_size));
+        if (text) {
+            current->text_pool = text;
+            current->text_capacity = current->text_size;
+        }
+    }
+    if (current->option_count && current->option_count < current->option_capacity) {
+        auto *options = static_cast<cached_option_t *>(cache_resize(
+            current->options, current->option_count * sizeof(cached_option_t)));
+        if (options) {
+            current->options = options;
+            current->option_capacity = current->option_count;
+        }
+    }
     cache_state = CACHE_READY;
     Log::logf(CAT_WEB, LOG_INFO,
               "[SETTINGS] Cached %u custom settings (%u options, %u text bytes)\n",
