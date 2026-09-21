@@ -1,9 +1,11 @@
 #include "ota_url_client.h"
+#include "debug_log.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
@@ -85,6 +87,16 @@ void capture_transport_error(esp_http_client_handle_t client,
         client, &tls_error, &tls_flags);
     error.tls_error = tls_error;
     error.tls_flags = tls_flags;
+    Log::logf(CAT_OTA, LOG_ERROR,
+              "[OTA] transport: esp=0x%x tls=0x%x mbed=%d flags=0x%x errno=%d\n",
+              (unsigned)result, (unsigned)tls_result, tls_error,
+              (unsigned)tls_flags, error.socket_error);
+    // Failure-time availability, not the handshake's peak allocation.
+    Log::logf(CAT_OTA, LOG_ERROR,
+              "[OTA] transport context: internal=%u largest=%u epoch=%lld\n",
+              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+              (long long)time(nullptr));
     if (error.code[0]) return;
 
     if (result == ESP_ERR_HTTP_MAX_REDIRECT) set_error(error, "url_too_many_redirects");
