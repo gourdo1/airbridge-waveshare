@@ -118,7 +118,9 @@ namespace Arbiter {
     void set_state(system_state_t state);
     bool wait_idle(uint16_t timeout_ms);
 
+    // Each session starts at 57600; BDD may change baud within the session.
     void enter_transparent(Stream *bridge);
+    // Detach the RX sink and wait for its in-flight calls before returning.
     void exit_transparent();
 
     void write_raw(const uint8_t *data, size_t len);

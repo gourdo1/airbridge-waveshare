@@ -10,6 +10,9 @@
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
 #include <freertos/queue.h>
+#include <freertos/stream_buffer.h>
+#include <lwip/sockets.h>
+#include <errno.h>
 
 extern void dispatch_command(const char *line, String &response);
 
@@ -284,6 +287,58 @@ static void handle_line(const char *line) {
     }
 }
 
+class TransparentOutput : public Stream {
+public:
+    TransparentOutput() {
+        queue = xStreamBufferCreateStatic(sizeof(storage), 1, storage, &queue_state);
+    }
+    ~TransparentOutput() { vStreamBufferDelete(queue); }
+
+    size_t write(uint8_t byte) override { return write(&byte, 1); }
+    size_t write(const uint8_t *data, size_t len) override {
+        if (__atomic_load_n(&failed, __ATOMIC_ACQUIRE)) return 0;
+        size_t n = xStreamBufferSend(queue, data, len, 0);
+        if (n != len) __atomic_store_n(&failed, true, __ATOMIC_RELEASE);
+        return n;
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+    bool pump(int fd) {
+        if (__atomic_load_n(&failed, __ATOMIC_ACQUIRE)) return false;
+        while (true) {
+            if (pending_pos == pending_len) {
+                pending_pos = 0;
+                pending_len = xStreamBufferReceive(queue, pending, sizeof(pending), 0);
+            }
+            if (!pending_len) return true;
+
+            // NetworkClient::write() can destroy the shared receive buffer on error.
+            int n = send(fd, pending + pending_pos, pending_len - pending_pos, MSG_DONTWAIT);
+            if (n > 0) {
+                pending_pos += n;
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                return true;
+            } else {
+                __atomic_store_n(&failed, true, __ATOMIC_RELEASE);
+                return false;
+            }
+        }
+    }
+
+private:
+    StaticStreamBuffer_t queue_state;
+    uint8_t storage[513];
+    StreamBufferHandle_t queue;
+    bool failed = false;
+    uint8_t pending[64];
+    size_t pending_pos = 0;
+    size_t pending_len = 0;
+};
+
 static void handle_transparent() {
     auto &cfg = Config::get();
     system_state_t st = Arbiter::get_state();
@@ -293,20 +348,22 @@ static void handle_transparent() {
         return;
     }
 
+    TransparentOutput output;
+    Arbiter::enter_transparent(&output);
     client.println("OK: entering transparent mode (idle timeout 5s)");
-    Arbiter::enter_transparent(&client);
 
     static const uint32_t TRANSPARENT_IDLE_TIMEOUT = 5000;
 
-    while (client.connected() && Arbiter::get_state() == SYS_TRANSPARENT) {
-        // TCP -> UART
-        if (client.available()) {
-            uint8_t buf[256];
-            int n = client.readBytes(buf, min(client.available(), (int)sizeof(buf)));
-            if (n > 0) {
-                Arbiter::write_raw(buf, n);
-            }
+    bool output_ok = true;
+    while (Arbiter::get_state() == SYS_TRANSPARENT) {
+        // Read first: even a reset socket can still have Arduino-buffered bytes.
+        uint8_t buf[256];
+        int n = client.read(buf, sizeof(buf));
+        if (n > 0) {
+            Arbiter::write_raw(buf, n);
         }
+        output_ok = output.pump(client.fd());
+        if (n <= 0 && (!output_ok || !client.connected())) break;
 
         // Idle timeout: 5s since last activity in either direction
         // TCP->UART tracked here, UART->TCP tracked by rx_task via transparent_last_activity
@@ -319,7 +376,10 @@ static void handle_transparent() {
     }
 
     Arbiter::exit_transparent();
-    if (client.connected()) {
+    if (!output_ok) {
+        client.stop();
+        Log::logf(CAT_TCP, LOG_WARN, "[TCP] Transparent output failed\n");
+    } else if (client.connected()) {
         client.println("OK: transparent mode exited");
     }
 }

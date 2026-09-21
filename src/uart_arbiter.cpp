@@ -46,6 +46,8 @@ static frame_listener_slot_t frame_listeners[FRAME_LISTENER_MAX];
 
 static volatile bool transparent_active = false;
 static Stream *transparent_bridge = nullptr;
+static portMUX_TYPE transparent_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t transparent_inflight = 0;
 static volatile uint32_t transparent_last_activity = 0;
 static qframe_parser_t transparent_parser;      // shadow parser for BDD sniffing
 static uint32_t transparent_pending_baud = 0;
@@ -356,7 +358,6 @@ static void dispatch_frame_listeners(const qframe_t *frame) {
 
 static void transparent_apply_baud(uint32_t new_baud, const char *reason) {
     if (new_baud && new_baud != current_baud) {
-        if (transparent_bridge) transparent_bridge->flush();
         vTaskDelay(pdMS_TO_TICKS(10));
         uart->updateBaudRate(new_baud);
         Log::logf(CAT_ARB, LOG_INFO,
@@ -549,9 +550,18 @@ static void rx_task(void *param) {
     qframe_parser_init(&rx_parser);
 
     while (true) {
-        transparent_check_reboot_baud(false);
+        portENTER_CRITICAL(&transparent_mux);
+        bool transparent = transparent_active;
+        Stream *bridge = transparent_bridge;
+        if (transparent && bridge) transparent_inflight++;
+        portEXIT_CRITICAL(&transparent_mux);
 
-        if (transparent_active) {
+        if (transparent) {
+            if (!bridge) {
+                vTaskDelay(1);
+                continue;
+            }
+            transparent_check_reboot_baud(false);
             if (transparent_pending_baud &&
                 (uint32_t)(millis() - transparent_pending_baud_at) > 1000) {
                 Log::logf(CAT_ARB, LOG_WARN,
@@ -568,8 +578,8 @@ static void rx_task(void *param) {
                 int n = uart->readBytes(buf, min(avail, (int)sizeof(buf)));
                 transparent_last_activity = millis();
                 Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] TRANSP RX %d bytes t=%lu\n", n, millis());
-                if (transparent_bridge && n > 0) {
-                    transparent_bridge->write(buf, n);
+                if (n > 0) {
+                    bridge->write(buf, n);
                 }
                 // Sniff for BDD R-frame
                 for (int i = 0; i < n; i++) {
@@ -604,6 +614,9 @@ static void rx_task(void *param) {
             } else {
                 vTaskDelay(1);
             }
+            portENTER_CRITICAL(&transparent_mux);
+            transparent_inflight--;
+            portEXIT_CRITICAL(&transparent_mux);
             continue;
         }
 
@@ -1179,15 +1192,18 @@ void Arbiter::set_cached_rop(int v)         { cached_rop = v; }
 void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
 
 void Arbiter::enter_transparent(Stream *bridge) {
-    transparent_bridge = bridge;
     qframe_parser_reset(&transparent_parser);
     transparent_tx_reset();
     transparent_pending_baud = 0;
     transparent_pending_baud_at = 0;
     transparent_reboot_baud_at = 0;
-    transparent_last_activity = millis();
-    transparent_active = true;
     sys_state = SYS_TRANSPARENT;
+    set_baud(RESMED_DEFAULT_BAUD);
+    transparent_last_activity = millis();
+    portENTER_CRITICAL(&transparent_mux);
+    transparent_bridge = bridge;
+    transparent_active = true;
+    portEXIT_CRITICAL(&transparent_mux);
 }
 
 uint32_t Arbiter::transparent_activity() {
@@ -1195,8 +1211,14 @@ uint32_t Arbiter::transparent_activity() {
 }
 
 void Arbiter::exit_transparent() {
-    transparent_active = false;
-    transparent_bridge = nullptr;
+    while (true) {
+        portENTER_CRITICAL(&transparent_mux);
+        transparent_bridge = nullptr;
+        bool busy = transparent_inflight != 0;
+        portEXIT_CRITICAL(&transparent_mux);
+        if (!busy) break;
+        vTaskDelay(1);
+    }
     qframe_parser_reset(&rx_parser);
     qframe_parser_reset(&transparent_parser);
     transparent_tx_reset();
@@ -1204,6 +1226,9 @@ void Arbiter::exit_transparent() {
     transparent_pending_baud_at = 0;
     transparent_check_reboot_baud(true);
     sys_state = SYS_IDLE;
+    portENTER_CRITICAL(&transparent_mux);
+    transparent_active = false;
+    portEXIT_CRITICAL(&transparent_mux);
 }
 
 void Arbiter::write_raw(const uint8_t *data, size_t len) {
