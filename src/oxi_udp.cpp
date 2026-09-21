@@ -36,7 +36,6 @@ static void udp_task(void *param) {
     }
     Log::logf(CAT_OXI, LOG_INFO, "[OXI] UDP listening on port %u\n", port);
 
-    uint32_t pkt_count = 0;
     while (true) {
         // One extra byte distinguishes oversized datagrams without retaining them.
         uint8_t buf[UDP_PACKET_SIZE + 1];
@@ -73,7 +72,6 @@ static void udp_task(void *param) {
         int16_t hr = parse_sfloat(hr_raw);
 
         if (spo2 >= 0 && spo2 <= 100 && hr >= 0 && hr <= 500) {
-            pkt_count++;
             if (OxiArbiter::active_source() == OXI_SRC_NONE) {
                 char address[INET_ADDRSTRLEN];
                 if (inet_ntop(AF_INET, &remote.sin_addr, address, sizeof(address)))

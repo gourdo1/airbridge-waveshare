@@ -47,7 +47,6 @@ static TaskHandle_t oxi_task_handle = nullptr;
 static volatile oxi_state_t state = OXI_DISABLED;
 static volatile bool state_dirty = false;
 static inline void set_state(oxi_state_t s) { state = s; state_dirty = true; }
-static oxi_reading_t reading = { -1, -1, false, 0 };  // local copy for callbacks
 static volatile bool scan_requested = false;
 static volatile bool active_scan_requested = false;
 typedef enum { CONN_NONE, CONN_AUTO, CONN_USER } connect_mode_t;

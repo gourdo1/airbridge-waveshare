@@ -163,10 +163,4 @@ bool is_active() {
     return LiveStream::is_stream_active(LivePmd::TAG);
 }
 
-uint16_t current_seq() {
-    uint16_t seq;
-    get_samples(nullptr, 0, 0, &seq);
-    return seq;
-}
-
 }

@@ -1700,7 +1700,6 @@ static bool recover_partial_output(const char *partial_path) {
     }
 
     portENTER_CRITICAL(&status_mux);
-    status.recovered_files++;
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_GENERAL, LOG_INFO,
               "[EDF] recovered %s (%u records)\n", final_path, records);
@@ -2233,7 +2232,6 @@ static void process_raw_frame(const RawFrame &raw) {
     if (!schema || !decode_frame(raw, *schema, decoded)) return;
 
     portENTER_CRITICAL(&status_mux);
-    status.raw_frames++;
     portEXIT_CRITICAL(&status_mux);
 
     if (strcmp(tag, wave_tag) == 0) process_wave(raw, *schema, decoded);
@@ -2570,7 +2568,6 @@ static void start_session(const ControlEvent &event) {
     status.active = true;
     status.post_processing = false;
     status.started_epoch = event.epoch;
-    status.raw_frames = 0;
     status.raw_dropped = 0;
     status.write_errors = 0;
     status.post_errors = 0;

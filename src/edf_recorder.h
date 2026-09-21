@@ -11,7 +11,6 @@ struct Status {
     bool post_processing;
     bool identification_ready;
     uint32_t started_epoch;
-    uint32_t raw_frames;
     uint32_t raw_dropped;
     uint32_t write_errors;
     uint32_t brp_records;
@@ -21,7 +20,6 @@ struct Status {
     uint32_t csl_records;
     uint32_t str_records;
     uint32_t post_errors;
-    uint32_t recovered_files;
     uint32_t pending_str;
     char therapy_day[9];
     char file_prefix[16];

@@ -57,39 +57,6 @@ MemoryStatus status() {
 #endif
 }
 
-#ifdef ARDUINO
-MemoryRegionStatus region_status(uint32_t caps) {
-    MemoryRegionStatus out;
-    multi_heap_info_t info = {};
-    heap_caps_get_info(&info, caps);
-    out.free_bytes = info.total_free_bytes;
-    out.allocated_bytes = info.total_allocated_bytes;
-    out.largest_free_block = info.largest_free_block;
-    out.minimum_free_bytes = info.minimum_free_bytes;
-    out.allocated_blocks = info.allocated_blocks;
-    out.free_blocks = info.free_blocks;
-    out.total_blocks = info.total_blocks;
-    return out;
-}
-#endif
-
-MemoryDetailStatus detail_status() {
-#ifdef ARDUINO
-    ensure_begin();
-    MemoryDetailStatus out;
-    out.summary = status();
-    out.default_8bit = region_status(MALLOC_CAP_8BIT);
-    out.internal_8bit = region_status(MALLOC_CAP_INTERNAL |
-                                      MALLOC_CAP_8BIT);
-    out.internal_dma = region_status(MALLOC_CAP_INTERNAL |
-                                    MALLOC_CAP_DMA);
-    out.psram_8bit = region_status(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return out;
-#else
-    return {};
-#endif
-}
-
 bool psram_available() {
 #ifdef ARDUINO
     return status().psram_available;

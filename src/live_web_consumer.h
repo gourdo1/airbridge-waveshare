@@ -25,6 +25,5 @@ int  get_samples(LivePmd::Sample *out, int max,
                  uint16_t since_seq, uint16_t *cur_seq);
 
 bool     is_active();
-uint16_t current_seq();
 
 }
