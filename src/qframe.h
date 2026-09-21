@@ -62,7 +62,6 @@ typedef struct {
     qframe_parse_state_t state;
     qframe_t    frame;
     uint16_t    raw_count;
-    uint8_t     raw_buf[QFRAME_MAX_RAW];
     uint8_t     len_chars[3];
     uint8_t     crc_chars[4];
 } qframe_parser_t;

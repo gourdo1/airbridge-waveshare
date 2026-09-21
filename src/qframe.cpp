@@ -21,6 +21,12 @@ void qframe_parser_init(qframe_parser_t *p) {
 void qframe_parser_reset(qframe_parser_t *p) {
     memset(p, 0, sizeof(*p));
     p->state = QFP_IDLE;
+    p->frame.crc_computed = 0xFFFF;
+}
+
+static void consume_wire_byte(qframe_parser_t *p, uint8_t byte) {
+    p->frame.crc_computed = crc16_ccitt(&byte, 1, p->frame.crc_computed);
+    p->raw_count++;
 }
 
 const qframe_t* qframe_parser_frame(const qframe_parser_t *p) {
@@ -36,32 +42,32 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
     case QFP_IDLE:
         if (byte == QFRAME_SYNC) {
             qframe_parser_reset(p);
-            p->raw_buf[p->raw_count++] = byte;
+            consume_wire_byte(p, byte);
             p->state = QFP_TYPE;
         }
         break;
 
     case QFP_TYPE:
         p->frame.type = byte;
-        p->raw_buf[p->raw_count++] = byte;
+        consume_wire_byte(p, byte);
         p->state = QFP_LEN0;
         break;
 
     case QFP_LEN0:
         p->len_chars[0] = byte;
-        p->raw_buf[p->raw_count++] = byte;
+        consume_wire_byte(p, byte);
         p->state = QFP_LEN1;
         break;
 
     case QFP_LEN1:
         p->len_chars[1] = byte;
-        p->raw_buf[p->raw_count++] = byte;
+        consume_wire_byte(p, byte);
         p->state = QFP_LEN2;
         break;
 
     case QFP_LEN2: {
         p->len_chars[2] = byte;
-        p->raw_buf[p->raw_count++] = byte;
+        consume_wire_byte(p, byte);
 
         int n0 = hex_nibble(p->len_chars[0]);
         int n1 = hex_nibble(p->len_chars[1]);
@@ -86,10 +92,10 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
             p->crc_chars[0] = byte;
             p->state = QFP_CRC1;
         } else if (byte == QFRAME_SYNC) {
-            p->raw_buf[p->raw_count++] = byte;
+            consume_wire_byte(p, byte);
             p->state = QFP_PAYLOAD_ESC;
         } else {
-            p->raw_buf[p->raw_count++] = byte;
+            consume_wire_byte(p, byte);
             if (p->frame.payload_len < QFRAME_MAX_PAYLOAD) {
                 p->frame.payload[p->frame.payload_len++] = byte;
             }
@@ -98,7 +104,7 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
 
     case QFP_PAYLOAD_ESC:
         if (byte == QFRAME_SYNC) {
-            p->raw_buf[p->raw_count++] = byte;
+            consume_wire_byte(p, byte);
             if (p->frame.payload_len < QFRAME_MAX_PAYLOAD) {
                 p->frame.payload[p->frame.payload_len++] = QFRAME_SYNC;
             }
@@ -106,7 +112,7 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
         } else {
             // Restart with the first 0x55 as new sync
             qframe_parser_reset(p);
-            p->raw_buf[p->raw_count++] = QFRAME_SYNC;
+            consume_wire_byte(p, QFRAME_SYNC);
             p->state = QFP_TYPE;
             return qframe_parser_feed(p, byte);
         }
@@ -134,7 +140,6 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
             break;
         }
         p->frame.crc_received = (c0 << 12) | (c1 << 8) | (c2 << 4) | c3;
-        p->frame.crc_computed = crc16_ccitt(p->raw_buf, p->raw_count);
         p->frame.crc_valid = (p->frame.crc_received == p->frame.crc_computed);
         p->state = QFP_COMPLETE;
         return true;
