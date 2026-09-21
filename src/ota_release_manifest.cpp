@@ -232,8 +232,20 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
     if (!json || json_len == 0 || !target || !*target || !error) return false;
 
     ManifestAllocator allocator;
+    JsonDocument filter(&allocator);
+    filter["schema"] = true;
+    filter["product"] = true;
+    filter["version"] = true;
+    JsonObject raw_filter = filter["targets"][target]["raw"].to<JsonObject>();
+    raw_filter["url"] = true;
+    raw_filter["size"] = true;
+    if (filter.overflowed()) {
+        set_error(error, "manifest_alloc_failed");
+        return false;
+    }
     JsonDocument document(&allocator);
-    DeserializationError parse_error = deserializeJson(document, json, json_len);
+    DeserializationError parse_error = deserializeJson(
+        document, json, json_len, DeserializationOption::Filter(filter));
     if (parse_error) {
         set_error(error, parse_error == DeserializationError::NoMemory
                              ? "manifest_alloc_failed"

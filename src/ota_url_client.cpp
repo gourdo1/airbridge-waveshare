@@ -7,6 +7,7 @@
 
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
+#include <esp_heap_caps.h>
 #include <esp_tls_errors.h>
 
 namespace OtaUrl {
@@ -14,7 +15,7 @@ namespace {
 
 static constexpr char USER_AGENT[] = "AirBridge OTA";
 static constexpr int HTTP_TIMEOUT_MS = 15000;
-static constexpr int HTTP_BUFFER_BYTES = 4096;
+static constexpr int HTTP_BUFFER_BYTES = 1024;
 static constexpr int HTTP_TX_BUFFER_BYTES = 1024;
 static constexpr int REDIRECT_LIMIT = 5;
 
@@ -150,10 +151,18 @@ esp_err_t fetch_event(esp_http_client_event_t *event) {
             return ESP_FAIL;
         }
         ctx.expected_size = (size_t)length;
+        ctx.buffer = (uint8_t *)heap_caps_malloc(
+            ctx.expected_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx.buffer)
+            ctx.buffer = (uint8_t *)heap_caps_malloc(ctx.expected_size, MALLOC_CAP_8BIT);
+        if (!ctx.buffer) {
+            set_error(*ctx.error, "manifest_alloc_failed");
+            return ESP_FAIL;
+        }
         ctx.size_checked = true;
     }
     size_t len = (size_t)event->data_len;
-    if (ctx.offset > ctx.capacity || len > ctx.capacity - ctx.offset) {
+    if (ctx.offset > ctx.expected_size || len > ctx.expected_size - ctx.offset) {
         set_error(*ctx.error, "url_response_too_large");
         return ESP_FAIL;
     }
@@ -208,18 +217,18 @@ bool stream(const char *url, size_t expected_size,
     return result == ESP_OK && status == 200 && context.offset == expected_size;
 }
 
-bool fetch(const char *url, uint8_t *buffer, size_t capacity, size_t &length,
+bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,
            Error &error, ContinueCallback continue_callback,
            void *callback_ctx) {
     length = 0;
+    buffer = nullptr;
     error = {};
-    if (!supported(url) || !buffer || capacity == 0) {
+    if (!supported(url) || capacity == 0) {
         set_error(error, "url_invalid_request");
         return false;
     }
 
     FetchContext context;
-    context.buffer = buffer;
     context.capacity = capacity;
     context.continue_callback = continue_callback;
     context.callback_ctx = callback_ctx;
@@ -240,6 +249,8 @@ bool fetch(const char *url, uint8_t *buffer, size_t capacity, size_t &length,
         set_error(error, "url_incomplete_response");
     else length = context.offset;
     esp_http_client_cleanup(client);
+    if (length) buffer = context.buffer;
+    else heap_caps_free(context.buffer);
     return length > 0;
 }
 

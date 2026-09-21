@@ -79,13 +79,6 @@ bool deadline_due(uint32_t now, uint32_t deadline) {
     return deadline && (int32_t)(now - deadline) >= 0;
 }
 
-void *allocate_manifest_buffer() {
-    void *buffer = heap_caps_malloc(
-        MANIFEST_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buffer) buffer = heap_caps_malloc(MANIFEST_MAX_BYTES, MALLOC_CAP_8BIT);
-    return buffer;
-}
-
 bool operation_allowed() {
     if (!lock(pdMS_TO_TICKS(50))) return false;
     bool allowed = runtime.operation == OP_CHECK;
@@ -128,19 +121,12 @@ void check_task(void *) {
         unlock();
     }
 
-    uint8_t *buffer = (uint8_t *)allocate_manifest_buffer();
-    if (!buffer) {
-        finish_check(nullptr, nullptr, false, false, "manifest_alloc_failed");
-        vTaskDelete(nullptr);
-        return;
-    }
-
+    uint8_t *buffer = nullptr;
     size_t length = 0;
     OtaUrl::Error transport_error;
     if (!OtaUrl::fetch(url, buffer, MANIFEST_MAX_BYTES, length,
                        transport_error,
                        [](void *) { return operation_allowed(); }, nullptr)) {
-        heap_caps_free(buffer);
         finish_check(nullptr, nullptr, false, false,
                      transport_error.code[0] ? transport_error.code
                                              : "manifest_fetch_failed");
