@@ -19,11 +19,6 @@ enum Stage : uint8_t {
     MAXIMUM, STEP, ENTRY_END, DONE
 };
 
-double display_value(uint32_t raw, int16_t scale) {
-    if (scale > 0) return (double)raw / scale;
-    if (scale < 0) return (double)raw * -(int32_t)scale;
-    return raw;
-}
 }
 
 Snapshot::~Snapshot() { reset(); }
@@ -143,8 +138,42 @@ void Cursor::integer(const char *key, int64_t value) {
     field(key, number_, false);
 }
 
-void Cursor::decimal(const char *key, double value, uint8_t places) {
-    snprintf(number_, sizeof(number_), "%.*f", places, value);
+void Cursor::decimal(const char *key, int64_t raw, int16_t scale, uint8_t places) {
+    uint64_t magnitude = raw < 0 ? -raw : raw;
+    uint32_t divisor = scale > 0 ? scale : 1;
+    if (scale < 0) magnitude *= -(int32_t)scale;
+    size_t length = snprintf(number_, sizeof(number_), "%s%llu",
+                              raw < 0 ? "-" : "",
+                              (unsigned long long)(magnitude / divisor));
+    uint32_t remainder = magnitude % divisor;
+    if (places) number_[length++] = '.';
+    uint8_t written = 0;
+    while (written < places && length < sizeof(number_) - 2) {
+        remainder *= 10;
+        number_[length++] = '0' + remainder / divisor;
+        remainder %= divisor;
+        written++;
+    }
+    // Round exact rational values to nearest, ties to even, without newlib's
+    // heap-backed floating-point formatting. Keep the bounded text buffer.
+    if (written == places && (remainder * 2 > divisor ||
+        (remainder * 2 == divisor && ((number_[length - 1] - '0') & 1)))) {
+        size_t first = raw < 0 ? 1 : 0;
+        size_t digit = length;
+        bool carry = true;
+        while (digit > first && carry) {
+            char &c = number_[--digit];
+            if (c == '.') continue;
+            if (c == '9') c = '0';
+            else { c++; carry = false; }
+        }
+        if (carry) {
+            memmove(number_ + first + 1, number_ + first, length - first);
+            number_[first] = '1';
+            length++;
+        }
+    }
+    number_[length] = '\0';
     field(key, number_);
 }
 
@@ -225,26 +254,22 @@ bool Cursor::next(const Snapshot &snapshot) {
             case UNITS: if (custom) { field(",\"units\":", entry.units); return true; } break;
             case DISPLAY_VALUE:
                 if (valid) {
-                    double display = custom ? display_value(value.raw, entry.scale)
-                        : (float)value.raw / (float)stock->scale_div;
-                    decimal(",\"display\":", display, decimals); return true;
+                    decimal(",\"display\":", value.raw,
+                            custom ? entry.scale : stock->scale_div, decimals); return true;
                 }
                 break;
             case MINIMUM:
-                if (custom) { decimal(",\"min\":", display_value(entry.minimum, entry.scale), decimals); return true; } break;
+                if (custom) { decimal(",\"min\":", entry.minimum, entry.scale, decimals); return true; } break;
             case MAXIMUM:
-                if (custom) { decimal(",\"max\":", display_value(entry.maximum, entry.scale), decimals); return true; } break;
+                if (custom) { decimal(",\"max\":", entry.maximum, entry.scale, decimals); return true; } break;
             case STEP:
                 if (custom) {
-                    double step = entry.step;
-                    if (entry.scale > 0) step /= entry.scale;
-                    if (entry.scale < 0) step *= -(int32_t)entry.scale;
-                    decimal(",\"step\":", step, decimals); return true;
+                    decimal(",\"step\":", entry.step, entry.scale, decimals); return true;
                 }
                 if (valid) {
-                    float step = 1.0f;
-                    for (uint8_t d = 0; d < decimals; d++) step /= 10.0f;
-                    snprintf(number_, sizeof(number_), "%g", step);
+                    // Stock precision is 0, 1 or 2 decimal places.
+                    snprintf(number_, sizeof(number_), "%s",
+                             decimals == 0 ? "1" : decimals == 1 ? "0.1" : "0.01");
                     field(",\"step\":", number_); return true;
                 }
                 break;

@@ -46,7 +46,7 @@ private:
     void token(const char *text, bool quoted = false, size_t length = SIZE_MAX);
     void field(const char *key, const char *text, bool quoted = true);
     void integer(const char *key, int64_t value);
-    void decimal(const char *key, double value, uint8_t places);
+    void decimal(const char *key, int64_t raw, int16_t scale, uint8_t places);
 
     uint16_t row_ = 0;
     uint8_t stage_ = 0, option_ = 0;
