@@ -25,6 +25,8 @@ struct entry_t {
     uint8_t decimals;
     const char *units;
     size_t units_len;
+    const char *groups;
+    uint8_t group_count;
     const char *label;
     size_t label_len;
 };
@@ -43,7 +45,10 @@ struct enum_option_t {
 };
 
 bool parse_header(const char *value, header_t &out);
-bool parse_entry(const char *value, entry_t &out);
+constexpr bool supported_version(uint8_t version) { return version == 1 || version == 2; }
+bool parse_entry(const char *value, uint8_t version, entry_t &out);
+// Consume a space followed by LL:TEXT, advancing by bytes rather than words.
+bool parse_text(const char *&cursor, const char *&text, size_t &length);
 bool parse_numeric_caps(const char *value, numeric_caps_t &out);
 bool parse_enum_flags(const char *value, uint8_t &flags);
 bool parse_enum_option(const char *value, enum_option_t &out);

@@ -13,7 +13,8 @@ constexpr uint8_t VALID = 1, CUSTOM = 2;
 const char *const GROUPS[] = {"therapy", "comfort", "accessories", "options", "configuration"};
 
 enum Stage : uint8_t {
-    ARRAY_START, ENTRY_START, LABEL, GROUP, VALUE, EDITABLE, SOURCE, TYPE,
+    ARRAY_START, ENTRY_START, LABEL, GROUP, GROUP_PATH_START, GROUP_PATH_ITEM,
+    VALUE, EDITABLE, SOURCE, TYPE,
     OPTIONS_START, OPTION_START, OPTION_VALUE, OPTION_LABEL, OPTION_END,
     SCALE, RAW_STEP, DECIMALS, RAW_MIN, RAW_MAX, UNITS, DISPLAY_VALUE, MINIMUM,
     MAXIMUM, STEP, ENTRY_END, DONE
@@ -207,6 +208,18 @@ bool Cursor::next(const Snapshot &snapshot) {
                 field(row_ ? ",{\"cmd\":" : "{\"cmd\":", custom ? entry.name : stock->cmd); return true;
             case LABEL: field(",\"label\":", custom ? entry.label : stock->label); return true;
             case GROUP: field(",\"group\":", GROUPS[value.group]); return true;
+            case GROUP_PATH_START:
+                if (!custom || !entry.group_count) { stage_ = VALUE; break; }
+                option_ = 0;
+                option_offset_ = 0;
+                token(",\"groups\":["); return true;
+            case GROUP_PATH_ITEM:
+                if (option_ == entry.group_count) { token("]"); return true; }
+                field(option_ ? "," : "", entry.groups + option_offset_);
+                option_offset_ += strlen(entry.groups + option_offset_) + 1;
+                option_++;
+                stage_ = GROUP_PATH_ITEM;
+                return true;
             case VALUE: integer(",\"value\":", valid ? (int64_t)value.raw : -1); return true;
             case EDITABLE: field(",\"editable\":", !custom || (entry.flags & 0x04) ? "true" : "false", false); return true;
             case SOURCE: if (custom) { field(",\"source\":", "custom"); return true; } break;

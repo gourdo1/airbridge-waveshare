@@ -82,9 +82,22 @@ bool parse_header(const char *value, header_t &out) {
     return true;
 }
 
-bool parse_entry(const char *value, entry_t &out) {
-    if (!value) return false;
+bool parse_text(const char *&cursor, const char *&text, size_t &length) {
+    if (!cursor) return false;
+    uint32_t bytes = 0;
+    if (!separator(cursor) || strlen(cursor) < 3 || cursor[2] != ':' ||
+        !fixed_hex(cursor, 2, bytes)) return false;
+    cursor += 3;
+    if (strlen(cursor) < bytes) return false;
+    text = cursor;
+    length = bytes;
+    cursor += bytes;
+    return true;
+}
+
+bool parse_entry(const char *value, uint8_t version, entry_t &out) {
     memset(&out, 0, sizeof(out));
+    if (!value || !supported_version(version)) return false;
 
     const char *cursor = value;
     const char *start = nullptr;
@@ -112,47 +125,39 @@ bool parse_entry(const char *value, entry_t &out) {
         return false;
     }
 
-    if (out.kind == ENTRY_ENUM) {
-        if (*cursor == '\0') {
-            out.label = cursor;
-            return true;
+    if (out.kind == ENTRY_NUMERIC) {
+        uint32_t raw_scale = 0;
+        uint32_t raw_step = 0;
+        if (!separator(cursor) || !token(cursor, start, length) ||
+            !fixed_hex_token(start, length, 4, raw_scale) ||
+            !separator(cursor) || !token(cursor, start, length) ||
+            !fixed_hex_token(start, length, 4, raw_step) ||
+            !separator(cursor) || !token(cursor, start, length) ||
+            !fixed_hex_token(start, length, 2, field)) {
+            return false;
         }
-        if (!separator(cursor)) return false;
-        out.label = cursor;
-        out.label_len = strlen(cursor);
-        return true;
+        out.scale = (int16_t)(uint16_t)raw_scale;
+        out.step = (int16_t)(uint16_t)raw_step;
+        out.decimals = (uint8_t)field;
+        if (!parse_text(cursor, out.units, out.units_len)) return false;
     }
 
-    uint32_t raw_scale = 0;
-    uint32_t raw_step = 0;
-    if (!separator(cursor) || !token(cursor, start, length) ||
-        !fixed_hex_token(start, length, 4, raw_scale) ||
-        !separator(cursor) || !token(cursor, start, length) ||
-        !fixed_hex_token(start, length, 4, raw_step) ||
-        !separator(cursor) || !token(cursor, start, length) ||
-        !fixed_hex_token(start, length, 2, field)) {
-        return false;
+    if (version == 2) {
+        if (!separator(cursor) || !token(cursor, start, length) ||
+            !fixed_hex_token(start, length, 2, field)) return false;
+        out.group_count = (uint8_t)field;
+        out.groups = cursor;
+        for (uint8_t i = 0; i < out.group_count; i++)
+            if (!parse_text(cursor, start, length)) return false;
     }
-    out.scale = (int16_t)(uint16_t)raw_scale;
-    out.step = (int16_t)(uint16_t)raw_step;
-    out.decimals = (uint8_t)field;
 
-    if (!separator(cursor) || strlen(cursor) < 3 || cursor[2] != ':' ||
-        !fixed_hex(cursor, 2, field)) {
-        return false;
-    }
-    cursor += 3;
-    if (strlen(cursor) < field) return false;
-    out.units = cursor;
-    out.units_len = field;
-    cursor += field;
-
-    if (*cursor == '\0') {
+    if (version == 1 && *cursor == '\0') {
         out.label = cursor;
         return true;
     }
     if (*cursor != ' ') return false;
     cursor++;
+    if (version == 1 && out.kind == ENTRY_ENUM && *cursor == ' ') return false;
     out.label = cursor;
     out.label_len = strlen(cursor);
     return true;

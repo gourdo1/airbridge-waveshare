@@ -63,6 +63,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* Rows, fields */
 .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #25254533}
 .row:last-child{border-bottom:none}
+.setting-group{margin-top:14px}
+.setting-group .setting-group{margin-left:12px}
+.setting-group h4{font-size:13px;color:var(--text);margin-bottom:4px}
 .row label{flex:1;font-size:14px}
 .row select,.row input[type=number]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
 .row input[type=number]{width:100px}
@@ -949,12 +952,30 @@ async function loadSettings() {
     settings = data;
     const containers = {therapy:'therapyFields',comfort:'comfortFields',accessories:'accessoriesFields',options:'optionsFields',configuration:'configurationFields'};
     for (const c in containers) { const el = document.getElementById(containers[c]); if (el) el.innerHTML = ''; }
+    const groups = new Map();
     settings.forEach(s => {
       const target = containers[s.group];
       const el = document.getElementById(target);
       if (el) {
+        let parent = el;
+        const path = [s.group];
+        (s.groups || []).forEach(name => {
+          path.push(name);
+          const key = JSON.stringify(path);
+          let section = groups.get(key);
+          if (!section) {
+            section = document.createElement('section');
+            section.className = 'setting-group';
+            const heading = document.createElement('h4');
+            heading.textContent = name;
+            section.appendChild(heading);
+            parent.appendChild(section);
+            groups.set(key, section);
+          }
+          parent = section;
+        });
         const field = renderField(s);
-        el.appendChild(field);
+        parent.appendChild(field);
         if (s.cmd === 'MOP') {
           const select = field.querySelector('select');
           if (select) select.addEventListener('change', async e => {

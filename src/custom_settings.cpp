@@ -15,7 +15,6 @@
 namespace CustomSettings {
 namespace {
 
-constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint8_t FLAG_EDITABLE = 0x04;
 constexpr uint8_t MAX_ENUM_OPTIONS = 32;
 constexpr uint32_t RETRY_DELAY_MS = 5000;
@@ -46,6 +45,7 @@ struct cached_entry_t {
     uint32_t maximum;
     uint16_t label_offset;
     uint16_t units_offset;
+    uint16_t groups_offset;
     uint16_t option_start;
     int16_t scale;
     int16_t step;
@@ -55,6 +55,7 @@ struct cached_entry_t {
     uint8_t width;
     uint8_t decimals;
     uint8_t option_count;
+    uint8_t group_count;
     kind_t kind;
 };
 
@@ -141,8 +142,8 @@ bool reserve_text_locked(uint16_t required) {
     return true;
 }
 
-uint16_t add_text_locked(const char *text, size_t length) {
-    if (!text || length == 0) return 0;
+uint16_t add_text_locked(const char *text, size_t length, bool keep_empty = false) {
+    if (!text || (length == 0 && !keep_empty)) return 0;
     if (length >= UINT16_MAX || current->text_size > UINT16_MAX - length - 1)
         return INVALID_OFFSET;
     uint16_t required = (uint16_t)(current->text_size + length + 1);
@@ -305,10 +306,10 @@ bool discover_locked() {
 
     CustomSettingsProtocol::header_t header = {};
     if (!CustomSettingsProtocol::parse_header(value, header)) return false;
-    if (header.version != PROTOCOL_VERSION) {
+    if (!CustomSettingsProtocol::supported_version(header.version)) {
         reset_cache_locked(CACHE_INCOMPATIBLE);
         Log::logf(CAT_WEB, LOG_WARN,
-                  "[SETTINGS] Unsupported custom registry version %u\n",
+                  "[SETTINGS] Unsupported custom registry version %02X\n",
                   header.version);
         return true;
     }
@@ -335,7 +336,7 @@ bool discover_locked() {
             return false;
 
         CustomSettingsProtocol::entry_t record = {};
-        if (!CustomSettingsProtocol::parse_entry(value, record)) return false;
+        if (!CustomSettingsProtocol::parse_entry(value, header.version, record)) return false;
         for (uint16_t previous = 0; previous < index; previous++) {
             if (strcmp(current->entries[previous].name, record.name) == 0) return false;
         }
@@ -354,6 +355,17 @@ bool discover_locked() {
         if (entry.label_offset == INVALID_OFFSET ||
             entry.units_offset == INVALID_OFFSET) {
             return false;
+        }
+        entry.group_count = record.group_count;
+        if (record.group_count) {
+            entry.groups_offset = current->text_size;
+            const char *cursor = record.groups;
+            for (uint8_t group = 0; group < record.group_count; group++) {
+                const char *text;
+                size_t length;
+                if (!CustomSettingsProtocol::parse_text(cursor, text, length) ||
+                    add_text_locked(text, length, true) == INVALID_OFFSET) return false;
+            }
         }
 
         snprintf(command, sizeof(command), "G C #%s", entry.name);
@@ -427,8 +439,9 @@ bool ensure_loaded_locked() {
             language_known = true;
         }
         if (cache_state == CACHE_READY) return true;
-    } else if (cache_state == CACHE_UNSUPPORTED ||
-               cache_state == CACHE_INCOMPATIBLE) {
+    } else if (cache_state == CACHE_INCOMPATIBLE) {
+        return false;
+    } else if (cache_state == CACHE_UNSUPPORTED) {
         return true;
     } else if (cache_state == CACHE_FAILED &&
                (int32_t)(millis() - retry_at_ms) < 0) {
@@ -446,7 +459,7 @@ bool ensure_loaded_locked() {
                   "[SETTINGS] Custom registry discovery failed\n");
         return false;
     }
-    return true;
+    return cache_state != CACHE_INCOMPATIBLE;
 }
 
 }  // namespace
@@ -515,6 +528,8 @@ bool MetadataLease::entry(uint16_t index, entry_view_t &view) const {
     view.name = entry.name;
     view.label = metadata_->text_pool + entry.label_offset;
     view.units = metadata_->text_pool + entry.units_offset;
+    view.groups = metadata_->text_pool + entry.groups_offset;
+    view.group_count = entry.group_count;
     view.flags = entry.flags;
     view.width = entry.width;
     view.scale = entry.scale;

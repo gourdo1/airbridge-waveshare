@@ -22,6 +22,8 @@ struct entry_view_t {
     const char *name;
     const char *label;
     const char *units;
+    const char *groups;  // group_count consecutive NUL-terminated names
+    uint8_t group_count;
     uint8_t flags;
     uint8_t width;
     int16_t scale;
