@@ -4,6 +4,9 @@
 
 namespace Air10Clock {
 
+// Published by the main health loop; never queries UART.
+void status_time(char (&out)[20]);
+
 // Civil seconds, not UTC: UDT/UTI have no timezone information.
 inline bool decode(uint32_t day, uint32_t uti, int64_t &civil) {
     const uint32_t hour = uti >> 16;

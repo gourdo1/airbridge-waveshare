@@ -18,6 +18,7 @@
 #include "airbridge_ota.h"
 #include "custom_settings.h"
 #include "clinical_jobs.h"
+#include "air10_clock.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -282,12 +283,6 @@ static size_t buildStatusJson(char *out, size_t cap) {
     int mhr = Arbiter::get_cached_mhr();
     system_state_t sys = Arbiter::get_state();
 
-    char dac_resp[32] = {}, tic_resp[32] = {};
-    uint16_t dac_len = sizeof(dac_resp), tic_len = sizeof(tic_resp);
-    bool got_dac = Arbiter::send_cmd("G S #DAC", CMD_SRC_TCP, CMD_PRIO_NORMAL, dac_resp, &dac_len);
-    bool got_tic = Arbiter::send_cmd("G S #TIC", CMD_SRC_TCP, CMD_PRIO_NORMAL, tic_resp, &tic_len);
-
-    Config::refresh_device_info();
     auto &cfg = Config::get();
 
     char esp_time[20] = "--";
@@ -300,19 +295,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
                  t.tm_hour, t.tm_min);
     }
 
-    char resmed_time[20] = "--";
-    if (got_dac && got_tic) {
-        const char *dv = qframe_response_value(dac_resp);
-        const char *tv = qframe_response_value(tic_resp);
-        if (dv && tv && strlen(dv) >= 8 && strlen(tv) >= 6) {
-            int dd, mm, yyyy, hh, mn, ss;
-            if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
-                sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
-                snprintf(resmed_time, sizeof(resmed_time), "%04d-%02d-%02d %02d:%02d",
-                         yyyy, mm, dd, hh, mn);
-            }
-        }
-    }
+    char resmed_time[20];
+    Air10Clock::status_time(resmed_time);
 
     FixedJson json = {out, cap, 0, false};
     fixedJsonPut(json, '{');

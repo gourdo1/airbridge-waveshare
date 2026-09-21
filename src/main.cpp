@@ -20,6 +20,7 @@
 #include "export_sync.h"
 #include "custom_settings.h"
 #include "device_uptime.h"
+#include "air10_clock.h"
 #include "board.h"
 #if defined(AB_BOARD_WROOM_S3)
 #include "hal/usb_serial_jtag_ll.h"
@@ -87,6 +88,45 @@ static std::atomic<bool> clock_sync_pending{true};
 static uint32_t clock_sync_attempt_ms = 0;
 static std::atomic<bool> clock_sync_attempted{false};
 static DeviceUptime::Tracker device_uptime;
+static portMUX_TYPE device_time_mux = portMUX_INITIALIZER_UNLOCKED;
+static char device_time[20] = "--";
+static uint32_t device_time_ms = 0;
+
+void Air10Clock::status_time(char (&out)[20]) {
+    system_state_t state = Arbiter::get_state();
+    portENTER_CRITICAL(&device_time_mux);
+    bool fresh = (state == SYS_IDLE || state == SYS_THERAPY) &&
+        uint32_t(millis() - device_time_ms) < 3 * HEALTH_POLL_INTERVAL_MS;
+    memcpy(out, device_time, sizeof(out));
+    portEXIT_CRITICAL(&device_time_mux);
+    if (!fresh) strcpy(out, "--");
+}
+
+static void publish_device_time(const char *text) {
+    portENTER_CRITICAL(&device_time_mux);
+    snprintf(device_time, sizeof(device_time), "%s", text);
+    device_time_ms = millis();
+    portEXIT_CRITICAL(&device_time_mux);
+}
+
+static void poll_device_time() {
+    char dac[32] = {}, tic[32] = {}, text[20] = "--";
+    uint16_t dac_len = sizeof(dac), tic_len = sizeof(tic);
+    bool got_dac = Arbiter::send_cmd("G S #DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                    dac, &dac_len, HEALTH_TIMEOUT_MS);
+    bool got_tic = Arbiter::send_cmd("G S #TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                    tic, &tic_len, HEALTH_TIMEOUT_MS);
+    const char *dv = qframe_response_value(dac), *tv = qframe_response_value(tic);
+    if (got_dac && got_tic && dv && tv && strlen(dv) >= 8 && strlen(tv) >= 6) {
+        int dd, mm, yyyy, hh, mn, ss;
+        if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
+            sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
+            snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+                     yyyy, mm, dd, hh, mn);
+        }
+    }
+    publish_device_time(text);
+}
 
 static void poll_device_uptime() {
     char response[48] = {};
@@ -99,6 +139,7 @@ static void poll_device_uptime() {
 
     Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] AirSense restart detected by STK\n");
     Config::invalidate_device_info();
+    publish_device_time("--");
     CustomSettings::invalidate("STK reset");
     LiveStream::reattach();
     clock_sync_pending = true;
@@ -149,6 +190,8 @@ static void poll_therapy_state() {
         if (airsense_present) {
             airsense_seen_ms = millis();
             poll_device_uptime();
+            Config::refresh_device_info();
+            poll_device_time();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = Arbiter::get_cached_rop();
             Arbiter::set_cached_rop(new_rop);
@@ -187,6 +230,7 @@ static void poll_therapy_state() {
             }
         }
     }
+    if (!airsense_present) publish_device_time("--");
 }
 
 static void attempt_recovery() {
