@@ -3,6 +3,7 @@
 #include <esp_heap_caps.h>
 #include <freertos/semphr.h>
 #include <utility>
+#include <new>
 
 namespace ClinicalJobs {
 namespace {
@@ -14,9 +15,11 @@ struct Job {
     State state = Free;
     bool write = false;
     bool delivered = false;
+    uint16_t readers = 0;
     uint32_t id = 0, queued_ms = 0, completed_ms = 0;
     int code = 0;
     String body, result;
+    ClinicalSettings::Snapshot snapshot;
 };
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr;
@@ -25,23 +28,32 @@ Handler handler = nullptr;
 uint32_t next_id = 1, active_since = 0;
 
 bool reusable(const Job &job) {
-    return job.state == Free || (job.state == Complete &&
+    return job.state == Free || (job.state == Complete && !job.readers &&
         uint32_t(millis() - job.completed_ms) >= (job.delivered ? 2000u : RETAIN_MS));
+}
+
+void reset_job(Job &job) {
+    // Arduino String move-assignment from an empty value retains capacity.
+    job.~Job();
+    new (&job) Job;
 }
 
 void worker(void *) {
     while (true) {
+        CustomSettings::reclaim();
         Job *job = nullptr;
+        String body;
         xSemaphoreTake(mutex, portMAX_DELAY);
         for (Job &candidate : jobs) {
             if (candidate.state == Complete && reusable(candidate))
-                candidate = Job{};
+                reset_job(candidate);
             if (candidate.state == Queued &&
                 (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
         }
         if (job) {
             job->state = Running;
             active_since = job->queued_ms;
+            body = std::move(job->body);
         }
         xSemaphoreGive(mutex);
         if (!job) {
@@ -49,12 +61,20 @@ void worker(void *) {
             continue;
         }
         String result;
-        int code = timeout_ms() ? handler(job->write, job->body, result) : 504;
+        int code = 504;
+        if (timeout_ms()) {
+            if (job->write) code = handler(body, result);
+            else {
+                code = ClinicalSettings::collect(job->snapshot);
+                if (code != 200) result = job->snapshot.error();
+            }
+        }
         if (!timeout_ms()) code = 504;
-        if (code == 504)
+        if (code == 504) {
+            job->snapshot.reset();
             result = "{\"error\":\"settings_deadline\",\"partial_write_possible\":true}";
+        }
         xSemaphoreTake(mutex, portMAX_DELAY);
-        job->body = String();
         job->result = std::move(result);
         job->code = code;
         job->completed_ms = millis();
@@ -74,6 +94,33 @@ void init(Handler callback) {
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS)
         xTaskCreatePinnedToCore(worker, "clinical", 6144, nullptr, 2, &task, 0);
+}
+
+Result::~Result() { reset(); }
+
+void Result::reset() {
+    if (!id_) return;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    for (Job &job : jobs) {
+        if (job.id != id_) continue;
+        if (job.readers) job.readers--;
+        if (reusable(job)) reset_job(job);
+        break;
+    }
+    xSemaphoreGive(mutex);
+    id_ = 0;
+    data_ = nullptr;
+    snapshot_ = nullptr;
+    length_ = 0;
+}
+
+size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
+                    char *out, size_t capacity) const {
+    if (snapshot_) return cursor.read(*snapshot_, out, capacity);
+    if (!data_ || offset >= length_) return 0;
+    size_t count = min(capacity, length_ - offset);
+    memcpy(out, data_ + offset, count);
+    return count;
 }
 
 bool submit(bool write, const String &body, uint32_t &id) {
@@ -99,9 +146,14 @@ bool submit(bool write, const String &body, uint32_t &id) {
         xSemaphoreGive(mutex);
         return false;
     }
-    *available = Job{};
+    reset_job(*available);
     available->write = write;
     available->body = body;
+    if (available->body.length() != body.length()) {
+        reset_job(*available);
+        xSemaphoreGive(mutex);
+        return false;
+    }
     available->id = next_id++;
     if (!next_id) next_id = 1;
     available->queued_ms = millis();
@@ -112,14 +164,24 @@ bool submit(bool write, const String &body, uint32_t &id) {
     return true;
 }
 
-int poll(uint32_t id, String &result) {
+int poll(uint32_t id, Result &result) {
+    result.reset();
     if (!task || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
     int code = 410;
     for (Job &job : jobs) {
         if (job.state == Free || job.id != id) continue;
         if (job.state == Complete) {
             if (uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
-                result = job.result;
+                size_t length = job.snapshot.length() ? job.snapshot.length() : job.result.length();
+                if (!length || job.readers == UINT16_MAX) {
+                    code = 503;
+                    break;
+                }
+                job.readers++;
+                result.id_ = job.id;
+                result.snapshot_ = job.snapshot.length() ? &job.snapshot : nullptr;
+                result.data_ = result.snapshot_ ? nullptr : job.result.c_str();
+                result.length_ = length;
                 code = job.code;
                 job.delivered = true;
             }

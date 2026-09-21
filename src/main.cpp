@@ -1,10 +1,11 @@
 #include <Arduino.h>
 #include <atomic>
 #include "app_config.h"
+#include "build_info.h"
 #include "debug_log.h"
 #include "uart_arbiter.h"
 #include "tcp_bridge.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "oxi_ble.h"
 #include "oxi_udp.h"
 #include "oxi_arbiter.h"
@@ -29,9 +30,6 @@ static void IRAM_ATTR usb_vbus_changed() {
     usb_serial_jtag_ll_phy_enable_pad(digitalRead(14) == HIGH);
 }
 #endif
-
-const char *airbridge_version() { return AIRBRIDGE_VERSION; }
-const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
 
 extern void dispatch_command(const char *line, String &response);
 
@@ -224,7 +222,7 @@ void setup() {
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
 
-    Log::printf("\n=== AirBridge " AIRBRIDGE_VERSION " ===\n");
+    Log::printf("\n=== AirBridge %s ===\n", airbridge_version());
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();

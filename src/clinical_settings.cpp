@@ -1,0 +1,286 @@
+#include "clinical_settings.h"
+#include "clinical_jobs.h"
+#include "settings_defs.h"
+#include "uart_arbiter.h"
+#include <esp_heap_caps.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+namespace ClinicalSettings {
+namespace {
+constexpr uint8_t VALID = 1, CUSTOM = 2;
+const char *const GROUPS[] = {"therapy", "comfort", "accessories", "options", "configuration"};
+
+enum Stage : uint8_t {
+    ARRAY_START, ENTRY_START, LABEL, GROUP, VALUE, EDITABLE, SOURCE, TYPE,
+    OPTIONS_START, OPTION_START, OPTION_VALUE, OPTION_LABEL, OPTION_END,
+    SCALE, RAW_STEP, DECIMALS, RAW_MIN, RAW_MAX, UNITS, DISPLAY_VALUE, MINIMUM,
+    MAXIMUM, STEP, ENTRY_END, DONE
+};
+
+double display_value(uint32_t raw, int16_t scale) {
+    if (scale > 0) return (double)raw / scale;
+    if (scale < 0) return (double)raw * -(int32_t)scale;
+    return raw;
+}
+}
+
+Snapshot::~Snapshot() { reset(); }
+
+void Snapshot::reset() {
+    heap_caps_free(values_);
+    values_ = nullptr;
+    count_ = 0;
+    length_ = 0;
+    error_ = nullptr;
+    metadata_.reset();
+}
+
+bool read_raw(const char *cmd, int &value) {
+    uint16_t timeout = ClinicalJobs::timeout_ms();
+    if (!timeout) return false;
+    char req[16];
+    snprintf(req, sizeof(req), "G S #%s", cmd);
+    char resp[64] = {};
+    uint16_t resp_len = sizeof(resp);
+    if (!Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL, resp, &resp_len, timeout))
+        return false;
+    const char *v = qframe_response_value(resp);
+    value = v ? (int)strtol(v, nullptr, 16) : -1;
+    return value >= 0;
+}
+
+bool known_stock(const char *cmd) { return var_lookup(cmd) != nullptr; }
+
+int collect(Snapshot &snapshot) {
+    snapshot.reset();
+    auto fail = [&](const char *error) {
+        snapshot.reset();
+        snapshot.error_ = error;
+        return 503;
+    };
+    if (!snapshot.metadata_.acquire())
+        return fail("{\"error\":\"settings_metadata_unavailable\"}");
+    int mop = 0;
+    if (!read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
+    if (mop < 0 || mop >= MODE_COUNT) mop = 0;
+
+    // Count the selected layout first, then allocate exactly its compact values.
+    auto layout = [&](bool read) {
+        uint16_t count = 0;
+        auto stock = [&](const char *name, uint8_t group) {
+            if (snapshot.metadata_.find(name) >= 0) return;
+            const var_def_t *v = var_lookup(name);
+            if (!v) return;
+            if (read) {
+                int raw = mop;
+                bool ok = strcmp(name, "MOP") == 0 || read_raw(name, raw);
+                snapshot.values_[count] = {(uint32_t)raw, (uint16_t)(v - VAR_CATALOG),
+                                          group, (uint8_t)(ok ? VALID : 0)};
+            }
+            count++;
+        };
+        auto list = [&](const char *const *names, uint8_t group) {
+            for (; *names; names++) stock(*names, group);
+        };
+        for (uint8_t group = 0; group < 5; group++) {
+            switch (group) {
+                case 0: stock("MOP", 0); list(MODE_LAYOUT[mop], 0); break;
+                case 1: list(COMFORT_LAYOUT[mop], 1); list(EPR_VARS, 1); break;
+                case 2: list(ACCESSORY_VARS, 2); break;
+                case 3: list(OPTION_VARS, 3); break;
+                case 4: list(CONFIGURATION_VARS, 4); break;
+            }
+            for (uint16_t i = 0; i < snapshot.metadata_.count(); i++) {
+                CustomSettings::entry_view_t entry;
+                snapshot.metadata_.entry(i, entry);
+                if (entry.category != group || !(entry.mop_mask & (1u << mop))) continue;
+                if (read) {
+                    uint32_t raw = 0;
+                    bool ok = snapshot.metadata_.read_raw(i, raw);
+                    snapshot.values_[count] = {raw, i, group, (uint8_t)(CUSTOM | (ok ? VALID : 0))};
+                }
+                count++;
+            }
+        }
+        return count;
+    };
+    snapshot.count_ = layout(false);
+    size_t bytes = snapshot.storage_bytes();
+    if (bytes) {
+        snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!snapshot.values_)
+            snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (!snapshot.values_) return fail("{\"error\":\"settings_allocation_failed\"}");
+    }
+    layout(true);
+    if (snapshot.metadata_.generation() != CustomSettings::generation())
+        return fail("{\"error\":\"settings_invalidated\"}");
+
+    Cursor counter;
+    size_t count;
+    while ((count = counter.read(snapshot, nullptr, 512))) snapshot.length_ += count;
+    return 200;
+}
+
+void Cursor::token(const char *text, bool quoted, size_t length) {
+    text_ = text;
+    length_ = length == SIZE_MAX ? strlen(text) : length;
+    offset_ = 0;
+    quoted_ = quoted;
+    quote_phase_ = 0;
+}
+
+void Cursor::field(const char *key, const char *text, bool quoted) {
+    token(key);
+    pending_ = text;
+    pending_quoted_ = quoted;
+}
+
+void Cursor::integer(const char *key, int64_t value) {
+    snprintf(number_, sizeof(number_), "%lld", (long long)value);
+    field(key, number_, false);
+}
+
+void Cursor::decimal(const char *key, double value, uint8_t places) {
+    snprintf(number_, sizeof(number_), "%.*f", places, value);
+    field(key, number_);
+}
+
+bool Cursor::next(const Snapshot &snapshot) {
+    if (pending_) {
+        token(pending_, pending_quoted_);
+        pending_ = nullptr;
+        return true;
+    }
+    if (stage_ == ARRAY_START) { stage_ = ENTRY_START; token("["); return true; }
+    if (row_ == snapshot.count_) {
+        if (stage_ == DONE) return false;
+        stage_ = DONE;
+        token("]");
+        return true;
+    }
+
+    const Value &value = snapshot.values_[row_];
+    bool custom = value.flags & CUSTOM, valid = value.flags & VALID;
+    CustomSettings::entry_view_t entry = {};
+    const var_def_t *stock = nullptr;
+    if (custom) snapshot.metadata_.entry(value.descriptor, entry);
+    else stock = &VAR_CATALOG[value.descriptor];
+    bool enumerated = custom ? entry.kind == CustomSettings::KIND_ENUM : stock->type == SET_ENUM;
+    bool scaled = !custom && stock->type == SET_SCALED && stock->scale_div > 1;
+    uint8_t decimals = custom ? entry.decimals : stock->decimals;
+
+    while (true) {
+        switch (stage_++) {
+            case ENTRY_START:
+                field(row_ ? ",{\"cmd\":" : "{\"cmd\":", custom ? entry.name : stock->cmd); return true;
+            case LABEL: field(",\"label\":", custom ? entry.label : stock->label); return true;
+            case GROUP: field(",\"group\":", GROUPS[value.group]); return true;
+            case VALUE: integer(",\"value\":", valid ? (int64_t)value.raw : -1); return true;
+            case EDITABLE: field(",\"editable\":", !custom || (entry.flags & 0x04) ? "true" : "false", false); return true;
+            case SOURCE: if (custom) { field(",\"source\":", "custom"); return true; } break;
+            case TYPE:
+                field(",\"type\":", enumerated ? "enum" : custom ? "numeric" : scaled ? "scaled" : "int"); return true;
+            case OPTIONS_START:
+                if (enumerated) {
+                    if (!custom && !stock->enum_options) { stage_ = ENTRY_END; break; }
+                    option_ = 0;
+                    option_offset_ = 0;
+                    token(",\"options\":["); return true;
+                }
+                stage_ = custom || scaled ? SCALE : ENTRY_END;
+                break;
+            case OPTION_START:
+                if ((custom && option_ == entry.option_count) || (!custom && option_offset_ == SIZE_MAX)) {
+                    stage_ = ENTRY_END; token("]"); return true;
+                }
+                token(option_ ? (custom ? ",{" : ",") : (custom ? "{" : "")); return true;
+            case OPTION_VALUE:
+                if (custom) {
+                    CustomSettings::option_view_t option;
+                    snapshot.metadata_.option(value.descriptor, option_, option);
+                    integer("\"value\":", option.value); return true;
+                } else {
+                    const char *start = stock->enum_options + option_offset_;
+                    size_t length = strcspn(start, ",");
+                    option_offset_ = start[length] ? option_offset_ + length + 1 : SIZE_MAX;
+                    token(start, true, length); stage_ = OPTION_END; return true;
+                }
+            case OPTION_LABEL: {
+                CustomSettings::option_view_t option;
+                snapshot.metadata_.option(value.descriptor, option_, option);
+                field(",\"label\":", option.label); return true;
+            }
+            case OPTION_END:
+                option_++; stage_ = OPTION_START;
+                if (custom) { token("}"); return true; }
+                break;
+            case SCALE: integer(custom ? ",\"scale\":" : ",\"scale_div\":", custom ? entry.scale : stock->scale_div); return true;
+            case RAW_STEP: if (custom) { integer(",\"raw_step\":", entry.step); return true; } break;
+            case DECIMALS: integer(",\"decimals\":", decimals); return true;
+            case RAW_MIN: if (custom) { integer(",\"raw_min\":", entry.minimum); return true; } break;
+            case RAW_MAX: if (custom) { integer(",\"raw_max\":", entry.maximum); return true; } break;
+            case UNITS: if (custom) { field(",\"units\":", entry.units); return true; } break;
+            case DISPLAY_VALUE:
+                if (valid) {
+                    double display = custom ? display_value(value.raw, entry.scale)
+                        : (float)value.raw / (float)stock->scale_div;
+                    decimal(",\"display\":", display, decimals); return true;
+                }
+                break;
+            case MINIMUM:
+                if (custom) { decimal(",\"min\":", display_value(entry.minimum, entry.scale), decimals); return true; } break;
+            case MAXIMUM:
+                if (custom) { decimal(",\"max\":", display_value(entry.maximum, entry.scale), decimals); return true; } break;
+            case STEP:
+                if (custom) {
+                    double step = entry.step;
+                    if (entry.scale > 0) step /= entry.scale;
+                    if (entry.scale < 0) step *= -(int32_t)entry.scale;
+                    decimal(",\"step\":", step, decimals); return true;
+                }
+                if (valid) {
+                    float step = 1.0f;
+                    for (uint8_t d = 0; d < decimals; d++) step /= 10.0f;
+                    snprintf(number_, sizeof(number_), "%g", step);
+                    field(",\"step\":", number_); return true;
+                }
+                break;
+            case ENTRY_END:
+                row_++; stage_ = ENTRY_START; token("}"); return true;
+            default: return false;
+        }
+    }
+}
+
+size_t Cursor::read(const Snapshot &snapshot, char *out, size_t capacity) {
+    size_t written = 0;
+    while (written < capacity) {
+        char c;
+        if (escape_) { c = escape_; escape_ = 0; }
+        else if (!text_) {
+            if (!next(snapshot)) break;
+            continue;
+        } else if (quoted_ && !quote_phase_) { c = '"'; quote_phase_ = 1; }
+        else if (offset_ < length_) {
+            c = text_[offset_++];
+            if (quoted_) {
+                if (c == '"' || c == '\\') { escape_ = c; c = '\\'; }
+                else if (c == '\n' || c == '\r' || c == '\t') {
+                    escape_ = c == '\n' ? 'n' : c == '\r' ? 'r' : 't'; c = '\\';
+                } else if ((uint8_t)c < 0x20) continue;
+            }
+        } else {
+            text_ = nullptr;
+            if (!quoted_) continue;
+            c = '"';
+        }
+        if (out) out[written] = c;
+        written++;
+    }
+    return written;
+}
+
+}  // namespace ClinicalSettings

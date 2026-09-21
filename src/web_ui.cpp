@@ -1,13 +1,13 @@
 #include "web_ui.h"
 #include "web_ui_html.h"
-#include "settings_defs.h"
 #include "uart_arbiter.h"
 #include "oxi_ble.h"
 #include "oxi_arbiter.h"
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
-#include "wifi.h"
+#include "build_info.h"
+#include "wifi_setup.h"
 #include "network_hints.h"
 #include "live_web_consumer.h"
 #include "crc.h"
@@ -26,9 +26,7 @@
 #include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <time.h>
-
-extern const char *airbridge_version();
-extern const char *airbridge_build_date();
+#include <new>
 
 static AsyncWebServer *http = nullptr;
 static AsyncEventSource *events = nullptr;
@@ -66,24 +64,6 @@ static void json_foreach_kv(const String &body, json_kv_fn fn, void *ctx) {
     }
 }
 
-static int parseResponseValue(const char *resp) {
-    const char *v = qframe_response_value(resp);
-    return v ? (int)strtol(v, nullptr, 16) : -1;
-}
-
-static bool readSetting(const char *cmd, int &value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout) return false;
-    char req[16];
-    snprintf(req, sizeof(req), "G S #%s", cmd);
-    char resp[64] = {};
-    uint16_t resp_len = sizeof(resp);
-    bool ok = Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                 resp, &resp_len, timeout);
-    if (!ok) return false;
-    value = parseResponseValue(resp);
-    return value >= 0;
-}
 
 static bool writeSetting(const char *cmd, int value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
@@ -424,191 +404,6 @@ static void handleStatus(AsyncWebServerRequest *request) {
 }
 
 
-static void emitVar(String &json, const var_def_t *v, const char *group, int raw, bool ok, bool &first) {
-    if (!first) json += ',';
-    first = false;
-
-    json += '{';
-    jsonAddString(json, "cmd", v->cmd, false);
-    jsonAddString(json, "label", v->label);
-    jsonAddString(json, "group", group);
-    jsonAddInt(json, "value", ok ? raw : -1);
-    jsonAddBool(json, "editable", true);
-
-    if (v->type == SET_ENUM) {
-        jsonAddString(json, "type", "enum");
-        if (v->enum_options) {
-            json += ",\"options\":[";
-            const char *start = v->enum_options;
-            bool firstOpt = true;
-            while (start) {
-                const char *end = strchr(start, ',');
-                if (!firstOpt) json += ',';
-                json += '"';
-                for (const char *p = start; p != end && *p; p++) json += *p;
-                json += '"';
-                firstOpt = false;
-                start = end ? end + 1 : nullptr;
-            }
-            json += ']';
-        }
-    } else if (v->type == SET_SCALED && v->scale_div > 1) {
-        jsonAddString(json, "type", "scaled");
-        jsonAddInt(json, "scale_div", v->scale_div);
-        jsonAddInt(json, "decimals", v->decimals);
-        if (ok) {
-            float disp = (float)raw / (float)v->scale_div;
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%.*f", v->decimals, disp);
-            jsonAddString(json, "display", buf);
-            float step = 1.0f;
-            for (int d = 0; d < v->decimals; d++) step /= 10.0f;
-            snprintf(buf, sizeof(buf), "%g", step);
-            jsonAddString(json, "step", buf);
-        }
-    } else {
-        jsonAddString(json, "type", "int");
-    }
-    json += '}';
-}
-
-
-static void emitVarList(String &json, const char * const *cmds, const char *group, bool &first) {
-    for (int i = 0; cmds[i]; i++) {
-        if (CustomSettings::contains(cmds[i])) continue;
-        const var_def_t *v = var_lookup(cmds[i]);
-        if (!v) continue;
-        int raw = 0;
-        bool ok = readSetting(v->cmd, raw);
-        emitVar(json, v, group, raw, ok, first);
-    }
-}
-
-static double customDisplayValue(uint32_t raw, int16_t scale) {
-    if (scale > 0) return (double)raw / scale;
-    if (scale < 0) return (double)raw * -(int32_t)scale;
-    return raw;
-}
-
-static double customDisplayStep(int16_t raw_step, int16_t scale) {
-    if (scale > 0) return (double)raw_step / scale;
-    if (scale < 0) return (double)raw_step * -(int32_t)scale;
-    return raw_step;
-}
-
-struct custom_emit_context_t {
-    String *json;
-    const char *group;
-    bool *first;
-};
-
-static void emitCustomVar(const CustomSettings::entry_view_t &entry,
-                          bool value_ok, uint32_t raw, void *context) {
-    custom_emit_context_t *emit = static_cast<custom_emit_context_t *>(context);
-    String &json = *emit->json;
-    if (!*emit->first) json += ',';
-    *emit->first = false;
-
-    json += '{';
-    jsonAddString(json, "cmd", entry.name, false);
-    jsonAddString(json, "label", entry.label);
-    jsonAddString(json, "group", emit->group);
-    if (value_ok) jsonAddUInt32(json, "value", raw);
-    else jsonAddInt(json, "value", -1);
-    jsonAddBool(json, "editable", (entry.flags & 0x04) != 0);
-    jsonAddString(json, "source", "custom");
-
-    if (entry.kind == CustomSettings::KIND_ENUM) {
-        jsonAddString(json, "type", "enum");
-        json += ",\"options\":[";
-        for (uint8_t i = 0; i < entry.option_count; i++) {
-            if (i) json += ',';
-            json += '{';
-            jsonAddInt(json, "value", entry.options[i].value, false);
-            jsonAddString(json, "label", entry.options[i].label);
-            json += '}';
-        }
-        json += ']';
-    } else {
-        jsonAddString(json, "type", "numeric");
-        jsonAddInt(json, "scale", entry.scale);
-        jsonAddInt(json, "raw_step", entry.step);
-        jsonAddInt(json, "decimals", entry.decimals);
-        jsonAddUInt32(json, "raw_min", entry.minimum);
-        jsonAddUInt32(json, "raw_max", entry.maximum);
-        jsonAddString(json, "units", entry.units);
-
-        char number[32];
-        if (value_ok) {
-            snprintf(number, sizeof(number), "%.*f", entry.decimals,
-                     customDisplayValue(raw, entry.scale));
-            jsonAddString(json, "display", number);
-        }
-        snprintf(number, sizeof(number), "%.*f", entry.decimals,
-                 customDisplayValue(entry.minimum, entry.scale));
-        jsonAddString(json, "min", number);
-        snprintf(number, sizeof(number), "%.*f", entry.decimals,
-                 customDisplayValue(entry.maximum, entry.scale));
-        jsonAddString(json, "max", number);
-        snprintf(number, sizeof(number), "%.*f", entry.decimals,
-                 customDisplayStep(entry.step, entry.scale));
-        jsonAddString(json, "step", number);
-    }
-    json += '}';
-}
-
-static void emitCustomCategory(String &json, uint8_t category, uint8_t mop,
-                               const char *group, bool &first) {
-    custom_emit_context_t context = {&json, group, &first};
-    CustomSettings::visit_category(category, mop, emitCustomVar, &context);
-}
-
-static int buildSettings(String &json) {
-    uint32_t generation = CustomSettings::generation();
-    if (!CustomSettings::ensure_loaded()) {
-        json = "{\"error\":\"settings_metadata_unavailable\"}";
-        return 503;
-    }
-
-    int mop = 0;
-    if (!readSetting("MOP", mop)) {
-        json = "{\"error\":\"settings_mode_unavailable\"}";
-        return 503;
-    }
-    if (mop < 0 || mop >= MODE_COUNT) mop = 0;
-
-    json.reserve(4096);
-    json = '[';
-    bool first = true;
-
-    // Mode selector
-    {
-        const var_def_t *v = var_lookup("MOP");
-        if (v && !CustomSettings::contains("MOP")) {
-            int raw = mop;
-            emitVar(json, v, "therapy", raw, true, first);
-        }
-    }
-
-    emitVarList(json, MODE_LAYOUT[mop], "therapy", first);
-    emitCustomCategory(json, 0, mop, "therapy", first);
-    emitVarList(json, COMFORT_LAYOUT[mop], "comfort", first);
-    emitVarList(json, EPR_VARS, "comfort", first);
-    emitCustomCategory(json, 1, mop, "comfort", first);
-    emitVarList(json, ACCESSORY_VARS, "accessories", first);
-    emitCustomCategory(json, 2, mop, "accessories", first);
-    emitVarList(json, OPTION_VARS, "options", first);
-    emitCustomCategory(json, 3, mop, "options", first);
-    emitVarList(json, CONFIGURATION_VARS, "configuration", first);
-    emitCustomCategory(json, 4, mop, "configuration", first);
-
-    json += ']';
-    if (generation != CustomSettings::generation()) {
-        json = "{\"error\":\"settings_invalidated\"}";
-        return 503;
-    }
-    return 200;
-}
 
 
 static int saveSettings(const String &body, String &json) {
@@ -631,8 +426,7 @@ static int saveSettings(const String &body, String &json) {
             }
             return;
         }
-        const var_def_t *def = var_lookup(key.c_str());
-        if (!def) { c->errors += key + ":unknown,"; return; }
+        if (!ClinicalSettings::known_stock(key.c_str())) { c->errors += key + ":unknown,"; return; }
         if (writeSetting(key.c_str(), atoi(val.c_str()))) {
             c->count++;
             if (key == "LAN") c->lan_changed = true;
@@ -652,18 +446,89 @@ static int saveSettings(const String &body, String &json) {
     return 200;
 }
 
-static int processSettings(bool write, const String &body, String &result) {
-    return write ? saveSettings(body, result) : buildSettings(result);
-}
+
+class ClinicalResponse : public AsyncWebServerResponse {
+public:
+    ClinicalJobs::Result result;
+
+    void begin(int code) {
+        _code = code;
+        _contentType = "application/json";
+        _contentLength = result.length();
+    }
+
+    bool _sourceValid() const override { return result.available(); }
+
+    void _respond(AsyncWebServerRequest *request) override {
+        addHeader("Connection", "close", false);
+        _assembleHead(headers_, request->version());
+        _state = RESPONSE_HEADERS;
+        _ack(request, 0, 0);
+    }
+
+    size_t _ack(AsyncWebServerRequest *request, size_t len, uint32_t) override {
+        _ackedLength += len;
+        size_t written = 0;
+        if (_state == RESPONSE_HEADERS) {
+            size_t count = request->client()->add(headers_.c_str() + header_offset_,
+                                                   headers_.length() - header_offset_);
+            header_offset_ += count;
+            written += count;
+            if (header_offset_ == headers_.length()) _state = RESPONSE_CONTENT;
+        }
+        if (_state == RESPONSE_CONTENT) {
+            while (_sentLength < _contentLength && request->client()->space()) {
+                if (buffer_offset_ == buffer_length_) {
+                    buffer_length_ = result.read(cursor_, _sentLength, buffer_, sizeof(buffer_));
+                    buffer_offset_ = 0;
+                    if (!buffer_length_) {
+                        _state = RESPONSE_FAILED;
+                        request->client()->close();
+                        return written;
+                    }
+                }
+                // Keep generated bytes until TCP has accepted them, even after a zero add.
+                size_t count = request->client()->add(buffer_ + buffer_offset_,
+                                                       buffer_length_ - buffer_offset_);
+                buffer_offset_ += count;
+                _sentLength += count;
+                written += count;
+                if (buffer_offset_ != buffer_length_) break;
+            }
+            if (_sentLength == _contentLength) _state = RESPONSE_WAIT_ACK;
+        }
+        _writtenLength += written;
+        if (_writtenLength > _ackedLength) request->client()->send();
+        if (_state == RESPONSE_WAIT_ACK && _ackedLength >= _writtenLength)
+            _state = RESPONSE_END;
+        return written;
+    }
+
+private:
+    String headers_;
+    size_t header_offset_ = 0;
+    ClinicalSettings::Cursor cursor_;
+    char buffer_[256];
+    size_t buffer_offset_ = 0, buffer_length_ = 0;
+};
 
 static void handleSettingsJob(AsyncWebServerRequest *request, bool write) {
     if (!checkAuth(request)) return;
     if (!write && request->hasArg("job")) {
-        String result;
-        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), result);
-        if (result.isEmpty()) result = code == 202 ? "{\"pending\":true}"
-            : "{\"error\":\"settings_job_unavailable\"}";
-        request->send(code, "application/json", result);
+        auto *response = new (std::nothrow) ClinicalResponse;
+        if (!response) {
+            request->send(503, "application/json", "{\"error\":\"settings_allocation_failed\"}");
+            return;
+        }
+        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), response->result);
+        if (response->result.available()) {
+            response->begin(code);
+            request->send(response);
+        } else {
+            delete response;
+            request->send(code, "application/json", code == 202 ? "{\"pending\":true}"
+                : "{\"error\":\"settings_job_unavailable\"}");
+        }
         return;
     }
     uint32_t id = 0;
@@ -1302,14 +1167,14 @@ static void handleReport(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
     int period = 0;
-    readSetting("URD", period);
+    ClinicalSettings::read_raw("URD", period);
 
     String json = "[";
     bool first = true;
 
     for (const report_var_t *v = REPORT_VARS; v->cmd; v++) {
         int raw = 0;
-        bool ok = readSetting(v->cmd, raw);
+        bool ok = ClinicalSettings::read_raw(v->cmd, raw);
 
         if (!first) json += ',';
         first = false;
@@ -1670,7 +1535,7 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
 
 void WebUI::init(uint16_t port) {
     if (port == 0) return;
-    ClinicalJobs::init(processSettings);
+    ClinicalJobs::init(saveSettings);
 
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");

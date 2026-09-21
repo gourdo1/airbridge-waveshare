@@ -30,7 +30,7 @@
 #include "qframe.h"
 #include "sd_storage.h"
 #include "uart_arbiter.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 
 namespace EdfRecorder {
 namespace {

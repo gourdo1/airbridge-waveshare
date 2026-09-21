@@ -58,16 +58,24 @@ struct cached_entry_t {
     kind_t kind;
 };
 
+}  // namespace
+
+struct Metadata {
+    cached_entry_t *entries = nullptr;
+    cached_option_t *options = nullptr;
+    char *text_pool = nullptr;
+    uint8_t entry_count = 0;
+    uint16_t option_count = 0, option_capacity = 0;
+    uint16_t text_size = 0, text_capacity = 0;
+    uint32_t epoch = 0;
+    mutable uint32_t readers = 0;
+};
+
+namespace {
 SemaphoreHandle_t cache_mutex = nullptr;
 cache_state_t cache_state = CACHE_UNKNOWN;
-cached_entry_t *entries = nullptr;
-cached_option_t *options = nullptr;
-char *text_pool = nullptr;
-uint8_t entry_count = 0;
-uint16_t option_count = 0;
-uint16_t option_capacity = 0;
-uint16_t text_size = 0;
-uint16_t text_capacity = 0;
+Metadata metadata_slots[2];
+Metadata *current = &metadata_slots[0];
 uint32_t retry_at_ms = 0;
 uint32_t cached_language = 0;
 bool language_known = false;
@@ -87,75 +95,77 @@ void *cache_alloc(size_t bytes, bool zero = false) {
     return ptr;
 }
 
-void clear_allocations_locked() {
-    if (entries) heap_caps_free(entries);
-    if (options) heap_caps_free(options);
-    if (text_pool) heap_caps_free(text_pool);
-    entries = nullptr;
-    options = nullptr;
-    text_pool = nullptr;
-    entry_count = 0;
-    option_count = 0;
-    option_capacity = 0;
-    text_size = 0;
-    text_capacity = 0;
+void clear_allocations(Metadata &data) {
+    if (data.entries) heap_caps_free(data.entries);
+    if (data.options) heap_caps_free(data.options);
+    if (data.text_pool) heap_caps_free(data.text_pool);
+    data.entries = nullptr;
+    data.options = nullptr;
+    data.text_pool = nullptr;
+    data.entry_count = 0;
+    data.option_count = 0;
+    data.option_capacity = 0;
+    data.text_size = 0;
+    data.text_capacity = 0;
 }
 
-void reset_cache_locked(cache_state_t state) {
-    clear_allocations_locked();
+bool reset_cache_locked(cache_state_t state) {
+    if (__atomic_load_n(&current->readers, __ATOMIC_ACQUIRE)) {
+        Metadata *other = current == &metadata_slots[0] ? &metadata_slots[1] : &metadata_slots[0];
+        if (__atomic_load_n(&other->readers, __ATOMIC_ACQUIRE)) return false;
+        current = other;
+    }
+    clear_allocations(*current);
     cache_state = state;
     retry_at_ms = state == CACHE_FAILED ? millis() + RETRY_DELAY_MS : 0;
+    return true;
 }
 
 bool reserve_text_locked(uint16_t required) {
-    if (required <= text_capacity) return true;
-    uint32_t next = text_capacity ? text_capacity : 256;
+    if (required <= current->text_capacity) return true;
+    uint32_t next = current->text_capacity ? current->text_capacity : 256;
     while (next < required) next *= 2;
     if (next > UINT16_MAX) next = UINT16_MAX;
     if (next < required) return false;
 
     char *replacement = static_cast<char *>(cache_alloc(next));
     if (!replacement) return false;
-    if (text_pool && text_size) memcpy(replacement, text_pool, text_size);
-    if (text_pool) heap_caps_free(text_pool);
-    text_pool = replacement;
-    text_capacity = (uint16_t)next;
+    if (current->text_pool && current->text_size) memcpy(replacement, current->text_pool, current->text_size);
+    if (current->text_pool) heap_caps_free(current->text_pool);
+    current->text_pool = replacement;
+    current->text_capacity = (uint16_t)next;
     return true;
 }
 
 uint16_t add_text_locked(const char *text, size_t length) {
     if (!text || length == 0) return 0;
-    if (length >= UINT16_MAX || text_size > UINT16_MAX - length - 1)
+    if (length >= UINT16_MAX || current->text_size > UINT16_MAX - length - 1)
         return INVALID_OFFSET;
-    uint16_t required = (uint16_t)(text_size + length + 1);
+    uint16_t required = (uint16_t)(current->text_size + length + 1);
     if (!reserve_text_locked(required)) return INVALID_OFFSET;
-    uint16_t offset = text_size;
-    memcpy(text_pool + text_size, text, length);
-    text_size += (uint16_t)length;
-    text_pool[text_size++] = '\0';
+    uint16_t offset = current->text_size;
+    memcpy(current->text_pool + current->text_size, text, length);
+    current->text_size += (uint16_t)length;
+    current->text_pool[current->text_size++] = '\0';
     return offset;
 }
 
 bool reserve_options_locked(uint16_t required) {
-    if (required <= option_capacity) return true;
-    uint32_t next = option_capacity ? option_capacity * 2u : 16u;
+    if (required <= current->option_capacity) return true;
+    uint32_t next = current->option_capacity ? current->option_capacity * 2u : 16u;
     while (next < required) next *= 2;
     if (next > UINT16_MAX) return false;
 
     cached_option_t *replacement = static_cast<cached_option_t *>(
         cache_alloc(next * sizeof(cached_option_t)));
     if (!replacement) return false;
-    if (options && option_count) {
-        memcpy(replacement, options, option_count * sizeof(cached_option_t));
+    if (current->options && current->option_count) {
+        memcpy(replacement, current->options, current->option_count * sizeof(cached_option_t));
     }
-    if (options) heap_caps_free(options);
-    options = replacement;
-    option_capacity = (uint16_t)next;
+    if (current->options) heap_caps_free(current->options);
+    current->options = replacement;
+    current->option_capacity = (uint16_t)next;
     return true;
-}
-
-const char *cached_text(uint16_t offset) {
-    return text_pool && offset < text_size ? text_pool + offset : "";
 }
 
 query_result_t query_value(const char *command, char *response,
@@ -196,12 +206,12 @@ bool read_raw_locked(const cached_entry_t &entry, uint32_t &value) {
 bool add_enum_option_locked(cached_entry_t &entry, uint8_t value,
                             const char *label, size_t label_len) {
     if (entry.option_count >= MAX_ENUM_OPTIONS ||
-        !reserve_options_locked((uint16_t)(option_count + 1))) {
+        !reserve_options_locked((uint16_t)(current->option_count + 1))) {
         return false;
     }
     uint16_t label_offset = add_text_locked(label, label_len);
     if (label_offset == INVALID_OFFSET) return false;
-    options[option_count++] = {label_offset, value};
+    current->options[current->option_count++] = {label_offset, value};
     entry.option_count++;
     return true;
 }
@@ -224,7 +234,7 @@ query_result_t query_enum_option(const char *name, uint8_t index,
 }
 
 bool discover_enum_options_locked(cached_entry_t &entry) {
-    entry.option_start = option_count;
+    entry.option_start = current->option_count;
     entry.option_count = 0;
 
     uint8_t total = 0;
@@ -308,17 +318,17 @@ bool discover_locked() {
         return true;
     }
 
-    entries = static_cast<cached_entry_t *>(
+    current->entries = static_cast<cached_entry_t *>(
         cache_alloc(header.count * sizeof(cached_entry_t), true));
-    if (!entries) return false;
-    entry_count = header.count;
+    if (!current->entries) return false;
+    current->entry_count = header.count;
     uint32_t initial_text = 1u + (uint32_t)header.count * 64u;
     if (initial_text > UINT16_MAX) initial_text = UINT16_MAX;
     if (!reserve_text_locked((uint16_t)initial_text)) return false;
-    text_pool[0] = '\0';
-    text_size = 1;
+    current->text_pool[0] = '\0';
+    current->text_size = 1;
 
-    for (uint16_t index = 0; index < entry_count; index++) {
+    for (uint16_t index = 0; index < current->entry_count; index++) {
         char command[20];
         snprintf(command, sizeof(command), "G C &CSG %02X", index);
         if (query_value(command, response, sizeof(response), value) != QUERY_OK)
@@ -327,10 +337,10 @@ bool discover_locked() {
         CustomSettingsProtocol::entry_t record = {};
         if (!CustomSettingsProtocol::parse_entry(value, record)) return false;
         for (uint16_t previous = 0; previous < index; previous++) {
-            if (strcmp(entries[previous].name, record.name) == 0) return false;
+            if (strcmp(current->entries[previous].name, record.name) == 0) return false;
         }
 
-        cached_entry_t &entry = entries[index];
+        cached_entry_t &entry = current->entries[index];
         memcpy(entry.name, record.name, sizeof(entry.name));
         entry.kind = record.kind == CustomSettingsProtocol::ENTRY_NUMERIC
             ? KIND_NUMERIC : KIND_ENUM;
@@ -369,14 +379,14 @@ bool discover_locked() {
     cache_state = CACHE_READY;
     Log::logf(CAT_WEB, LOG_INFO,
               "[SETTINGS] Cached %u custom settings (%u options, %u text bytes)\n",
-              entry_count, option_count, text_size);
+              current->entry_count, current->option_count, current->text_size);
     return true;
 }
 
 cached_entry_t *find_entry_locked(const char *name) {
     if (!name || cache_state != CACHE_READY) return nullptr;
-    for (uint16_t i = 0; i < entry_count; i++) {
-        if (strcmp(entries[i].name, name) == 0) return &entries[i];
+    for (uint16_t i = 0; i < current->entry_count; i++) {
+        if (strcmp(current->entries[i].name, name) == 0) return &current->entries[i];
     }
     return nullptr;
 }
@@ -384,7 +394,7 @@ cached_entry_t *find_entry_locked(const char *name) {
 bool ensure_loaded_locked() {
     uint32_t current = generation();
     if (loaded_generation != current) {
-        reset_cache_locked(CACHE_UNKNOWN);
+        if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
         language_known = false;
         loaded_generation = current;
     }
@@ -394,7 +404,9 @@ bool ensure_loaded_locked() {
             if (language_known && language != cached_language) {
                 Log::logf(CAT_WEB, LOG_INFO,
                           "[SETTINGS] LAN changed, refreshing custom registry\n");
-                reset_cache_locked(CACHE_UNKNOWN);
+                if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
+                invalidate("LAN change");
+                loaded_generation = generation();
             }
             cached_language = language;
             language_known = true;
@@ -408,7 +420,7 @@ bool ensure_loaded_locked() {
         return false;
     }
 
-    reset_cache_locked(CACHE_UNKNOWN);
+    if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
     uint32_t language = 0;
     language_known = read_language(language);
     if (language_known) cached_language = language;
@@ -445,49 +457,79 @@ bool contains(const char *name) {
     return result;
 }
 
-void visit_category(uint8_t category, uint8_t mop, entry_visitor_t visitor,
-                    void *context) {
-    if (!cache_mutex || !visitor || mop >= 32) return;
+
+MetadataLease::~MetadataLease() { reset(); }
+
+void MetadataLease::reset() {
+    if (metadata_) __atomic_sub_fetch(&metadata_->readers, 1, __ATOMIC_RELEASE);
+    metadata_ = nullptr;
+}
+
+bool MetadataLease::acquire() {
+    reset();
+    if (!cache_mutex) init();
+    if (!cache_mutex) return false;
     xSemaphoreTake(cache_mutex, portMAX_DELAY);
-    if (cache_state != CACHE_READY) {
-        xSemaphoreGive(cache_mutex);
-        return;
+    bool ok = ensure_loaded_locked() && loaded_generation == CustomSettings::generation();
+    if (ok) {
+        if (!__atomic_load_n(&current->readers, __ATOMIC_ACQUIRE))
+            current->epoch = loaded_generation;
+        __atomic_add_fetch(&current->readers, 1, __ATOMIC_ACQ_REL);
+        metadata_ = current;
     }
+    xSemaphoreGive(cache_mutex);
+    return ok;
+}
 
-    for (uint16_t i = 0; i < entry_count; i++) {
-        cached_entry_t &cached = entries[i];
-        if (cached.category != category ||
-            (cached.mop_mask & (1u << mop)) == 0) {
-            continue;
-        }
+uint32_t MetadataLease::generation() const { return metadata_ ? metadata_->epoch : 0; }
+uint16_t MetadataLease::count() const { return metadata_ ? metadata_->entry_count : 0; }
 
-        option_view_t option_views[MAX_ENUM_OPTIONS];
-        for (uint8_t option = 0; option < cached.option_count; option++) {
-            const cached_option_t &stored = options[cached.option_start + option];
-            option_views[option] = {stored.value, cached_text(stored.label_offset)};
-        }
+int MetadataLease::find(const char *name) const {
+    for (uint16_t i = 0; i < count(); i++)
+        if (strcmp(metadata_->entries[i].name, name) == 0) return i;
+    return -1;
+}
 
-        entry_view_t view = {};
-        view.kind = cached.kind;
-        view.category = cached.category;
-        view.mop_mask = cached.mop_mask;
-        view.name = cached.name;
-        view.label = cached_text(cached.label_offset);
-        view.units = cached_text(cached.units_offset);
-        view.flags = cached.flags;
-        view.width = cached.width;
-        view.scale = cached.scale;
-        view.step = cached.step;
-        view.decimals = cached.decimals;
-        view.minimum = cached.minimum;
-        view.maximum = cached.maximum;
-        view.options = option_views;
-        view.option_count = cached.option_count;
+bool MetadataLease::entry(uint16_t index, entry_view_t &view) const {
+    if (index >= count()) return false;
+    const cached_entry_t &entry = metadata_->entries[index];
+    view = {};
+    view.kind = entry.kind;
+    view.category = entry.category;
+    view.mop_mask = entry.mop_mask;
+    view.name = entry.name;
+    view.label = metadata_->text_pool + entry.label_offset;
+    view.units = metadata_->text_pool + entry.units_offset;
+    view.flags = entry.flags;
+    view.width = entry.width;
+    view.scale = entry.scale;
+    view.step = entry.step;
+    view.decimals = entry.decimals;
+    view.minimum = entry.minimum;
+    view.maximum = entry.maximum;
+    view.option_count = entry.option_count;
+    return true;
+}
 
-        uint32_t value = 0;
-        bool value_ok = read_raw_locked(cached, value);
-        visitor(view, value_ok, value, context);
-    }
+bool MetadataLease::option(uint16_t index, uint8_t option_index, option_view_t &view) const {
+    if (index >= count()) return false;
+    const cached_entry_t &entry = metadata_->entries[index];
+    if (option_index >= entry.option_count) return false;
+    const cached_option_t &option = metadata_->options[entry.option_start + option_index];
+    view = {option.value, metadata_->text_pool + option.label_offset};
+    return true;
+}
+
+bool MetadataLease::read_raw(uint16_t index, uint32_t &value) const {
+    if (index >= count() || generation() != CustomSettings::generation()) return false;
+    return read_raw_locked(metadata_->entries[index], value);
+}
+
+void reclaim() {
+    if (!cache_mutex || xSemaphoreTake(cache_mutex, 0) != pdTRUE) return;
+    for (Metadata &data : metadata_slots)
+        if (&data != current && !__atomic_load_n(&data.readers, __ATOMIC_ACQUIRE))
+            clear_allocations(data);
     xSemaphoreGive(cache_mutex);
 }
 
@@ -506,7 +548,7 @@ bool write_raw(const char *name, uint32_t value) {
     } else {
         valid = false;
         for (uint8_t i = 0; i < entry->option_count; i++) {
-            if (options[entry->option_start + i].value == value) {
+            if (current->options[entry->option_start + i].value == value) {
                 valid = true;
                 break;
             }

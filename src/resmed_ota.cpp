@@ -186,9 +186,17 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
 
     Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
+    if (!timeout_ms) return true;  // Reset commands need TX completion, not ACK.
 
     qframe_t rx;
-    if (Arbiter::wait_frame(&rx, timeout_ms)) {
+    uint32_t started = millis();
+    while (true) {
+        uint32_t elapsed = millis() - started;
+        if (elapsed >= timeout_ms) break;
+        uint16_t remaining = timeout_ms - elapsed;
+        if (!Arbiter::wait_frame(&rx, remaining)) break;
+        if ((rx.type != QFRAME_TYPE_R && rx.type != QFRAME_TYPE_E) ||
+            !qframe_response_matches(frame, frame_len, rx)) continue;
         if (resp && resp_size > 0) {
             uint16_t copy = min((uint16_t)rx.payload_len, (uint16_t)(resp_size - 1));
             memcpy(resp, rx.payload, copy);
@@ -251,6 +259,7 @@ static bool negotiate_baud_460800() {
 }
 
 static bool enter_bootloader(bool send_bll = true) {
+    if (flash_cancel) return false;
     char resp[48] = {};
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
@@ -265,7 +274,10 @@ static bool enter_bootloader(bool send_bll = true) {
             }
         }
         Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
-        send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+        if (flash_cancel) return false;
+        if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
+        // write_raw flushes TX at the old baud; reset starts at 57600.
+        Arbiter::set_baud(57600);
     }
 
 
@@ -285,8 +297,10 @@ static bool enter_bootloader(bool send_bll = true) {
                 bls0_count++;
                 Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: app running (BLS=0)\n", i);
                 if (bls0_count >= 3) {
+                    if (flash_cancel) return false;
                     Log::logf(CAT_OTA, LOG_INFO, "[OTA] Sending BLL...\n");
-                    send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+                    if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
+                    Arbiter::set_baud(57600);
                     bls0_count = 0;
                 }
             }

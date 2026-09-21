@@ -5,6 +5,7 @@ Pre-build script: minify JavaScript, compact HTML and gzip into src/web_ui_html.
 import gzip
 import importlib.util
 import os
+from pathlib import Path
 import re
 
 try:
@@ -15,7 +16,6 @@ except NameError:
 # SCons executes extra scripts without defining __file__.
 PROJECT_DIR = (os.path.abspath(env.get("PROJECT_DIR", ".")) if env is not None
                else os.path.dirname(os.path.abspath(__file__)))
-GENERATOR_PATH = os.path.join(PROJECT_DIR, "generate_web_ui.py")
 RJS_MIN_PATH = os.path.join(PROJECT_DIR, "third_party", "rjsmin", "rjsmin.py")
 
 
@@ -59,28 +59,24 @@ def generate_header(project_dir):
     if not os.path.exists(html_path):
         print(f"[web_ui] WARNING: {html_path} not found")
         return
-    needs_update = not os.path.exists(header_path) or \
-                   max(os.path.getmtime(html_path), os.path.getmtime(GENERATOR_PATH),
-                       os.path.getmtime(RJS_MIN_PATH)) > os.path.getmtime(header_path)
-
-    if needs_update:
-        with open(html_path, "r", encoding="utf-8") as f:
-            raw = f.read()
-
-        minified = minify_html(raw)
-        compressed = gzip.compress(minified.encode("utf-8"), compresslevel=9, mtime=0)
-
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("// Auto-generated from www/index.html, do not edit!\n")
-            f.write("#pragma once\n")
-            f.write("#include <stdint.h>\n\n")
-            f.write(f"#define HTML_PAGE_GZ_SIZE {len(compressed)}\n\n")
-            f.write("static const uint8_t HTML_PAGE_GZ[] PROGMEM = {\n")
-            for i in range(0, len(compressed), 16):
-                chunk = compressed[i:i+16]
-                f.write("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
-            f.write("};\n")
-
+    raw = Path(html_path).read_text(encoding="utf-8")
+    minified = minify_html(raw)
+    compressed = gzip.compress(minified.encode("utf-8"), compresslevel=9, mtime=0)
+    lines = [
+        "// Auto-generated from www/index.html, do not edit!\n",
+        "#pragma once\n",
+        "#include <stdint.h>\n\n",
+        f"#define HTML_PAGE_GZ_SIZE {len(compressed)}\n\n",
+        "static const uint8_t HTML_PAGE_GZ[] PROGMEM = {\n",
+    ]
+    for i in range(0, len(compressed), 16):
+        chunk = compressed[i:i+16]
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
+    lines.append("};\n")
+    content = "".join(lines)
+    header = Path(header_path)
+    if not header.exists() or header.read_text(encoding="utf-8") != content:
+        header.write_text(content, encoding="utf-8")
         print(f"[web_ui] {html_path} ({len(raw)} -> {len(minified)} minified -> {len(compressed)} gzipped)")
 
 

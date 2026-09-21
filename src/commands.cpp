@@ -6,10 +6,11 @@
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
+#include "build_info.h"
 #include "airbridge_ota.h"
 #include <esp_partition.h>
 #include <time.h>
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_pmd.h"
@@ -267,8 +268,8 @@ void dispatch_command(const char *line, String &response) {
     }
 
     if (upper == "VERSION") {
-        response = "AirBridge " + String(AIRBRIDGE_VERSION) + "\n";
-        response += "Built: " + String(AIRBRIDGE_BUILD_DATE) + "\n";
+        response = "AirBridge " + String(airbridge_version()) + "\n";
+        response += "Built: " + String(airbridge_build_date()) + "\n";
         response += "ESP32 SDK: " + String(ESP.getSdkVersion()) + "\n";
         response += "Chip: " + String(ESP.getChipModel()) + " rev" + String(ESP.getChipRevision()) + "\n";
         response += "Flash: " + String(ESP.getFlashChipSize() / 1024) + "KB\n";

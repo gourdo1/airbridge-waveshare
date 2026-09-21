@@ -1,6 +1,7 @@
 #include "airbridge_ota.h"
 
 #include "app_config.h"
+#include "build_info.h"
 #include "debug_log.h"
 #include "export_sync.h"
 #include "ota_release_manifest.h"
@@ -16,8 +17,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
-
-extern const char *airbridge_version();
 
 namespace OtaManager {
 namespace {

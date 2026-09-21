@@ -3,15 +3,13 @@
 
 #include <Arduino.h>
 #include "app_config.h"
+#include "build_info.h"
 #include "debug_log.h"
 #include "uart_arbiter.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "airbridge_ota.h"
 #include "migrate.h"
 #include "network_hints.h"
-
-const char *airbridge_version()    { return "MIGRATE-" AIRBRIDGE_VERSION; }
-const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
 
 void dispatch_command(const char *, String &) {}
 
@@ -28,7 +26,7 @@ void setup() {
     while (Serial.available()) Serial.read();
     Log::init();
 
-    Log::printf("\n=== AirBridge MIGRATE " AIRBRIDGE_VERSION " ===\n");
+    Log::printf("\n=== AirBridge %s ===\n", airbridge_version());
     Log::printf("Heap: %d bytes\n", ESP.getFreeHeap());
 
     Config::init();

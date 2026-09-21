@@ -4,10 +4,14 @@ Runs gen_esp32part.py to convert partitions.csv to binary,
 then convert it to C array in src/target_ptable.h
 """
 import subprocess, sys, os
+from pathlib import Path
 
-Import("env")
+try:
+    Import("env")
+except NameError:
+    env = None
 
-def generate_ptable_header(source, target, env):
+def generate_ptable_header(env):
     project_dir = env.get("PROJECT_DIR", ".")
     csv_path = os.path.join(project_dir, "partitions.csv")
     header_path = os.path.join(project_dir, "src", "target_ptable.h")
@@ -29,17 +33,23 @@ def generate_ptable_header(source, target, env):
 
     data = result.stdout
 
-    with open(header_path, "w") as f:
-        f.write("// Auto-generated from partitions.csv — do not edit\n")
-        f.write("#pragma once\n")
-        f.write("#include <stdint.h>\n\n")
-        f.write(f"#define TARGET_PTABLE_SIZE {len(data)}\n\n")
-        f.write("static const uint8_t TARGET_PTABLE[] PROGMEM = {\n")
-        for i in range(0, len(data), 12):
-            chunk = data[i:i+12]
-            f.write("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
-        f.write("};\n")
+    lines = [
+        "// Auto-generated from partitions.csv — do not edit\n",
+        "#pragma once\n",
+        "#include <stdint.h>\n\n",
+        f"#define TARGET_PTABLE_SIZE {len(data)}\n\n",
+        "static const uint8_t TARGET_PTABLE[] PROGMEM = {\n",
+    ]
+    for i in range(0, len(data), 12):
+        chunk = data[i:i+12]
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
+    lines.append("};\n")
+    content = "".join(lines)
+    header = Path(header_path)
+    if not header.exists() or header.read_text(encoding="utf-8") != content:
+        header.write_text(content, encoding="utf-8")
+        print(f"[ptable] Generated {header_path} ({len(data)} bytes from {csv_path})")
 
-    print(f"[ptable] Generated {header_path} ({len(data)} bytes from {csv_path})")
-
-env.AddPreAction("$BUILD_DIR/src/migrate.cpp.o", generate_ptable_header)
+if env is not None:
+    # Refresh before SCons scans includes, even when migrate.cpp is unchanged.
+    generate_ptable_header(env)

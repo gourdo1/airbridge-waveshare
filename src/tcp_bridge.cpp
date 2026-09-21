@@ -3,14 +3,13 @@
 #include "debug_log.h"
 #include "web_ui.h"
 #include "app_config.h"
+#include "build_info.h"
 #include "live_stream.h"
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
 #include <freertos/queue.h>
-
-extern const char *airbridge_version();
 
 extern void dispatch_command(const char *line, String &response);
 
