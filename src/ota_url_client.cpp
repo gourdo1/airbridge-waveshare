@@ -135,6 +135,7 @@ esp_err_t fetch_event(esp_http_client_event_t *event) {
     if (!event || !event->user_data || event->event_id != HTTP_EVENT_ON_DATA ||
         event->data_len <= 0) return ESP_OK;
     FetchContext &ctx = *(FetchContext *)event->user_data;
+    if (ctx.error->code[0]) return ESP_FAIL;
     if (esp_http_client_get_status_code(event->client) != 200) return ESP_OK;
     if (!allowed(ctx.continue_callback, ctx.callback_ctx)) {
         set_error(*ctx.error, "url_cancelled");
@@ -247,7 +248,7 @@ bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,
     else if (status != 200) snprintf(error.code, sizeof(error.code), "url_http_%d", status);
     else if (!context.size_checked || context.offset != context.expected_size)
         set_error(error, "url_incomplete_response");
-    else length = context.offset;
+    else if (!error.code[0]) length = context.offset;
     esp_http_client_cleanup(client);
     if (length) buffer = context.buffer;
     else heap_caps_free(context.buffer);
