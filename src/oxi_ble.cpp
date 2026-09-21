@@ -8,6 +8,7 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <new>
 #include "nvs_optional.h"
 
 #define OXI_TASK_STACK      4096
@@ -1081,6 +1082,10 @@ void OxiBle::task(void *param) {
                 }
             } else {
                 if (scan_mutex) xSemaphoreTake(scan_mutex, portMAX_DELAY);
+                for (auto &result : scan_results) {
+                    result.~oxi_scan_result_t();
+                    new (&result) oxi_scan_result_t{};
+                }
                 scan_result_count = 0;
                 if (scan_mutex) xSemaphoreGive(scan_mutex);
                 scan_complete = false;
@@ -1088,6 +1093,7 @@ void OxiBle::task(void *param) {
                 set_state(OXI_SCANNING);
                 Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Starting scan (%dms)\n", SCAN_DURATION_MS);
                 pScan->setScanCallbacks(&scanCB);
+                pScan->setMaxResults(0);  // callbacks own the bounded oximeter list
                 bool active = active_scan_requested;
                 active_scan_requested = false;
                 // AirCANnect observer timing; active discovery is user-requested.
