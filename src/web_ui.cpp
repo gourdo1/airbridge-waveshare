@@ -19,6 +19,7 @@
 #include "custom_settings.h"
 #include "clinical_jobs.h"
 #include "air10_clock.h"
+#include "board.h"
 
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -268,6 +269,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     oxi_state_t oxi = OxiBle::get_state();
     oxi_reading_t r;
     OxiArbiter::snapshot(r);
+#if AB_STORAGE_HAS_SDCARD
     SdStorage::Status sd;
     SdStorage::get_status(sd);
     EdfRecorder::Status edf;
@@ -278,6 +280,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     ExportSync::get_status(export_status);
     ExportSync::SleepHqStatus sleephq_status;
     ExportSync::get_sleephq_status(sleephq_status);
+#endif
 
     int rop = Arbiter::get_cached_rop();
     int mhr = Arbiter::get_cached_mhr();
@@ -316,6 +319,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddInt(json, "rssi", WiFi.RSSI());
     fixedJsonAddInt(json, "mhr", mhr);
     fixedJsonAddInt(json, "uptime", millis() / 1000);
+#if AB_STORAGE_HAS_SDCARD
     fixedJsonAddString(json, "sd", !sd.supported ? "unsupported" :
                        sd.mounted ? "mounted" : "unavailable");
     fixedJsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
@@ -353,13 +357,19 @@ static size_t buildStatusJson(char *out, size_t cap) {
                        sleephq_status.import_status);
     fixedJsonAddString(json, "sleephq_error",
                        sleephq_status.last_error);
+#else
+    fixedJsonAddString(json, "sd", "unsupported");
+    fixedJsonAddString(json, "edf", "unsupported");
+    fixedJsonAddString(json, "smb_sync", "unsupported");
+    fixedJsonAddString(json, "sleephq_sync", "unsupported");
+#endif
     fixedJsonPut(json, '}');
 
     return json.overflow ? 0 : json.len;
 }
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
-static const size_t STATUS_JSON_MAX = 1408;
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 1408 : 896;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 
