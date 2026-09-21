@@ -2,7 +2,8 @@
 #include "oxi_arbiter.h"
 #include "app_config.h"
 #include "debug_log.h"
-#include <WiFiUdp.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
 
 #define UDP_TASK_STACK  3072
 #define UDP_TASK_PRIO   3
@@ -22,8 +23,13 @@ static void udp_task(void *param) {
         return;
     }
 
-    WiFiUDP udp;
-    if (!udp.begin(port)) {
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(port);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (fd < 0 || bind(fd, (sockaddr *)&local, sizeof(local)) < 0) {
+        if (fd >= 0) close(fd);
         Log::logf(CAT_OXI, LOG_ERROR, "[OXI] UDP bind failed on port %u\n", port);
         vTaskDelete(NULL);
         return;
@@ -32,24 +38,23 @@ static void udp_task(void *param) {
 
     uint32_t pkt_count = 0;
     while (true) {
-        int len = udp.parsePacket();
-        if (len <= 0) {
+        // One extra byte distinguishes oversized datagrams without retaining them.
+        uint8_t buf[UDP_PACKET_SIZE + 1];
+        sockaddr_in remote = {};
+        socklen_t remote_size = sizeof(remote);
+        int len = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT,
+                           (sockaddr *)&remote, &remote_size);
+        if (len < 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         vTaskDelay(1);  // yield after each packet
 
         if (len != UDP_PACKET_SIZE) {
-            // drain the packet
-            uint8_t drain[32];
-            while (udp.available()) udp.read(drain, sizeof(drain));
             Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP bad length %d (expected %d)\n",
                       len, UDP_PACKET_SIZE);
             continue;
         }
-
-        uint8_t buf[UDP_PACKET_SIZE];
-        udp.read(buf, UDP_PACKET_SIZE);
 
         if (buf[0] != UDP_MAGIC_0 || buf[1] != UDP_MAGIC_1) {
             Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP bad magic %02X %02X\n",
@@ -69,8 +74,11 @@ static void udp_task(void *param) {
 
         if (spo2 >= 0 && spo2 <= 100 && hr >= 0 && hr <= 500) {
             pkt_count++;
-            if (OxiArbiter::active_source() == OXI_SRC_NONE)
-                OxiArbiter::set_source_id(udp.remoteIP().toString().c_str());
+            if (OxiArbiter::active_source() == OXI_SRC_NONE) {
+                char address[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &remote.sin_addr, address, sizeof(address)))
+                    OxiArbiter::set_source_id(address);
+            }
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] UDP SpO2=%d HR=%d\n", spo2, hr);
             OxiArbiter::feed(OXI_SRC_UDP, spo2, hr, true);
         } else if (spo2 < 0 || hr < 0) {
