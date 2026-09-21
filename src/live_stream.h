@@ -13,7 +13,7 @@
 //
 // Callback contract:
 //   Consumer callbacks run on the UART rx_task. They MUST return quickly:
-//   target <1 ms, hard limit 2 ms (logged as a slow-cb warning above that).
+//   target <1 ms, budget 2 ms. Do not log timings on the RX path.
 //   Heavy work belongs in the consumer's own task.
 
 namespace LiveStream {

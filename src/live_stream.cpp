@@ -2,9 +2,7 @@
 #include "uart_arbiter.h"
 #include "debug_log.h"
 #include <string.h>
-#include <esp_timer.h>
 
-#define LS_CB_WARN_US           2000
 #define LS_DEVICE_CMD_TIMEOUT   1000
 #define LS_DECODE_BUF           64
 
@@ -374,7 +372,6 @@ void on_l_frame(const uint8_t *payload, uint16_t len) {
     int sidx = -1;
     decode_fn_t decode_fn = nullptr;
     uint16_t sample_size = 0;
-    char tag[LIVE_STREAM_TAG_LEN + 1] = {};
     consumer_cb_t callbacks[LIVE_CONSUMERS_MAX] = {};
     void *contexts[LIVE_CONSUMERS_MAX] = {};
     uint8_t callback_slots[LIVE_CONSUMERS_MAX] = {};
@@ -391,7 +388,6 @@ void on_l_frame(const uint8_t *payload, uint16_t len) {
     if (sidx >= 0) {
         decode_fn = streams[sidx].decode_fn;
         sample_size = streams[sidx].sample_size;
-        memcpy(tag, streams[sidx].tag, sizeof(tag));
         if (decode_fn && sample_size > 0) {
             for (uint8_t i = 0; i < LIVE_CONSUMERS_MAX; i++) {
                 if (!consumers[i].in_use || consumers[i].stream_idx != sidx ||
@@ -417,14 +413,7 @@ void on_l_frame(const uint8_t *payload, uint16_t len) {
 
     for (uint8_t i = 0; i < callback_count; i++) {
         if (decoded) {
-            int64_t t0 = esp_timer_get_time();
             callbacks[i](sample_buf, sample_size, contexts[i]);
-            int64_t dt = esp_timer_get_time() - t0;
-            if (dt > LS_CB_WARN_US) {
-                Log::logf(CAT_GENERAL, LOG_WARN,
-                          "[LS] %s consumer cb slow: %lld us\n",
-                          tag, (long long)dt);
-            }
         }
         portENTER_CRITICAL(&data_mux);
         Consumer &consumer = consumers[callback_slots[i]];
