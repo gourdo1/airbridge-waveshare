@@ -46,6 +46,10 @@ namespace OxiBle {
     void suspend();
     void resume();
 
+    // OTA worker only. Separate from ordinary scan/connection suspension.
+    bool release_memory(uint32_t timeout_ms);
+    bool restore_memory(uint32_t timeout_ms);
+
     oxi_state_t get_state();
     bool state_changed();
 

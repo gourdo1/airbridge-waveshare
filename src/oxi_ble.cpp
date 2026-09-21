@@ -8,6 +8,8 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <atomic>
+#include <esp_heap_caps.h>
 #include <new>
 #include "nvs_optional.h"
 
@@ -58,6 +60,11 @@ static volatile bool del_all_requested = false;
 static char del_one_addr[18] = "";
 static volatile bool ble_suspended = false;
 static volatile bool suspend_enter_requested = false;  // handle entry side-effects in task
+static std::atomic<bool> stop_scan_requested{false};
+
+enum class MemoryPause { Ready, Requested, Releasing, Released, Rejected, Resume, Failed };
+static std::atomic<MemoryPause> memory_pause{MemoryPause::Ready};
+static SemaphoreHandle_t lifecycle_mutex = nullptr;
 
 #define USER_CONNECT_RETRIES  3
 #define USER_RETRY_DELAY_MS   2000
@@ -952,16 +959,71 @@ static void set_viatom_datetime() {
 static bool do_remove_known(const char *addr);
 static void do_clear_all_known();
 
+static bool init_stack() {
+    if (!NimBLEDevice::init(Config::get().hostname.c_str())) return false;
+    NimBLEDevice::setSecurityAuth(true, false, false);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    return true;
+}
+
+// Only the BLE task changes the stack lifecycle. A timed-out caller may request
+// Resume while deinit is still running; never overwrite that cancellation.
+static bool handle_memory_pause() {
+    static bool released = false;
+    MemoryPause phase = memory_pause.load();
+    if (phase == MemoryPause::Requested &&
+        memory_pause.compare_exchange_strong(phase, MemoryPause::Releasing)) {
+        bool idle = !pClient->isConnected() && !OxiArbiter::is_feeding();
+        if (idle) {
+            Log::logf(CAT_OXI, LOG_INFO,
+                      "[OXI] Before OTA pause: internal=%u largest=%u\n",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            NimBLEDevice::getScan()->stop();
+            xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+            released = NimBLEDevice::deinit(false);
+            xSemaphoreGive(lifecycle_mutex);
+            scan_complete = false;
+            if (state != OXI_DISABLED) set_state(OXI_DISCONNECTED);
+            Log::logf(CAT_OXI, released ? LOG_INFO : LOG_ERROR,
+                      "[OXI] OTA memory release: %s internal=%u largest=%u\n",
+                      released ? "done" : "failed",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        phase = MemoryPause::Releasing;
+        memory_pause.compare_exchange_strong(
+            phase, released ? MemoryPause::Released : MemoryPause::Rejected);
+    }
+
+    if (memory_pause.load() == MemoryPause::Resume) {
+        bool restored = true;
+        if (released) {
+            xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+            restored = init_stack();
+            xSemaphoreGive(lifecycle_mutex);
+            if (restored) released = false;
+            Log::logf(CAT_OXI, restored ? LOG_INFO : LOG_ERROR,
+                      "[OXI] OTA memory restore: %s internal=%u largest=%u\n",
+                      restored ? "done" : "failed",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        memory_pause.store(restored ? MemoryPause::Ready : MemoryPause::Failed);
+    }
+    return memory_pause.load() != MemoryPause::Ready;
+}
+
 void OxiBle::task(void *param) {
     scan_mutex = xSemaphoreCreateMutex();
     known_load();
-    NimBLEDevice::init(Config::get().hostname.c_str());
-    NimBLEDevice::setSecurityAuth(true, false, false);
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+    init_stack();
 
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(&clientCB);
     pClient->setConnectionParams(12, 12, 0, 400);
+    xSemaphoreGive(lifecycle_mutex);
 
     auto &cfg = Config::get();
     if (cfg.oxi_enabled) {
@@ -972,6 +1034,13 @@ void OxiBle::task(void *param) {
     uint32_t last_reconnect = 0;
 
     while (true) {
+        if (handle_memory_pause()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (stop_scan_requested.exchange(false)) NimBLEDevice::getScan()->stop();
+
         if (disable_requested) {
             disable_requested = false;
             disconnect_requested = false;
@@ -1287,12 +1356,14 @@ void OxiBle::task(void *param) {
 
 
 void OxiBle::init() {
+    lifecycle_mutex = xSemaphoreCreateMutex();
+    if (!lifecycle_mutex) return;
     xTaskCreatePinnedToCore(OxiBle::task, "ble_oxi", OXI_TASK_STACK,
                             nullptr, OXI_TASK_PRIO, &oxi_task_handle, 0);
 }
 
 void OxiBle::start_scan()  { active_scan_requested = true; scan_requested = true; }
-void OxiBle::stop_scan()   { NimBLEDevice::getScan()->stop(); }
+void OxiBle::stop_scan()   { stop_scan_requested.store(true); }
 
 void OxiBle::connect(const char *addr) {
     strncpy(target_addr, addr ? addr : "", sizeof(target_addr) - 1);
@@ -1321,6 +1392,36 @@ void OxiBle::resume() {
         // Task's auto-reconnect will pick up from OXI_DISCONNECTED.
     }
 }
+
+bool OxiBle::release_memory(uint32_t timeout_ms) {
+    if (!oxi_task_handle) return false;
+    MemoryPause expected = MemoryPause::Ready;
+    if (!memory_pause.compare_exchange_strong(expected, MemoryPause::Requested)) return false;
+
+    uint32_t started = millis();
+    do {
+        MemoryPause phase = memory_pause.load();
+        if (phase == MemoryPause::Released) return true;
+        if (phase == MemoryPause::Rejected) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (millis() - started < timeout_ms);
+
+    memory_pause.store(MemoryPause::Resume);
+    return false;
+}
+
+bool OxiBle::restore_memory(uint32_t timeout_ms) {
+    memory_pause.store(MemoryPause::Resume);
+    uint32_t started = millis();
+    do {
+        MemoryPause phase = memory_pause.load();
+        if (phase == MemoryPause::Ready) return true;
+        if (phase == MemoryPause::Failed) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (millis() - started < timeout_ms);
+    return false;
+}
+
 oxi_state_t OxiBle::get_state()            { return state; }
 bool OxiBle::state_changed()               { bool d = state_dirty; state_dirty = false; return d; }
 
@@ -1337,13 +1438,15 @@ int OxiBle::get_scan_results(oxi_scan_result_t *out, int max) {
 int OxiBle::get_all_known(char addrs[][18], int max) {
     int n = 0;
     // NimBLE bonds
-    int nb = NimBLEDevice::getNumBonds();
+    if (!lifecycle_mutex || xSemaphoreTake(lifecycle_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return 0;
+    int nb = NimBLEDevice::isInitialized() ? NimBLEDevice::getNumBonds() : 0;
     for (int i = 0; i < nb && n < max; i++) {
         NimBLEAddress ba = NimBLEDevice::getBondedAddress(i);
         strncpy(addrs[n], ba.toString().c_str(), 17);
         addrs[n][17] = '\0';
         n++;
     }
+    xSemaphoreGive(lifecycle_mutex);
     // Known list (skip duplicates with bonds)
     for (int i = 0; i < known_count && n < max; i++) {
         bool dup = false;

@@ -8,6 +8,7 @@
 #include "ota_url_client.h"
 #include "resmed_ota.h"
 #include "oxi_arbiter.h"
+#include "oxi_ble.h"
 #include "uart_arbiter.h"
 
 #include <ArduinoOTA.h>
@@ -27,6 +28,7 @@ static constexpr uint32_t CHECK_INTERVAL_MS = 24UL * 60 * 60 * 1000;
 static constexpr uint32_t RETRY_INTERVAL_MS = 60UL * 60 * 1000;
 static constexpr uint32_t REBOOT_DELAY_MS = 1500;
 static constexpr uint32_t TASK_STACK_BYTES = 8192;
+static constexpr uint32_t BLE_PAUSE_TIMEOUT_MS = 5000;
 
 enum Operation : uint8_t {
     OP_NONE,
@@ -124,22 +126,33 @@ void check_task(void *) {
     uint8_t *buffer = nullptr;
     size_t length = 0;
     OtaUrl::Error transport_error;
-    if (!OtaUrl::fetch(url, buffer, MANIFEST_MAX_BYTES, length,
-                       transport_error,
-                       [](void *) { return operation_allowed(); }, nullptr)) {
+    if (!OxiBle::release_memory(BLE_PAUSE_TIMEOUT_MS)) {
+        finish_check(nullptr, nullptr, false, false, "ble_memory_busy");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    bool fetched = OtaUrl::fetch(url, buffer, MANIFEST_MAX_BYTES, length,
+                                transport_error,
+                                [](void *) { return operation_allowed(); }, nullptr);
+    OtaRelease::Manifest manifest;
+    char manifest_error[OtaRelease::ERROR_MAX] = {};
+    bool parsed = fetched && OtaRelease::parse_manifest(
+        (char *)buffer, length, AB_OTA_RELEASE_TARGET,
+        manifest, manifest_error);
+    heap_caps_free(buffer);
+
+    // TLS and the manifest buffer are gone before BLE allocates again.
+    bool restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
+    if (!fetched || !restored) {
         finish_check(nullptr, nullptr, false, false,
+                     !restored ? "ble_restore_failed" :
                      transport_error.code[0] ? transport_error.code
                                              : "manifest_fetch_failed");
         vTaskDelete(nullptr);
         return;
     }
 
-    OtaRelease::Manifest manifest;
-    char manifest_error[OtaRelease::ERROR_MAX] = {};
-    bool parsed = OtaRelease::parse_manifest(
-        (char *)buffer, length, AB_OTA_RELEASE_TARGET,
-        manifest, manifest_error);
-    heap_caps_free(buffer);
     if (!parsed) {
         finish_check(nullptr, nullptr, false, false, manifest_error);
         vTaskDelete(nullptr);
