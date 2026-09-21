@@ -43,12 +43,19 @@ void worker(void *) {
         CustomSettings::reclaim();
         Job *job = nullptr;
         String body;
+        bool retained = false;
         xSemaphoreTake(mutex, portMAX_DELAY);
         for (Job &candidate : jobs) {
             if (candidate.state == Complete && reusable(candidate))
                 reset_job(candidate);
             if (candidate.state == Queued &&
                 (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
+            if (candidate.state != Free) retained = true;
+        }
+        if (!retained) {
+            task = nullptr;
+            xSemaphoreGive(mutex);
+            break;
         }
         if (job) {
             job->state = Running;
@@ -81,19 +88,26 @@ void worker(void *) {
         job->state = Complete;
         xSemaphoreGive(mutex);
     }
-}
+    CustomSettings::reclaim();
+    vTaskDeleteWithCaps(nullptr);
 }
 
-void init(Handler callback) {
-    if (task) return;
-    handler = callback;
-    mutex = xSemaphoreCreateMutex();
-    if (!mutex) return;
+bool start_worker() {
     BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
         worker, "clinical", 6144, nullptr, 2, &task, 0,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS)
-        xTaskCreatePinnedToCore(worker, "clinical", 6144, nullptr, 2, &task, 0);
+        created = xTaskCreatePinnedToCoreWithCaps(
+            worker, "clinical", 6144, nullptr, 2, &task, 0,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return created == pdPASS;
+}
+}
+
+void init(Handler callback) {
+    if (mutex) return;
+    handler = callback;
+    mutex = xSemaphoreCreateMutex();
 }
 
 Result::~Result() { reset(); }
@@ -124,7 +138,7 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
 }
 
 bool submit(bool write, const String &body, uint32_t &id) {
-    if (!task || body.length() > 2048 || xSemaphoreTake(mutex, 0) != pdTRUE)
+    if (!mutex || body.length() > 2048 || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
     bool mutation_pending = false;
@@ -158,15 +172,20 @@ bool submit(bool write, const String &body, uint32_t &id) {
     if (!next_id) next_id = 1;
     available->queued_ms = millis();
     available->state = Queued;
+    if (!task && !start_worker()) {
+        reset_job(*available);
+        xSemaphoreGive(mutex);
+        return false;
+    }
     id = available->id;
-    xSemaphoreGive(mutex);
     xTaskNotifyGive(task);
+    xSemaphoreGive(mutex);
     return true;
 }
 
 int poll(uint32_t id, Result &result) {
     result.reset();
-    if (!task || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
     int code = 410;
     for (Job &job : jobs) {
         if (job.state == Free || job.id != id) continue;
