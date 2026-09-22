@@ -19,6 +19,7 @@
 #include "custom_settings.h"
 #include "clinical_jobs.h"
 #include "memory_manager.h"
+#include "json_util.h"
 #include "air10_clock.h"
 #include "board.h"
 
@@ -50,22 +51,20 @@ static bool checkAuth(AsyncWebServerRequest *request) {
 // iterate json string key-value pairs
 // calls fn(key, val) for each pair. Only handles string values.
 typedef void (*json_kv_fn)(const String &key, const String &val, void *ctx);
-static void json_foreach_kv(const String &body, json_kv_fn fn, void *ctx) {
-    int pos = 0;
-    while (pos < (int)body.length()) {
-        int ks = body.indexOf('"', pos);
-        if (ks < 0) break;
-        int ke = body.indexOf('"', ks + 1);
-        if (ke < 0) break;
-        String key = body.substring(ks + 1, ke);
-        int vs = body.indexOf('"', ke + 1);
-        if (vs < 0) break;
-        int ve = body.indexOf('"', vs + 1);
-        if (ve < 0) break;
-        String val = body.substring(vs + 1, ve);
-        pos = ve + 1;
-        fn(key, val, ctx);
-    }
+static bool parseJsonObject(const String &body, JsonDocument &doc) {
+    return !deserializeJson(doc, body) && doc.is<JsonObject>();
+}
+
+static bool json_foreach_kv(const String &body, json_kv_fn fn, void *ctx) {
+    aircannect::JsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (!parseJsonObject(body, doc)) return false;
+    // Validate the whole object before a callback can mutate configuration.
+    for (JsonPairConst pair : doc.as<JsonObjectConst>())
+        if (!pair.value().is<const char *>()) return false;
+    for (JsonPairConst pair : doc.as<JsonObjectConst>())
+        fn(pair.key().c_str(), pair.value().as<const char *>(), ctx);
+    return true;
 }
 
 
@@ -409,7 +408,7 @@ static int saveSettings(const String &body, String &json) {
     }
 
     struct { int count; String errors; bool lan_changed; } ctx = {0, "", false};
-    json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    bool parsed = json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         auto *c = (decltype(ctx)*)p;
         char *end = nullptr;
         errno = 0;
@@ -437,6 +436,10 @@ static int saveSettings(const String &body, String &json) {
             if (key == "LAN") c->lan_changed = true;
         } else c->errors += key + ":fail,";
     }, &ctx);
+    if (!parsed) {
+        json = "{\"error\":\"bad_json\"}";
+        return 400;
+    }
     int count = ctx.count;
     String errors = ctx.errors;
     if (ctx.lan_changed) CustomSettings::invalidate("LAN write");
@@ -590,9 +593,12 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     if (!getBody(request, body)) return;
     String previous_update_url = Config::get().update_url;
     int count = 0;
-    json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         if (Config::set_value(key.c_str(), val.c_str())) (*(int*)p)++;
-    }, &count);
+    }, &count)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
 
     if (count > 0) Config::save();
     if (Config::get().update_url != previous_update_url)
@@ -946,11 +952,14 @@ static void handleBleAction(AsyncWebServerRequest *request) {
     if (!getBody(request, body)) return;
     String action, addr;
     struct { String *action; String *addr; } ctx = {&action, &addr};
-    json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         auto *c = (decltype(ctx)*)p;
         if (key == "action") *c->action = val;
         else if (key == "addr") *c->addr = val;
-    }, &ctx);
+    }, &ctx)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
 
     String result = "unknown action";
     bool ok = false;
@@ -1030,18 +1039,13 @@ static void handleCmd(AsyncWebServerRequest *request) {
 
     String body;
     if (!getBody(request, body)) return;
-    int valStart = body.indexOf("\"cmd\"");
-    if (valStart < 0) {
+    aircannect::JsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (!parseJsonObject(body, doc) || !doc["cmd"].is<const char *>()) {
         request->send(400, "application/json", "{\"ok\":false,\"error\":\"missing cmd\"}");
         return;
     }
-    int qs = body.indexOf('"', valStart + 5);
-    int qe = body.indexOf('"', qs + 1);
-    if (qs < 0 || qe < 0) {
-        request->send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
-        return;
-    }
-    String cmd = body.substring(qs + 1, qe);
+    String cmd = doc["cmd"].as<const char *>();
 
     String json = "{";
 
@@ -1102,6 +1106,13 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
     String body;
     if (!getBody(request, body)) return;
 
+    aircannect::JsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (!parseJsonObject(body, doc)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
+
     if (ResmedOta::is_active()) {
         request->send(409, "application/json", "{\"ok\":false,\"error\":\"flash already active\"}");
         return;
@@ -1119,37 +1130,9 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
         return;
     }
 
-    String block = "";
-    bool flash_blx = false;
-    bool force_blx = false;
-
-    int pos = 0;
-    while (pos < (int)body.length()) {
-        int keyStart = body.indexOf('"', pos);
-        if (keyStart < 0) break;
-        int keyEnd = body.indexOf('"', keyStart + 1);
-        if (keyEnd < 0) break;
-        String key = body.substring(keyStart + 1, keyEnd);
-
-        int valStart = body.indexOf(':', keyEnd);
-        if (valStart < 0) break;
-        valStart++;
-        while (valStart < (int)body.length() && body[valStart] == ' ') valStart++;
-
-        if (key == "force_blx") {
-            force_blx = (body.substring(valStart, valStart + 4) == "true");
-            pos = valStart + 5;
-        } else if (key == "flash_blx") {
-            flash_blx = (body.substring(valStart, valStart + 4) == "true");
-            pos = valStart + 5;
-        } else {
-            int qs = body.indexOf('"', valStart);
-            int qe = body.indexOf('"', qs + 1);
-            if (qs < 0 || qe < 0) break;
-            if (key == "block") block = body.substring(qs + 1, qe);
-            pos = qe + 1;
-        }
-    }
+    String block = doc["block"] | "";
+    bool flash_blx = doc["flash_blx"] | false;
+    bool force_blx = doc["force_blx"] | false;
 
     ResmedOta::start_flash(
         block.length() > 0 ? block.c_str() : nullptr,
@@ -1377,13 +1360,16 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
 
     struct wifi_kv_ctx { String *action; String *ssid; String *pass; int *idx; };
     wifi_kv_ctx wctx = {&action, &ssid, &pass, &idx};
-    json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         wifi_kv_ctx *c = (wifi_kv_ctx *)p;
         if (key == "action") *c->action = val;
         else if (key == "ssid") *c->ssid = val;
         else if (key == "pass") *c->pass = val;
         else if (key == "idx") *c->idx = val.toInt();
-    }, &wctx);
+    }, &wctx)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
 
     String result = "unknown action";
     bool ok = false;
@@ -1447,9 +1433,12 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
     String body;
     if (!getBody(request, body)) return;
     String action;
-    json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         if (key == "action") *(String*)p = val;
-    }, &action);
+    }, &action)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
 
     String result = "unknown action";
     bool ok = false;
