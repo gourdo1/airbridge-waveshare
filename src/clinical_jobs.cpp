@@ -14,7 +14,7 @@ constexpr uint8_t SLOT_COUNT = 4;
 enum State : uint8_t { Free, Queued, Running, Complete };
 struct Job {
     State state = Free;
-    bool write = false;
+    Kind kind = Kind::Read;
     bool delivered = false;
     uint16_t readers = 0;
     uint32_t id = 0, queued_ms = 0, completed_ms = 0;
@@ -63,9 +63,9 @@ void worker(void *) {
         String result;
         int code = 504;
         if (timeout_ms()) {
-            if (job->write) code = handler(body, result);
+            if (job->kind == Kind::Write) code = handler(body, result);
             else {
-                code = ClinicalSettings::collect(job->snapshot);
+                code = ClinicalSettings::collect(job->snapshot, job->kind == Kind::Report);
                 if (code != 200) result = job->snapshot.error();
             }
         }
@@ -140,19 +140,19 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
     return count;
 }
 
-bool submit(bool write, const String &body, uint32_t &id) {
+bool submit(Kind kind, const String &body, uint32_t &id) {
     if (!mutex || body.length() > 2048 || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
     bool mutation_pending = false;
     for (Job &job : jobs) {
         if (reusable(job)) available = &job;
-        if (job.write && (job.state == Queued || job.state == Running))
+        if (job.kind == Kind::Write && (job.state == Queued || job.state == Running))
             mutation_pending = true;
     }
-    if (!write && !mutation_pending) {
+    if (kind != Kind::Write && !mutation_pending) {
         for (Job &job : jobs) {
-            if (!job.write && (job.state == Queued || job.state == Running)) {
+            if (job.kind == kind && (job.state == Queued || job.state == Running)) {
                 id = job.id;
                 xSemaphoreGive(mutex);
                 return true;
@@ -164,7 +164,7 @@ bool submit(bool write, const String &body, uint32_t &id) {
         return false;
     }
     reset_job(*available);
-    available->write = write;
+    available->kind = kind;
     available->body = body;
     if (available->body.length() != body.length()) {
         reset_job(*available);

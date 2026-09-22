@@ -12,6 +12,53 @@ namespace {
 constexpr uint8_t VALID = 1, CUSTOM = 2;
 const char *const GROUPS[] = {"therapy", "comfort", "accessories", "options", "configuration"};
 
+struct ReportField {
+    const char *cmd;
+    const char *label;
+    int16_t divisor;  // -61 minutes H:MM, -60 hours, -3 days/period, -1 I:E
+    uint8_t decimals;
+    const char *unit;
+    bool summary;
+};
+
+const ReportField REPORT_FIELDS[] = {
+    {"UQD", "Usage", -61, 0, "", false},
+    {"OND", "Mask On Duration", -61, 0, "", false},
+    {"AQD", "Events/hr", 10, 1, "/hr", false},
+    {"MSP", "Median Pressure", 50, 1, "cmH2O", false},
+    {"AIS", "AI (All)", 10, 1, "/hr", false},
+    {"PM9", "Pressure P95", 50, 1, "cmH2O", false},
+    {"OPI", "Central AI", 10, 1, "/hr", false},
+    {"PMA", "Max Pressure", 50, 1, "cmH2O", false},
+    {"CLI", "Obstructive AI", 10, 1, "/hr", false},
+    {"AEP", "Avg EPR Pressure", 50, 1, "cmH2O", false},
+    {"HIS", "Hypopnea Index", 10, 1, "/hr", false},
+    {"LKM", "Leak Median", 50, 2, "L/s", false},
+    {"UAI", "Unknown AI", 10, 1, "/hr", false},
+    {"LK9", "Leak P95", 50, 2, "L/s", false},
+    {"RIN", "RERA Index", 10, 1, "/hr", false},
+    {"PHM", "Total Used Hrs", 0, 0, "hrs", true},
+    {"LRD", "Leak", 10, 0, "L/min", true},
+    {"DRD", "Days Used", -3, 0, "", true},
+    {"ZAV", "Vt", 0, 0, "ml", true},
+    {"VRD", "Days 4hrs+", -3, 0, "", true},
+    {"ZAR", "RR", 5, 0, "bpm", true},
+    {"WRD", "Avg. Usage", -60, 1, "hrs", true},
+    {"ZAM", "MV", 8, 1, "L/min", true},
+    {"XRD", "Used Hrs", -60, 1, "hrs", true},
+    {"ZA2", "TgMV", 8, 1, "L/min", true},
+    {"ZAI", "Pressure", 50, 1, "cmH2O", true},
+    {"ZA3", "Va", 8, 1, "L/min", true},
+    {"ZAE", "Exp. Pressure", 50, 1, "cmH2O", true},
+    {"ZAZ", "Ti", 50, 2, "s", true},
+    {"ARD", "AHI", 10, 1, "/hr", true},
+    {"ZA1", "I:E", -1, 0, "", true},
+    {"TRD", "Total AI", 10, 1, "/hr", true},
+    {"ZAS", "Spont Trig", 2, 1, "%", true},
+    {"CRD", "Central AI", 10, 1, "/hr", true},
+    {"ZAY", "Spont Cyc", 2, 1, "%", true},
+};
+
 enum Stage : uint8_t {
     ARRAY_START, ENTRY_START, LABEL, GROUP, GROUP_PATH_START, GROUP_PATH_ITEM,
     VALUE, EDITABLE, SOURCE, TYPE,
@@ -30,6 +77,8 @@ void Snapshot::reset() {
     count_ = 0;
     length_ = 0;
     error_ = nullptr;
+    report_ = false;
+    period_ = 0;
     metadata_.reset();
 }
 
@@ -49,17 +98,18 @@ bool read_raw(const char *cmd, int &value) {
 
 bool known_stock(const char *cmd) { return var_lookup(cmd) != nullptr; }
 
-int collect(Snapshot &snapshot) {
+int collect(Snapshot &snapshot, bool report) {
     snapshot.reset();
+    snapshot.report_ = report;
     auto fail = [&](const char *error) {
         snapshot.reset();
         snapshot.error_ = error;
         return 503;
     };
-    if (!snapshot.metadata_.acquire())
+    if (!report && !snapshot.metadata_.acquire())
         return fail("{\"error\":\"settings_metadata_unavailable\"}");
     int mop = 0;
-    if (!read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
+    if (!report && !read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
     // Count the selected layout first, then allocate exactly its compact values.
@@ -102,7 +152,7 @@ int collect(Snapshot &snapshot) {
         }
         return count;
     };
-    snapshot.count_ = layout(false);
+    snapshot.count_ = report ? sizeof(REPORT_FIELDS) / sizeof(REPORT_FIELDS[0]) : layout(false);
     size_t bytes = snapshot.storage_bytes();
     if (bytes) {
         snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -110,8 +160,15 @@ int collect(Snapshot &snapshot) {
             snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         if (!snapshot.values_) return fail("{\"error\":\"settings_allocation_failed\"}");
     }
-    layout(true);
-    if (snapshot.metadata_.generation() != CustomSettings::generation())
+    if (report) {
+        read_raw("URD", snapshot.period_);
+        for (uint16_t i = 0; i < snapshot.count_; i++) {
+            int raw = 0;
+            bool ok = read_raw(REPORT_FIELDS[i].cmd, raw);
+            snapshot.values_[i] = {(uint32_t)raw, i, 0, (uint8_t)(ok ? VALID : 0)};
+        }
+    } else layout(true);
+    if (!report && snapshot.metadata_.generation() != CustomSettings::generation())
         return fail("{\"error\":\"settings_invalidated\"}");
 
     Cursor counter;
@@ -193,6 +250,50 @@ bool Cursor::next(const Snapshot &snapshot) {
     }
 
     const Value &value = snapshot.values_[row_];
+    if (snapshot.report_) {
+        const ReportField &v = REPORT_FIELDS[row_];
+        int raw = value.flags & VALID ? (int)value.raw : -1;
+        switch (stage_) {
+            case ENTRY_START:
+                stage_ = LABEL;
+                field(row_ ? ",{\"cmd\":" : "{\"cmd\":", v.cmd); return true;
+            case LABEL:
+                stage_ = VALUE; field(",\"label\":", v.label); return true;
+            case VALUE:
+                stage_ = DISPLAY_VALUE; integer(",\"raw\":", raw); return true;
+            case DISPLAY_VALUE:
+                stage_ = UNITS;
+                if (raw < 0 || (v.divisor == -1 && raw == 0)) {
+                    field(",\"value\":", "--");
+                } else if (v.divisor == -61 || v.divisor == -3) {
+                    if (v.divisor == -61)
+                        snprintf(number_, sizeof(number_), "%d:%02d", raw / 60, raw % 60);
+                    else
+                        snprintf(number_, sizeof(number_), "%d/%d", raw, snapshot.period_);
+                    field(",\"value\":", number_);
+                } else if (v.divisor == -1) {
+                    decimal(",\"value\":", raw >= 100 ? raw : 100, raw >= 100 ? 100 : raw, 1);
+                    if (raw >= 100) strcat(number_, ":1");
+                    else {
+                        memmove(number_ + 2, number_, strlen(number_) + 1);
+                        memcpy(number_, "1:", 2);
+                    }
+                } else {
+                    decimal(",\"value\":", raw,
+                            v.divisor == -60 ? 60 : v.divisor > 0 ? v.divisor : 1,
+                            v.decimals);
+                }
+                return true;
+            case UNITS:
+                stage_ = GROUP; field(",\"unit\":", v.unit); return true;
+            case GROUP:
+                stage_ = ENTRY_END;
+                field(",\"section\":", v.summary ? "summary" : "session"); return true;
+            case ENTRY_END:
+                row_++; stage_ = ENTRY_START; token("}"); return true;
+            default: return false;
+        }
+    }
     bool custom = value.flags & CUSTOM, valid = value.flags & VALID;
     CustomSettings::entry_view_t entry = {};
     const var_def_t *stock = nullptr;

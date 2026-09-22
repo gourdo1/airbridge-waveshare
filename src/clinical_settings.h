@@ -28,12 +28,14 @@ public:
 
 private:
     friend class Cursor;
-    friend int collect(Snapshot &snapshot);
+    friend int collect(Snapshot &snapshot, bool report);
     CustomSettings::MetadataLease metadata_;
     Value *values_ = nullptr;
     uint16_t count_ = 0;
     size_t length_ = 0;
     const char *error_ = nullptr;
+    bool report_ = false;
+    int period_ = 0;
 };
 
 // A resumable token stream. Its strings refer only to the pinned snapshot.
@@ -59,7 +61,7 @@ private:
     char escape_ = 0;
 };
 
-int collect(Snapshot &snapshot);  // Worker only.
+int collect(Snapshot &snapshot, bool report = false);  // Worker only.
 bool read_raw(const char *cmd, int &value);
 bool known_stock(const char *cmd);
 

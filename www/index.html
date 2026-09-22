@@ -873,9 +873,7 @@ async function loadReport() {
   const sp = document.getElementById('reportSpinner');
   if (sp) sp.style.display = 'block';
   try {
-    const r = await api('/api/report');
-    if (!r) return;
-    const data = await r.json();
+    const data = await settingsRequest(undefined, '/api/report');
     const sg = document.getElementById('sessionGrid'); sg.innerHTML = '';
     const ug = document.getElementById('summaryGrid'); ug.innerHTML = '';
     data.forEach(v => {
@@ -885,8 +883,8 @@ async function loadReport() {
     });
     if (!sg.children.length) sg.innerHTML = '<div class="stat"><span class="k">No session data</span></div>';
     if (!ug.children.length) ug.innerHTML = '<div class="stat"><span class="k">No summary data</span></div>';
-  } catch(e) { console.error(e); }
-  if (sp) sp.style.display = 'none';
+  } catch(e) { showMsg(null, 'Report: ' + e.message, 'err'); }
+  finally { if (sp) sp.style.display = 'none'; }
 }
 
 function renderField(s) {
@@ -922,18 +920,18 @@ function renderField(s) {
   return div;
 }
 
-async function settingsRequest(options) {
+async function settingsRequest(options, endpoint = '/api/settings') {
   const deadline = Date.now() + 35000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 35000);
   try {
-  let r = await api('/api/settings', {...options, signal:controller.signal});
+  let r = await api(endpoint, {...options, signal:controller.signal});
   if (!r) throw new Error('Request cancelled');
   let data = await r.json();
   const job = data.job;
   while (r.status === 202 && job && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 250));
-    r = await api('/api/settings?job=' + job, {signal:controller.signal});
+    r = await api(endpoint + '?job=' + job, {signal:controller.signal});
     if (!r) throw new Error('Request cancelled');
     data = await r.json();
   }
