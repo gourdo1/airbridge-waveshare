@@ -1243,8 +1243,8 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     }
     if (!ownsUpload(request)) return;
 
-    String json = "{";
     bool ok = false;
+    const char *error = "invalid firmware image";
 
     if (uploadComplete && uploadKind == UPLOAD_ESP && uploadOk &&
         uploadSize > 0 && esp_ota_part) {
@@ -1257,16 +1257,19 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
                 Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA OK, boot set to '%s'\n",
                           esp_ota_part->label);
             } else {
+                error = esp_err_to_name(err);
                 Log::logf(CAT_WEB, LOG_ERROR, "[WEB] set_boot_partition failed: %s\n",
                           esp_err_to_name(err));
             }
         } else {
             Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_end failed: %s\n", esp_err_to_name(err));
-            jsonAddString(json, "error", esp_err_to_name(err));
+            error = esp_err_to_name(err);
         }
     }
 
+    String json = "{";
     jsonAddString(json, "ok", ok ? "true" : "false", false);
+    if (!ok) jsonAddString(json, "error", error);
     jsonAddInt(json, "size", uploadSize);
     char hexcrc[8];
     snprintf(hexcrc, sizeof(hexcrc), "%04X", uploadCrc);
