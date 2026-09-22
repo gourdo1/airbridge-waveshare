@@ -1065,8 +1065,10 @@ async function loadWifiNets() {
         var status = connected
           ? ' <span class="badge badge-streaming" style="margin-left:8px">Connected' + rssi_str + '</span>'
           : (net.rssi ? ' <span style="color:var(--text-dim);margin-left:8px;font-size:12px">' + net.rssi + ' dBm</span>' : '');
-        row.innerHTML = '<label><strong>' + net.ssid + '</strong>' + status +
-          '</label><button class="btn btn-danger" onclick="wifiRemove(' + i + ')" style="padding:4px 12px;font-size:12px">Remove</button>';
+        row.innerHTML = '<label><strong></strong>' + status +
+          '</label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px">Remove</button>';
+        row.querySelector('strong').textContent = net.ssid;
+        row.querySelector('button').onclick = () => wifiRemove(i);
         el.appendChild(row);
       });
     } else {
@@ -1134,13 +1136,35 @@ async function loadConfig() {
       var row = document.createElement('div'); row.className = 'row';
       var isPass = k.includes('pass') || k.includes('secret');
       var opts = meta[2];
-      var labelHtml = '<label>' + k + (meta[1] ? '<br><small style="color:#555;font-weight:normal">' + meta[1] + '</small>' : '') + '</label>';
-      if (opts) {
-        var optHtml = opts.map(function(o){return '<option value="' + o[0] + '"' + (String(o[0]) === String(v) ? ' selected' : '') + '>' + o[1] + '</option>';}).join('');
-        row.innerHTML = labelHtml + '<select data-key="' + k + '" data-orig="' + v + '">' + optHtml + '</select>';
-      } else {
-        row.innerHTML = labelHtml + '<input type="' + (isPass ? 'password' : 'text') + '" data-key="' + k + '" data-orig="' + (isPass ? '' : v) + '"' + (isPass ? ' placeholder="(unchanged)" data-pass="1"' : '') + ' value="' + (isPass ? '' : v) + '">';
+      var label = document.createElement('label');
+      label.textContent = k;
+      if (meta[1]) {
+        var help = document.createElement('small');
+        help.style.cssText = 'color:#555;font-weight:normal';
+        help.textContent = meta[1];
+        label.appendChild(document.createElement('br'));
+        label.appendChild(help);
       }
+      row.appendChild(label);
+      var control = document.createElement(opts ? 'select' : 'input');
+      control.dataset.key = k;
+      control.dataset.orig = isPass ? '' : v;
+      if (opts) {
+        opts.forEach(function(o) {
+          var option = document.createElement('option');
+          option.value = o[0];
+          option.textContent = o[1];
+          control.appendChild(option);
+        });
+      } else {
+        control.type = isPass ? 'password' : 'text';
+        if (isPass) {
+          control.placeholder = '(unchanged)';
+          control.dataset.pass = '1';
+        }
+      }
+      control.value = isPass ? '' : v;
+      row.appendChild(control);
       el.appendChild(row);
       if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
       if (k === 'tz') attachTzHelper(row.querySelector('input'));
@@ -1203,8 +1227,15 @@ async function loadBle() {
     const d = await r.json();
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
     const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
-    for (const [k,v] of Object.entries(fields))
-      g.innerHTML += '<div class="stat"><span class="k">'+k+':</span> <span class="v" data-field="'+k+'">'+v+'</span></div>';
+    for (const [k,v] of Object.entries(fields)) {
+      const stat = document.createElement('div'); stat.className = 'stat';
+      stat.innerHTML = '<span class="k"></span> <span class="v"></span>';
+      stat.querySelector('.k').textContent = k + ':';
+      const value = stat.querySelector('.v');
+      value.dataset.field = k;
+      value.textContent = v;
+      g.appendChild(stat);
+    }
     const fb = document.getElementById('btnFeed');
     if (d.feeding === 'yes') { fb.textContent = 'Stop Feed'; fb.onclick = () => bleAction('stop_feed'); }
     else { fb.textContent = 'Start Feed'; fb.onclick = () => bleAction('start_feed'); }
@@ -1219,10 +1250,12 @@ async function loadBle() {
       d.devices.forEach(dev => {
         const row = document.createElement('div'); row.className = 'row';
         var active = isConn && dev.addr.toLowerCase() === connAddr;
-        var btn = active
-          ? '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>'
-          : '<button class="btn btn-accent" onclick="bleConnect(\''+dev.addr+'\')">Connect</button>';
-        row.innerHTML = '<label><strong>'+(dev.name||'Unknown')+'</strong><br><small style="color:var(--text-dim)">'+dev.addr+' ('+dev.rssi+' dBm)</small></label>' + btn;
+        row.innerHTML = '<label><strong></strong><br><small style="color:var(--text-dim)"></small></label>' +
+          (active ? '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>'
+                  : '<button class="btn btn-accent">Connect</button>');
+        row.querySelector('strong').textContent = dev.name || 'Unknown';
+        row.querySelector('small').textContent = dev.addr + ' (' + dev.rssi + ' dBm)';
+        if (!active) row.querySelector('button').onclick = () => bleConnect(dev.addr);
         dl.appendChild(row);
       });
     } else {
@@ -1238,7 +1271,9 @@ async function loadBle() {
     if (d.bonds && d.bonds.length) {
       d.bonds.forEach(addr => {
         const row = document.createElement('div'); row.className = 'row';
-        row.innerHTML = '<label style="font-family:monospace">'+addr+'</label><button class="btn btn-danger" onclick="bleAction(\'delete_bond\',\''+addr+'\')" style="padding:4px 12px;font-size:12px">Delete</button>';
+        row.innerHTML = '<label style="font-family:monospace"></label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px">Delete</button>';
+        row.querySelector('label').textContent = addr;
+        row.querySelector('button').onclick = () => bleAction('delete_bond', addr);
         bl.appendChild(row);
       });
     } else {
