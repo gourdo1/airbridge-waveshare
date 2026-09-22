@@ -179,7 +179,8 @@ bool SleepHqRemoteFileListStreamParser::feed_seek_item(char ch) {
 }
 
 bool SleepHqRemoteFileListStreamParser::publish_item() {
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     const DeserializationError err = deserializeJson(doc, item_.c_str());
     if (err) return fail("file_list_json_parse");
 
@@ -324,7 +325,8 @@ bool sleephq_parse_machine_list_json(const char *json,
         return false;
     }
 
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         set_error(error, error_size, "machine_list_json_parse");
@@ -369,7 +371,8 @@ bool sleephq_parse_machine_date_json(const char *json,
         return false;
     }
 
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
         set_error(error, error_size, "machine_date_json_parse");

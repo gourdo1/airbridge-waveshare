@@ -1,4 +1,5 @@
 #include "ota_release_manifest.h"
+#include "json_util.h"
 
 #include <ArduinoJson.h>
 #include <ctype.h>
@@ -7,33 +8,11 @@
 #include <string.h>
 #include <strings.h>
 
-#include <esp_heap_caps.h>
-
 namespace OtaRelease {
 namespace {
 
 static constexpr uint32_t MANIFEST_SCHEMA = 1;
 static constexpr char MANIFEST_PRODUCT[] = "airbridge";
-
-class ManifestAllocator : public ArduinoJson::Allocator {
-public:
-    void *allocate(size_t size) override {
-        void *ptr = heap_caps_malloc(
-            size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        return ptr ? ptr : heap_caps_malloc(size, MALLOC_CAP_8BIT);
-    }
-
-    void deallocate(void *ptr) override {
-        heap_caps_free(ptr);
-    }
-
-    void *reallocate(void *ptr, size_t new_size) override {
-        void *resized = heap_caps_realloc(
-            ptr, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        return resized ? resized
-                       : heap_caps_realloc(ptr, new_size, MALLOC_CAP_8BIT);
-    }
-};
 
 struct ParsedVersion {
     uint32_t major = 0;
@@ -231,7 +210,7 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
     if (error) error[0] = '\0';
     if (!json || json_len == 0 || !target || !*target || !error) return false;
 
-    ManifestAllocator allocator;
+    aircannect::JsonAllocator allocator;
     JsonDocument filter(&allocator);
     filter["schema"] = true;
     filter["product"] = true;

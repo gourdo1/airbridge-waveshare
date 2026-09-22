@@ -681,7 +681,8 @@ bool SleepHqClient::authenticate(
 }
 
 bool SleepHqClient::parse_token(const SleepHqHttpResponse &response) {
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     DeserializationError err = deserializeJson(doc, response.body.c_str());
     if (err) {
         set_error("token_json_parse");
@@ -720,7 +721,8 @@ bool SleepHqClient::resolve_team_id(
 
 bool SleepHqClient::parse_team_id(const SleepHqHttpResponse &response,
                                   uint32_t &team_id) {
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     DeserializationError err = deserializeJson(doc, response.body.c_str());
     if (err) {
         set_error("team_json_parse");
@@ -1256,7 +1258,8 @@ bool SleepHqClient::parse_machine_date(const SleepHqHttpResponse &response,
 
 bool SleepHqClient::parse_import(const SleepHqHttpResponse &response,
                                  SleepHqImportInfo &out) {
-    JsonDocument doc;
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
     DeserializationError err = deserializeJson(doc, response.body.c_str());
     if (err) {
         set_error("import_json_parse");

@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include <ArduinoJson.h>
+#include "memory_manager.h"
 
 #if __has_include(<Arduino.h>)
 #include <Arduino.h>
@@ -17,6 +18,15 @@
 namespace aircannect {
 
 class LargeTextBuffer;
+
+class JsonAllocator : public ArduinoJson::Allocator {
+public:
+    void *allocate(size_t size) override { return Memory::alloc_large(size); }
+    void deallocate(void *ptr) override { Memory::free(ptr); }
+    void *reallocate(void *ptr, size_t size) override {
+        return Memory::realloc_large(ptr, size);
+    }
+};
 
 bool json_variant_to_string(JsonVariantConst value, std::string &out);
 bool json_variant_to_uint32(JsonVariantConst value, uint32_t &out);
