@@ -1470,6 +1470,11 @@ void WebUI::init(uint16_t port) {
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");
     live_events = new AsyncEventSource("/events/live");
+    auto authenticate_events = [](AsyncWebServerRequest *request, ArMiddlewareNext next) {
+        if (checkAuth(request)) next();
+    };
+    events->addMiddleware(authenticate_events);
+    live_events->addMiddleware(authenticate_events);
     live_events->onConnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::acquire();
     });
