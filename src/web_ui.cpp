@@ -1184,7 +1184,6 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         resmed_part = nullptr;
         uploadSize = 0;
         uploadOk = false;
-        uploadCrc = 0xFFFF;
 
         esp_ota_part = esp_ota_get_next_update_partition(NULL);
         if (!esp_ota_part) {
@@ -1229,7 +1228,6 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             abortEspOtaUpload(request);
             return;
         }
-        uploadCrc = crc16_ccitt(data, len, uploadCrc);
         uploadSize += len;
     }
 
@@ -1273,9 +1271,6 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     jsonAddString(json, "ok", ok ? "true" : "false", false);
     if (!ok) jsonAddString(json, "error", error);
     jsonAddInt(json, "size", uploadSize);
-    char hexcrc[8];
-    snprintf(hexcrc, sizeof(hexcrc), "%04X", uploadCrc);
-    jsonAddString(json, "crc", hexcrc);
     if (esp_ota_part)
         jsonAddString(json, "partition", esp_ota_part->label);
 
