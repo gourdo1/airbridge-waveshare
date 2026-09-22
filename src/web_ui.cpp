@@ -80,11 +80,8 @@ static bool writeSetting(const char *cmd, int value) {
                               resp, &resp_len, timeout);
 }
 
-static void jsonAddString(String &out, const char *key, const char *val, bool comma = true) {
-    if (comma) out += ',';
+static void jsonQuote(String &out, const char *val) {
     out += '"';
-    out += key;
-    out += "\":\"";
     while (*val) {
         if (*val == '"') out += "\\\"";
         else if (*val == '\\') out += "\\\\";
@@ -96,6 +93,13 @@ static void jsonAddString(String &out, const char *key, const char *val, bool co
         val++;
     }
     out += '"';
+}
+
+static void jsonAddString(String &out, const char *key, const char *val, bool comma = true) {
+    if (comma) out += ',';
+    jsonQuote(out, key);
+    out += ':';
+    jsonQuote(out, val);
 }
 
 static void jsonAddInt(String &out, const char *key, int val, bool comma = true) {
@@ -449,7 +453,9 @@ static int saveSettings(const String &body, String &json) {
     jsonAddInt(json, "saved", count, false);
     if (errors.length() > 0) {
         errors.remove(errors.length() - 1);  // trailing comma
-        json += ",\"errors\":[\"" + errors + "\"]";
+        json += ",\"errors\":[";
+        jsonQuote(json, errors.c_str());
+        json += ']';
     }
     json += '}';
     return 200;
