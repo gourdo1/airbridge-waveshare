@@ -1,5 +1,5 @@
 """
-Pre-build script: minify JavaScript, compact HTML and gzip into src/web_ui_html.h
+Pre-build script: minify JavaScript, compact HTML and gzip into a build header.
 """
 
 import gzip
@@ -53,9 +53,9 @@ def minify_html(html):
     return ''.join(blocks).strip()
 
 
-def generate_header(project_dir):
+def generate_header(project_dir, output_dir):
     html_path = os.path.join(project_dir, "www", "index.html")
-    header_path = os.path.join(project_dir, "src", "web_ui_html.h")
+    header_path = os.path.join(output_dir, "web_ui_generated.h")
     if not os.path.exists(html_path):
         print(f"[web_ui] WARNING: {html_path} not found")
         return
@@ -76,11 +76,18 @@ def generate_header(project_dir):
     content = "".join(lines)
     header = Path(header_path)
     if not header.exists() or header.read_text(encoding="utf-8") != content:
+        header.parent.mkdir(parents=True, exist_ok=True)
         header.write_text(content, encoding="utf-8")
         print(f"[web_ui] {html_path} ({len(raw)} -> {len(minified)} minified -> {len(compressed)} gzipped)")
 
 
 if env is not None:
-    generate_header(PROJECT_DIR)
+    output_dir = os.path.join(env.subst("$BUILD_DIR"), "generated")
+    generate_header(PROJECT_DIR, output_dir)
+    env.AppendUnique(CPPPATH=[output_dir])
 elif __name__ == "__main__":
-    generate_header(PROJECT_DIR)
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_dir", help="Directory for the generated header")
+    generate_header(PROJECT_DIR, parser.parse_args().output_dir)

@@ -1,5 +1,5 @@
 #include "web_ui.h"
-#include "web_ui_html.h"
+#include "web_ui_generated.h"
 #include "uart_arbiter.h"
 #include "oxi_ble.h"
 #include "oxi_arbiter.h"

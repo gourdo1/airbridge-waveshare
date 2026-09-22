@@ -1,6 +1,6 @@
 #include "migrate.h"
 #include "debug_log.h"
-#include "target_ptable.h"
+#include "target_ptable_generated.h"
 
 #include <esp_partition.h>
 #include <esp_ota_ops.h>

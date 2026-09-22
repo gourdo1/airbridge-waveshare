@@ -1,7 +1,7 @@
 """generate target partition table header from partitions.csv for ota migration
 
 Runs gen_esp32part.py to convert partitions.csv to binary,
-then convert it to C array in src/target_ptable.h
+then convert it to a C array in the build directory.
 """
 import subprocess, sys, os
 from pathlib import Path
@@ -14,7 +14,8 @@ except NameError:
 def generate_ptable_header(env):
     project_dir = env.get("PROJECT_DIR", ".")
     csv_path = os.path.join(project_dir, "partitions.csv")
-    header_path = os.path.join(project_dir, "src", "target_ptable.h")
+    output_dir = os.path.join(env.subst("$BUILD_DIR"), "generated")
+    header_path = os.path.join(output_dir, "target_ptable_generated.h")
 
     framework_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
     gen_part = os.path.join(framework_dir, "tools", "gen_esp32part.py")
@@ -47,8 +48,10 @@ def generate_ptable_header(env):
     content = "".join(lines)
     header = Path(header_path)
     if not header.exists() or header.read_text(encoding="utf-8") != content:
+        header.parent.mkdir(parents=True, exist_ok=True)
         header.write_text(content, encoding="utf-8")
         print(f"[ptable] Generated {header_path} ({len(data)} bytes from {csv_path})")
+    env.AppendUnique(CPPPATH=[output_dir])
 
 if env is not None:
     # Refresh before SCons scans includes, even when migrate.cpp is unchanged.
