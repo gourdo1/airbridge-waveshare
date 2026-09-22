@@ -102,10 +102,6 @@ struct OutputFile {
     bool created;
     bool failed;
     bool open;
-    char partial_path[128];
-    char final_path[128];
-    char crc_partial_path[128];
-    char crc_final_path[128];
 };
 
 struct Accumulator {
@@ -158,8 +154,6 @@ static OutputFile eve;
 static OutputFile csl;
 static uint8_t *header_buffer = nullptr;
 static size_t header_capacity = 0;
-static uint8_t *record_buffer = nullptr;
-static size_t record_capacity = 0;
 
 static uint32_t session_start_capture_ms = 0;
 static uint32_t segment_duration_ms = 0;
@@ -1918,27 +1912,23 @@ static bool render_output_header(OutputFile &output, uint32_t records,
                                    header_capacity, written);
 }
 
+static void output_path(const OutputFile &output, const char *extension,
+                         char (&path)[128]) {
+    snprintf(path, sizeof(path), "%s/%s_%s.%s", session_directory,
+             status.file_prefix, output.schema->suffix, extension);
+}
+
 static bool open_output(OutputFile &output, const Air10Edf::Schema &schema) {
     output = {};
     output.schema = &schema;
-    snprintf(output.partial_path, sizeof(output.partial_path), "%s/%s_%s.edf.part",
-             session_directory, status.file_prefix, schema.suffix);
-    snprintf(output.final_path, sizeof(output.final_path), "%s/%s_%s.edf",
-             session_directory, status.file_prefix, schema.suffix);
-    snprintf(output.crc_partial_path, sizeof(output.crc_partial_path),
-             "%s/%s_%s.crc.part", session_directory, status.file_prefix,
-             schema.suffix);
-    snprintf(output.crc_final_path, sizeof(output.crc_final_path),
-             "%s/%s_%s.crc", session_directory, status.file_prefix,
-             schema.suffix);
 
-    if (storage->exists(output.partial_path) ||
-        storage->exists(output.final_path) ||
-        storage->exists(output.crc_partial_path) ||
-        storage->exists(output.crc_final_path)) {
-        return false;
+    char path[128];
+    for (const char *extension : {"edf.part", "edf", "crc.part", "crc"}) {
+        output_path(output, extension, path);
+        if (storage->exists(path)) return false;
     }
-    output.file = storage->open(output.partial_path, FILE_WRITE);
+    output_path(output, "edf.part", path);
+    output.file = storage->open(path, FILE_WRITE);
     if (!output.file) return false;
     output.created = true;
 
@@ -1988,7 +1978,10 @@ static bool finalize_output(OutputFile &output) {
     uint8_t sidecar[8];
     put_le32(sidecar, crc32_ieee(header_buffer, 256));
     put_le32(sidecar + 4, crc32_ieee_finish(output.rest_crc));
-    fs::File crc_file = storage->open(output.crc_partial_path, FILE_WRITE);
+    char partial_path[128], final_path[128];
+    output_path(output, "crc.part", partial_path);
+    output_path(output, "crc", final_path);
+    fs::File crc_file = storage->open(partial_path, FILE_WRITE);
     if (!crc_file || !write_exact(crc_file, sidecar, sizeof(sidecar))) {
         if (crc_file) crc_file.close();
         status_error("CRC sidecar write failed");
@@ -1996,12 +1989,15 @@ static bool finalize_output(OutputFile &output) {
     }
     crc_file.flush();
     crc_file.close();
-    if (!storage->rename(output.crc_partial_path, output.crc_final_path)) {
+    if (!storage->rename(partial_path, final_path)) {
         status_error("CRC sidecar rename failed");
         return false;
     }
-    if (!storage->rename(output.partial_path, output.final_path)) {
-        storage->remove(output.crc_final_path);
+    output_path(output, "edf.part", partial_path);
+    output_path(output, "edf", final_path);
+    if (!storage->rename(partial_path, final_path)) {
+        output_path(output, "crc", final_path);
+        storage->remove(final_path);
         status_error("EDF rename failed");
         return false;
     }
@@ -2010,8 +2006,11 @@ static bool finalize_output(OutputFile &output) {
 
 static void close_output(OutputFile &output, bool remove_partial) {
     if (output.file) output.file.close();
-    if (remove_partial && output.created && storage && output.partial_path[0])
-        storage->remove(output.partial_path);
+    if (remove_partial && output.created && storage) {
+        char path[128];
+        output_path(output, "edf.part", path);
+        storage->remove(path);
+    }
     output = {};
 }
 
@@ -2020,7 +2019,7 @@ static bool initialize_accumulator(Accumulator &accumulator,
     accumulator = {};
     accumulator.sample_count = Air10Edf::numeric_sample_count(schema);
     accumulator.samples = static_cast<int16_t *>(
-        allocate_large(accumulator.sample_count * sizeof(int16_t)));
+        allocate_large((accumulator.sample_count + 1) * sizeof(int16_t)));
     if (!accumulator.samples) return false;
     memset(accumulator.samples, 0xFF,
            accumulator.sample_count * sizeof(int16_t));
@@ -2035,15 +2034,14 @@ static void release_accumulator(Accumulator &accumulator, bool remove_partial) {
 }
 
 static bool write_current_record(Accumulator &accumulator) {
-    size_t written = 0;
-    if (!Air10Edf::render_numeric_record(
-            *accumulator.output.schema, accumulator.samples,
-            accumulator.sample_count, record_buffer, record_capacity,
-            written)) {
-        status_error("numeric record encoding failed");
-        return false;
-    }
-    if (!append_output_record(accumulator.output, record_buffer, written))
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                  "EDF accumulator writes require little-endian samples");
+    if (!accumulator.initialized) return false;
+    const size_t bytes = accumulator.sample_count * sizeof(int16_t);
+    uint8_t *record = reinterpret_cast<uint8_t *>(accumulator.samples);
+    const uint16_t crc = crc16_ccitt(record, bytes);
+    memcpy(record + bytes, &crc, sizeof(crc));
+    if (!append_output_record(accumulator.output, record, bytes + sizeof(crc)))
         return false;
     memset(accumulator.samples, 0xFF,
            accumulator.sample_count * sizeof(int16_t));
@@ -2158,14 +2156,15 @@ static void sample_pld() {
 
 static bool append_annotation(OutputFile &output, uint32_t onset,
                               uint32_t duration, const char *label) {
+    uint8_t record[40];
     size_t written = 0;
     if (!Air10Edf::render_annotation_record(
             *output.schema, onset, duration, label,
-            record_buffer, record_capacity, written)) {
+            record, sizeof(record), written)) {
         status_error("annotation encoding failed");
         return false;
     }
-    return append_output_record(output, record_buffer, written);
+    return append_output_record(output, record, written);
 }
 
 static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
@@ -2314,11 +2313,8 @@ static void clear_session_memory(bool remove_partial) {
     close_output(eve, remove_partial);
     close_output(csl, remove_partial);
     if (header_buffer) heap_caps_free(header_buffer);
-    if (record_buffer) heap_caps_free(record_buffer);
     header_buffer = nullptr;
-    record_buffer = nullptr;
     header_capacity = 0;
-    record_capacity = 0;
 }
 
 static bool anchor_session_clock(const ControlEvent &event) {
@@ -2452,11 +2448,7 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
     if (brp_header > header_capacity) header_capacity = brp_header;
     header_buffer = static_cast<uint8_t *>(allocate_large(header_capacity));
 
-    record_capacity = Air10Edf::record_size(brp_schema);
-    const size_t pld_record = Air10Edf::record_size(pld_schema);
-    if (pld_record > record_capacity) record_capacity = pld_record;
-    record_buffer = static_cast<uint8_t *>(allocate_large(record_capacity));
-    if (!header_buffer || !record_buffer) return false;
+    if (!header_buffer) return false;
 
     if (!initialize_accumulator(brp, brp_schema) ||
         !initialize_accumulator(pld, pld_schema) ||
