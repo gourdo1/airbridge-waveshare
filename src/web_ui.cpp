@@ -18,6 +18,7 @@
 #include "airbridge_ota.h"
 #include "custom_settings.h"
 #include "clinical_jobs.h"
+#include "memory_manager.h"
 #include "air10_clock.h"
 #include "board.h"
 
@@ -441,17 +442,13 @@ static int saveSettings(const String &body, String &json) {
 }
 
 
-class ClinicalResponse : public AsyncWebServerResponse {
+class BufferedJsonResponse : public AsyncWebServerResponse {
 public:
-    ClinicalJobs::Result result;
-
-    void begin(int code) {
+    void begin(int code, size_t length) {
         _code = code;
         _contentType = "application/json";
-        _contentLength = result.length();
+        _contentLength = length;
     }
-
-    bool _sourceValid() const override { return result.available(); }
 
     void _respond(AsyncWebServerRequest *request) override {
         addHeader("Connection", "close", false);
@@ -473,7 +470,7 @@ public:
         if (_state == RESPONSE_CONTENT) {
             while (_sentLength < _contentLength && request->client()->space()) {
                 if (buffer_offset_ == buffer_length_) {
-                    buffer_length_ = result.read(cursor_, _sentLength, buffer_, sizeof(buffer_));
+                    buffer_length_ = readBody(_sentLength, buffer_, sizeof(buffer_));
                     buffer_offset_ = 0;
                     if (!buffer_length_) {
                         _state = RESPONSE_FAILED;
@@ -498,12 +495,30 @@ public:
         return written;
     }
 
+protected:
+    virtual size_t readBody(size_t offset, char *out, size_t capacity) = 0;
+
 private:
     String headers_;
     size_t header_offset_ = 0;
-    ClinicalSettings::Cursor cursor_;
     char buffer_[256];
     size_t buffer_offset_ = 0, buffer_length_ = 0;
+};
+
+class ClinicalResponse : public BufferedJsonResponse {
+public:
+    ClinicalJobs::Result result;
+
+    void begin(int code) { BufferedJsonResponse::begin(code, result.length()); }
+    bool _sourceValid() const override { return result.available(); }
+
+protected:
+    size_t readBody(size_t offset, char *out, size_t capacity) override {
+        return result.read(cursor_, offset, out, capacity);
+    }
+
+private:
+    ClinicalSettings::Cursor cursor_;
 };
 
 static void handleSettingsJob(AsyncWebServerRequest *request, bool write) {
@@ -788,7 +803,70 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
 }
 
 
-#define LIVE_BATCH_MAX  128
+class LiveResponse : public BufferedJsonResponse {
+public:
+    ~LiveResponse() override { aircannect::Memory::free(samples_); }
+
+    bool prepare(uint16_t since) {
+        samples_ = static_cast<LiveWebConsumer::Sample *>(aircannect::Memory::alloc_large(
+            LiveWebConsumer::HISTORY_CAPACITY * sizeof(*samples_)));
+        if (!samples_) return false;
+
+        count_ = LiveWebConsumer::get_samples(samples_, LiveWebConsumer::HISTORY_CAPACITY,
+                                               since, &sequence_);
+        oxi_reading_t reading;
+        OxiArbiter::snapshot(reading);
+        spo2_ = reading.valid ? reading.spo2 : -1;
+        pulse_ = reading.valid ? reading.pulse_bpm : -1;
+        active_ = LiveWebConsumer::is_active();
+
+        char token[128];
+        size_t length = 0;
+        for (uint16_t part = 0; part < count_ + 2; part++)
+            length += formatPart(part, token, sizeof(token));
+        BufferedJsonResponse::begin(200, length);
+        return true;
+    }
+
+    bool _sourceValid() const override { return samples_ != nullptr; }
+
+protected:
+    size_t readBody(size_t, char *out, size_t capacity) override {
+        size_t written = 0;
+        while (written < capacity && part_ < count_ + 2) {
+            char token[128];
+            size_t length = formatPart(part_, token, sizeof(token));
+            size_t count = min(capacity - written, length - part_offset_);
+            memcpy(out + written, token + part_offset_, count);
+            written += count;
+            part_offset_ += count;
+            if (part_offset_ == length) { part_++; part_offset_ = 0; }
+        }
+        return written;
+    }
+
+private:
+    size_t formatPart(uint16_t part, char *out, size_t capacity) const {
+        if (part == 0) {
+            return snprintf(out, capacity,
+                "{\"seq\":%u,\"rate\":25,\"active\":\"%s\",\"spo2\":%d,\"pulse\":%d,\"samples\":[",
+                sequence_, active_ ? "yes" : "no", spo2_, pulse_);
+        }
+        if (part <= count_) {
+            const auto &sample = samples_[part - 1];
+            return snprintf(out, capacity, "%s[%d,%d,%d]", part == 1 ? "" : ",",
+                            sample.mkp, sample.rfl, sample.lyk);
+        }
+        memcpy(out, "]}", 2);
+        return 2;
+    }
+
+    LiveWebConsumer::Sample *samples_ = nullptr;
+    uint16_t count_ = 0, sequence_ = 0, part_ = 0;
+    size_t part_offset_ = 0;
+    int16_t spo2_ = -1, pulse_ = -1;
+    bool active_ = false;
+};
 
 static void handleLive(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
@@ -797,34 +875,13 @@ static void handleLive(AsyncWebServerRequest *request) {
     if (request->hasArg("since"))
         since = (uint16_t)request->arg("since").toInt();
 
-    LiveWebConsumer::Sample samples[LIVE_BATCH_MAX];
-    uint16_t cur_seq = 0;
-    int n = LiveWebConsumer::get_samples(samples, LIVE_BATCH_MAX, since, &cur_seq);
-
-    oxi_reading_t r;
-    OxiArbiter::snapshot(r);
-
-    String json;
-    json.reserve(64 + n * 24);
-    json = "{";
-    jsonAddInt(json, "seq", cur_seq, false);
-    jsonAddInt(json, "rate", 25);
-    jsonAddString(json, "active", LiveWebConsumer::is_active() ? "yes" : "no");
-    jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
-    jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
-    json += ",\"samples\":[";
-    for (int i = 0; i < n; i++) {
-        if (i > 0) json += ',';
-        json += '[';
-        json += String(samples[i].mkp);
-        json += ',';
-        json += String(samples[i].rfl);
-        json += ',';
-        json += String(samples[i].lyk);
-        json += ']';
+    auto *response = new (std::nothrow) LiveResponse;
+    if (!response || !response->prepare(since)) {
+        delete response;
+        request->send(503, "application/json", "{\"error\":\"live_allocation_failed\"}");
+        return;
     }
-    json += "]}";
-    request->send(200, "application/json", json);
+    request->send(response);
 }
 
 

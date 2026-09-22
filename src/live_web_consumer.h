@@ -7,6 +7,8 @@
 
 namespace LiveWebConsumer {
 
+constexpr uint16_t HISTORY_CAPACITY = 128;
+
 struct Sample {
     int16_t mkp;
     int16_t rfl;

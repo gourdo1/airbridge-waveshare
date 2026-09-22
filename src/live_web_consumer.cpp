@@ -5,12 +5,11 @@
 #include "oxi_arbiter.h"
 #include "debug_log.h"
 
-#define LWC_BUF             128         // ~5 s @ 25 Hz
 #define LWC_BATCH           5           // samples per SSE event (~5 Hz fire @ 25 Hz)
 
 namespace LiveWebConsumer {
 
-static Sample buf[LWC_BUF];
+static Sample buf[HISTORY_CAPACITY];
 static uint16_t head = 0;
 static uint16_t ring_count = 0;
 static uint16_t sent_seq = 0;
@@ -33,7 +32,7 @@ static void flush_batch() {
     }
     uint16_t begin = (uint16_t)(head - available);
     for (uint8_t i = 0; i < LWC_BATCH; i++)
-        batch[i] = buf[(uint16_t)(begin + i) % LWC_BUF];
+        batch[i] = buf[(uint16_t)(begin + i) % HISTORY_CAPACITY];
     sent_seq = (uint16_t)(begin + LWC_BATCH);
     uint16_t sequence = sent_seq;
     portEXIT_CRITICAL(&ring_mux);
@@ -65,11 +64,11 @@ static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
     // Always store every frame (25 Hz) into the ring; the GET /api/live
     // backfill endpoint walks since_seq -> head at full resolution.
     portENTER_CRITICAL(&ring_mux);
-    uint16_t idx = head % LWC_BUF;
+    uint16_t idx = head % HISTORY_CAPACITY;
     buf[idx] = {s->mkp, s->rfl, s->lyk};
     head = (uint16_t)(head + 1);
 
-    if (ring_count < LWC_BUF) ring_count++;
+    if (ring_count < HISTORY_CAPACITY) ring_count++;
     portEXIT_CRITICAL(&ring_mux);
 }
 
@@ -152,7 +151,7 @@ int get_samples(Sample *out, int max,
     if (available > (uint16_t)max) available = (uint16_t)max;
 
     for (uint16_t i = 0; i < available; i++) {
-        uint16_t idx = (uint16_t)(seq - available + i) % LWC_BUF;
+        uint16_t idx = (uint16_t)(seq - available + i) % HISTORY_CAPACITY;
         out[i] = buf[idx];
     }
     portEXIT_CRITICAL(&ring_mux);
