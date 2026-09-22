@@ -30,6 +30,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <new>
+#include <errno.h>
 
 static AsyncWebServer *http = nullptr;
 static AsyncEventSource *events = nullptr;
@@ -410,11 +411,16 @@ static int saveSettings(const String &body, String &json) {
     struct { int count; String errors; bool lan_changed; } ctx = {0, "", false};
     json_foreach_kv(body, [](const String &key, const String &val, void *p) {
         auto *c = (decltype(ctx)*)p;
+        char *end = nullptr;
+        errno = 0;
+        int64_t raw = strtoll(val.c_str(), &end, 10);
+        if (end == val.c_str() || *end != '\0' || errno == ERANGE ||
+            raw < INT32_MIN || raw > UINT32_MAX) {
+            c->errors += key + ":invalid_number,";
+            return;
+        }
         if (CustomSettings::contains(key.c_str())) {
-            char *end = nullptr;
-            unsigned long raw = strtoul(val.c_str(), &end, 10);
-            if (end != val.c_str() && *end == '\0' &&
-                CustomSettings::write_raw(key.c_str(), (uint32_t)raw)) {
+            if (CustomSettings::write_raw(key.c_str(), (uint32_t)raw)) {
                 c->count++;
             } else {
                 c->errors += key + ":fail,";
@@ -422,7 +428,11 @@ static int saveSettings(const String &body, String &json) {
             return;
         }
         if (!ClinicalSettings::known_stock(key.c_str())) { c->errors += key + ":unknown,"; return; }
-        if (writeSetting(key.c_str(), atoi(val.c_str()))) {
+        if (raw < INT16_MIN || raw > UINT16_MAX) {
+            c->errors += key + ":invalid_number,";
+            return;
+        }
+        if (writeSetting(key.c_str(), (int)raw)) {
             c->count++;
             if (key == "LAN") c->lan_changed = true;
         } else c->errors += key + ":fail,";
