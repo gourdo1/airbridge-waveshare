@@ -530,12 +530,14 @@ static void handle_framed() {
 
 static WiFiServer *debug_server = nullptr;
 static WiFiClient debug_clients[DEBUG_MAX_CLIENTS];
+static SemaphoreHandle_t debug_mutex = nullptr;
 
 // Print adapter that writes to all connected debug clients
 class DebugPrint : public Print {
 public:
     size_t write(uint8_t c) override { return write(&c, 1); }
     size_t write(const uint8_t *buf, size_t len) override {
+        if (!debug_mutex || xSemaphoreTake(debug_mutex, 0) != pdTRUE) return 0;
         size_t written = 0;
         for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) {
             if (debug_clients[i] && debug_clients[i].connected()) {
@@ -543,6 +545,7 @@ public:
                 written = len;
             }
         }
+        xSemaphoreGive(debug_mutex);
         return written;
     }
 };
@@ -551,6 +554,11 @@ static DebugPrint debug_print;
 
 void TcpBridge::init_debug_server(uint16_t port) {
     if (port == 0) return;
+    debug_mutex = xSemaphoreCreateMutex();
+    if (!debug_mutex) {
+        Log::logf(CAT_TCP, LOG_ERROR, "[DBG] Client mutex allocation failed\n");
+        return;
+    }
     debug_server = new WiFiServer(port);
     debug_server->begin();
     debug_server->setNoDelay(true);
@@ -559,8 +567,13 @@ void TcpBridge::init_debug_server(uint16_t port) {
 }
 
 void TcpBridge::poll_debug_clients() {
-    if (!debug_server) return;
+    if (!debug_server || xSemaphoreTake(debug_mutex, 0) != pdTRUE) return;
 
+    for (auto &debug_client : debug_clients)
+        if (!debug_client.connected()) debug_client.stop();
+
+    int connected_slot = -1;
+    IPAddress connected_address;
     WiFiClient nc = debug_server->accept();
     if (nc) {
         int slot = -1;
@@ -573,8 +586,8 @@ void TcpBridge::poll_debug_clients() {
         if (slot >= 0) {
             debug_clients[slot] = nc;
             debug_clients[slot].setNoDelay(true);
-            Log::logf(CAT_TCP, LOG_INFO, "[DBG] Debug client %d connected from %s\n",
-                        slot, nc.remoteIP().toString().c_str());
+            connected_slot = slot;
+            connected_address = nc.remoteIP();
         } else {
             nc.println("ERR: max debug clients");
             nc.stop();
@@ -587,6 +600,10 @@ void TcpBridge::poll_debug_clients() {
             while (debug_clients[i].available()) debug_clients[i].read();
         }
     }
+    xSemaphoreGive(debug_mutex);
+    if (connected_slot >= 0)
+        Log::logf(CAT_TCP, LOG_INFO, "[DBG] Debug client %d connected from %s\n",
+                  connected_slot, connected_address.toString().c_str());
 }
 
 void TcpBridge::task(void *param) {
@@ -604,7 +621,8 @@ void TcpBridge::task(void *param) {
     Log::logf(CAT_TCP, LOG_INFO, "[TCP] Listening on port %d\n", cfg.tcp_port);
 
     while (true) {
-        if (!client || !client.connected()) {
+        if (!client.connected() && !client.available()) {
+            client.stop();
             WiFiClient newClient = server->accept();
             if (newClient) {
                 client = newClient;
@@ -616,7 +634,7 @@ void TcpBridge::task(void *param) {
             }
         }
 
-        if (!client || !client.connected()) {
+        if (!client.connected() && !client.available()) {
             poll_debug_clients();
             WebUI::handle();
             vTaskDelay(pdMS_TO_TICKS(50));
