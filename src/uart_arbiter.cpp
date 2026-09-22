@@ -5,6 +5,7 @@
 #include "custom_settings.h"
 #include <freertos/queue.h>
 #include <atomic>
+#include <cstddef>
 
 #define ARBITER_QUEUE_DEPTH     8
 #define ARBITER_TASK_STACK      4096
@@ -75,10 +76,10 @@ static uint32_t stat_error = 0;
 
 static uint32_t next_ticket_id = 1;
 
-struct uart_transaction_t {
+struct alignas(std::max_align_t) uart_transaction_t {
     cmd_source_t source;
     cmd_priority_t priority;
-    uint8_t frame[QFRAME_MAX_RAW];
+    uint8_t *frame;
     uint16_t frame_len;
     uint32_t ticket_id;
     uart_response_policy_t policy;
@@ -935,7 +936,7 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
     }
 
     uart_transaction_t *t =
-        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t) + context_size);
+        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t) + context_size + frame_len);
     if (!t) return nullptr;
 
     t->source = src;
@@ -950,6 +951,7 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
         memcpy(t->sink_context, sink_context, context_size);
     }
     t->ticket_id = __atomic_fetch_add(&next_ticket_id, 1, __ATOMIC_RELAXED);
+    t->frame = reinterpret_cast<uint8_t *>(t + 1) + context_size;
     memcpy(t->frame, frame, frame_len);
     t->frame_len = frame_len;
 
@@ -1059,14 +1061,20 @@ bool Arbiter::transact_cmd(const char *cmd,
 }
 
 typedef struct {
-    qframe_t frame;
+    uint16_t capacity;
+    uint16_t length;
     bool received;
+    // The retained payload and its terminator follow this header.
 } single_response_capture_t;
 
 static bool capture_single_response(const qframe_t *frame, void *context) {
     single_response_capture_t *capture =
         static_cast<single_response_capture_t *>(context);
-    memcpy(&capture->frame, frame, sizeof(*frame));
+    uint16_t len = min(frame->payload_len, capture->capacity);
+    auto *payload = reinterpret_cast<uint8_t *>(capture + 1);
+    memcpy(payload, frame->payload, len);
+    payload[len] = '\0';
+    capture->length = frame->payload_len;
     capture->received = true;
     return true;
 }
@@ -1082,22 +1090,31 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     policy.first_timeout_ms = timeout_ms;
     policy.overall_timeout_ms = timeout_ms;
 
-    single_response_capture_t capture = {};
+    uint16_t output_capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
+    if (resp_buf && resp_len && *resp_len)
+        output_capacity = min(output_capacity, (uint16_t)(*resp_len - 1));
+    bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
+    struct {
+        single_response_capture_t result;
+        uint8_t payload[QFRAME_MAX_PAYLOAD + 1];
+    } capture = {};
+    capture.result.capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
+    size_t capture_size = sizeof(capture.result) + capture.result.capacity + 1;
     uart_transaction_result_t result = {};
     bool completed = transact_cmd(cmd, src, prio, policy,
                                   capture_single_response, &capture, &result,
-                                  sizeof(capture));
+                                  capture_size);
     bool ok = completed && result.success;
 
-    if (!capture.received) {
+    if (!capture.result.received) {
         if (resp_len) *resp_len = 0;
         return false;
     }
 
     // BDD baud switching (arbiter mode)
-    if (ok && strncmp(cmd, "P S #BDD ", 9) == 0) {
-        uint32_t new_baud = parse_bdd_baud(capture.frame.payload,
-                                           capture.frame.payload_len);
+    if (ok && bdd) {
+        uint32_t new_baud = parse_bdd_baud(capture.payload,
+            min(capture.result.length, capture.result.capacity));
         if (new_baud && new_baud != current_baud) {
             uart->updateBaudRate(new_baud);
             Log::logf(CAT_ARB, LOG_INFO, "[ARB] BDD arbiter: baud %u -> %u\n",
@@ -1106,15 +1123,12 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
         }
     }
 
-    if (resp_buf && capture.frame.payload_len > 0) {
-        uint16_t copy_len = capture.frame.payload_len;
-        if (resp_len && *resp_len > 0) {
-            copy_len = min(copy_len, (uint16_t)(*resp_len - 1));
-        }
-        memcpy(resp_buf, capture.frame.payload, copy_len);
+    if (resp_buf && capture.result.length > 0) {
+        uint16_t copy_len = min(capture.result.length, output_capacity);
+        memcpy(resp_buf, capture.payload, copy_len);
         resp_buf[copy_len] = '\0';
     }
-    if (resp_len) *resp_len = capture.frame.payload_len;
+    if (resp_len) *resp_len = capture.result.length;
     return ok;
 }
 
