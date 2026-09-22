@@ -4,6 +4,7 @@
 #include <freertos/semphr.h>
 #include <utility>
 #include <new>
+#include <atomic>
 
 namespace ClinicalJobs {
 namespace {
@@ -23,7 +24,7 @@ struct Job {
 };
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr;
-TaskHandle_t task = nullptr;
+std::atomic<TaskHandle_t> task{nullptr};
 Handler handler = nullptr;
 uint32_t next_id = 1, active_since = 0;
 
@@ -43,30 +44,22 @@ void worker(void *) {
         CustomSettings::reclaim();
         Job *job = nullptr;
         String body;
-        bool retained = false;
         xSemaphoreTake(mutex, portMAX_DELAY);
         for (Job &candidate : jobs) {
             if (candidate.state == Complete && reusable(candidate))
                 reset_job(candidate);
             if (candidate.state == Queued &&
                 (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
-            if (candidate.state != Free) retained = true;
         }
-        if (!retained) {
+        if (!job) {
             task = nullptr;
             xSemaphoreGive(mutex);
             break;
         }
-        if (job) {
-            job->state = Running;
-            active_since = job->queued_ms;
-            body = std::move(job->body);
-        }
+        job->state = Running;
+        active_since = job->queued_ms;
+        body = std::move(job->body);
         xSemaphoreGive(mutex);
-        if (!job) {
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-            continue;
-        }
         String result;
         int code = 504;
         if (timeout_ms()) {
@@ -93,13 +86,15 @@ void worker(void *) {
 }
 
 bool start_worker() {
+    TaskHandle_t created_task = nullptr;
     BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
-        worker, "clinical", 6144, nullptr, 2, &task, 0,
+        worker, "clinical", 6144, nullptr, 2, &created_task, 0,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS)
         created = xTaskCreatePinnedToCoreWithCaps(
-            worker, "clinical", 6144, nullptr, 2, &task, 0,
+            worker, "clinical", 6144, nullptr, 2, &created_task, 0,
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (created == pdPASS) task = created_task;
     return created == pdPASS;
 }
 }
@@ -108,6 +103,14 @@ void init(Handler callback) {
     if (mutex) return;
     handler = callback;
     mutex = xSemaphoreCreateMutex();
+}
+
+void tick() {
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
+    for (Job &job : jobs)
+        if (job.state == Complete && reusable(job)) reset_job(job);
+    xSemaphoreGive(mutex);
+    CustomSettings::reclaim();
 }
 
 Result::~Result() { reset(); }
@@ -178,7 +181,6 @@ bool submit(bool write, const String &body, uint32_t &id) {
         return false;
     }
     id = available->id;
-    xTaskNotifyGive(task);
     xSemaphoreGive(mutex);
     return true;
 }
@@ -213,7 +215,7 @@ int poll(uint32_t id, Result &result) {
 
 uint16_t timeout_ms() {
     uint16_t limit = Config::get().uart_cmd_timeout_ms;
-    if (!task || xTaskGetCurrentTaskHandle() != task) return limit;
+    if (xTaskGetCurrentTaskHandle() != task.load()) return limit;
     uint32_t elapsed = millis() - active_since;
     return elapsed >= DEADLINE_MS ? 0 : min(uint32_t(limit), DEADLINE_MS - elapsed);
 }

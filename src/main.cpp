@@ -20,6 +20,7 @@
 #include "edf_recorder.h"
 #include "export_sync.h"
 #include "custom_settings.h"
+#include "clinical_jobs.h"
 #include "device_uptime.h"
 #include "air10_clock.h"
 #include "board.h"
@@ -405,6 +406,7 @@ static void sync_resmed_clock() {
 
 void loop() {
     serial_poll();
+    ClinicalJobs::tick();
 
 #if AB_STORAGE_HAS_SDCARD
     static uint32_t recorder_retry_ms = 0;

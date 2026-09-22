@@ -58,7 +58,7 @@ private:
 void init();
 bool ensure_loaded();
 bool contains(const char *name);
-void reclaim();  // Worker cleanup of unreferenced retired metadata.
+void reclaim();  // Nonblocking cleanup of unreferenced retired metadata.
 bool write_raw(const char *name, uint32_t value);
 
 // Invalidate metadata after a device reboot, firmware replacement, or LAN change.
