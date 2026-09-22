@@ -32,6 +32,7 @@
 #include <time.h>
 #include <new>
 #include <errno.h>
+#include <utility>
 
 static AsyncWebServer *http = nullptr;
 static AsyncEventSource *events = nullptr;
@@ -520,6 +521,7 @@ private:
 
 class ClinicalResponse : public BufferedJsonResponse {
 public:
+    explicit ClinicalResponse(ClinicalJobs::Result &&ready) : result(std::move(ready)) {}
     ClinicalJobs::Result result;
 
     void begin(int code) { BufferedJsonResponse::begin(code, result.length()); }
@@ -538,17 +540,17 @@ static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind
     if (!checkAuth(request)) return;
     bool write = kind == ClinicalJobs::Kind::Write;
     if (!write && request->hasArg("job")) {
-        auto *response = new (std::nothrow) ClinicalResponse;
-        if (!response) {
-            request->send(503, "application/json", "{\"error\":\"settings_allocation_failed\"}");
-            return;
-        }
-        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), response->result);
-        if (response->result.available()) {
+        ClinicalJobs::Result result;
+        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), result);
+        if (result.available()) {
+            auto *response = new (std::nothrow) ClinicalResponse(std::move(result));
+            if (!response) {
+                request->send(503, "application/json", "{\"error\":\"settings_allocation_failed\"}");
+                return;
+            }
             response->begin(code);
             request->send(response);
         } else {
-            delete response;
             request->send(code, "application/json", code == 202 ? "{\"pending\":true}"
                 : "{\"error\":\"settings_job_unavailable\"}");
         }

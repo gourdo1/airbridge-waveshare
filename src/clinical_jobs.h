@@ -20,6 +20,7 @@ public:
     ~Result();
     Result(const Result &) = delete;
     Result &operator=(const Result &) = delete;
+    Result(Result &&other) noexcept;
     bool available() const { return id_ != 0; }
     size_t length() const { return length_; }
     size_t read(ClinicalSettings::Cursor &cursor, size_t offset, char *out, size_t capacity) const;

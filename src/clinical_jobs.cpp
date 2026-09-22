@@ -115,6 +115,10 @@ void tick() {
 
 Result::~Result() { reset(); }
 
+Result::Result(Result &&other) noexcept
+    : id_(std::exchange(other.id_, 0)), data_(std::exchange(other.data_, nullptr)),
+      snapshot_(std::exchange(other.snapshot_, nullptr)), length_(std::exchange(other.length_, 0)) {}
+
 void Result::reset() {
     if (!id_) return;
     xSemaphoreTake(mutex, portMAX_DELAY);
