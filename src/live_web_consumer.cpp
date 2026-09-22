@@ -10,7 +10,7 @@
 
 namespace LiveWebConsumer {
 
-static LivePmd::Sample buf[LWC_BUF];
+static Sample buf[LWC_BUF];
 static uint16_t head = 0;
 static uint16_t ring_count = 0;
 static uint16_t sent_seq = 0;
@@ -23,7 +23,7 @@ static int      client_count = 0;
 // Coalesce N samples per SSE event so the wire format mirrors /api/live and
 // each event amortizes the SSE framing overhead across the batch.
 static void flush_batch() {
-    LivePmd::Sample batch[LWC_BATCH];
+    Sample batch[LWC_BATCH];
     portENTER_CRITICAL(&ring_mux);
     uint16_t available = (uint16_t)(head - sent_seq);
     if (available > ring_count) available = ring_count;
@@ -66,7 +66,7 @@ static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
     // backfill endpoint walks since_seq -> head at full resolution.
     portENTER_CRITICAL(&ring_mux);
     uint16_t idx = head % LWC_BUF;
-    buf[idx] = *s;
+    buf[idx] = {s->mkp, s->rfl, s->lyk};
     head = (uint16_t)(head + 1);
 
     if (ring_count < LWC_BUF) ring_count++;
@@ -137,7 +137,7 @@ void tick() {
     if (wanted) for (uint8_t i = 0; i < 4; i++) flush_batch();
 }
 
-int get_samples(LivePmd::Sample *out, int max,
+int get_samples(Sample *out, int max,
                 uint16_t since_seq, uint16_t *cur_seq) {
     portENTER_CRITICAL(&ring_mux);
     uint16_t seq = head;

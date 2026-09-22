@@ -797,7 +797,7 @@ static void handleLive(AsyncWebServerRequest *request) {
     if (request->hasArg("since"))
         since = (uint16_t)request->arg("since").toInt();
 
-    LivePmd::Sample samples[LIVE_BATCH_MAX];
+    LiveWebConsumer::Sample samples[LIVE_BATCH_MAX];
     uint16_t cur_seq = 0;
     int n = LiveWebConsumer::get_samples(samples, LIVE_BATCH_MAX, since, &cur_seq);
 

@@ -1,11 +1,17 @@
 #pragma once
-#include "live_pmd.h"
+#include <stdint.h>
 
 // Web UI consumer for the PMD live stream. Owns the per-frame ring buffer
 // served by /api/live, and pushes throttled SSE "live" events for clients
 // that prefer event-source pull.
 
 namespace LiveWebConsumer {
+
+struct Sample {
+    int16_t mkp;
+    int16_t rfl;
+    int16_t lyk;
+};
 
 // Lifecycle is driven by /events/live presence: web_ui calls acquire() on
 // AsyncEventSource onConnect and release() on onDisconnect. The PMD device
@@ -21,7 +27,7 @@ void tick();
 
 // Copy samples with seq > since_seq into out[]. Returns count. Always
 // writes the current sequence to *cur_seq (NULL allowed).
-int  get_samples(LivePmd::Sample *out, int max,
+int  get_samples(Sample *out, int max,
                  uint16_t since_seq, uint16_t *cur_seq);
 
 bool     is_active();
