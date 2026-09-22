@@ -79,6 +79,7 @@ bool LargeTextBuffer::append(const char *text, size_t len) {
 
 bool LargeTextBuffer::ensure_capacity(size_t needed) {
     if (needed <= capacity_) return true;
+    if (needed == SIZE_MAX) return false;
 
     size_t target = capacity_ ? capacity_ : 256;
     while (target < needed) {
@@ -89,11 +90,9 @@ bool LargeTextBuffer::ensure_capacity(size_t needed) {
         target *= 2;
     }
 
-    char *next = static_cast<char *>(Memory::alloc_large(target + 1));
+    char *next = static_cast<char *>(Memory::realloc_large(data_, target + 1));
     if (!next) return false;
-    if (data_ && length_) memcpy(next, data_, length_);
     next[length_] = 0;
-    Memory::free(data_);
     data_ = next;
     capacity_ = target;
     return true;
