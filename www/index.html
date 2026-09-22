@@ -1366,6 +1366,7 @@ async function loadBle() {
     } else {
       bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No bonded devices</div>';
     }
+    return d;
   } catch(e) { console.error(e); }
 }
 
@@ -1375,10 +1376,8 @@ async function bleScan() {
   document.getElementById('bleScanSpinner').style.display = 'inline-block';
   let polls = 0;
   bleTimer = setInterval(async () => {
-    await loadBle(); polls++;
-    const r = await api('/api/ble'); if (!r) return;
-    const d = await r.json();
-    if (d.state !== 'SCANNING' || polls > 20) { clearInterval(bleTimer); bleTimer = null; document.getElementById('bleScanSpinner').style.display = 'none'; }
+    const d = await loadBle(); polls++;
+    if ((d && d.state !== 'SCANNING') || polls > 20) { clearInterval(bleTimer); bleTimer = null; document.getElementById('bleScanSpinner').style.display = 'none'; }
   }, 1500);
 }
 
