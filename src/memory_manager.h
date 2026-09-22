@@ -17,7 +17,6 @@ struct MemoryStatus {
 
 namespace Memory {
 
-void begin();
 MemoryStatus status();
 bool psram_available();
 

@@ -13,37 +13,22 @@ namespace Memory {
 namespace {
 
 #ifdef ARDUINO
-bool initialized = false;
-bool psram_detected = false;
-
 bool detect_psram() {
     return psramFound() && ESP.getPsramSize() > 0;
-}
-
-void ensure_begin() {
-    if (!initialized) begin();
 }
 #endif
 
 }  // namespace
 
-void begin() {
-#ifdef ARDUINO
-    psram_detected = detect_psram();
-    initialized = true;
-#endif
-}
-
 MemoryStatus status() {
 #ifdef ARDUINO
-    ensure_begin();
     MemoryStatus out;
     out.heap_total = ESP.getHeapSize();
     out.heap_free = ESP.getFreeHeap();
     out.heap_max_alloc =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                          MALLOC_CAP_8BIT);
-    out.psram_available = psram_detected && detect_psram();
+    out.psram_available = detect_psram();
     if (out.psram_available) {
         out.psram_total = ESP.getPsramSize();
         out.psram_free = ESP.getFreePsram();
@@ -59,7 +44,7 @@ MemoryStatus status() {
 
 bool psram_available() {
 #ifdef ARDUINO
-    return status().psram_available;
+    return detect_psram();
 #else
     return false;
 #endif
@@ -67,10 +52,9 @@ bool psram_available() {
 
 void *alloc_large(size_t size, bool allow_internal_fallback) {
 #ifdef ARDUINO
-    ensure_begin();
     if (size == 0) return nullptr;
 
-    if (psram_detected && detect_psram()) {
+    if (detect_psram()) {
         void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM |
                                            MALLOC_CAP_8BIT);
         if (ptr) return ptr;
@@ -88,14 +72,13 @@ void *realloc_large(void *ptr,
                     size_t size,
                     bool allow_internal_fallback) {
 #ifdef ARDUINO
-    ensure_begin();
     if (!ptr) return alloc_large(size, allow_internal_fallback);
     if (size == 0) {
         ::free(ptr);
         return nullptr;
     }
 
-    if (psram_detected && detect_psram()) {
+    if (detect_psram()) {
         void *next = heap_caps_realloc(ptr,
                                        size,
                                        MALLOC_CAP_SPIRAM |

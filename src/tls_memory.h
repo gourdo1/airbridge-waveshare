@@ -21,6 +21,7 @@ struct TlsMemoryStatus {
 
 namespace TlsMemory {
 
+// Install once during setup, before any task can allocate TLS contexts.
 bool begin();
 TlsMemoryStatus status();
 

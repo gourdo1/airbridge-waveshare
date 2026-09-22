@@ -87,7 +87,6 @@ void tls_free(void *ptr) {
 bool begin() {
     if (installed.load(std::memory_order_acquire)) return true;
 
-    Memory::begin();
     psram_enabled.store(Memory::psram_available(), std::memory_order_release);
 
     const int rc = mbedtls_platform_set_calloc_free(tls_calloc, tls_free);

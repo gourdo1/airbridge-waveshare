@@ -10,6 +10,7 @@
 #include "oxi_udp.h"
 #include "oxi_arbiter.h"
 #include "airbridge_ota.h"
+#include "tls_memory.h"
 #include "web_ui.h"
 #include "qframe.h"
 #include "network_hints.h"
@@ -265,6 +266,9 @@ void setup() {
     delay(500);
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
+
+    if (!aircannect::TlsMemory::begin())
+        Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
 
     Log::printf("\n=== AirBridge %s ===\n", airbridge_version());
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());

@@ -618,7 +618,7 @@ static bool run_sleephq(const Request &request) {
                           error[0] ? error : nullptr);
         return !error[0];
     }
-    if (!aircannect::TlsMemory::begin()) {
+    if (!aircannect::TlsMemory::status().installed) {
         set_sleephq_state(State::Error, "tls_allocator_install");
         return false;
     }
@@ -751,7 +751,6 @@ void init() {
     if (request_queue || !SdStorage::mounted()) return;
     storage = SdStorage::filesystem();
     if (!storage) return;
-    aircannect::Memory::begin();
     request_queue = xQueueCreate(4, sizeof(Request));
     BaseType_t created = pdFAIL;
     if (request_queue && aircannect::Memory::psram_available()) {
