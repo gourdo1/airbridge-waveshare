@@ -569,9 +569,6 @@ static bool run_smb(const Request &request) {
         if (run_aborted(&run)) set_state(State::Idle);
         else set_state(State::Error,
                        error[0] ? error : "smb_sync_failed");
-        Log::logf(CAT_EXPORT, LOG_WARN,
-                  "[SMB] sync failed error=%s\n",
-                  error[0] ? error : "smb_sync_failed");
         return false;
     }
 
@@ -672,9 +669,6 @@ static bool run_sleephq(const Request &request) {
         if (run_aborted(&run)) set_sleephq_state(State::Idle);
         else set_sleephq_state(State::Error,
                                error[0] ? error : "sleephq_sync_failed");
-        Log::logf(CAT_EXPORT, LOG_WARN,
-                  "[SLEEPHQ] sync failed error=%s\n",
-                  error[0] ? error : "sleephq_sync_failed");
         return false;
     }
 
@@ -684,6 +678,29 @@ static bool run_sleephq(const Request &request) {
     portEXIT_CRITICAL(&sleephq_status_mux);
     set_sleephq_state(State::Idle);
     return true;
+}
+
+template <typename T>
+static void run_logged(const Request &request, const char *name,
+                        bool (*run)(const Request &), void (*snapshot)(T &)) {
+    const uint32_t started = millis();
+    Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s\n", name,
+              request.kind == RequestKind::PostTherapy ? "post_therapy" : "requested");
+    bool success = run(request);
+    T result;
+    snapshot(result);
+    if (!success && generation_aborted(request.generation)) {
+        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted by therapy\n", name);
+    } else if (!success) {
+        Log::logf(CAT_EXPORT, LOG_WARN, "[%s] Sync failed: %s\n", name, result.last_error);
+    } else if (result.state == State::Disabled) {
+        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync skipped: disabled\n", name);
+    } else {
+        Log::logf(CAT_EXPORT, LOG_INFO,
+                  "[%s] Sync complete uploaded=%u skipped=%u bytes=%llu elapsed=%ums\n",
+                  name, result.files_uploaded, result.files_skipped,
+                  (unsigned long long)result.bytes_uploaded, (unsigned)(millis() - started));
+    }
 }
 
 static void export_task(void *) {
@@ -718,16 +735,16 @@ static void export_task(void *) {
         }
 
         if (request.kind == RequestKind::ManualSmb) {
-            (void)run_smb(request);
+            run_logged(request, "SMB", run_smb, get_status);
         } else if (request.kind == RequestKind::ManualSleepHq) {
-            (void)run_sleephq(request);
+            run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
         } else {
             const AirBridgeConfig &config = Config::get();
             if (config.smb_enabled && config.smb_auto_after_therapy)
-                (void)run_smb(request);
+                run_logged(request, "SMB", run_smb, get_status);
             if (!generation_aborted(request.generation) &&
                 config.sleephq_enabled && config.sleephq_auto_after_therapy)
-                (void)run_sleephq(request);
+                run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
         }
         EdfRecorder::release_storage();
     }
@@ -767,6 +784,7 @@ void init() {
     if (!request_queue || created != pdPASS) {
         set_state(State::Error, "task_initialization_failed");
         set_sleephq_state(State::Error, "task_initialization_failed");
+        Log::logf(CAT_EXPORT, LOG_ERROR, "[EXPORT] Task initialization failed\n");
         return;
     }
     set_state(Config::get().smb_enabled ? State::Idle : State::Disabled);
