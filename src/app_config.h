@@ -43,6 +43,9 @@ struct AirBridgeConfig {
     bool        allow_transparent_during_therapy;
 
     uint16_t    debug_port;
+    bool        syslog_enabled;
+    String      syslog_host;
+    uint16_t    syslog_port;
 
     uint16_t    http_port;
     String      http_user;

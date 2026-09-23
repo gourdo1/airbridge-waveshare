@@ -27,6 +27,10 @@ typedef enum {
 namespace Log {
     void init();
 
+    bool configure_syslog(bool enabled, const char *host, uint16_t port,
+                          const char *hostname);
+    void poll();
+
     void printf(const char *fmt, ...);
 
     void logf(log_cat_t cat, log_level_t lvl, const char *fmt, ...);

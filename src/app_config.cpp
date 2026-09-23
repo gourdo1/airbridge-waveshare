@@ -2,7 +2,10 @@
 #include "uart_arbiter.h"
 #include "qframe.h"
 #include "network_hints.h"
+#include "debug_log.h"
 #include <Preferences.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
 
 #define CFG_DEFAULT_TCP_PORT    23
 #define CFG_DEFAULT_BAUD        57600
@@ -39,6 +42,9 @@ static void apply_defaults() {
     cfg.allow_transparent_during_therapy = false;
 
     cfg.debug_port = 8023;
+    cfg.syslog_enabled = false;
+    cfg.syslog_host = "";
+    cfg.syslog_port = 514;
 
     cfg.http_port = 80;
     cfg.http_user = "admin";
@@ -122,6 +128,13 @@ static void load_wifi_nets() {
     }
 }
 
+static void apply_syslog() {
+    if (!Log::configure_syslog(cfg.syslog_enabled, cfg.syslog_host.c_str(),
+                               cfg.syslog_port, cfg.hostname.c_str())) {
+        Log::logf(CAT_GENERAL, LOG_WARN, "[LOG] Cannot enable syslog\n");
+    }
+}
+
 void Config::load() {
     cfg.hostname        = prefs.getString("hostname", cfg.hostname);
     cfg.wifi_mode       = prefs.getUChar("wifi_mode", cfg.wifi_mode);
@@ -146,6 +159,9 @@ void Config::load() {
     cfg.allow_transparent_during_therapy = prefs.getBool("allow_transp", cfg.allow_transparent_during_therapy);
 
     cfg.debug_port      = prefs.getUShort("debug_port", cfg.debug_port);
+    cfg.syslog_enabled  = prefs.getBool("syslog_en", cfg.syslog_enabled);
+    cfg.syslog_host     = prefs.getString("syslog_host", cfg.syslog_host);
+    cfg.syslog_port     = prefs.getUShort("syslog_port", cfg.syslog_port);
 
     cfg.http_port       = prefs.getUShort("http_port", cfg.http_port);
     cfg.http_user       = prefs.getString("http_user", cfg.http_user);
@@ -170,6 +186,7 @@ void Config::load() {
     cfg.sleephq_client_secret = prefs.getString("shq_secret", cfg.sleephq_client_secret);
     cfg.sleephq_team_id = prefs.getString("shq_team", cfg.sleephq_team_id);
     cfg.sleephq_device_id = prefs.getString("shq_device", cfg.sleephq_device_id);
+    apply_syslog();
 }
 
 void Config::save() {
@@ -196,6 +213,9 @@ void Config::save() {
     prefs.putBool("allow_transp", cfg.allow_transparent_during_therapy);
 
     prefs.putUShort("debug_port", cfg.debug_port);
+    prefs.putBool("syslog_en", cfg.syslog_enabled);
+    prefs.putString("syslog_host", cfg.syslog_host);
+    prefs.putUShort("syslog_port", cfg.syslog_port);
 
     prefs.putUShort("http_port", cfg.http_port);
     prefs.putString("http_user", cfg.http_user);
@@ -220,6 +240,7 @@ void Config::save() {
     prefs.putString("shq_secret", cfg.sleephq_client_secret);
     prefs.putString("shq_team", cfg.sleephq_team_id);
     prefs.putString("shq_device", cfg.sleephq_device_id);
+    apply_syslog();
 }
 
 void Config::reset_defaults() {
@@ -294,6 +315,9 @@ static const KVEntry kv_table[] = {
     KV_U8("uart_max_retries", uart_max_retries),
     KV_BOOL("allow_transparent_during_therapy", allow_transparent_during_therapy),
     KV_U16("debug_port", debug_port),
+    KV_BOOL("syslog_en", syslog_enabled),
+    KV_STR("syslog_host", syslog_host),
+    KV_U16("syslog_port", syslog_port),
     KV_U16("http_port", http_port),
     KV_STR("http_user", http_user),
     KV_STR("http_pass", http_pass),
@@ -334,6 +358,18 @@ bool Config::get_value(const char *key, String &out) {
 }
 
 bool Config::set_value(const char *key, const char *value) {
+    if (strcasecmp(key, "syslog_host") == 0 && *value) {
+        in_addr address;
+        if (inet_pton(AF_INET, value, &address) != 1) return false;
+    } else if (strcasecmp(key, "syslog_port") == 0) {
+        char *end;
+        unsigned long port = strtoul(value, &end, 10);
+        if (*value < '0' || *value > '9' || *end || port == 0 || port > 65535)
+            return false;
+    } else if (strcasecmp(key, "syslog_en") == 0) {
+        if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) return false;
+    }
+
     for (const KVEntry *e = kv_table; e->key; e++) {
         if (strcasecmp(key, e->key) == 0) {
             switch (e->type) {

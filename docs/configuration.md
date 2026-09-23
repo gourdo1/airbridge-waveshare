@@ -137,6 +137,14 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 | `uart_cmd_timeout_ms` | 500 | Command response timeout |
 | `uart_max_retries` | 3 | Retry count for failed commands |
 
+### Logging
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `syslog_en` | 0 | Enable UDP syslog forwarding |
+| `syslog_host` | *(empty)* | Syslog server IPv4 address; required for forwarding |
+| `syslog_port` | 514 | Syslog server UDP port (1-65535) |
+
 ### Advanced
 
 | Key | Default | Description |

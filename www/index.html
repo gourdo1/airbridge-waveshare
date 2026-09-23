@@ -1157,7 +1157,7 @@ function wifiRemove(idx) {
 
 async function loadConfig() {
   const sp = document.getElementById('configSpinner'); sp.style.display = 'block';
-  var CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','Storage Export','UART','Advanced'];
+  var CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','Storage Export','UART','Logging','Advanced'];
   var CFG_META = {
     hostname:['WiFi & Network','Device hostname (mDNS + AP name)'],wifi_mode:['WiFi & Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['WiFi & Network','Enable hysteresis-based roaming'],wifi_country:['WiFi & Network','ISO 3166 country code (01 = worldwide)'],tcp_port:['WiFi & Network','TCP command port'],debug_port:['WiFi & Network','Debug log stream port (read-only)'],http_port:['WiFi & Network','Web server port'],http_user:['WiFi & Network','Web UI username'],http_pass:['WiFi & Network','Web UI password'],ota_password:['WiFi & Network','ArduinoOTA password'],udp_oxi_port:['WiFi & Network','UDP oximetry port (0=disabled)'],
     update_url:['Firmware Updates','Release manifest URL (empty disables automatic checks)'],
@@ -1166,6 +1166,7 @@ async function loadConfig() {
     smb_enabled:['Storage Export','Enable SMB synchronization',[['0','disabled'],['1','enabled']]],smb_auto_after_therapy:['Storage Export','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],smb_endpoint:['Storage Export','//host/share/optional/path'],smb_user:['Storage Export','SMB username'],smb_password:['Storage Export','SMB password'],
     sleephq_enabled:['Storage Export','Enable SleepHQ synchronization',[['0','disabled'],['1','enabled']]],sleephq_auto_after_therapy:['Storage Export','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],sleephq_client_id:['Storage Export','SleepHQ API client ID'],sleephq_client_secret:['Storage Export','SleepHQ API client secret'],sleephq_team_id:['Storage Export','Optional team ID (resolved automatically when empty)'],sleephq_device_id:['Storage Export','Optional SleepHQ device ID'],
     uart_baud:['UART','AirSense UART baud rate'],uart_cmd_timeout_ms:['UART','Command response timeout (ms)'],uart_max_retries:['UART','Retry count for failed commands'],
+    syslog_en:['Logging','Forward logs to a UDP syslog server',[['0','disabled'],['1','enabled']]],syslog_host:['Logging','Syslog server IPv4 address'],syslog_port:['Logging','Syslog UDP port (1-65535, default 514)'],
     allow_transparent_during_therapy:['Advanced','Allow raw UART passthrough during therapy'],mitm_mode:['Advanced','0=off, 1=forward, 2=log, 3=filter']
   };
   try {

@@ -418,6 +418,7 @@ void loop() {
 
     OtaManager::handle();
     WiFiSetup::check();
+    Log::poll();
 
     // Suspend WiFi scanning during therapy/streaming/oximetry/OTA
     system_state_t sys_st = Arbiter::get_state();

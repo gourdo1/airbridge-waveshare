@@ -55,6 +55,7 @@ void setup() {
 }
 
 void loop() {
+    Log::poll();
     if (ota_enabled) {
         OtaManager::handle();
     }
