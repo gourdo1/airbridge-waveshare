@@ -317,7 +317,7 @@ static void ws20a_process_rx() {
 }
 
 static void ws20a_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
-    if (len > 0) {
+    if (len > 0 && Log::get_cat_level(CAT_OXI) >= LOG_DEBUG) {
         char hex[64] = {};
         int n = len > 20 ? 20 : (int)len;
         for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02X ", data[i]);
@@ -352,8 +352,7 @@ static uint8_t viatom_invalid_count = 0;
 #define VIATOM_WRITE_CHUNK_DELAY_MS 50
 
 static void viatom_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
-    // debug
-    if (len > 0) {
+    if (len > 0 && Log::get_cat_level(CAT_OXI) >= LOG_DEBUG) {
         char hex[64] = {};
         int n = len > 20 ? 20 : len;
         for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02X ", data[i]);
@@ -408,6 +407,9 @@ static uint8_t oxyii_sequence = 0;
 static volatile bool oxyii_need_auth = false;
 static volatile bool oxyii_need_setup = false;
 static volatile bool oxyii_need_time_sync = false;
+static bool oxyii_waiting_clock = false;
+static std::atomic<bool> oxyii_problem{false};
+static std::atomic<bool> oxyii_stream_started{false};
 
 static const char *oxyii_command_name(uint8_t cmd) {
     switch (cmd) {
@@ -418,6 +420,12 @@ static const char *oxyii_command_name(uint8_t cmd) {
         case OXYII_NO_PENDING_CMD: return "none";
         default: return "unknown";
     }
+}
+
+static void oxyii_log_problem(uint8_t cmd, const char *reason) {
+    bool already_reported = oxyii_problem.exchange(true);
+    Log::logf(CAT_OXI, already_reported ? LOG_DEBUG : LOG_WARN,
+              "[OXI] OxyII %s: %s\n", oxyii_command_name(cmd), reason);
 }
 
 static void oxyii_reset_rx() {
@@ -439,6 +447,9 @@ static void oxyii_reset() {
     oxyii_need_auth = false;
     oxyii_need_setup = false;
     oxyii_need_time_sync = false;
+    oxyii_waiting_clock = false;
+    oxyii_problem = false;
+    oxyii_stream_started = false;
 }
 
 static void oxyii_process_frame(const uint8_t *frame, size_t frame_len) {
@@ -472,10 +483,15 @@ static void oxyii_process_frame(const uint8_t *frame, size_t frame_len) {
     }
 
     if (payload_len < 9) {
-        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII live packet too short: %u\n",
-                  (unsigned)payload_len);
+        oxyii_log_problem(OXYII_CMD_LIVE_SAMPLES, "short response");
         return;
     }
+
+    bool recovering = oxyii_problem.exchange(false);
+    bool started = oxyii_stream_started.exchange(true);
+    if (!started || recovering)
+        Log::logf(CAT_OXI, LOG_INFO, "[OXI] OxyII stream %s\n",
+                  started ? "recovered" : "started");
 
     const uint8_t *payload = frame + 7;
     uint8_t spo2 = payload[6];
@@ -601,20 +617,25 @@ static void oxyii_poll(uint32_t now_ms) {
 
     if (oxyii_pending_cmd != OXYII_NO_PENDING_CMD &&
         now_ms - oxyii_pending_ms >= OXYII_RESPONSE_TIMEOUT_MS) {
-        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII response timeout cmd=%s\n",
-                  oxyii_command_name(oxyii_pending_cmd));
+        oxyii_log_problem(oxyii_pending_cmd, "response timeout");
         oxyii_reset_rx();
         oxyii_clear_pending();
     }
     if (oxyii_pending_cmd != OXYII_NO_PENDING_CMD) return;
 
     if (oxyii_need_auth) {
-        if (time(nullptr) < 1704067200) return;
+        if (time(nullptr) < 1704067200) {
+            if (!oxyii_waiting_clock)
+                Log::logf(CAT_OXI, LOG_INFO, "[OXI] OxyII auth waiting for clock\n");
+            oxyii_waiting_clock = true;
+            return;
+        }
         if (oxyii_send_auth(now_ms)) {
             oxyii_need_auth = false;
             oxyii_need_setup = true;
+            Log::logf(CAT_OXI, LOG_INFO, "[OXI] OxyII auth sent, starting setup\n");
         } else {
-            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII auth write failed\n");
+            oxyii_log_problem(OXYII_CMD_AUTH, "write failed");
         }
         return;
     }
@@ -624,7 +645,7 @@ static void oxyii_poll(uint32_t now_ms) {
         if (oxyii_send_command(OXYII_CMD_SETUP, &payload, sizeof(payload), now_ms)) {
             oxyii_need_setup = false;
         } else {
-            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII setup write failed\n");
+            oxyii_log_problem(OXYII_CMD_SETUP, "write failed");
         }
         return;
     }
@@ -633,7 +654,7 @@ static void oxyii_poll(uint32_t now_ms) {
         if (!WiFiSetup::time_synced()) {
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Skipping OxyII datetime - NTP not synced\n");
         } else if (!oxyii_sync_datetime(now_ms)) {
-            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII datetime write failed\n");
+            oxyii_log_problem(OXYII_CMD_SET_TIME, "write failed");
         }
         oxyii_need_time_sync = false;
         return;
@@ -641,7 +662,7 @@ static void oxyii_poll(uint32_t now_ms) {
 
     if (now_ms - oxyii_last_poll_ms < OXYII_SENSOR_POLL_MS) return;
     if (!oxyii_send_command(OXYII_CMD_LIVE_SAMPLES, nullptr, 0, now_ms)) {
-        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] OxyII poll write failed\n");
+        oxyii_log_problem(OXYII_CMD_LIVE_SAMPLES, "write failed");
     }
     oxyii_last_poll_ms = now_ms;
 }
@@ -878,7 +899,7 @@ static bool subscribe_services(NimBLEClient *cl) {
 // Set date/time on Nonin devices so stored records have correct timestamps.
 static void set_nonin_datetime(NimBLEClient *cl) {
     if (!WiFiSetup::time_synced()) {
-        Log::logf(CAT_OXI, LOG_WARN, "[OXI] Skipping Nonin datetime — NTP not synced\n");
+        Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Skipping Nonin datetime - NTP not synced\n");
         return;
     }
 
@@ -1306,7 +1327,8 @@ void OxiBle::task(void *param) {
                     set_viatom_datetime();
                     OxiArbiter::set_source_id(pClient->getPeerAddress().toString().c_str());
                     set_state(OXI_STREAMING);
-                    Log::logf(CAT_OXI, LOG_INFO, "[OXI] Streaming started\n");
+                    Log::logf(CAT_OXI, LOG_INFO, oxyii_write_chr
+                        ? "[OXI] Subscribed, initializing OxyII\n" : "[OXI] Streaming started\n");
 
                     if (mode == CONN_USER && !device_needs_encryption) {
                         known_add(addr.c_str());

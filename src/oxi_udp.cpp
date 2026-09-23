@@ -80,7 +80,7 @@ static void udp_task(void *param) {
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] UDP SpO2=%d HR=%d\n", spo2, hr);
             OxiArbiter::feed(OXI_SRC_UDP, spo2, hr, true);
         } else if (spo2 < 0 || hr < 0) {
-            Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP invalid (raw=%04X,%04X)\n", spo2_raw, hr_raw);
+            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] UDP invalid (raw=%04X,%04X)\n", spo2_raw, hr_raw);
             OxiArbiter::feed(OXI_SRC_UDP, -1, -1, false);
         } else {
             Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP out of range (spo2=%d hr=%d)\n", spo2, hr);
