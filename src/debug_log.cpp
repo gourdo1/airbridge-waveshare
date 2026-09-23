@@ -75,10 +75,12 @@ static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
     if (!queue) return;
     if (count == SYSLOG_QUEUE_DEPTH) {
         size_t victim = count;
+        uint8_t lowest_priority = record.level;
         for (size_t i = 0; i < count; i++) {
-            if (queue[(head + i) % SYSLOG_QUEUE_DEPTH].level > record.level) {
+            uint8_t level = queue[(head + i) % SYSLOG_QUEUE_DEPTH].level;
+            if (level > lowest_priority) {
                 victim = i;
-                break;
+                lowest_priority = level;
             }
         }
         if (victim == count) return;
