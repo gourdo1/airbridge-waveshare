@@ -532,6 +532,25 @@ static WiFiServer *debug_server = nullptr;
 static WiFiClient debug_clients[DEBUG_MAX_CLIENTS];
 static SemaphoreHandle_t debug_mutex = nullptr;
 
+struct DebugPending {
+    uint8_t data[160];
+    size_t pos = 0;
+    size_t len = 0;
+};
+static DebugPending debug_pending[DEBUG_MAX_CLIENTS];
+
+static void flush_debug_client(int slot) {
+    auto &pending = debug_pending[slot];
+    if (pending.pos == pending.len) return;
+    int n = send(debug_clients[slot].fd(), pending.data + pending.pos,
+                 pending.len - pending.pos, MSG_DONTWAIT);
+    if (n > 0) pending.pos += n;
+    else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        debug_clients[slot].stop();
+        pending.pos = pending.len = 0;
+    }
+}
+
 // Print adapter that writes to all connected debug clients
 class DebugPrint : public Print {
 public:
@@ -541,7 +560,13 @@ public:
         size_t written = 0;
         for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) {
             if (debug_clients[i] && debug_clients[i].connected()) {
-                debug_clients[i].write(buf, len);
+                auto &pending = debug_pending[i];
+                // Keep a partial line intact; a slow client loses whole new lines.
+                if (pending.pos != pending.len || len > sizeof(pending.data)) continue;
+                memcpy(pending.data, buf, len);
+                pending.pos = 0;
+                pending.len = len;
+                flush_debug_client(i);
                 written = len;
             }
         }
@@ -569,8 +594,14 @@ void TcpBridge::init_debug_server(uint16_t port) {
 void TcpBridge::poll_debug_clients() {
     if (!debug_server || xSemaphoreTake(debug_mutex, 0) != pdTRUE) return;
 
-    for (auto &debug_client : debug_clients)
-        if (!debug_client.connected()) debug_client.stop();
+    for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) {
+        if (!debug_clients[i].connected()) {
+            debug_clients[i].stop();
+            debug_pending[i].pos = debug_pending[i].len = 0;
+        } else {
+            flush_debug_client(i);
+        }
+    }
 
     int connected_slot = -1;
     IPAddress connected_address;
@@ -589,7 +620,8 @@ void TcpBridge::poll_debug_clients() {
             connected_slot = slot;
             connected_address = nc.remoteIP();
         } else {
-            nc.println("ERR: max debug clients");
+            const char message[] = "ERR: max debug clients\n";
+            send(nc.fd(), message, sizeof(message) - 1, MSG_DONTWAIT);
             nc.stop();
         }
     }

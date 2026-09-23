@@ -11,8 +11,8 @@
 
 static Preferences log_prefs;
 
-static Print *outputs[LOG_MAX_OUTPUTS] = { &Serial };
-static int output_count = 1;
+static Print *outputs[LOG_MAX_OUTPUTS] = {};
+static int output_count = 0;
 static SemaphoreHandle_t log_mutex = nullptr;
 static log_level_t cat_levels[CAT_COUNT];
 
@@ -25,6 +25,10 @@ struct SyslogRecord {
     char text[128];
 };
 
+static SyslogRecord *local_queue = nullptr;
+static size_t local_head = 0;
+static size_t local_count = 0;
+
 static SyslogRecord *syslog_queue = nullptr;
 static size_t syslog_head = 0;
 static size_t syslog_count = 0;
@@ -33,12 +37,69 @@ static char syslog_hostname[64] = {};
 
 void Log::init() {
     log_mutex = xSemaphoreCreateMutex();
+    local_queue = static_cast<SyslogRecord *>(aircannect::Memory::alloc_large(
+        SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
     bool stored = open_optional_preferences(log_prefs, "log_levels");
     for (int i = 0; i < CAT_COUNT; i++) {
         cat_levels[i] = stored ? (log_level_t)log_prefs.getUChar(
             Log::cat_name((log_cat_t)i), LOG_INFO) : LOG_INFO;
     }
     log_prefs.end();
+}
+
+static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
+                    const SyslogRecord &record) {
+    if (!queue) return;
+    if (count == SYSLOG_QUEUE_DEPTH) {
+        size_t victim = count;
+        for (size_t i = 0; i < count; i++) {
+            if (queue[(head + i) % SYSLOG_QUEUE_DEPTH].level > record.level) {
+                victim = i;
+                break;
+            }
+        }
+        if (victim == count) return;
+        for (size_t i = victim; i + 1 < count; i++)
+            queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
+                queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
+        count--;
+    }
+    queue[(head + count++) % SYSLOG_QUEUE_DEPTH] = record;
+}
+
+static void poll_local() {
+    static char serial_pending[160];
+    static size_t serial_pos = 0, serial_len = 0;
+    for (size_t i = 0; i < SYSLOG_SEND_BUDGET; i++) {
+        int room = Serial.availableForWrite();
+        if (room > 0 && serial_pos < serial_len) {
+            size_t remaining = serial_len - serial_pos;
+            size_t count = remaining < (size_t)room ? remaining : (size_t)room;
+            serial_pos += Serial.write(
+                (const uint8_t *)serial_pending + serial_pos, count);
+        }
+        if (xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
+        if (!local_count) {
+            xSemaphoreGive(log_mutex);
+            return;
+        }
+        SyslogRecord record = local_queue[local_head];
+        local_head = (local_head + 1) % SYSLOG_QUEUE_DEPTH;
+        local_count--;
+        char line[160];
+        size_t len = snprintf(line, sizeof(line), "[%s][%s] %s\n",
+            Log::level_name((log_level_t)record.level),
+            Log::cat_name((log_cat_t)record.cat), record.text);
+        // Registered sinks must be nonblocking. Serial has its own partial line.
+        for (int j = 0; j < output_count; j++)
+            outputs[j]->write((const uint8_t *)line, len);
+        xSemaphoreGive(log_mutex);
+        if (serial_pos == serial_len) {
+            memcpy(serial_pending, line, len);
+            serial_pos = 0;
+            serial_len = len;
+        }
+    }
 }
 
 bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
@@ -85,6 +146,8 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
 void Log::poll() {
     // Only the loop task owns this socket; producers never touch the network.
     static int fd = -1;
+    if (!log_mutex) return;
+    poll_local();
     if (!log_mutex || xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
     bool enabled = syslog_queue != nullptr;
     xSemaphoreGive(log_mutex);
@@ -198,7 +261,7 @@ void Log::add_output(Print *out) {
 void Log::remove_output(Print *out) {
     if (!log_mutex) return;
     xSemaphoreTake(log_mutex, portMAX_DELAY);
-    for (int i = 1; i < output_count; i++) {
+    for (int i = 0; i < output_count; i++) {
         if (outputs[i] == out) {
             for (int j = i; j < output_count - 1; j++)
                 outputs[j] = outputs[j + 1];
@@ -211,30 +274,23 @@ void Log::remove_output(Print *out) {
 
 static void log_dispatch(log_cat_t cat, log_level_t lvl,
                          const char *fmt, va_list args) {
-    char buf[128];
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    SyslogRecord record = {};
+    record.cat = cat;
+    record.level = lvl;
+    int len = vsnprintf(record.text, sizeof(record.text), fmt, args);
     if (len <= 0) return;
-    if (len >= (int)sizeof(buf)) len = sizeof(buf) - 1;
+    if (len >= (int)sizeof(record.text)) {
+        len = sizeof(record.text) - 1;
+        memcpy(record.text + len - 3, "...", 3);
+    }
+    while (len > 0 && (record.text[len - 1] == '\r' || record.text[len - 1] == '\n'))
+        record.text[--len] = 0;
+    if (!len) return;
 
-    if (log_mutex && xSemaphoreTake(log_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        for (int i = 0; i < output_count; i++) {
-            if (outputs[i]) outputs[i]->write((const uint8_t*)buf, len);
-        }
-        if (syslog_queue && syslog_count < SYSLOG_QUEUE_DEPTH) {
-            while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n'))
-                buf[--len] = 0;
-            if (len > 0) {
-                SyslogRecord &record =
-                    syslog_queue[(syslog_head + syslog_count) % SYSLOG_QUEUE_DEPTH];
-                record.cat = cat;
-                record.level = lvl;
-                memcpy(record.text, buf, len + 1);
-                syslog_count++;
-            }
-        }
+    if (log_mutex && xSemaphoreTake(log_mutex, 0) == pdTRUE) {
+        enqueue(local_queue, local_head, local_count, record);
+        enqueue(syslog_queue, syslog_head, syslog_count, record);
         xSemaphoreGive(log_mutex);
-    } else {
-        Serial.write((const uint8_t*)buf, len);
     }
 }
 

@@ -44,6 +44,7 @@ namespace Log {
     const char *level_name(log_level_t lvl);
     const char *cat_name(log_cat_t cat);
 
+    // Sinks run from poll(), must not wait for transport capacity.
     void add_output(Print *out);
     void remove_output(Print *out);
 }
