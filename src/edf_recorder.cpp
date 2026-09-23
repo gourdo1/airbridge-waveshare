@@ -173,15 +173,15 @@ static WaveClock wave_clock = {};
 static uint32_t last_pld_slot = UINT32_MAX;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
-static void status_error(const char *message) {
+static void status_error(const char *message, const char *file = nullptr) {
     portENTER_CRITICAL(&status_mux);
     status.write_errors++;
     strncpy(status.last_error, message ? message : "error",
             sizeof(status.last_error) - 1);
     status.last_error[sizeof(status.last_error) - 1] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_GENERAL, LOG_ERROR, "[EDF] %s\n",
-              message ? message : "error");
+    Log::logf(CAT_GENERAL, LOG_ERROR, "[EDF] %s%s%s\n",
+              file ? file : "", file ? ": " : "", message ? message : "error");
 }
 
 static void post_error(const char *message) {
@@ -1951,7 +1951,7 @@ static bool append_output_record(OutputFile &output,
         output.failed = true;
         output.file.close();
         output.open = false;
-        status_error("SD record write failed");
+        status_error("SD record write failed", output.schema->suffix);
         return false;
     }
     output.rest_crc = crc32_ieee_update(output.rest_crc, data, len);
@@ -1966,7 +1966,7 @@ static bool finalize_output(OutputFile &output) {
     if (!render_output_header(output, output.records, header_len) ||
         !output.file.seek(0) ||
         !write_exact(output.file, header_buffer, header_len)) {
-        status_error("EDF header finalization failed");
+        status_error("EDF header finalization failed", output.schema->suffix);
         output.file.close();
         output.open = false;
         return false;
@@ -1984,13 +1984,13 @@ static bool finalize_output(OutputFile &output) {
     fs::File crc_file = storage->open(partial_path, FILE_WRITE);
     if (!crc_file || !write_exact(crc_file, sidecar, sizeof(sidecar))) {
         if (crc_file) crc_file.close();
-        status_error("CRC sidecar write failed");
+        status_error("CRC sidecar write failed", output.schema->suffix);
         return false;
     }
     crc_file.flush();
     crc_file.close();
     if (!storage->rename(partial_path, final_path)) {
-        status_error("CRC sidecar rename failed");
+        status_error("CRC sidecar rename failed", output.schema->suffix);
         return false;
     }
     output_path(output, "edf.part", partial_path);
@@ -1998,7 +1998,7 @@ static bool finalize_output(OutputFile &output) {
     if (!storage->rename(partial_path, final_path)) {
         output_path(output, "crc", final_path);
         storage->remove(final_path);
-        status_error("EDF rename failed");
+        status_error("EDF rename failed", output.schema->suffix);
         return false;
     }
     return true;
@@ -2589,27 +2589,32 @@ static void update_record_status() {
 }
 
 static void close_segment(uint32_t ended_ms, bool rollover, bool known_end = true) {
-    if (known_end) (void)save_pending(true, ended_ms, rollover);
-    (void)write_current_record(brp);
-    (void)write_current_record(pld);
-    (void)write_current_record(sad);
+    bool complete = !known_end || save_pending(true, ended_ms, rollover);
+    complete = write_current_record(brp) && complete;
+    complete = write_current_record(pld) && complete;
+    complete = write_current_record(sad) && complete;
     update_record_status();
 
-    (void)finalize_output(brp.output);
-    (void)finalize_output(pld.output);
-    (void)finalize_output(sad.output);
-    (void)finalize_output(eve);
-    (void)finalize_output(csl);
+    // Attempt every finalization even after an earlier output failed.
+    for (OutputFile *output : {&brp.output, &pld.output, &sad.output, &eve, &csl})
+        complete = finalize_output(*output) && complete;
     update_record_status();
-    Log::logf(CAT_GENERAL, LOG_INFO,
-              "[EDF] complete %s BRP=%u PLD=%u SAD=%u EVE=%u CSL=%u drops=%u\n",
-              status.file_prefix, status.brp_records, status.pld_records,
-              status.sad_records, status.eve_records, status.csl_records,
-              status.raw_dropped);
+    Status finished;
+    portENTER_CRITICAL(&status_mux);
+    finished = status;
+    portEXIT_CRITICAL(&status_mux);
+    complete = complete && !finished.write_errors;
     clear_session_memory(false);
 
     EdfCatalog::Entry catalog_entry;
-    (void)commit_session_catalog(false, false, catalog_entry);
+    complete = commit_session_catalog(false, false, catalog_entry) && complete;
+    Log::logf(CAT_GENERAL, !complete ? LOG_ERROR : finished.raw_dropped ? LOG_WARN : LOG_INFO,
+              "[EDF] %s %s drops=%u\n",
+              !complete ? "incomplete" : finished.raw_dropped ? "complete with gaps" : "complete",
+              finished.file_prefix, finished.raw_dropped);
+    Log::logf(CAT_GENERAL, LOG_DEBUG, "[EDF] records BRP=%u PLD=%u SAD=%u EVE=%u CSL=%u\n",
+              finished.brp_records, finished.pld_records,
+              finished.sad_records, finished.eve_records, finished.csl_records);
 }
 
 static bool advance_segment(uint32_t captured_ms) {
