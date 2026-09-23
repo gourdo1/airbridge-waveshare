@@ -26,7 +26,7 @@ void setup() {
     while (Serial.available()) Serial.read();
     Log::init();
 
-    Log::printf("\n=== AirBridge %s ===\n", airbridge_version());
+    Log::boot();
     Log::printf("Heap: %d bytes\n", ESP.getFreeHeap());
 
     Config::init();

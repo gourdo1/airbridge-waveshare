@@ -271,7 +271,7 @@ void setup() {
     if (!aircannect::TlsMemory::begin())
         Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
 
-    Log::printf("\n=== AirBridge %s ===\n", airbridge_version());
+    Log::boot();
     Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();

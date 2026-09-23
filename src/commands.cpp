@@ -285,12 +285,7 @@ void dispatch_command(const char *line, String &response) {
 
     if (upper == "RESETREASON") {
         esp_reset_reason_t reason = esp_reset_reason();
-        const char *names[] = {
-            "UNKNOWN","POWERON","EXT","SW","PANIC",
-            "INT_WDT","TASK_WDT","WDT","DEEPSLEEP",
-            "BROWNOUT","SDIO","USB","JTAG","EFUSE","PWR_GLITCH","CPU_LOCKUP"
-        };
-        const char *name = (reason < sizeof(names)/sizeof(names[0])) ? names[reason] : "?";
+        const char *name = Log::reset_reason_name();
         response = "reset reason: " + String(name) + " (" + String(reason) + ")\n";
         return;
     }

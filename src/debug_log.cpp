@@ -1,5 +1,7 @@
 #include "debug_log.h"
 #include "memory_manager.h"
+#include "build_info.h"
+#include <esp_system.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -34,6 +36,27 @@ static size_t syslog_head = 0;
 static size_t syslog_count = 0;
 static sockaddr_in syslog_remote = {};
 static char syslog_hostname[64] = {};
+static bool boot_pending = false;
+
+const char *Log::reset_reason_name() {
+    static const char *const names[] = {
+        "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT", "TASK_WDT",
+        "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO", "USB", "JTAG", "EFUSE",
+        "PWR_GLITCH", "CPU_LOCKUP"
+    };
+    unsigned reason = esp_reset_reason();
+    return reason < sizeof(names) / sizeof(names[0]) ? names[reason] : "?";
+}
+
+static SyslogRecord boot_record() {
+    SyslogRecord record = {};
+    record.cat = CAT_GENERAL;
+    record.level = LOG_INFO;
+    snprintf(record.text, sizeof(record.text), "[BOOT] %s build=%s reset=%s(%u)",
+             airbridge_version(), airbridge_build_date(), Log::reset_reason_name(),
+             (unsigned)esp_reset_reason());
+    return record;
+}
 
 void Log::init() {
     log_mutex = xSemaphoreCreateMutex();
@@ -65,6 +88,15 @@ static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
         count--;
     }
     queue[(head + count++) % SYSLOG_QUEUE_DEPTH] = record;
+}
+
+void Log::boot() {
+    if (!log_mutex) return;
+    SyslogRecord record = boot_record();
+    xSemaphoreTake(log_mutex, portMAX_DELAY);
+    enqueue(local_queue, local_head, local_count, record);
+    boot_pending = true;
+    xSemaphoreGive(log_mutex);
 }
 
 static void poll_local() {
@@ -162,14 +194,20 @@ void Log::poll() {
             fd = -1;
             return;
         }
-        if (!syslog_count) {
+        if (!syslog_count && !boot_pending) {
             xSemaphoreGive(log_mutex);
             return;
         }
 
-        SyslogRecord record = syslog_queue[syslog_head];
-        syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
-        syslog_count--;
+        bool sending_boot = boot_pending;
+        SyslogRecord record;
+        if (sending_boot) {
+            record = boot_record();
+        } else {
+            record = syslog_queue[syslog_head];
+            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
+            syslog_count--;
+        }
         sockaddr_in remote = syslog_remote;
         char hostname[sizeof(syslog_hostname)];
         memcpy(hostname, syslog_hostname, sizeof(hostname));
@@ -190,6 +228,11 @@ void Log::poll() {
             close(fd);
             fd = -1;
             return;
+        }
+        if (sending_boot) {
+            xSemaphoreTake(log_mutex, portMAX_DELAY);
+            boot_pending = false;
+            xSemaphoreGive(log_mutex);
         }
     }
 }

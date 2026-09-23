@@ -26,6 +26,8 @@ typedef enum {
 
 namespace Log {
     void init();
+    void boot();
+    const char *reset_reason_name();
 
     bool configure_syslog(bool enabled, const char *host, uint16_t port,
                           const char *hostname);
