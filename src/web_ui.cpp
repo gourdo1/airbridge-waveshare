@@ -428,6 +428,7 @@ static int saveSettings(const String &body, String &json) {
                 c->count++;
             } else {
                 c->errors += key + ":fail,";
+                Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Custom write #%.3s failed\n", key.c_str());
             }
             return;
         }
@@ -439,7 +440,10 @@ static int saveSettings(const String &body, String &json) {
         if (writeSetting(key.c_str(), (int)raw)) {
             c->count++;
             if (key == "LAN") c->lan_changed = true;
-        } else c->errors += key + ":fail,";
+        } else {
+            c->errors += key + ":fail,";
+            Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Stock write #%.3s failed\n", key.c_str());
+        }
     }, &ctx);
     if (!parsed) {
         json = "{\"error\":\"bad_json\"}";
@@ -448,6 +452,9 @@ static int saveSettings(const String &body, String &json) {
     int count = ctx.count;
     String errors = ctx.errors;
     if (ctx.lan_changed) CustomSettings::invalidate("LAN write");
+    Log::logf(CAT_WEB, errors.length() ? LOG_WARN : LOG_INFO,
+              "[CLINICAL] Save applied=%d%s\n", count,
+              errors.length() ? " with rejected or failed fields" : "");
 
     json = "{";
     jsonAddInt(json, "saved", count, false);

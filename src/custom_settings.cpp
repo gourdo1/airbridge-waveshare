@@ -180,6 +180,9 @@ query_result_t query_value(const char *command, char *response,
                                 response, &response_len, timeout);
     value = qframe_response_value(response);
     if (ok && value) return QUERY_OK;
+    if (command[0] == 'G')
+        Log::logf(CAT_WEB, LOG_DEBUG, "[SETTINGS] %s: %s\n", command,
+                  value ? value : "no response");
     return value ? QUERY_ERROR : QUERY_TIMEOUT;
 }
 
@@ -293,6 +296,12 @@ bool discover_enum_options_locked(cached_entry_t &entry) {
 }
 
 bool discover_locked() {
+    char command[20] = "G C &CSG";
+    auto fail = [&](const char *stage) {
+        Log::logf(CAT_WEB, LOG_WARN, "[SETTINGS] Discovery failed: %s (%s)\n",
+                  command, stage);
+        return false;
+    };
     char response[QFRAME_MAX_PAYLOAD + 1];
     const char *value = nullptr;
     query_result_t result = query_value("G C &CSG", response, sizeof(response), value);
@@ -302,10 +311,10 @@ bool discover_locked() {
                   "[SETTINGS] Airbreak custom registry unavailable\n");
         return true;
     }
-    if (result != QUERY_OK) return false;
+    if (result != QUERY_OK) return fail("header query");
 
     CustomSettingsProtocol::header_t header = {};
-    if (!CustomSettingsProtocol::parse_header(value, header)) return false;
+    if (!CustomSettingsProtocol::parse_header(value, header)) return fail("header syntax");
     if (!CustomSettingsProtocol::supported_version(header.version)) {
         reset_cache_locked(CACHE_INCOMPATIBLE);
         Log::logf(CAT_WEB, LOG_WARN,
@@ -321,24 +330,25 @@ bool discover_locked() {
 
     current->entries = static_cast<cached_entry_t *>(
         cache_alloc(header.count * sizeof(cached_entry_t), true));
-    if (!current->entries) return false;
+    if (!current->entries) return fail("entry allocation");
     current->entry_count = header.count;
     uint32_t initial_text = 1u + (uint32_t)header.count * 64u;
     if (initial_text > UINT16_MAX) initial_text = UINT16_MAX;
-    if (!reserve_text_locked((uint16_t)initial_text)) return false;
+    if (!reserve_text_locked((uint16_t)initial_text)) return fail("text allocation");
     current->text_pool[0] = '\0';
     current->text_size = 1;
 
     for (uint16_t index = 0; index < current->entry_count; index++) {
-        char command[20];
         snprintf(command, sizeof(command), "G C &CSG %02X", index);
         if (query_value(command, response, sizeof(response), value) != QUERY_OK)
-            return false;
+            return fail("entry query");
 
         CustomSettingsProtocol::entry_t record = {};
-        if (!CustomSettingsProtocol::parse_entry(value, header.version, record)) return false;
+        if (!CustomSettingsProtocol::parse_entry(value, header.version, record))
+            return fail("entry syntax");
         for (uint16_t previous = 0; previous < index; previous++) {
-            if (strcmp(current->entries[previous].name, record.name) == 0) return false;
+            if (strcmp(current->entries[previous].name, record.name) == 0)
+                return fail("duplicate variable");
         }
 
         cached_entry_t &entry = current->entries[index];
@@ -354,7 +364,7 @@ bool discover_locked() {
         entry.units_offset = add_text_locked(record.units, record.units_len);
         if (entry.label_offset == INVALID_OFFSET ||
             entry.units_offset == INVALID_OFFSET) {
-            return false;
+            return fail("label allocation");
         }
         entry.group_count = record.group_count;
         if (record.group_count) {
@@ -364,27 +374,28 @@ bool discover_locked() {
                 const char *text;
                 size_t length;
                 if (!CustomSettingsProtocol::parse_text(cursor, text, length) ||
-                    add_text_locked(text, length, true) == INVALID_OFFSET) return false;
+                    add_text_locked(text, length, true) == INVALID_OFFSET)
+                    return fail("group text");
             }
         }
 
         snprintf(command, sizeof(command), "G C #%s", entry.name);
         if (query_value(command, response, sizeof(response), value) != QUERY_OK)
-            return false;
+            return fail("capability query");
 
         if (entry.kind == KIND_NUMERIC) {
             CustomSettingsProtocol::numeric_caps_t caps = {};
             if (!CustomSettingsProtocol::parse_numeric_caps(value, caps))
-                return false;
+                return fail("numeric capabilities");
             entry.flags = caps.flags;
             entry.width = caps.width;
             entry.minimum = caps.minimum;
             entry.maximum = caps.maximum;
         } else {
             if (!CustomSettingsProtocol::parse_enum_flags(value, entry.flags))
-                return false;
+                return fail("enum capabilities");
             entry.width = 4;
-            if (!discover_enum_options_locked(entry)) return false;
+            if (!discover_enum_options_locked(entry)) return fail("enum options");
         }
     }
 
@@ -455,8 +466,6 @@ bool ensure_loaded_locked() {
 
     if (!discover_locked()) {
         reset_cache_locked(CACHE_FAILED);
-        Log::logf(CAT_WEB, LOG_WARN,
-                  "[SETTINGS] Custom registry discovery failed\n");
         return false;
     }
     return cache_state != CACHE_INCOMPATIBLE;

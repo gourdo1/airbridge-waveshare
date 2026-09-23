@@ -1,5 +1,6 @@
 #include "clinical_jobs.h"
 #include "app_config.h"
+#include "debug_log.h"
 #include <esp_heap_caps.h>
 #include <freertos/semphr.h>
 #include <utility>
@@ -74,6 +75,14 @@ void worker(void *) {
             job->snapshot.reset();
             result = "{\"error\":\"settings_deadline\",\"partial_write_possible\":true}";
         }
+        const char *operation = job->kind == Kind::Write ? "write" :
+                                job->kind == Kind::Report ? "report" : "read";
+        Log::logf(CAT_WEB, code == 200 ? LOG_DEBUG : LOG_WARN,
+                  "[CLINICAL] %s job=%u status=%d elapsed=%ums%s\n",
+                  operation, job->id, code, (unsigned)(millis() - active_since),
+                  code == 504 && job->kind == Kind::Write ? " possibly partially applied" : "");
+        if (code != 200)
+            Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] reason: %.90s\n", result.c_str());
         xSemaphoreTake(mutex, portMAX_DELAY);
         job->result = std::move(result);
         job->code = code;
@@ -95,6 +104,7 @@ bool start_worker() {
             worker, "clinical", 6144, nullptr, 2, &created_task, 0,
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created == pdPASS) task = created_task;
+    else Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Worker allocation failed\n");
     return created == pdPASS;
 }
 }
@@ -103,6 +113,7 @@ void init(Handler callback) {
     if (mutex) return;
     handler = callback;
     mutex = xSemaphoreCreateMutex();
+    if (!mutex) Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Mutex allocation failed\n");
 }
 
 void tick() {
@@ -173,6 +184,7 @@ bool submit(Kind kind, const String &body, uint32_t &id) {
     if (available->body.length() != body.length()) {
         reset_job(*available);
         xSemaphoreGive(mutex);
+        Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Request allocation failed\n");
         return false;
     }
     available->id = next_id++;
