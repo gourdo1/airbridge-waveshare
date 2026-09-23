@@ -764,7 +764,7 @@ static void arbiter_task(void *param) {
         uart->write(t->frame, t->frame_len);
         uart->flush();
         stat_tx++;
-        {
+        if (Log::get_cat_level(CAT_ARB) >= LOG_DEBUG) {
             // payload starts at offset=5
             char snip[33] = {};
             int plen = t->frame_len > 5 ? t->frame_len - 9 : 0;  // minus header(5)+crc(4)
@@ -841,15 +841,17 @@ static void arbiter_task(void *param) {
                     stat_error++;
                 }
 
-                char snip[33] = {};
-                if (rx.payload_len > 0) {
-                    memcpy(snip, rx.payload,
-                           min((int)rx.payload_len, (int)sizeof(snip) - 1));
+                if (Log::get_cat_level(CAT_ARB) >= LOG_DEBUG) {
+                    char snip[33] = {};
+                    if (rx.payload_len > 0) {
+                        memcpy(snip, rx.payload,
+                               min((int)rx.payload_len, (int)sizeof(snip) - 1));
+                    }
+                    Log::logf(CAT_ARB, LOG_DEBUG,
+                              "[ARB] RX-%c %s ticket=%lu t=%lu\n",
+                              (char)rx.type, snip,
+                              (unsigned long)t->ticket_id, millis());
                 }
-                Log::logf(CAT_ARB, LOG_DEBUG,
-                          "[ARB] RX-%c %s ticket=%lu t=%lu\n",
-                          (char)rx.type, snip,
-                          (unsigned long)t->ticket_id, millis());
 
                 qframe_type_mask_t terminal = t->policy.terminal_types |
                                               QFRAME_MASK_E;

@@ -21,6 +21,8 @@ typedef enum {
     CAT_ARB,
     CAT_HEALTH,
     CAT_EXPORT,
+    CAT_EDF,
+    CAT_STREAM,
     CAT_COUNT
 } log_cat_t;
 

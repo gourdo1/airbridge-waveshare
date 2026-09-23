@@ -288,6 +288,8 @@ const char *Log::cat_name(log_cat_t cat) {
         case CAT_ARB:     return "ARB";
         case CAT_HEALTH:  return "HEALTH";
         case CAT_EXPORT:  return "EXPORT";
+        case CAT_EDF:     return "EDF";
+        case CAT_STREAM:  return "STREAM";
         default:          return "?";
     }
 }

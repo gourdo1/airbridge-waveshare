@@ -191,4 +191,5 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$VERSION` | Firmware version |
 | `$REBOOT` | Restart device |
 
-Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`, `ALL`
+Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`,
+`EXPORT`, `EDF`, `STREAM`, `ALL`

@@ -74,7 +74,7 @@ static void set_error(const char *message) {
             sizeof(status.error) - 1);
     status.error[sizeof(status.error) - 1] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_GENERAL, LOG_ERROR, "[EDF] catalog: %s\n",
+    Log::logf(CAT_EDF, LOG_ERROR, "[EDF] catalog: %s\n",
               message ? message : "catalog error");
 }
 
@@ -247,7 +247,7 @@ void init() {
     status.generation = header.generation;
     status.error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_GENERAL, LOG_INFO,
+    Log::logf(CAT_EDF, LOG_INFO,
               "[EDF] catalog ready entries=%u generation=%u\n",
               status.entries, status.generation);
 }
@@ -332,7 +332,7 @@ bool commit(const Entry &entry) {
         status.entries = new_header.count;
         status.generation = new_header.generation;
         portEXIT_CRITICAL(&status_mux);
-        Log::logf(CAT_GENERAL, LOG_INFO,
+        Log::logf(CAT_EDF, LOG_INFO,
                   "[EDF] catalog commit %s entries=%u generation=%u\n",
                   entry.file_prefix, status.entries, status.generation);
     }
