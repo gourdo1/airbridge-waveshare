@@ -114,6 +114,12 @@ void finish_check(const OtaRelease::Manifest *manifest,
     if (artifact && update_available) available_artifact = *artifact;
     if (error) set_error_locked(error);
     unlock();
+    if (error) {
+        Log::logf(CAT_OTA, LOG_WARN, "[OTA] Release check failed: %s\n", error);
+    } else {
+        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Release check: latest=%s available=%d\n",
+                  manifest ? manifest->version : "?", update_available);
+    }
 }
 
 void check_task(void *) {
@@ -180,10 +186,6 @@ void check_task(void *) {
     bool installable = newer && partition && resolved.size <= partition->size;
     finish_check(&manifest, &resolved, newer, installable,
                  newer && !installable ? "artifact_too_large" : nullptr);
-    Log::logf(CAT_OTA, LOG_INFO,
-              "[OTA] Release check: current=%s latest=%s available=%d target=%s\n",
-              airbridge_version(), manifest.version, newer,
-              AB_OTA_RELEASE_TARGET);
     vTaskDelete(nullptr);
 }
 
