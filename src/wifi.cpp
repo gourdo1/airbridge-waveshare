@@ -537,7 +537,8 @@ void WiFiSetup::check() {
 
     if (sta_disconnected && wf_state == WF_CONNECTED) {
         sta_disconnected = false;
-        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Disconnected, scanning...\n");
+        Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Disconnected reason=%u, scanning...\n",
+                  (unsigned)last_disconnect_reason);
         start_scan();
         set_state(WF_SCANNING);
         return;
@@ -586,7 +587,8 @@ void WiFiSetup::check() {
             }
             connect_retries++;
             if (connect_retries < CONNECT_RETRIES) {
-                Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Connect timeout, retry %d\n", connect_retries);
+                Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Connect timeout, retry=%d last_reason=%u\n",
+                          connect_retries, (unsigned)last_disconnect_reason);
                 // Keep the staged SSID/BSSID configuration. Calling WiFi.begin()
                 // while STA is still connecting makes esp_wifi_set_config fail.
                 retry_current_connect();
@@ -597,7 +599,8 @@ void WiFiSetup::check() {
                     Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Trying next candidate\n");
                     begin_connect_candidate(try_pos);
                 } else {
-                    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] All candidates exhausted\n");
+                    Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] All candidates exhausted, last_reason=%u\n",
+                              (unsigned)last_disconnect_reason);
                     enter_ap_fallback();
                 }
             }
@@ -606,7 +609,8 @@ void WiFiSetup::check() {
 
     case WF_PMF_RETRY:
         if (elapsed > CONNECT_TIMEOUT_MS) {
-            Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] PMF retry timed out, advancing\n");
+            Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] PMF retry timed out, last_reason=%u\n",
+                      (unsigned)last_disconnect_reason);
             stop_sta_attempt();
             try_pos++;
             if (try_pos < scan_candidate_count) {
