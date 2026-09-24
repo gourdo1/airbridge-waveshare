@@ -2,10 +2,13 @@
 
 ## What you need
 
-- Waveshare ESP32-S3-LCD-1.54 (with or without touch)
+- One of the supported boards:
+  - Waveshare ESP32-S3-LCD-1.54 (with or without touch)
+  - M5Stamp Pico (ESP32-PICO-D4)
+  - XIAO ESP32S3 Plus
 - MP1584 buck converter (24V to 3.3V)
 - AirSense 10 with edge connector access
-- USB-to-serial adapter (3.3V) for initial flash
+- USB-C cable (Waveshare, XIAO) or a 3.3V USB-to-serial adapter (M5Stamp Pico) for the initial flash
 - PlatformIO installed
 
 ## Wiring
@@ -13,6 +16,18 @@
 See [hardware.md](hardware.md) for the pinout, wiring diagram, and power notes.
 
 ## Flash firmware
+
+For the Waveshare ESP32-S3-LCD-1.54:
+
+```bash
+pio run -e waveshare-s3-lcd154 -t upload
+```
+
+The board flashes over its USB-C port. If the upload can't connect, hold the
+**BOOT** button while plugging in the USB cable, then retry. The serial
+console for this board is the same USB-C port.
+
+For the M5Stamp Pico:
 
 ```bash
 pio run -e m5stamp-pico -t upload
@@ -39,6 +54,9 @@ python provision.py <serial port>
 ```
 
 Provisioning also runs automatically after every serial flash (`pio run -t upload`).
+On boards with native USB (Waveshare, XIAO), the USB port briefly disappears
+while the board resets after flashing. If automatic provisioning reports that
+the device is not responding, run `python provision.py <serial port>` again by hand.
 
 **Manual via AP:** If SmartConfig times out, the device creates a WiFi access point (`airbridge_XXXXXX`, password `airbridge`). Connect to it, open `http://192.168.4.1/`, go to the **Device** tab, set your WiFi SSID and password, wifi_mode to `0`. Save and reboot.
 
@@ -69,7 +87,8 @@ After initial setup, you can update firmware over WiFi:
 
 ```bash
 export AIRBRIDGE_OTA_PASS=airbridge
-pio run -e ota -t upload
+pio run -e ota -t upload                    # M5Stamp Pico
+pio run -e waveshare-s3-lcd154-ota -t upload  # Waveshare ESP32-S3-LCD-1.54
 ```
 
 ## Oximetry

@@ -11,10 +11,20 @@ ESP32 bridge for ResMed AirSense 10 CPAP.
 - **TCP-UART bridge** - send commands to AirSense over WiFi. Single UART writer (arbiter) with priority queue prevents collisions between concurrent sources (TCP clients, BLE feeder, health monitor, web UI).
 - **ResMed OTA** - flash AirSense firmware (BLX/CMX/CDX) over UART from web UI or CLI. Handles baud negotiation, block chaining, bootloader re-entry.
 
+## Supported boards
+
+| Board | PlatformIO env |
+|-------|----------------|
+| Waveshare ESP32-S3-LCD-1.54 | `waveshare-s3-lcd154` |
+| M5Stamp Pico | `m5stamp-pico` |
+| XIAO ESP32S3 Plus | `xiao-esp32s3-plus`, `xiao-esp32s3-plus-sdmmc4` |
+
+Wiring for each board is in [docs/hardware.md](docs/hardware.md).
+
 ## First setup
 
 1. Copy `provision.env.example` to `provision.env`, fill in your WiFi credentials
-2. Flash: `pio run -t upload`
+2. Flash: `pio run -e <env> -t upload` (see the table above)
 3. Open `http://airbridge/` (default login: admin/airbridge)
 
 Without `provision.env`, the device tries SmartConfig for 60 seconds - use the [EspTouch](https://github.com/EspressifApp/EsptouchForAndroid/releases) app (v1 mode, phone must be on the target WiFi) to send credentials. If SmartConfig times out, it falls back to AP mode (`airbridge_XXXX`) where you can configure WiFi via web UI at `http://192.168.4.1/`.

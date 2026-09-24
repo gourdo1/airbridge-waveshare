@@ -14,6 +14,16 @@
 #define AB_LED_GPIO 27
 #endif
 
+// LCD backlight; driven low at boot to keep an unused panel dark (-1 = none)
+#ifndef AB_LCD_BL_GPIO
+#define AB_LCD_BL_GPIO -1
+#endif
+
+// Battery power latch; driven high at boot so the board stays on (-1 = none)
+#ifndef AB_POWER_HOLD_GPIO
+#define AB_POWER_HOLD_GPIO -1
+#endif
+
 #ifndef AB_STORAGE_SDMMC_ENABLED
 #define AB_STORAGE_SDMMC_ENABLED 0
 #endif

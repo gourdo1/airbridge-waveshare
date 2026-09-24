@@ -4,7 +4,7 @@
 #include "debug_log.h"
 #include "uart_arbiter.h"
 #include "tcp_bridge.h"
-#include "wifi.h"
+#include "wifi_setup.h"
 #include "oxi_ble.h"
 #include "oxi_udp.h"
 #include "oxi_arbiter.h"
@@ -170,6 +170,15 @@ static void attempt_recovery() {
 bool pull_time_from_resmed(bool force = false);
 
 void setup() {
+#if AB_POWER_HOLD_GPIO >= 0
+    pinMode(AB_POWER_HOLD_GPIO, OUTPUT);      // keep battery path latched on
+    digitalWrite(AB_POWER_HOLD_GPIO, HIGH);
+#endif
+#if AB_LCD_BL_GPIO >= 0
+    pinMode(AB_LCD_BL_GPIO, OUTPUT);          // no display driver yet: keep panel dark
+    digitalWrite(AB_LCD_BL_GPIO, LOW);
+#endif
+
     Serial.begin(115200);
     delay(500);
     while (Serial.available()) Serial.read();  // flush boot garbage
