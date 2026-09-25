@@ -780,20 +780,10 @@ static bool subscribe_services(NimBLEClient *cl) {
         }
     }
 
-    if (!got_spo2) {
-        NimBLERemoteService *viatomSvc = cl->getService(VIATOM_SERVICE_UUID);
-        if (viatomSvc) {
-            NimBLERemoteCharacteristic *viatomRead = viatomSvc->getCharacteristic(VIATOM_READ_UUID);
-            if (viatomRead && viatomRead->canNotify() && viatomRead->subscribe(true, viatom_notify_cb)) {
-                Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Subscribed Viatom read\n");
-                viatom_invalid_count = 0;
-                viatom_write_chr = viatomSvc->getCharacteristic(VIATOM_WRITE_UUID);
-                if (viatom_write_chr) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Viatom write chr found\n");
-                got_spo2 = got_hr = true;
-            }
-        }
-    }
-
+    // OxyII must be checked before Viatom: some O2Ring-S firmware exposes the
+    // legacy Viatom service too, but only answers live-sample requests over
+    // OxyII. Only OxyII-generation devices have this service, so older
+    // Viatom devices still fall through to the Viatom block below.
     if (!got_spo2) {
         NimBLERemoteService *oxyiiSvc = cl->getService(OXYII_SERVICE_UUID);
         if (oxyiiSvc) {
@@ -814,6 +804,20 @@ static bool subscribe_services(NimBLEClient *cl) {
                 Log::logf(CAT_OXI, LOG_WARN,
                           "[OXI] OxyII characteristics unavailable: notify=%d write=%d\n",
                           oxyiiNotify && oxyiiNotify->canNotify(), oxyiiWrite != nullptr);
+            }
+        }
+    }
+
+    if (!got_spo2) {
+        NimBLERemoteService *viatomSvc = cl->getService(VIATOM_SERVICE_UUID);
+        if (viatomSvc) {
+            NimBLERemoteCharacteristic *viatomRead = viatomSvc->getCharacteristic(VIATOM_READ_UUID);
+            if (viatomRead && viatomRead->canNotify() && viatomRead->subscribe(true, viatom_notify_cb)) {
+                Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Subscribed Viatom read\n");
+                viatom_invalid_count = 0;
+                viatom_write_chr = viatomSvc->getCharacteristic(VIATOM_WRITE_UUID);
+                if (viatom_write_chr) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Viatom write chr found\n");
+                got_spo2 = got_hr = true;
             }
         }
     }
