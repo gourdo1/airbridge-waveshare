@@ -14,9 +14,58 @@
 #define AB_LED_GPIO 27
 #endif
 
-// LCD backlight; driven low at boot to keep an unused panel dark (-1 = none)
+// LCD backlight; driven low at boot until the status screen takes over (-1 = none)
 #ifndef AB_LCD_BL_GPIO
 #define AB_LCD_BL_GPIO -1
+#endif
+
+// ST7789 240x240 SPI status screen (src/status_screen.cpp). 0 = no screen.
+#ifndef AB_LCD_ENABLED
+#define AB_LCD_ENABLED 0
+#endif
+
+#ifndef AB_LCD_MOSI_GPIO
+#define AB_LCD_MOSI_GPIO -1
+#endif
+
+#ifndef AB_LCD_SCLK_GPIO
+#define AB_LCD_SCLK_GPIO -1
+#endif
+
+#ifndef AB_LCD_CS_GPIO
+#define AB_LCD_CS_GPIO -1
+#endif
+
+#ifndef AB_LCD_DC_GPIO
+#define AB_LCD_DC_GPIO -1
+#endif
+
+#ifndef AB_LCD_RST_GPIO
+#define AB_LCD_RST_GPIO -1
+#endif
+
+// Backlight PWM duty (0-1023) when idle. Tune on hardware to the lowest
+// level that is still readable in a dark room.
+#ifndef AB_LCD_DIM_DUTY
+#define AB_LCD_DIM_DUTY 8
+#endif
+
+// How long a button press keeps the backlight at full brightness
+#ifndef AB_LCD_WAKE_MS
+#define AB_LCD_WAKE_MS 10000
+#endif
+
+// Active-low buttons that wake the screen (-1 = unused)
+#ifndef AB_BTN1_GPIO
+#define AB_BTN1_GPIO -1
+#endif
+
+#ifndef AB_BTN2_GPIO
+#define AB_BTN2_GPIO -1
+#endif
+
+#ifndef AB_BTN3_GPIO
+#define AB_BTN3_GPIO -1
 #endif
 
 // Battery power latch; driven high at boot so the board stays on (-1 = none)

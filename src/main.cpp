@@ -14,6 +14,7 @@
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_web_consumer.h"
+#include "status_screen.h"
 
 const char *airbridge_version() { return AIRBRIDGE_VERSION; }
 const char *airbridge_build_date() { return AIRBRIDGE_BUILD_DATE; }
@@ -73,6 +74,9 @@ static uint32_t airsense_seen_ms = 0;
 static std::atomic<bool> clock_sync_pending{true};
 static uint32_t clock_sync_attempt_ms = 0;
 static std::atomic<bool> clock_sync_attempted{false};
+
+// True if the last health poll got a valid answer from the AirSense.
+bool airsense_is_present() { return airsense_present; }
 
 static void poll_mhr() {
     char mhr_resp[32] = {};
@@ -175,7 +179,7 @@ void setup() {
     digitalWrite(AB_POWER_HOLD_GPIO, HIGH);
 #endif
 #if AB_LCD_BL_GPIO >= 0
-    pinMode(AB_LCD_BL_GPIO, OUTPUT);          // no display driver yet: keep panel dark
+    pinMode(AB_LCD_BL_GPIO, OUTPUT);          // keep panel dark until it is initialized
     digitalWrite(AB_LCD_BL_GPIO, LOW);
 #endif
 
@@ -196,6 +200,9 @@ void setup() {
 
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX, Config::get().uart_baud);
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] UART arbiter started\n");
+
+    // Before WiFi, which can block for a minute during SmartConfig.
+    StatusScreen::init();
 
     bool wifi_ok = WiFiSetup::init();
 
@@ -337,6 +344,7 @@ void loop() {
     sync_resmed_clock();
 
     LiveWebConsumer::tick();
+    StatusScreen::tick();
 
     OxiArbiter::poll();
 

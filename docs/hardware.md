@@ -132,8 +132,16 @@ on the +24V input.
 
 Notes:
 
-- The LCD backlight (GPIO46) is driven  off at boot. The screen stays dark;
-  there is no display output yet.
+- The LCD shows a status screen: IP address, time, AirSense state, mask
+  pressure during therapy, and SpO2/pulse when an oximeter is feeding.
+  The backlight runs at a low dim level. Pressing any of the three buttons
+  (BOOT, GPIO4, GPIO5) raises it to full brightness for 10 seconds. It also
+  stays bright for 10 seconds after boot so the IP address can be read. Tune
+  the dim level with `-DAB_LCD_DIM_DUTY=<0-1023>` in `platformio.ini` if the
+  default (8) is too dark or too bright.
+- While therapy is running, the screen subscribes to the AirSense's 25 Hz
+  pressure stream (the same one the web UI's live graph uses) and shows a
+  one-second average.
 - GPIO2 (battery power latch) is driven high at boot. This only matters when
   the board runs from a LiPo, and does nothing when powered through the 3V3 pad.
 - The ESP32-S3 boot ROM prints a short burst of text on GPIO43 at 115200 baud
