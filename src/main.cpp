@@ -37,7 +37,7 @@ static void serial_poll() {
                     // Internal command
                     String response;
                     dispatch_command(serial_line + 1, response);
-                    if (response.length() > 0) Serial.print(response);
+                    if (response.length() > 0) Log::write_crlf(Serial, response);
                 } else {
                     // Q-frame
                     char resp_buf[512] = {};

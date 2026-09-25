@@ -99,6 +99,20 @@ void Log::remove_output(Print *out) {
     xSemaphoreGive(log_mutex);
 }
 
+size_t Log::write_crlf(Print &out, const char *buf, size_t len) {
+    size_t written = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) {
+            if (i > start) written += out.write((const uint8_t *)buf + start, i - start);
+            written += out.write((const uint8_t *)"\r\n", 2);
+            start = i + 1;
+        }
+    }
+    if (len > start) written += out.write((const uint8_t *)buf + start, len - start);
+    return written;
+}
+
 static void log_dispatch(const char *fmt, va_list args) {
     char buf[128];
     int len = vsnprintf(buf, sizeof(buf), fmt, args);
@@ -107,11 +121,11 @@ static void log_dispatch(const char *fmt, va_list args) {
 
     if (log_mutex && xSemaphoreTake(log_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (int i = 0; i < output_count; i++) {
-            if (outputs[i]) outputs[i]->write((const uint8_t*)buf, len);
+            if (outputs[i]) Log::write_crlf(*outputs[i], buf, len);
         }
         xSemaphoreGive(log_mutex);
     } else {
-        Serial.write((const uint8_t*)buf, len);
+        Log::write_crlf(Serial, buf, len);
     }
 }
 

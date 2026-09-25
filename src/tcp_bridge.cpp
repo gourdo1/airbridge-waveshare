@@ -55,7 +55,7 @@ static void handle_line(const char *line) {
     }
 
     if (client.connected() && response.length() > 0) {
-        client.print(response);
+        Log::write_crlf(client, response);
     }
 }
 
@@ -186,7 +186,7 @@ void TcpBridge::task(void *param) {
                 line_pos = 0;
                 Log::logf(CAT_TCP, LOG_INFO, "[TCP] Client connected from %s\n",
                             client.remoteIP().toString().c_str());
-                client.printf("AirBridge %s\n", airbridge_version());
+                client.printf("AirBridge %s\r\n", airbridge_version());
             }
         }
 

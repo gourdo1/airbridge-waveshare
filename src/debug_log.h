@@ -41,4 +41,12 @@ namespace Log {
 
     void add_output(Print *out);
     void remove_output(Print *out);
+
+    // Write text, turning bare "\n" into "\r\n" so line-oriented terminals
+    // (telnet, PuTTY, Windows consoles) return to column 0. Existing "\r\n"
+    // is left alone. Only for human-readable text, never raw UART traffic.
+    size_t write_crlf(Print &out, const char *buf, size_t len);
+    inline size_t write_crlf(Print &out, const String &s) {
+        return write_crlf(out, s.c_str(), s.length());
+    }
 }
