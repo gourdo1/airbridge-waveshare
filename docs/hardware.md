@@ -119,20 +119,20 @@ on the +24V input.
                                          |                      |
     Tx  -------------------------------- ESP_RXD pad (GPIO44)   |
     Rx  -------------------------------- ESP_TXD pad (GPIO43)   |
-    GND ----------------+--------------- GND pad                |
-                        |                |                      |
-    +24V ---[47R]--+    |    +---------> 3V3 pad                |
-                   |    |    |           +----------------------+
-               +---+----+----+---+
-               |  IN+  GND  OUT+ |
-               |    MP1584EN     |
-               |   (3.3V out)    |
-               +-----------------+
+    GND ----------------+      +-------- GND pad                |
+                        |      |    +--> 3V3 pad                |
+    +24V ---[47R]--+    |      |    |    +----------------------+
+                   |    |      |    |
+               +---+----+------+----+----+
+               |  IN+  IN-    OUT- OUT+  |
+               |        MP1584EN         |
+               |       (3.3V out)        |
+               +-------------------------+
 ```
 
 Notes:
 
-- The LCD backlight (GPIO46) is driven off at boot. The screen stays dark;
+- The LCD backlight (GPIO46) is driven  off at boot. The screen stays dark;
   there is no display output yet.
 - GPIO2 (battery power latch) is driven high at boot. This only matters when
   the board runs from a LiPo, and does nothing when powered through the 3V3 pad.
