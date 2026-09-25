@@ -845,9 +845,10 @@ static void recover_identification_files() {
     if (storage->exists(TARGET_PART)) storage->remove(TARGET_PART);
     if (storage->exists(CRC_PART)) storage->remove(CRC_PART);
 
+    // SD lookups may wait for an interrupt; publish only the result under lock.
+    const bool identification_ready = storage->exists(TARGET) && storage->exists(CRC);
     portENTER_CRITICAL(&status_mux);
-    status.identification_ready = storage->exists(TARGET) &&
-                                  storage->exists(CRC);
+    status.identification_ready = identification_ready;
     portEXIT_CRITICAL(&status_mux);
 }
 
