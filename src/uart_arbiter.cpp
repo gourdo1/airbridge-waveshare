@@ -76,6 +76,20 @@ static uint32_t stat_error = 0;
 
 static uint32_t next_ticket_id = 1;
 
+static constexpr size_t LCD_COMMAND_SIZE = 32;
+static constexpr size_t LCD_FRAME_SIZE = 9 + 2 * (LCD_COMMAND_SIZE - 1);
+
+enum class LcdStep : uint8_t { None, Hide, Text, Show, Clear, Expire };
+
+struct lcd_request_t {
+    char text[LCD_COMMAND_SIZE - sizeof("P S #LCT ") + 1];
+    uint32_t timeout_ms;
+    uint32_t expires_at;
+};
+
+static uint32_t lcd_clear_at = 0;
+static bool lcd_clear_pending = false;
+
 struct alignas(std::max_align_t) uart_transaction_t {
     cmd_source_t source;
     cmd_priority_t priority;
@@ -93,6 +107,7 @@ struct alignas(std::max_align_t) uart_transaction_t {
 
     bool completed;
     bool cancelled;
+    LcdStep lcd_step;
     SemaphoreHandle_t done;
 };
 
@@ -136,8 +151,8 @@ static void pq_init() {
     pq.available = xSemaphoreCreateCounting(ARBITER_QUEUE_DEPTH, 0);
 }
 
-static bool pq_push(uart_transaction_t *t) {
-    xSemaphoreTake(pq.mutex, portMAX_DELAY);
+static bool pq_push(uart_transaction_t *t, TickType_t wait = portMAX_DELAY) {
+    if (xSemaphoreTake(pq.mutex, wait) != pdTRUE) return false;
     if (pq.count >= ARBITER_QUEUE_DEPTH) {
         xSemaphoreGive(pq.mutex);
         return false;
@@ -678,8 +693,16 @@ static void rx_task(void *param) {
 
 
 static void lcd_check();
+static bool lcd_advance(uart_transaction_t *t);
+
+static bool transaction_source_allowed(const uart_transaction_t *t) {
+    if (t->lcd_step != LcdStep::None &&
+        sys_state != SYS_IDLE && sys_state != SYS_THERAPY) return false;
+    return uart_source_allowed(t->source);
+}
 
 static void finish_ticket(uart_transaction_t *t) {
+    if (t->lcd_step == LcdStep::Expire) lcd_clear_pending = false;
     __atomic_store_n(&t->completed, true, __ATOMIC_RELEASE);
     if (t->done) xSemaphoreGive(t->done);
     release_ticket(t);
@@ -714,37 +737,50 @@ static uint32_t transaction_wait_ms(const uart_transaction_t *t,
 }
 
 static void arbiter_task(void *param) {
+    uart_transaction_t *t = nullptr;
     while (true) {
-        uart_transaction_t *t = pq_pop(pdMS_TO_TICKS(100));
         if (!t) {
             lcd_check();
-            continue;
+            t = pq_pop(pdMS_TO_TICKS(100));
+            if (!t) continue;
+
+            if (t->lcd_step == LcdStep::Expire) {
+                auto *request = static_cast<lcd_request_t *>(t->sink_context);
+                if (request->expires_at != lcd_clear_at) {
+                    finish_ticket(t);
+                    t = nullptr;
+                    continue;
+                }
+            }
         }
 
         if (__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE)) {
             finish_ticket(t);
+            t = nullptr;
             continue;
         }
         if ((uint32_t)(millis() - t->queued_ms) >= t->policy.overall_timeout_ms) {
             t->result.timed_out = true;
             stat_timeout++;
             finish_ticket(t);
+            t = nullptr;
             continue;
         }
 
-        if (!uart_source_allowed(t->source)) {
+        if (!transaction_source_allowed(t)) {
             t->result.success = false;
             stat_error++;
             Log::logf(CAT_ARB, LOG_WARN,
                       "[ARB] TX blocked by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
+            t = nullptr;
             continue;
         }
 
         // Send frame
         current_ticket = t;
-        if (!uart_source_allowed(t->source)) {
+        if (!transaction_source_allowed(t)) {
             current_ticket = nullptr;
             t->result.success = false;
             stat_error++;
@@ -752,13 +788,17 @@ static void arbiter_task(void *param) {
                       "[ARB] TX blocked before write by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
+            t = nullptr;
             continue;
         }
         if (__atomic_load_n(&t->cancelled, __ATOMIC_ACQUIRE)) {
             current_ticket = nullptr;
             finish_ticket(t);
+            t = nullptr;
             continue;
         }
+        if (t->lcd_step == LcdStep::Hide || t->lcd_step == LcdStep::Clear ||
+            t->lcd_step == LcdStep::Expire) lcd_clear_at = 0;
         if (t->policy.accepted_types) Arbiter::clear_rx_frames();
 
         uart->write(t->frame, t->frame_len);
@@ -878,7 +918,9 @@ static void arbiter_task(void *param) {
             }
         }
         current_ticket = nullptr;
+        if (lcd_advance(t)) continue;
         finish_ticket(t);
+        t = nullptr;
     }
 }
 
@@ -930,15 +972,17 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
                                              uart_frame_sink_t sink,
                                              const void *sink_context,
                                              bool auto_release,
-                                             size_t context_size = 0) {
+                                             size_t context_size = 0,
+                                             LcdStep lcd_step = LcdStep::None) {
     if (!frame || !frame_len || frame_len > QFRAME_MAX_RAW ||
         !uart_source_allowed(src) || (context_size && !sink_context) ||
         (sink_context && !context_size) || context_size > 4096) {
         return nullptr;
     }
 
+    size_t frame_capacity = lcd_step == LcdStep::None ? frame_len : LCD_FRAME_SIZE;
     uart_transaction_t *t =
-        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t) + context_size + frame_len);
+        (uart_transaction_t *)calloc(1, sizeof(uart_transaction_t) + context_size + frame_capacity);
     if (!t) return nullptr;
 
     t->source = src;
@@ -948,6 +992,7 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
     t->references = auto_release ? 1 : 2;
     t->queued_ms = millis();
     t->context_size = context_size;
+    t->lcd_step = lcd_step;
     if (context_size) {
         t->sink_context = t + 1;
         memcpy(t->sink_context, sink_context, context_size);
@@ -965,7 +1010,7 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
         }
     }
 
-    if (!pq_push(t)) {
+    if (!pq_push(t, lcd_step == LcdStep::None ? portMAX_DELAY : 0)) {
         if (t->done) vSemaphoreDelete(t->done);
         free(t);
         return nullptr;
@@ -1347,36 +1392,70 @@ uint32_t Arbiter::get_l_rx_count()     { return stat_l_rx; }
 uint32_t Arbiter::get_timeout_count()  { return stat_timeout; }
 uint32_t Arbiter::get_error_count()    { return stat_error; }
 
-static uint32_t lcd_clear_at = 0;
+static bool queue_lcd(const lcd_request_t &request, LcdStep step) {
+    if (sys_state != SYS_IDLE && sys_state != SYS_THERAPY) return false;
 
-void Arbiter::lcd_message(const char *msg, uint32_t timeout_ms) {
-    char cmd[32], resp[8];
-    uint16_t rlen;
-    rlen = sizeof(resp);
-    send_cmd("P S #LCA 0000", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &rlen);
-    snprintf(cmd, sizeof(cmd), "P S #LCT %s", msg);
-    rlen = sizeof(resp);
-    send_cmd(cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &rlen);
-    rlen = sizeof(resp);
-    send_cmd("P S #LCA 0001", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &rlen);
+    uint8_t frame[LCD_FRAME_SIZE];
+    int len = qframe_build_cmd("P S #LCA 0000", frame, sizeof(frame));
+    if (len < 0) return false;
 
-    lcd_clear_at = timeout_ms ? millis() + timeout_ms : 0;
+    uart_response_policy_t policy = {};
+    policy.accepted_types = policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
+    policy.success_types = QFRAME_MASK_R;
+    policy.first_timeout_ms = Config::get().uart_cmd_timeout_ms;
+    policy.overall_timeout_ms = policy.first_timeout_ms * (step == LcdStep::Hide ? 3u : 1u);
+    return queue_transaction(frame, len, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                             policy, nullptr, &request, true, sizeof(request), step) != nullptr;
 }
 
-void Arbiter::lcd_clear() {
-    char resp[8];
-    uint16_t rlen = sizeof(resp);
-    send_cmd("P S #LCA 0000", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &rlen);
-    lcd_clear_at = 0;
+bool Arbiter::lcd_message(const char *msg, uint32_t timeout_ms) {
+    if (!msg) return false;
+    lcd_request_t request = {};
+    snprintf(request.text, sizeof(request.text), "%s", msg);
+    request.timeout_ms = timeout_ms;
+    return queue_lcd(request, LcdStep::Hide);
 }
 
-// Called from arbiter task idle loop, can't use send_cmd
-static void lcd_check() {
-    if (lcd_clear_at && millis() >= lcd_clear_at) {
-        lcd_clear_at = 0;
-        uint8_t frame[32];
-        int len = qframe_build_cmd("P S #LCA 0000", frame, sizeof(frame));
-        if (len > 0)
-            Arbiter::send_frame(frame, len, CMD_SRC_INTERNAL, CMD_PRIO_LOW);
+bool Arbiter::lcd_clear() {
+    return queue_lcd({}, LcdStep::Clear);
+}
+
+static bool lcd_advance(uart_transaction_t *t) {
+    if (t->lcd_step == LcdStep::None) return false;
+    if (!t->result.success) {
+        Log::logf(CAT_ARB, LOG_WARN, "[ARB] LCD command failed at step %u\n",
+                  static_cast<unsigned>(t->lcd_step));
+        return false;
     }
+
+    auto *request = static_cast<lcd_request_t *>(t->sink_context);
+    char cmd[LCD_COMMAND_SIZE];
+    if (t->lcd_step == LcdStep::Hide) {
+        snprintf(cmd, sizeof(cmd), "P S #LCT %s", request->text);
+        t->lcd_step = LcdStep::Text;
+    } else if (t->lcd_step == LcdStep::Text) {
+        strcpy(cmd, "P S #LCA 0001");
+        t->lcd_step = LcdStep::Show;
+    } else {
+        if (t->lcd_step == LcdStep::Show && request->timeout_ms) {
+            lcd_clear_at = millis() + request->timeout_ms;
+            if (!lcd_clear_at) lcd_clear_at = 1;
+        }
+        return false;
+    }
+
+    int len = qframe_build_cmd(cmd, t->frame, LCD_FRAME_SIZE);
+    if (len < 0) return false;
+    t->frame_len = len;
+    t->result = {};
+    return true;
+}
+
+static void lcd_check() {
+    if (!lcd_clear_at || lcd_clear_pending ||
+        static_cast<int32_t>(millis() - lcd_clear_at) < 0) return;
+
+    lcd_request_t request = {};
+    request.expires_at = lcd_clear_at;
+    lcd_clear_pending = queue_lcd(request, LcdStep::Expire);
 }

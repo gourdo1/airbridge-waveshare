@@ -145,8 +145,9 @@ namespace Arbiter {
     void set_cached_rop(int value);
     void set_cached_mhr(int value);
 
-    void lcd_message(const char *msg, uint32_t timeout_ms = 0);  // 0 = persistent
-    void lcd_clear();
+    // Queue a copied LCD request without waiting for UART; false = not queued.
+    bool lcd_message(const char *msg, uint32_t timeout_ms = 0);  // 0 = persistent
+    bool lcd_clear();
 
     uint32_t transparent_activity();
 }
