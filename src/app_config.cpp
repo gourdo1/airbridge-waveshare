@@ -196,36 +196,30 @@ void Config::load() {
 
 void Config::save() {
     for (const KVEntry &entry : kv_table) {
-        const bool present = prefs.isKey(entry.nvs_key);
         switch (entry.type) {
             case KVEntry::STR: {
                 const auto &value = *(String *)entry.ptr;
-                if (!present || prefs.getString(entry.nvs_key, value) != value)
-                    prefs.putString(entry.nvs_key, value);
+                prefs.putString(entry.nvs_key, value);
                 break;
             }
             case KVEntry::U8: {
                 const auto &value = *(uint8_t *)entry.ptr;
-                if (!present || prefs.getUChar(entry.nvs_key, value) != value)
-                    prefs.putUChar(entry.nvs_key, value);
+                prefs.putUChar(entry.nvs_key, value);
                 break;
             }
             case KVEntry::U16: {
                 const auto &value = *(uint16_t *)entry.ptr;
-                if (!present || prefs.getUShort(entry.nvs_key, value) != value)
-                    prefs.putUShort(entry.nvs_key, value);
+                prefs.putUShort(entry.nvs_key, value);
                 break;
             }
             case KVEntry::U32: {
                 const auto &value = *(uint32_t *)entry.ptr;
-                if (!present || prefs.getULong(entry.nvs_key, value) != value)
-                    prefs.putULong(entry.nvs_key, value);
+                prefs.putULong(entry.nvs_key, value);
                 break;
             }
             case KVEntry::BOOL: {
                 const auto &value = *(bool *)entry.ptr;
-                if (!present || prefs.getBool(entry.nvs_key, value) != value)
-                    prefs.putBool(entry.nvs_key, value);
+                prefs.putBool(entry.nvs_key, value);
                 break;
             }
         }
@@ -281,12 +275,6 @@ bool Config::get_value(const char *key, String &out) {
     return false;
 }
 
-bool Config::is_sensitive(const char *key) {
-    for (const KVEntry &entry : kv_table)
-        if (strcasecmp(key, entry.key) == 0) return entry.sensitive;
-    return false;
-}
-
 bool Config::set_value(const char *key, const char *value) {
     if (strcasecmp(key, "syslog_host") == 0 && *value) {
         in_addr address;
@@ -301,14 +289,13 @@ bool Config::set_value(const char *key, const char *value) {
     }
 
     for (const KVEntry &entry : kv_table) {
-        const KVEntry *e = &entry;
-        if (strcasecmp(key, e->key) == 0) {
-            switch (e->type) {
-            case KVEntry::STR:  *(String*)e->ptr = value; break;
-            case KVEntry::U8:   *(uint8_t*)e->ptr = atoi(value); break;
-            case KVEntry::U16:  *(uint16_t*)e->ptr = atoi(value); break;
-            case KVEntry::U32:  *(uint32_t*)e->ptr = atol(value); break;
-            case KVEntry::BOOL: *(bool*)e->ptr = (atoi(value) != 0); break;
+        if (strcasecmp(key, entry.key) == 0) {
+            switch (entry.type) {
+            case KVEntry::STR:  *(String*)entry.ptr = value; break;
+            case KVEntry::U8:   *(uint8_t*)entry.ptr = atoi(value); break;
+            case KVEntry::U16:  *(uint16_t*)entry.ptr = atoi(value); break;
+            case KVEntry::U32:  *(uint32_t*)entry.ptr = atol(value); break;
+            case KVEntry::BOOL: *(bool*)entry.ptr = (atoi(value) != 0); break;
             }
             return true;
         }
@@ -319,9 +306,8 @@ bool Config::set_value(const char *key, const char *value) {
 void Config::foreach_kv(kv_visitor_fn fn, void *ctx) {
     String val;
     for (const KVEntry &entry : kv_table) {
-        const KVEntry *e = &entry;
         format_value(entry, val);
-        fn(e->key, val, ctx);
+        fn(entry.key, val, entry.sensitive, ctx);
     }
 }
 
@@ -334,10 +320,9 @@ String Config::dump() {
         out += "\n";
     }
     // KV table entries
-    foreach_kv([](const char *key, const String &val, void *p) {
+    foreach_kv([](const char *key, const String &val, bool sensitive, void *p) {
         String v = val;
-        if (Config::is_sensitive(key) &&
-            v.length() > 0) v = "****";
+        if (sensitive && v.length() > 0) v = "****";
         *(String*)p += String(key) + "=" + v + "\n";
     }, &out);
     return out;

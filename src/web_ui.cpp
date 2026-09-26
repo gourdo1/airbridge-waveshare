@@ -581,11 +581,10 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
 
     String json = "{";
     struct { String *json; bool first; } ctx = {&json, true};
-    Config::foreach_kv([](const char *key, const String &val, void *p) {
+    Config::foreach_kv([](const char *key, const String &val, bool sensitive, void *p) {
         auto *c = (decltype(ctx)*)p;
         if (!c->first) *c->json += ',';
         c->first = false;
-        const bool sensitive = Config::is_sensitive(key);
         jsonAddString(*c->json, key, sensitive ? "" : val.c_str(), false);
     }, &ctx);
     json += '}';

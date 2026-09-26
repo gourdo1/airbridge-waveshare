@@ -87,7 +87,6 @@ namespace Config {
 
     AirBridgeConfig& get();
 
-    bool is_sensitive(const char *key);
     bool get_value(const char *key, String &out);
     bool set_value(const char *key, const char *value);
 
@@ -96,7 +95,8 @@ namespace Config {
 
     String dump();
 
-    typedef void (*kv_visitor_fn)(const char *key, const String &val, void *ctx);
+    typedef void (*kv_visitor_fn)(const char *key, const String &val,
+                                  bool sensitive, void *ctx);
     void foreach_kv(kv_visitor_fn fn, void *ctx);
 
     bool add_network(const char *ssid, const char *pass);
