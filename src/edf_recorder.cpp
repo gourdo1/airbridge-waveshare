@@ -2578,7 +2578,8 @@ static void process_pending() {
                          generation != synced_str_generation;
     if (!changed && pending_scanned && !status.pending_str) {
         portENTER_CRITICAL(&status_mux);
-        str_scan_complete = true;
+        str_scan_complete = device ==
+            __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
         status.post_processing = false;
         portEXIT_CRITICAL(&status_mux);
         return;
@@ -2658,7 +2659,8 @@ static void process_pending() {
     }
     portENTER_CRITICAL(&status_mux);
     status.post_processing = false;
-    str_scan_complete = success && !status.pending_str;
+    str_scan_complete = success && !status.pending_str && device ==
+        __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
     portEXIT_CRITICAL(&status_mux);
     if (success && !status.pending_str && summary_export_pending) {
         (void)ExportSync::request_post_therapy(summary_export_entry);
