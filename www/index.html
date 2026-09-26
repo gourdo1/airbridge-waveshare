@@ -143,11 +143,28 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .toast.err{background:#450a0a;color:var(--red);border:1px solid #7f1d1d}
 @keyframes slideIn{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:translateX(0)}}
 
+/* Storage */
+#p-storage .btn{font-family:inherit}
+#storageUsage{font-size:12px;color:var(--text-dim);margin-bottom:16px}
+.storage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+#storagePath{flex:1 1 200px;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font:12px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
+.storage-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+#storageEntries:not(:empty){border:1px solid var(--border-light);border-radius:8px;overflow:hidden;background:var(--surface)}
+.storage-row{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:12px;align-items:center;padding:11px 12px;border-bottom:1px solid var(--border)}
+.storage-row:last-child{border-bottom:none}
+.storage-row:hover{background:#ffffff04}
+.storage-row input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+.storage-row a{color:var(--text);font-size:14px;font-weight:600;text-decoration:none;overflow-wrap:anywhere;cursor:pointer}
+.storage-row a:hover{color:var(--accent)}
+.storage-row a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.storage-row small{display:block;color:var(--text-dim);margin-top:4px;font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere;line-height:1.5}
+.storage-row .storage-download{width:38px;height:34px;padding:0;font-size:20px;line-height:1}
+#storageMessage{font-size:12px;color:var(--text-dim);line-height:1.5}
+#storageMessage:not(:empty){margin:10px 0}
+.storage-pagination{display:flex;align-items:center;gap:8px;margin-top:12px}
+#storagePage{font-size:12px;color:var(--text-dim);margin:0 4px}
+
 /* Spinner */
-.storage-row{display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
-.storage-row a{color:var(--accent);overflow-wrap:anywhere;cursor:pointer}
-.storage-row small{display:block;color:var(--text-dim);margin-top:4px}
-#storagePath{overflow-wrap:anywhere}
 .spinner{display:none;border:3px solid #333;border-top:3px solid var(--accent);border-radius:50%;width:20px;height:20px;animation:spin 0.8s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 
@@ -172,6 +189,9 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
   .topbar .page-title{font-size:14px}
   .oxi-metric .big{font-size:32px}
   .status-grid{grid-template-columns:1fr}
+  #storagePath{flex-basis:100%}
+  .storage-actions .btn{width:100%}
+  .storage-row{gap:8px;padding:10px}
 }
 </style>
 </head>
@@ -456,18 +476,20 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
       <div class="pane" id="p-storage">
         <div class="card">
-          <div class="card-header"><span class="label">SD card</span><span id="storageState">--</span></div>
-          <div id="storageUsage" class="hint"></div>
-          <h3 id="storagePath">/</h3>
-          <div class="btn-group">
+          <div class="card-header"><span class="label">SD card</span><span id="storageState" class="badge badge-idle">--</span></div>
+          <div id="storageUsage"></div>
+          <div class="storage-toolbar">
+            <div id="storagePath" aria-label="Current folder">/</div>
             <button class="btn" id="storageUp" onclick="storageUp()">Up</button>
             <button class="btn" id="storageRefresh" onclick="loadStorage()">Refresh</button>
+          </div>
+          <div class="storage-actions">
             <button class="btn" id="storageZip" onclick="storageDownload('archive')">Download folder ZIP</button>
-            <button class="btn" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
+            <button class="btn btn-accent" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
           </div>
           <div id="storageMessage" role="status" aria-live="polite"></div>
           <div id="storageEntries"></div>
-          <div class="btn-group">
+          <div class="storage-pagination">
             <button class="btn" id="storagePrev" onclick="loadStorage(storagePath, storageOffset - 32)">Previous</button>
             <span id="storagePage"></span>
             <button class="btn" id="storageNext" onclick="loadStorage(storagePath, storageOffset + 32)">Next</button>
@@ -1744,18 +1766,22 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
       if (entry.directory) link.onclick = event => { event.preventDefault(); loadStorage(storageChild(entry.name), 0); };
       else link.download = entry.name;
       const detail = document.createElement('small');
-      detail.textContent = (entry.directory ? 'Folder' : entry.size.toLocaleString() + ' bytes') +
+      const unit = entry.size >= 1048576 ? 2 : entry.size >= 1024 ? 1 : 0;
+      detail.textContent = (entry.directory ? 'Folder' :
+        (entry.size / 1024 ** unit).toFixed(unit ? 1 : 0) + ' ' + ['B', 'KiB', 'MiB'][unit]) +
         (entry.modified ? ' | ' + new Date(entry.modified * 1000).toLocaleString() : '');
       content.append(link, detail);
-      const action = document.createElement('button'); action.className = 'btn';
-      action.textContent = entry.directory ? 'ZIP' : 'Download';
+      const action = document.createElement('button'); action.className = 'btn btn-accent storage-download';
+      action.textContent = '\u2193';
+      action.title = (entry.directory ? 'Download folder ZIP: ' : 'Download: ') + entry.name;
+      action.setAttribute('aria-label', action.title);
       action.onclick = () => storageDownload(entry.directory ? 'archive' : 'download', entry.name);
       row.append(check, content, action); entries.append(row);
     }
     document.getElementById('storagePage').textContent = 'Page ' + (offset / 32 + 1);
     message.textContent = data.entries.length ? '' : 'This directory is empty.';
   } catch (error) {
-    message.textContent = error.message + '. Files are available in standby; recording takes priority.';
+    message.textContent = error.message;
   } finally { storageLoading = false; storageControls(); }
 }
 

@@ -130,9 +130,9 @@ public:
 bool list(Job &job, aircannect::LargeTextBuffer &json) {
     SdStorage::Reader dir;
     if (!dir.open(job.session, job.request.path, true)) return false;
-    json = "{\"ok\":true,";
+    json = "{\"ok\":true";
     aircannect::json_add_string(json, "path", job.request.path);
-    json += "\"entries\":[";
+    json += ",\"entries\":[";
     uint32_t seen = 0, count = 0;
     bool end = false;
     SdStorage::Reader::Entry entry;
@@ -143,14 +143,14 @@ bool list(Job &job, aircannect::LargeTextBuffer &json) {
         if (count == 32) break;
         if (count++) json += ',';
         json += '{';
-        aircannect::json_add_string(json, "name", entry.name);
+        aircannect::json_add_string(json, "name", entry.name, false);
         aircannect::json_add_uint64(json, "size", entry.size);
         aircannect::json_add_uint64(json, "modified", entry.modified > 0 ? entry.modified : 0);
-        aircannect::json_add_bool(json, "directory", entry.directory, false);
+        aircannect::json_add_bool(json, "directory", entry.directory);
         json += '}';
     }
-    json += "],";
-    aircannect::json_add_bool(json, "more", !end, false);
+    json += ']';
+    aircannect::json_add_bool(json, "more", !end);
     json += '}';
     return !json.overflowed();
 }
