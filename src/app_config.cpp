@@ -84,8 +84,7 @@ static const KVEntry kv_table[] = {
 };
 
 
-static void apply_defaults() {
-    for (const KVEntry &entry : kv_table) {
+static void reset_value(const KVEntry &entry) {
         switch (entry.type) {
             case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
             case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
@@ -93,7 +92,10 @@ static void apply_defaults() {
             case KVEntry::U32:  *(uint32_t *)entry.ptr = entry.initial.number; break;
             case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
         }
-    }
+}
+
+static void apply_defaults() {
+    for (const KVEntry &entry : kv_table) reset_value(entry);
     cfg.wifi_net_count = 0;
     for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
         cfg.wifi_nets[i].ssid = "";
@@ -200,9 +202,10 @@ static void apply_syslog() {
     }
 }
 
-void Config::load() {
+static bool load_values() {
     bool legacy = prefs.isKey("wifi_ssid");
     for (const KVEntry &entry : kv_table) {
+        reset_value(entry);
         if (!prefs.isKey(entry.nvs_key)) continue;
         legacy = true;
         switch (entry.type) {
@@ -233,6 +236,11 @@ void Config::load() {
             }
         }
     }
+    return legacy;
+}
+
+void Config::load() {
+    bool legacy = load_values();
     // Classify old installations before migration or any new settings are saved.
     nvs_handle_t networks;
     if (nvs_open("wnet", NVS_READONLY, &networks) == ESP_OK) {
@@ -267,9 +275,9 @@ static bool store_onboarding_marker() {
 }
 
 bool Config::save() {
-    if (!store_onboarding_marker()) return false;
+    if (!store_onboarding_marker()) { load_values(); return false; }
     nvs_handle_t handle;
-    if (nvs_open("airbridge", NVS_READWRITE, &handle) != ESP_OK) return false;
+    if (nvs_open("airbridge", NVS_READWRITE, &handle) != ESP_OK) { load_values(); return false; }
     esp_err_t error = ESP_OK;
     for (const KVEntry &entry : kv_table) {
         error = store_value(handle, entry);
@@ -277,6 +285,7 @@ bool Config::save() {
     }
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
+    if (error != ESP_OK) load_values();
     apply_syslog();
     __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
     return error == ESP_OK;

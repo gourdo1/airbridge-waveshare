@@ -607,26 +607,33 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     String body;
     if (!getBody(request, body)) return;
     String previous_update_url = Config::get().update_url;
-    struct Changes { int count = 0; bool network = false; bool clock = false; } changes;
+    const auto &config = Config::get();
+    const String hostname = config.hostname, country = config.wifi_country;
+    const String timezone = config.tz, ntp = config.ntp_server;
+    const uint8_t mode = config.wifi_mode;
+    if (!json_foreach_kv(body, [](const char *, const char *, void *) {}, nullptr)) {
+        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
+        return;
+    }
+    struct Changes { int count = 0; } changes;
     if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         auto &changes = *static_cast<Changes *>(p);
         if (!Config::set_value(key, val)) return;
         changes.count++;
-        if (!strcasecmp(key, "hostname") || !strcasecmp(key, "wifi_mode") ||
-            !strcasecmp(key, "wifi_country")) changes.network = true;
-        if (!strcasecmp(key, "tz") || !strcasecmp(key, "ntp_server")) changes.clock = true;
     }, &changes)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
     }
 
-    if (changes.count > 0 && !Config::save()) {
+    const bool saved = !changes.count || Config::save();
+    WiFiSetup::request_reconfigure(hostname != config.hostname || country != config.wifi_country ||
+        mode != config.wifi_mode, timezone != config.tz || ntp != config.ntp_server);
+    if (Config::get().update_url != previous_update_url)
+        OtaManager::config_changed();
+    if (!saved) {
         request->send(500, "application/json", "{\"ok\":false,\"error\":\"nvs_save_failed\"}");
         return;
     }
-    WiFiSetup::request_reconfigure(changes.network, changes.clock);
-    if (Config::get().update_url != previous_update_url)
-        OtaManager::config_changed();
 
     String json = "{\"ok\":true,\"saved\":";
     json += String(changes.count);
