@@ -184,6 +184,10 @@ const SignalSpec STR_SIGNALS[] = {
     {"Fault.Alarm", "", "0", "16", "0", "16", 1},
     {"Fault.Humidifier", "", "0", "16", "0", "16", 1},
     {"Fault.HeatedTube", "", "0", "16", "0", "16", 1},
+    {"S.BL.BackupRate", "bpm", "0.00", "50.00", "0", "250", 1},
+    {"S.BL.RespRate", "bpm", "5.00", "50.00", "25", "250", 1},
+    {"S.Ti", "seconds", "0.30", "4.00", "15", "200", 1},
+    {"SpontTrig%", "%", "0.00", "100.00", "0", "200", 1},
     {"Crc16", "", "-32768", "32767", "-32768", "32767", 1},
 };
 
@@ -203,7 +207,8 @@ const char *const STR_TAGS[] = {
     "LK9", "LK7", "LMX", "VTM", "VT9", "VTA", "RRM", "RR9",
     "RRA", "TVM", "TV9", "TVA", "IEM", "IE9", "IEA", "ISM",
     "IS9", "ISA", "VAM", "VA9", "VAA", "AHI", "HIS", "AIS",
-    "CLI", "OPI", "UAI", "RIN", "SYS", "SYT", "SYC", "SYH", "DCR",
+    "CLI", "OPI", "UAI", "RIN", "SYS", "SYT", "SYC", "SYH",
+    "BRR", "RRT", "ITT", "VSR", "DCR",
 };
 
 const Schema BRP = {FileKind::BRP, "BRP", "EDF", BRP_SIGNALS, 3, 0, 60};
@@ -213,7 +218,7 @@ const Schema SAD = {FileKind::SAD, "SAD", "EDF", SAD_SIGNALS, 3, 0, 60};
 const Schema EVE = {FileKind::EVE, "EVE", "EDF+D", EVE_SIGNALS, 2, 38, 0};
 const Schema CSL = {FileKind::CSL, "CSL", "EDF+D", CSL_SIGNALS, 2, 30, 0};
 const Schema STR = {
-    FileKind::STR, "STR", "EDF", STR_SIGNALS, 116, 0, 86400,
+    FileKind::STR, "STR", "EDF", STR_SIGNALS, 120, 0, 86400,
 };
 
 static_assert(sizeof(STR_SIGNALS) / sizeof(STR_SIGNALS[0]) ==
