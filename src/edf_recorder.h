@@ -50,6 +50,7 @@ void init();
 // Detailed capture follows ZLE; system standby/connection loss can also stop it.
 void therapy_started();
 void therapy_ended();
+void device_restarted();
 bool clock_write_allowed();
 void get_status(Status &out);
 void get_progress(Progress &out);

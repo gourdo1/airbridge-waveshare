@@ -165,8 +165,8 @@ static void poll_device_uptime() {
     clock_sync_pending = true;
     clock_sync_attempted = false;
     Arbiter::set_cached_mhr(-1);
+    EdfRecorder::device_restarted();
     if (Arbiter::get_state() == SYS_THERAPY) {
-        EdfRecorder::therapy_ended();
         Arbiter::set_state(SYS_IDLE);
     }
 }
