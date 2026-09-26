@@ -43,6 +43,7 @@ constexpr uint8_t STREAM_FIELD_MAX = 8;
 constexpr uint8_t STREAM_COUNT = 4;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
+constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
 constexpr uint16_t STR_GENERATION_POLL_MS = 100;
@@ -133,6 +134,7 @@ static uint32_t therapy_on_capture_ms = 0;
 static uint32_t recording_therapy_on_ms = 0;
 static ControlEvent latest_stop = {};
 static uint32_t next_start_ms = 0;
+static uint32_t next_recording_state_ms = 0;
 static bool storage_ready = false;
 static uint32_t next_storage_ms = 0;
 
@@ -222,7 +224,8 @@ static void post_error(const char *message) {
 }
 
 static bool post_processing_cancelled() {
-    return __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
+    return Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0 ||
+           __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
 }
 
@@ -2721,9 +2724,29 @@ static void retry_recording() {
     start_session(event);
 }
 
+static void poll_recording_state() {
+    const bool wanted = __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
+    if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) {
+        next_recording_state_ms = 0;
+        if (wanted) therapy_ended();
+        return;
+    }
+    if (next_recording_state_ms && int32_t(millis() - next_recording_state_ms) < 0)
+        return;
+    next_recording_state_ms = millis() + RECORDING_STATE_POLL_MS;
+    uint32_t zle = 0;
+    if (!read_u32_variable("ZLE", zle) || zle > 1) return;
+    // ROP may have changed while the queued read was in flight.
+    if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1)
+        return;
+    if (zle && !wanted) therapy_started();
+    else if (!zle && wanted) therapy_ended();
+}
+
 static void recorder_task(void *) {
     while (true) {
         const bool have_storage = prepare_storage();
+        if (have_storage) poll_recording_state();
         ControlEvent control;
         while (xQueueReceive(control_queue, &control, 0) == pdTRUE) {
             if (control.kind == ControlKind::Start) {

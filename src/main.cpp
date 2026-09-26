@@ -220,7 +220,6 @@ static void poll_therapy_state() {
                 Arbiter::set_state(SYS_THERAPY);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy started\n");
                 ExportSync::therapy_started();
-                EdfRecorder::therapy_started();
             } else if (new_rop == 0 && current == SYS_THERAPY) {
                 Arbiter::set_state(SYS_IDLE);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy ended\n");

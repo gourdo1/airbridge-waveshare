@@ -47,6 +47,7 @@ struct Progress {
 };
 
 void init();
+// Detailed capture follows ZLE; system standby/connection loss can also stop it.
 void therapy_started();
 void therapy_ended();
 bool clock_write_allowed();
