@@ -275,6 +275,12 @@ bool Config::get_value(const char *key, String &out) {
     return false;
 }
 
+bool Config::is_sensitive(const char *key) {
+    for (const KVEntry &entry : kv_table)
+        if (strcasecmp(key, entry.key) == 0) return entry.sensitive;
+    return false;
+}
+
 bool Config::set_value(const char *key, const char *value) {
     if (strcasecmp(key, "syslog_host") == 0 && *value) {
         in_addr address;

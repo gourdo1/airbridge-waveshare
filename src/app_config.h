@@ -87,6 +87,7 @@ namespace Config {
 
     AirBridgeConfig& get();
 
+    bool is_sensitive(const char *key);
     bool get_value(const char *key, String &out);
     bool set_value(const char *key, const char *value);
 
