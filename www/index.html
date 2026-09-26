@@ -207,10 +207,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
     <nav>
       <a class="nav-item active" data-tab="status"><span class="icon">&#9878;</span> Dashboard</a>
       <a class="nav-item" data-tab="report"><span class="icon">&#9776;</span> Sleep Report</a>
+      <a class="nav-item" data-tab="sync" hidden><span class="icon">&#8644;</span> Sync</a>
       <a class="nav-item" data-tab="clinical"><span class="icon">&#9881;</span> Clinical</a>
       <a class="nav-item" data-tab="bluetooth"><span class="icon">&#9829;</span> Oximetry</a>
       <a class="nav-item" data-tab="console"><span class="icon">&#9002;</span> Console</a>
-      <a class="nav-item" data-tab="sync" hidden><span class="icon">&#8644;</span> Sync</a>
       <a class="nav-item" data-tab="storage" hidden><span class="icon">&#9635;</span> Storage</a>
       <a class="nav-item" data-tab="device"><span class="icon">&#9881;</span> Config</a>
       <a class="nav-item" data-tab="ota"><span class="icon">&#8679;</span> OTA Upload</a>
@@ -601,10 +601,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 <nav class="bottom-nav">
   <a class="bnav-item active" data-tab="status"><span class="icon">&#9878;</span>Home</a>
   <a class="bnav-item" data-tab="report"><span class="icon">&#9776;</span>Report</a>
+  <a class="bnav-item" data-tab="sync" hidden><span class="icon">&#8644;</span>Sync</a>
   <a class="bnav-item" data-tab="clinical"><span class="icon">&#9881;</span>Clinical</a>
   <a class="bnav-item" data-tab="bluetooth"><span class="icon">&#9829;</span>Oxi</a>
   <a class="bnav-item" data-tab="console"><span class="icon">&#9002;</span>CLI</a>
-  <a class="bnav-item" data-tab="sync" hidden><span class="icon">&#8644;</span>Sync</a>
   <a class="bnav-item" data-tab="storage" hidden><span class="icon">&#9635;</span>Storage</a>
   <a class="bnav-item" data-tab="device"><span class="icon">&#9881;</span>Config</a>
   <a class="bnav-item" data-tab="ota"><span class="icon">&#8679;</span>OTA</a>
@@ -994,7 +994,7 @@ async function setupMove(direction, skip = false) {
 }
 
 // Navigation
-const tabNames = ['status','report','clinical','bluetooth','console','device','sync','storage','ota'];
+const tabNames = ['status','report','sync','clinical','bluetooth','console','storage','device','ota'];
 
 function showTab(id) {
   if (setupBusy) return;
