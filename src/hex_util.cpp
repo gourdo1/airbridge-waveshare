@@ -15,13 +15,6 @@ const char *digits_for(HexCase letter_case) {
 
 }  // namespace
 
-int hex_nibble(char value) {
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
 char hex_digit(uint8_t value, HexCase letter_case) {
     return digits_for(letter_case)[value & 0x0f];
 }

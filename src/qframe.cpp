@@ -1,12 +1,10 @@
 #include "qframe.h"
 #include "crc.h"
+#include "hex_util.h"
 #include <string.h>
 
 int hex_nibble(uint8_t c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
+    return aircannect::hex_nibble(c);
 }
 
 uint8_t nibble_hex(uint8_t n) {

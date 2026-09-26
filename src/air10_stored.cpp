@@ -1,4 +1,5 @@
 #include "air10_stored.h"
+#include "hex_util.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -6,21 +7,8 @@
 namespace Air10Stored {
 namespace {
 
-int hex_nibble(uint8_t c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
 bool parse_hex(const uint8_t *text, size_t width, uint32_t &value) {
-    value = 0;
-    for (size_t i = 0; i < width; i++) {
-        const int nibble = hex_nibble(text[i]);
-        if (nibble < 0) return false;
-        value = (value << 4) | static_cast<uint32_t>(nibble);
-    }
-    return true;
+    return aircannect::parse_hex(reinterpret_cast<const char *>(text), width, value);
 }
 
 bool minute_matches(int32_t sample, uint16_t expected,

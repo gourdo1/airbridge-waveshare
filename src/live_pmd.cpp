@@ -1,4 +1,5 @@
 #include "live_pmd.h"
+#include "hex_util.h"
 #include "live_stream.h"
 #include <Arduino.h>
 #include <string.h>
@@ -10,21 +11,10 @@ const uint16_t SAMPLE_SIZE = sizeof(Sample);
 
 #define PMD_MIN_LEN     13      // "PMD" + 2 + 3 + 3 + 2
 
-static int hex_nib(uint8_t c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
 static int parse_hex(const uint8_t *p, int n) {
-    int v = 0;
-    for (int i = 0; i < n; i++) {
-        int d = hex_nib(p[i]);
-        if (d < 0) return -1;
-        v = (v << 4) | d;
-    }
-    return v;
+    uint32_t value;
+    return aircannect::parse_hex(reinterpret_cast<const char *>(p), n, value)
+        ? static_cast<int>(value) : -1;
 }
 
 static bool decode(const uint8_t *payload, uint16_t len,

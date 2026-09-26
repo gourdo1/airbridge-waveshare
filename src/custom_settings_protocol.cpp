@@ -1,4 +1,5 @@
 #include "custom_settings_protocol.h"
+#include "hex_util.h"
 
 #include <string.h>
 
@@ -6,27 +7,14 @@ namespace CustomSettingsProtocol {
 namespace {
 
 bool hex_digit(char c, uint8_t &out) {
-    if (c >= '0' && c <= '9') {
-        out = (uint8_t)(c - '0');
-        return true;
-    }
-    if (c >= 'A' && c <= 'F') {
-        out = (uint8_t)(c - 'A' + 10);
-        return true;
-    }
-    return false;
+    uint32_t value;
+    if (!aircannect::parse_hex(&c, 1, value, true)) return false;
+    out = value;
+    return true;
 }
 
 bool fixed_hex(const char *text, size_t digits, uint32_t &out) {
-    if (!text || digits == 0 || digits > 8) return false;
-    uint32_t value = 0;
-    for (size_t i = 0; i < digits; i++) {
-        uint8_t nibble = 0;
-        if (!hex_digit(text[i], nibble)) return false;
-        value = (value << 4) | nibble;
-    }
-    out = value;
-    return true;
+    return aircannect::parse_hex(text, digits, out, true);
 }
 
 bool token(const char *&cursor, const char *&start, size_t &length) {

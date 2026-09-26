@@ -1,4 +1,5 @@
 #include "edf_recorder.h"
+#include "hex_util.h"
 
 #include "board.h"
 
@@ -210,22 +211,8 @@ static bool post_processing_delay(uint32_t delay_ms) {
     return !post_processing_cancelled();
 }
 
-static int hex_nibble_local(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
 static bool parse_hex_value(const char *text, size_t width, uint32_t &value) {
-    value = 0;
-    if (!text || width == 0 || width > 8) return false;
-    for (size_t i = 0; i < width; i++) {
-        int nibble = hex_nibble_local(text[i]);
-        if (nibble < 0) return false;
-        value = (value << 4) | static_cast<uint32_t>(nibble);
-    }
-    return true;
+    return aircannect::parse_hex(text, width, value);
 }
 
 static bool parse_decimal_field(const uint8_t *text, size_t width,
