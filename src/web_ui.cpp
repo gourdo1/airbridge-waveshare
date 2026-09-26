@@ -143,7 +143,9 @@ struct JsonBody {
 static void handleJsonBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
     if (request->getResponse()) return;
     if (!checkAuth(request)) return;
-    if (total > JSON_BODY_MAX) {
+    size_t limit = request->url() == "/api/settings"
+        ? ClinicalJobs::MAX_BODY_SIZE : JSON_BODY_MAX;
+    if (total > limit) {
         request->send(413, "application/json", "{\"error\":\"body_too_large\"}");
         return;
     }

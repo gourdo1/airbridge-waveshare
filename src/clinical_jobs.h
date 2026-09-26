@@ -7,6 +7,7 @@ namespace ClinicalJobs {
 
 using Handler = int (*)(const String &body, String &result);
 enum class Kind : uint8_t { Read, Write, Report };
+constexpr size_t MAX_BODY_SIZE = 2048;
 void init(Handler handler);
 void tick();  // Nonblocking result/cache cleanup from the main loop.
 // Results outlive HTTP requests: 30 s unread, at least 2 s after completion

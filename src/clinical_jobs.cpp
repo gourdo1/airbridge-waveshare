@@ -156,7 +156,7 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
 }
 
 bool submit(Kind kind, const String &body, uint32_t &id) {
-    if (!mutex || body.length() > 2048 || xSemaphoreTake(mutex, 0) != pdTRUE)
+    if (!mutex || body.length() > MAX_BODY_SIZE || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
     bool mutation_pending = false;
