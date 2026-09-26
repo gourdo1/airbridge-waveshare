@@ -601,20 +601,21 @@ static void apply_profile_changes() {
 }
 
 void WiFiSetup::check() {
+    const uint8_t pending = reconfigure_pending.fetch_and(
+        roaming_suspended ? uint8_t(~2) : uint8_t(0), std::memory_order_acq_rel);
+    if (pending & 2) {
+        const auto &cfg = Config::get();
+        setenv("TZ", cfg.tz.isEmpty() ? "UTC0" : cfg.tz.c_str(), 1);
+        tzset();
+        ntp_done = false;
+        if (WiFi.status() == WL_CONNECTED) {
+            sync_ntp();
+            ntp_done = true;
+        }
+    }
     if (!roaming_suspended) {
-        const uint8_t pending = reconfigure_pending.exchange(0, std::memory_order_acq_rel);
         if (pending & 1) apply_network_config();
         else if (pending & 4) apply_profile_changes();
-        if (pending & 2) {
-            const auto &cfg = Config::get();
-            setenv("TZ", cfg.tz.isEmpty() ? "UTC0" : cfg.tz.c_str(), 1);
-            tzset();
-            ntp_done = false;
-            if (WiFi.status() == WL_CONNECTED) {
-                sync_ntp();
-                ntp_done = true;
-            }
-        }
     }
 
     auto &cfg = Config::get();
