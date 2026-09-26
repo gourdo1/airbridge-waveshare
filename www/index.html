@@ -398,7 +398,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         <div class="card">
           <h3>Device Configuration</h3>
           <div class="spinner" id="configSpinner"></div>
-          <div id="configFields"></div>
+          <div id="configFields" data-config-form=""></div>
           <div class="btn-row"><button class="btn btn-accent" onclick="saveConfig()">Save & Persist</button></div>
           <div class="msg" id="configMsg"></div>
         </div>
@@ -1155,80 +1155,76 @@ function wifiRemove(idx) {
   wifiAction('remove', null, undefined, idx);
 }
 
-async function loadConfig() {
-  const sp = document.getElementById('configSpinner'); sp.style.display = 'block';
-  var CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','Storage Export','UART','Logging','Advanced'];
-  var CFG_META = {
+const CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','SMB','SleepHQ','UART','Logging','Advanced'];
+const CFG_META = {
     hostname:['WiFi & Network','Device hostname (mDNS + AP name)'],wifi_mode:['WiFi & Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['WiFi & Network','Enable hysteresis-based roaming'],wifi_country:['WiFi & Network','ISO 3166 country code (01 = worldwide)'],tcp_port:['WiFi & Network','TCP command port'],debug_port:['WiFi & Network','Debug log stream port (read-only)'],http_port:['WiFi & Network','Web server port'],http_user:['WiFi & Network','Web UI username'],http_pass:['WiFi & Network','Web UI password'],ota_password:['WiFi & Network','ArduinoOTA password'],udp_oxi_port:['WiFi & Network','UDP oximetry port (0=disabled)'],
     update_url:['Firmware Updates','Release manifest URL (empty disables automatic checks)'],
     ntp_server:['Time & Timezone','NTP server (empty = DHCP or pool.ntp.org)'],tz:['Time & Timezone','POSIX timezone string'],
     oxi_enabled:['Oximetry','Enable BLE oximeter support'],oxi_auto_start:['Oximetry','Auto-start feeding on connect'],oxi_feed_therapy_only:['Oximetry','Only inject during active therapy'],oxi_device_type:['Oximetry','0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A'],oxi_device_addr:['Oximetry','Preferred oximeter MAC'],oxi_interval_ms:['Oximetry','Injection interval (ms)'],oxi_lframe_continuous:['Oximetry','Send L-frames even without valid reading'],oxi_require_known:['Oximetry','Only auto-connect to known devices'],
-    smb_enabled:['Storage Export','Enable SMB synchronization',[['0','disabled'],['1','enabled']]],smb_auto_after_therapy:['Storage Export','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],smb_endpoint:['Storage Export','//host/share/optional/path'],smb_user:['Storage Export','SMB username'],smb_password:['Storage Export','SMB password'],
-    sleephq_enabled:['Storage Export','Enable SleepHQ synchronization',[['0','disabled'],['1','enabled']]],sleephq_auto_after_therapy:['Storage Export','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],sleephq_client_id:['Storage Export','SleepHQ API client ID'],sleephq_client_secret:['Storage Export','SleepHQ API client secret'],sleephq_team_id:['Storage Export','Optional team ID (resolved automatically when empty)'],sleephq_device_id:['Storage Export','Optional SleepHQ device ID'],
+    smb_enabled:['SMB','Enable SMB synchronization',[['0','disabled'],['1','enabled']]],smb_auto_after_therapy:['SMB','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],smb_endpoint:['SMB','//host/share/optional/path'],smb_user:['SMB','SMB username'],smb_password:['SMB','SMB password'],
+    sleephq_enabled:['SleepHQ','Enable SleepHQ synchronization',[['0','disabled'],['1','enabled']]],sleephq_auto_after_therapy:['SleepHQ','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],sleephq_client_id:['SleepHQ','SleepHQ API client ID'],sleephq_client_secret:['SleepHQ','SleepHQ API client secret'],sleephq_team_id:['SleepHQ','Optional team ID (resolved automatically when empty)'],sleephq_device_id:['SleepHQ','Optional SleepHQ device ID'],
     uart_baud:['UART','AirSense UART baud rate'],uart_cmd_timeout_ms:['UART','Command response timeout (ms)'],uart_max_retries:['UART','Retry count for failed commands'],
     syslog_en:['Logging','Forward logs to a UDP syslog server',[['0','disabled'],['1','enabled']]],syslog_host:['Logging','Syslog server IPv4 address'],syslog_port:['Logging','Syslog UDP port (1-65535, default 514)'],
     allow_transparent_during_therapy:['Advanced','Allow raw UART passthrough during therapy'],mitm_mode:['Advanced','0=off, 1=forward, 2=log, 3=filter']
   };
-  try {
-    const r = await api('/api/config'); if (!r) return;
-    const d = await r.json();
-    const el = document.getElementById('configFields'); el.innerHTML = '';
-    var lastGroup = '';
-    var entries = Object.entries(d).sort(function(a,b){var sa=CFG_META[a[0]]?CFG_SECTIONS.indexOf(CFG_META[a[0]][0]):99;var sb=CFG_META[b[0]]?CFG_SECTIONS.indexOf(CFG_META[b[0]][0]):99;return sa-sb});
-    for (const [k,v] of entries) {
-      var meta = CFG_META[k] || ['Other',''];
-      if (meta[0] !== lastGroup) {
-        lastGroup = meta[0];
-        var hdr = document.createElement('h4');
-        hdr.textContent = lastGroup;
-        hdr.style.cssText = 'color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px';
-        el.appendChild(hdr);
-      }
-      var row = document.createElement('div'); row.className = 'row';
-      var isPass = k.includes('pass') || k.includes('secret');
-      var opts = meta[2];
-      var label = document.createElement('label');
-      label.textContent = k;
-      if (meta[1]) {
-        var help = document.createElement('small');
-        help.style.cssText = 'color:#555;font-weight:normal';
-        help.textContent = meta[1];
-        label.appendChild(document.createElement('br'));
-        label.appendChild(help);
-      }
-      row.appendChild(label);
-      var control = document.createElement(opts ? 'select' : 'input');
-      control.dataset.key = k;
-      control.dataset.orig = isPass ? '' : v;
-      if (opts) {
-        opts.forEach(function(o) {
-          var option = document.createElement('option');
-          option.value = o[0];
-          option.textContent = o[1];
-          control.appendChild(option);
-        });
-      } else {
-        control.type = isPass ? 'password' : 'text';
-        if (isPass) {
-          control.placeholder = '(unchanged)';
-          control.dataset.pass = '1';
-        }
-      }
-      control.value = isPass ? '' : v;
-      row.appendChild(control);
-      el.appendChild(row);
-      if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
-      if (k === 'tz') attachTzHelper(row.querySelector('input'));
+
+let configStorageSupported = false;
+
+function renderConfigFields(root, d) {
+  root.innerHTML = '';
+  var lastGroup = '';
+  var entries = Object.entries(d).sort(function(a,b){var sa=CFG_META[a[0]]?CFG_SECTIONS.indexOf(CFG_META[a[0]][0]):99;var sb=CFG_META[b[0]]?CFG_SECTIONS.indexOf(CFG_META[b[0]][0]):99;return sa-sb});
+  for (const [k,v] of entries) {
+    if (!configStorageSupported && (k.startsWith('smb_') || k.startsWith('sleephq_'))) continue;
+    var meta = CFG_META[k] || ['Other',''];
+    if (meta[0] !== lastGroup) {
+      lastGroup = meta[0];
+      var hdr = document.createElement('h4');
+      hdr.textContent = lastGroup;
+      hdr.style.cssText = 'color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px';
+      root.appendChild(hdr);
     }
-  } catch(e) { console.error(e); }
-  sp.style.display = 'none';
+    var row = document.createElement('div'); row.className = 'row';
+    var isPass = k.includes('pass') || k.includes('secret');
+    var opts = meta[2];
+    var label = document.createElement('label');
+    label.textContent = k;
+    if (meta[1]) {
+      var help = document.createElement('small');
+      help.style.cssText = 'color:#555;font-weight:normal';
+      help.textContent = meta[1];
+      label.appendChild(document.createElement('br'));
+      label.appendChild(help);
+    }
+    row.appendChild(label);
+    var control = document.createElement(opts ? 'select' : 'input');
+    control.dataset.key = k;
+    control.dataset.orig = isPass ? '' : v;
+    if (opts) {
+      opts.forEach(function(o) {
+        var option = document.createElement('option');
+        option.value = o[0];
+        option.textContent = o[1];
+        control.appendChild(option);
+      });
+    } else {
+      control.type = isPass ? 'password' : 'text';
+      if (isPass) {
+        control.placeholder = '(unchanged)';
+        control.dataset.pass = '1';
+      }
+    }
+    control.value = isPass ? '' : v;
+    row.appendChild(control);
+    root.appendChild(row);
+    if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
+    if (k === 'tz') attachTzHelper(row.querySelector('input'));
+  }
 }
 
-let configSaving = false;
-async function saveConfig() {
-  if (configSaving) return;
+function collectConfigChanges(root) {
   const changes = {};
-  const fields = document.querySelectorAll('#configFields [data-key]');
+  const fields = root.querySelectorAll('[data-key]');
   fields.forEach(inp => {
     if (inp.dataset.pass) {
       if (inp.getAttribute('data-dirty')) changes[inp.dataset.key] = inp.value;
@@ -1236,9 +1232,60 @@ async function saveConfig() {
       if (inp.value !== inp.dataset.orig) changes[inp.dataset.key] = inp.value;
     }
   });
-  const msgEl = document.getElementById('configMsg');
+  return changes;
+}
+
+async function loadConfigFields(root, section, messageId) {
+  if (root.dataset.loading === '1' || root.dataset.saving === '1') return;
+  root.dataset.loading = '1';
+  try {
+    const r = await api('/api/config' + (section ? '?section=' + encodeURIComponent(section) : ''));
+    if (!r) return;
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Config read failed');
+    const drafts = collectConfigChanges(root);
+    renderConfigFields(root, d);
+    root.querySelectorAll('[data-key]').forEach(input => {
+      if (!Object.hasOwn(drafts, input.dataset.key)) return;
+      input.value = drafts[input.dataset.key];
+      if (input.dataset.pass) {
+        input.setAttribute('data-dirty', '1');
+        input.placeholder = '(empty = remove)';
+      }
+    });
+    delete root.dataset.stale;
+  } catch(e) {
+    showMsg(document.getElementById(messageId), 'Error: ' + e.message, 'err');
+  } finally {
+    delete root.dataset.loading;
+  }
+}
+
+async function loadConfig() {
+  const sp = document.getElementById('configSpinner');
+  sp.style.display = 'block';
+  try {
+    const r = await api('/api/status');
+    if (!r) return;
+    if (!r.ok) throw new Error('Status read failed');
+    const status = await r.json();
+    configStorageSupported = status.sd !== undefined && status.sd !== 'unsupported';
+    await loadConfigFields(document.getElementById('configFields'), '', 'configMsg');
+  } catch(e) {
+    showMsg(document.getElementById('configMsg'), 'Error: ' + e.message, 'err');
+  } finally {
+    sp.style.display = 'none';
+  }
+}
+
+async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
+  const root = document.getElementById(rootId);
+  if (root.dataset.saving === '1') return;
+  const changes = collectConfigChanges(root);
+  const fields = root.querySelectorAll('[data-key]');
+  const msgEl = document.getElementById(messageId);
   if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return; }
-  configSaving = true;
+  root.dataset.saving = '1';
   try {
     const r = await api('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
     if (!r) return;
@@ -1257,9 +1304,15 @@ async function saveConfig() {
         }
       } else inp.dataset.orig = changes[key];
     });
+    document.querySelectorAll('[data-config-form]').forEach(other => {
+      if (other === root) return;
+      const section = other.dataset.configForm;
+      if (!section || Object.keys(changes).some(key => key.startsWith(section + '_')))
+        other.dataset.stale = '1';
+    });
     showMsg(msgEl, 'Config saved', 'ok');
   } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
-  finally { configSaving = false; }
+  finally { delete root.dataset.saving; }
 }
 
 function showMsg(el, text, type, timeout) {
