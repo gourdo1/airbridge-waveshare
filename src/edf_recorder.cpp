@@ -1976,6 +1976,8 @@ static void sample_pld() {
         {"IERatio.2s", "IER"},   {"Snore.2s", "SNI"},
         {"FlowLim.2s", "FFL"},   {"B5ITime.2s", "IN5"},
         {"B5ETime.2s", "EX5"},   {"Ti.2s", "INT"},
+        {"AlvMinVent.2s", "AAV"}, {"CLRatio.2s", "RCR"},
+        {"TRRatio.2s", "RTR"},
     };
 
     const uint32_t elapsed = relative_ms(millis());

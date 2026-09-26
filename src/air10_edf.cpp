@@ -47,6 +47,9 @@ const SignalSpec PLD_SIGNALS[] = {
     {"B5ITime.2s", "seconds", "0.00", "10.00", "0", "500", 30},
     {"B5ETime.2s", "seconds", "0.00", "10.00", "0", "500", 30},
     {"Ti.2s", "seconds", "0.00", "10.00", "0", "500", 30},
+    {"AlvMinVent.2s", "L/min", "0.00", "30.00", "0", "240", 30},
+    {"CLRatio.2s", "%", "0.00", "100.00", "0", "100", 30},
+    {"TRRatio.2s", "%", "0.00", "100.00", "0", "100", 30},
     {"Crc16", "", "-32768", "32767", "-32768", "32767", 1},
 };
 
@@ -213,7 +216,10 @@ const char *const STR_TAGS[] = {
 
 const Schema BRP = {FileKind::BRP, "BRP", "EDF", BRP_SIGNALS, 3, 0, 60};
 const Schema BRP_TCV = {FileKind::BRP, "BRP", "EDF", BRP_TCV_SIGNALS, 4, 0, 60};
-const Schema PLD = {FileKind::PLD, "PLD", "EDF", PLD_SIGNALS, 15, 0, 60};
+const Schema PLD = {
+    FileKind::PLD, "PLD", "EDF", PLD_SIGNALS,
+    sizeof(PLD_SIGNALS) / sizeof(PLD_SIGNALS[0]), 0, 60,
+};
 const Schema SAD = {FileKind::SAD, "SAD", "EDF", SAD_SIGNALS, 3, 0, 60};
 const Schema EVE = {FileKind::EVE, "EVE", "EDF+D", EVE_SIGNALS, 2, 38, 0};
 const Schema CSL = {FileKind::CSL, "CSL", "EDF+D", CSL_SIGNALS, 2, 30, 0};
