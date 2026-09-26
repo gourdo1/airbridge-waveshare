@@ -204,7 +204,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
     <div class="content">
 
       <!-- STATUS / DASHBOARD -->
-      <div class="pane active" id="p-status">
+      <div class="pane" id="p-status">
         <div class="card-grid">
           <div class="card">
             <div class="card-header">
@@ -389,6 +389,34 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         </div>
       </div>
 
+      <!-- INITIAL SETUP -->
+      <div class="pane" id="p-setup">
+        <div class="card">
+          <div class="card-header"><h3 id="setupTitle" tabindex="-1">Initial setup</h3><span id="setupProgress"></span></div>
+          <p id="setupNote" class="sync-note"></p>
+          <div id="setupNetwork" hidden>
+            <div class="sync-note" id="setupWifiStatus" aria-live="polite"></div>
+            <div class="row"><label for="setupSsid">Network name</label><input id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
+            <div class="row"><label for="setupPass">WiFi password</label><input id="setupPass" type="password" autocomplete="new-password"></div>
+            <div class="sync-note">Leave the network name empty to keep saved networks. Your current access point stays available while connecting.</div>
+            <a id="setupWifiLink" hidden>Open on the local network</a>
+          </div>
+          <div id="setupDevice" class="sync-note" aria-live="polite" hidden></div>
+          <div id="setupForms"></div>
+          <div id="setupFinish" hidden>
+            <p>Setup saved. You can change these settings in Config and Sync.</p>
+            <div class="btn-row"><a class="btn btn-accent" href="/">Open dashboard</a><a class="btn" href="/#bluetooth">Set up oximetry</a></div>
+          </div>
+          <div class="msg" id="setupMsg" role="status"></div>
+          <div class="btn-row" id="setupActions">
+            <button class="btn" id="setupBack" onclick="setupMove(-1)">Back</button>
+            <button class="btn" id="setupSkip" onclick="setupMove(1, true)">Skip</button>
+            <button class="btn btn-accent" id="setupNext" onclick="setupMove(1)">Next</button>
+            <button class="btn" onclick="showTab('device')">Later</button>
+          </div>
+        </div>
+      </div>
+
       <!-- DEVICE CONFIG -->
       <div class="pane" id="p-device">
         <div class="card" style="border-left:3px solid var(--accent)">
@@ -402,6 +430,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         </div>
         <div class="card">
           <h3>Device Configuration</h3>
+          <div class="btn-row"><button class="btn" onclick="startSetup()">Initial setup</button></div>
           <div class="spinner" id="configSpinner"></div>
           <div id="configFields" data-config-form=""></div>
           <div class="btn-row"><button class="btn btn-accent" onclick="saveConfig()">Save & Persist</button></div>
@@ -573,6 +602,7 @@ function initSSE() {
     // Refresh WiFi list if Config tab is active
     var pane = document.getElementById('p-device');
     if (pane && pane.classList.contains('active')) loadWifiNets();
+    if (setupActive() && setupStep === 'network') loadSetupWifi();
   });
   evtSrc.onerror = () => {
     exportsFresh = false;
@@ -582,6 +612,7 @@ function initSSE() {
   };
   evtSrc.onopen = () => {
     loadExports();
+    if (setupActive() && setupStep === 'network') loadSetupWifi();
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
   };
@@ -591,6 +622,7 @@ let lastStatus = {};
 function updateStatusFromPush(d) {
   Object.assign(lastStatus, d);
   renderStatus(lastStatus);
+  renderSetupDevice();
   updateBleFromPush(d);
 }
 
@@ -715,10 +747,208 @@ function updateChartsFromPush(d) {
   updateCharts(slowChanged);
 }
 
+// Initial setup shares Config forms and the existing status/WiFi events.
+let setupStep = 'network';
+let setupBusy = false;
+let setupWifiRead = null;
+const SETUP_STEPS = {
+  network: ['Network', 'Add a network or keep using the AirBridge access point.'],
+  airsense: ['AirSense', 'Connect the Air10 service cable. You can continue without the device.'],
+  time: ['Time', 'Choose your timezone. NTP uses the configured server when a network is available.'],
+  smb: ['SMB (optional)', 'Configure a shared folder, or skip this step.'],
+  sleephq: ['SleepHQ (optional)', 'Configure your SleepHQ endpoint, or skip this step.'],
+  access: ['Access', 'Changes to the Web UI login apply only when you finish. Leave the password untouched to keep it.']
+};
+
+function setupActive() {
+  return document.getElementById('p-setup').classList.contains('active');
+}
+
+function rememberSetup(step) {
+  try { sessionStorage.setItem('airbridge.setup', step); } catch(e) {}
+}
+
+function setupSteps() {
+  return Object.keys(SETUP_STEPS).filter(id => configStorageSupported || (id !== 'smb' && id !== 'sleephq'));
+}
+
+function setupLock(busy) {
+  setupBusy = busy;
+  document.querySelectorAll('#setupActions button, #setupForms input, #setupForms select, #setupNetwork input').forEach(button => { button.disabled = busy; });
+  document.getElementById('setupBack').disabled = busy || setupSteps().indexOf(setupStep) === 0;
+}
+
+function renderSetupDevice() {
+  const el = document.getElementById('setupDevice');
+  el.textContent = [lastStatus.pna, lastStatus.srn, lastStatus.system].filter(Boolean).join(' | ') ||
+    'Waiting for cached AirSense status. You can continue and connect it later.';
+}
+
+function setupNetworkSelected() {
+  const mode = document.querySelector('#setup-network [data-key="wifi_mode"]');
+  if (mode && mode.value === '1' && document.getElementById('setupSsid').value) mode.value = '0';
+}
+
+async function loadSetupWifi() {
+  if (setupWifiRead) return setupWifiRead;
+  setupWifiRead = (async () => {
+    try {
+      const r = await api('/api/wifi');
+      if (!r || !r.ok) throw new Error('Cannot read WiFi status');
+      const d = await r.json();
+      document.getElementById('setupWifiStatus').textContent =
+        'State: ' + d.state + (d.ssid ? ' | ' + d.ssid : '') +
+        ' | Saved: ' + (d.networks.map(n => n.ssid).join(', ') || 'none');
+      const link = document.getElementById('setupWifiLink');
+      link.hidden = !d.ip;
+      if (d.ip) { link.href = 'http://' + d.ip + '/wizard'; link.textContent = 'Continue at ' + d.ip; }
+      return d;
+    } catch(e) {
+      showMsg(document.getElementById('setupMsg'), e.message, 'err');
+      return null;
+    } finally { setupWifiRead = null; }
+  })();
+  return setupWifiRead;
+}
+
+async function renderSetup() {
+  setupLock(true);
+  try {
+    const steps = setupSteps();
+    const index = steps.indexOf(setupStep);
+    rememberSetup(setupStep);
+    document.getElementById('setupTitle').textContent = SETUP_STEPS[setupStep][0];
+    document.getElementById('setupProgress').textContent = (index + 1) + ' of ' + steps.length;
+    document.getElementById('setupNote').textContent = SETUP_STEPS[setupStep][1];
+    document.getElementById('setupNetwork').hidden = setupStep !== 'network';
+    document.getElementById('setupDevice').hidden = setupStep !== 'airsense';
+    document.getElementById('setupNext').textContent = setupStep === 'access' ? 'Finish' : 'Save & next';
+    document.getElementById('setupSkip').textContent = setupStep === 'access' ? 'Keep access & finish' : 'Skip';
+    document.getElementById('setupMsg').textContent = '';
+    document.getElementById('setupMsg').className = 'msg';
+    const forms = document.getElementById('setupForms');
+    Array.from(forms.children).forEach(root => { root.hidden = true; });
+    if (setupStep !== 'airsense') {
+      let root = document.getElementById('setup-' + setupStep);
+      if (!root) {
+        root = document.createElement('div');
+        root.id = 'setup-' + setupStep;
+        root.dataset.configForm = setupStep;
+        forms.appendChild(root);
+      }
+      root.hidden = false;
+      if (!root.children.length || root.dataset.stale === '1')
+        await loadConfigFields(root, setupStep, 'setupMsg');
+      if (setupStep === 'network') {
+        const mode = root.querySelector('[data-key="wifi_mode"]');
+        if (mode) {
+          // Unsafe modes remain available in Config, not in the AP setup flow.
+          Array.from(mode.options).forEach(option => { if (['2', '3'].includes(option.value)) option.remove(); });
+          if (!mode.value) mode.value = '0';
+        }
+        await loadSetupWifi();
+      }
+    } else renderSetupDevice();
+    document.getElementById('setupTitle').focus();
+  } finally { setupLock(false); }
+}
+
+async function startSetup() {
+  if (setupBusy) return;
+  showTab('setup');
+  document.getElementById('setupActions').hidden = false;
+  document.getElementById('setupFinish').hidden = true;
+  let stored;
+  try { stored = sessionStorage.getItem('airbridge.setup'); } catch(e) {}
+  if (!Object.hasOwn(lastStatus, 'onboarding_complete')) {
+    setupLock(true);
+    const status = await loadStatus();
+    setupLock(false);
+    if (!status) {
+      showMsg(document.getElementById('setupMsg'), 'Cannot read device status. Reload to retry.', 'err');
+      document.getElementById('setupNext').disabled = true;
+      document.getElementById('setupSkip').disabled = true;
+      return;
+    }
+  }
+  configStorageSupported = lastStatus.sd !== 'unsupported' && !!lastStatus.sd;
+  setupStep = setupSteps().includes(stored) ? stored : 'network';
+  await renderSetup();
+}
+
+async function setupMove(direction, skip = false) {
+  if (setupBusy) return;
+  setupLock(true);
+  try {
+    const root = document.getElementById('setup-' + setupStep);
+    if (direction > 0) {
+      if (!skip && setupStep !== 'airsense') {
+        if (!root || !root.children.length) {
+          if (!root || !await loadConfigFields(root, setupStep, 'setupMsg')) return;
+        }
+        if (setupStep === 'network') {
+          const ssid = document.getElementById('setupSsid');
+          const pass = document.getElementById('setupPass');
+          const wifi = await loadSetupWifi();
+          if (!wifi) return;
+          const mode = root.querySelector('[data-key="wifi_mode"]');
+          if (mode.value !== '1' && !ssid.value && !wifi.networks.some(n => n.enabled === '1'))
+            throw new Error('Add a network or select AP only.');
+          if (ssid.value) {
+            const idx = wifi.networks.findIndex(n => n.ssid === ssid.value);
+            if (!await wifiAction(idx < 0 ? 'add' : 'update', ssid.value, pass.value,
+                idx < 0 ? undefined : idx, 'setupMsg')) return;
+            ssid.value = ''; pass.value = '';
+          }
+        }
+        if (setupStep !== 'access' && !await saveConfig(root.id, 'setupMsg')) return;
+      }
+      if (setupStep === 'access') {
+        const changes = skip ? {} : collectConfigChanges(root);
+        // Do not issue authenticated background requests across a login change.
+        if (evtSrc) { evtSrc.close(); evtSrc = null; }
+        const r = await api('/api/onboarding', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
+        if (!r) { initSSE(); return; }
+        const d = await r.json();
+        if (!r.ok || d.ok !== true) throw new Error(d.error || 'Setup save failed');
+        lastStatus.onboarding_complete = 1;
+        rememberSetup('done');
+        document.getElementById('setupForms').innerHTML = '';
+        document.getElementById('setupActions').hidden = true;
+        document.getElementById('setupFinish').hidden = false;
+        document.getElementById('setupNote').textContent =
+          Object.keys(changes).length ? 'Use your new credentials when opening the dashboard.' : 'Initial setup is complete.';
+        return;
+      }
+      if (skip && root) root.innerHTML = '';
+      if (skip && setupStep === 'network') {
+        document.getElementById('setupSsid').value = '';
+        document.getElementById('setupPass').value = '';
+      }
+    }
+    const steps = setupSteps();
+    setupStep = steps[Math.max(0, steps.indexOf(setupStep) + direction)];
+  } catch(e) {
+    if (!evtSrc) initSSE();
+    showMsg(document.getElementById('setupMsg'), 'Save not confirmed: ' + e.message, 'err');
+    return;
+  } finally { setupLock(false); }
+  await renderSetup();
+}
+
 // Navigation
 const tabNames = ['status','report','clinical','bluetooth','console','device','sync','ota'];
 
 function showTab(id) {
+  if (setupBusy) return;
+  if (id !== 'setup' && setupActive()) {
+    rememberSetup('later');
+    document.getElementById('setupForms').innerHTML = '';
+    document.getElementById('setupPass').value = '';
+    document.getElementById('setupSsid').value = '';
+    if (window.location.pathname === '/wizard') history.replaceState(null, '', '/');
+  }
+  document.getElementById('p-setup').classList.toggle('active', id === 'setup');
   tabNames.forEach(t => {
     const pane = document.getElementById('p-' + t);
     if (pane) pane.classList.toggle('active', t === id);
@@ -853,8 +1083,11 @@ async function loadStatus() {
   try {
     const r = await api('/api/status');
     if (!r) return;
+    if (!r.ok) throw new Error("Status read failed");
     lastStatus = await r.json();
     renderStatus(lastStatus);
+    renderSetupDevice();
+    return lastStatus;
   } catch(e) { console.error(e); }
 }
 
@@ -1161,7 +1394,7 @@ function wifiAddPrompt() {
   wifiAction('add', ssid, pass);
 }
 
-async function wifiAction(action, ssid, pass, idx) {
+async function wifiAction(action, ssid, pass, idx, messageId = 'wifiMsg') {
   var body = {action: action};
   if (ssid) body.ssid = ssid;
   if (pass !== undefined) body.pass = pass;
@@ -1170,8 +1403,9 @@ async function wifiAction(action, ssid, pass, idx) {
     var r = await api('/api/wifi', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     var d = await r.json();
-    showMsg(document.getElementById('wifiMsg'), d.result, d.ok === 'true' ? 'ok' : 'err');
-    loadWifiNets();
+    showMsg(document.getElementById(messageId), d.result, d.ok === 'true' ? 'ok' : 'err');
+    if (messageId === 'wifiMsg') loadWifiNets();
+    return r.ok && d.ok === 'true';
   } catch(e) { showMsg(document.getElementById('wifiMsg'), 'Error: ' + e.message, 'err'); }
 }
 
@@ -1279,6 +1513,7 @@ async function loadConfigFields(root, section, messageId) {
       }
     });
     delete root.dataset.stale;
+    return true;
   } catch(e) {
     showMsg(document.getElementById(messageId), 'Error: ' + e.message, 'err');
   } finally {
@@ -1305,7 +1540,7 @@ async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
   const changes = collectConfigChanges(root);
   const fields = root.querySelectorAll('[data-key]');
   const msgEl = document.getElementById(messageId);
-  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return; }
+  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return true; }
   root.dataset.saving = '1';
   try {
     const r = await api('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
@@ -1333,6 +1568,7 @@ async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
     });
     showMsg(msgEl, 'Config saved', 'ok');
     await loadExports();
+    return true;
   } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
   finally { delete root.dataset.saving; }
 }
@@ -2032,9 +2268,17 @@ async function backfillLive() {
 }
 
 // Init
-const ht = window.location.hash.slice(1);
-showTab(tabNames.includes(ht) ? ht : 'status');
-initSSE();
+async function startUI() {
+  const ht = window.location.hash.slice(1);
+  const status = await loadStatus();
+  let deferred = false;
+  try { deferred = sessionStorage.getItem('airbridge.setup') === 'later'; } catch(e) {}
+  if (window.location.pathname === '/wizard' || ht === 'setup' ||
+      (status && !status.onboarding_complete && !deferred)) await startSetup();
+  else showTab(tabNames.includes(ht) ? ht : 'status');
+  initSSE();
+}
+startUI();
 </script>
 </body>
 </html>
