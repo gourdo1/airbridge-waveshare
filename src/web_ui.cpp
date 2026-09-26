@@ -589,7 +589,7 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
         auto *c = (decltype(ctx)*)p;
         if (!c->first) *c->json += ',';
         c->first = false;
-        const bool sensitive = strstr(key, "pass") || strstr(key, "secret");
+        const bool sensitive = Config::is_sensitive(key);
         jsonAddString(*c->json, key, sensitive ? "" : val.c_str(), false);
     }, &ctx);
     json += '}';

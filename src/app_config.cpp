@@ -13,64 +13,88 @@
 static Preferences prefs;
 static AirBridgeConfig cfg;
 
+struct KVEntry {
+    const char *key;
+    const char *nvs_key;
+    enum { STR, U8, U16, U32, BOOL } type;
+    void *ptr;
+    union Default {
+        const char *text;
+        uint32_t number;
+        constexpr Default(const char *value) : text(value) {}
+        constexpr Default(uint32_t value) : number(value) {}
+    } initial;
+    bool sensitive;
+};
+
+#define KV_STR(k, n, f, d) {k, n, KVEntry::STR, &cfg.f, {d}, false}
+#define KV_SECRET(k, n, f, d) {k, n, KVEntry::STR, &cfg.f, {d}, true}
+#define KV_U8(k, n, f, d) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false}
+#define KV_U16(k, n, f, d) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false}
+#define KV_U32(k, n, f, d) {k, n, KVEntry::U32, &cfg.f, {uint32_t(d)}, false}
+#define KV_BOOL(k, n, f, d) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false}
+
+static const KVEntry kv_table[] = {
+    KV_STR("hostname", "hostname", hostname, DEFAULT_HOSTNAME),
+    KV_U8("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY),
+    KV_BOOL("wifi_roam", "wifi_roam", wifi_roam, true),
+    KV_STR("wifi_country", "wifi_country", wifi_country, "01"),
+    KV_U16("tcp_port", "tcp_port", tcp_port, CFG_DEFAULT_TCP_PORT),
+    KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true),
+    KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true),
+    KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false),
+    KV_U8("oxi_device_type", "oxi_devtype", oxi_device_type, 0),
+    KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, ""),
+    KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500),
+    KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true),
+    KV_BOOL("oxi_require_known", "oxi_req_known", oxi_require_known, false),
+    KV_U32("uart_baud", "uart_baud", uart_baud, CFG_DEFAULT_BAUD),
+    KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500),
+    KV_U8("uart_max_retries", "uart_retries", uart_max_retries, 3),
+    KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false),
+    KV_U16("debug_port", "debug_port", debug_port, 8023),
+    KV_BOOL("syslog_en", "syslog_en", syslog_enabled, false),
+    KV_STR("syslog_host", "syslog_host", syslog_host, ""),
+    KV_U16("syslog_port", "syslog_port", syslog_port, 514),
+    KV_U16("http_port", "http_port", http_port, 80),
+    KV_STR("http_user", "http_user", http_user, "admin"),
+    KV_SECRET("http_pass", "http_pass", http_pass, "airbridge"),
+    KV_SECRET("ota_password", "ota_pass", ota_password, "airbridge"),
+    KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL),
+    KV_STR("ntp_server", "ntp_server", ntp_server, ""),
+    KV_STR("tz", "tz", tz, "UTC0"),
+    KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025),
+    KV_U8("mitm_mode", "mitm_mode", mitm_mode, 0),
+    KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false),
+    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true),
+    KV_STR("smb_endpoint", "smb_ep", smb_endpoint, ""),
+    KV_STR("smb_user", "smb_user", smb_user, ""),
+    KV_SECRET("smb_password", "smb_pass", smb_password, ""),
+    KV_BOOL("sleephq_enabled", "shq_enable", sleephq_enabled, false),
+    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true),
+    KV_STR("sleephq_client_id", "shq_id", sleephq_client_id, ""),
+    KV_SECRET("sleephq_client_secret", "shq_secret", sleephq_client_secret, ""),
+    KV_STR("sleephq_team_id", "shq_team", sleephq_team_id, ""),
+    KV_STR("sleephq_device_id", "shq_device", sleephq_device_id, ""),
+};
+
+
 static void apply_defaults() {
-    cfg.hostname = DEFAULT_HOSTNAME;
+    for (const KVEntry &entry : kv_table) {
+        switch (entry.type) {
+            case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
+            case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
+            case KVEntry::U16:  *(uint16_t *)entry.ptr = entry.initial.number; break;
+            case KVEntry::U32:  *(uint32_t *)entry.ptr = entry.initial.number; break;
+            case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
+        }
+    }
     cfg.wifi_net_count = 0;
     for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
         cfg.wifi_nets[i].ssid = "";
         cfg.wifi_nets[i].pass = "";
         cfg.wifi_nets[i].enabled = false;
     }
-    cfg.wifi_mode = WIFI_MODE_AP_ONLY;   // virgin device: AP up, user provisions
-    cfg.wifi_roam = true;
-    cfg.wifi_country = "01";             // worldwide / ESP-IDF default
-    cfg.tcp_port = CFG_DEFAULT_TCP_PORT;
-
-    cfg.oxi_enabled = true;
-    cfg.oxi_auto_start = true;
-    cfg.oxi_feed_therapy_only = false;
-    cfg.oxi_device_type = 0;
-    cfg.oxi_device_addr = "";
-    cfg.oxi_interval_ms = 500;
-    cfg.oxi_lframe_continuous = true;
-    cfg.oxi_require_known = false;
-
-    cfg.uart_baud = CFG_DEFAULT_BAUD;
-    cfg.uart_cmd_timeout_ms = 500;
-    cfg.uart_max_retries = 3;
-
-    cfg.allow_transparent_during_therapy = false;
-
-    cfg.debug_port = 8023;
-    cfg.syslog_enabled = false;
-    cfg.syslog_host = "";
-    cfg.syslog_port = 514;
-
-    cfg.http_port = 80;
-    cfg.http_user = "admin";
-    cfg.http_pass = "airbridge";
-
-    cfg.ota_password = "airbridge";
-    cfg.update_url = AB_DEFAULT_UPDATE_URL;
-
-    cfg.ntp_server = "";
-    cfg.tz = "UTC0";
-    cfg.udp_oxi_port = 8025;
-
-    cfg.mitm_mode = 0;
-
-    cfg.smb_enabled = false;
-    cfg.smb_auto_after_therapy = true;
-    cfg.smb_endpoint = "";
-    cfg.smb_user = "";
-    cfg.smb_password = "";
-
-    cfg.sleephq_enabled = false;
-    cfg.sleephq_auto_after_therapy = true;
-    cfg.sleephq_client_id = "";
-    cfg.sleephq_client_secret = "";
-    cfg.sleephq_team_id = "";
-    cfg.sleephq_device_id = "";
 }
 
 void Config::init() {
@@ -136,110 +160,76 @@ static void apply_syslog() {
 }
 
 void Config::load() {
-    cfg.hostname        = prefs.getString("hostname", cfg.hostname);
-    cfg.wifi_mode       = prefs.getUChar("wifi_mode", cfg.wifi_mode);
-    cfg.wifi_roam       = prefs.getBool("wifi_roam", cfg.wifi_roam);
-    cfg.wifi_country    = prefs.getString("wifi_country", cfg.wifi_country);
-    cfg.tcp_port        = prefs.getUShort("tcp_port", cfg.tcp_port);
+    for (const KVEntry &entry : kv_table) {
+        if (!prefs.isKey(entry.nvs_key)) continue;
+        switch (entry.type) {
+            case KVEntry::STR: {
+                auto &value = *(String *)entry.ptr;
+                value = prefs.getString(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U8: {
+                auto &value = *(uint8_t *)entry.ptr;
+                value = prefs.getUChar(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U16: {
+                auto &value = *(uint16_t *)entry.ptr;
+                value = prefs.getUShort(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U32: {
+                auto &value = *(uint32_t *)entry.ptr;
+                value = prefs.getULong(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::BOOL: {
+                auto &value = *(bool *)entry.ptr;
+                value = prefs.getBool(entry.nvs_key, value);
+                break;
+            }
+        }
+    }
     load_wifi_nets();
-
-    cfg.oxi_enabled     = prefs.getBool("oxi_enabled", cfg.oxi_enabled);
-    cfg.oxi_auto_start  = prefs.getBool("oxi_autostart", cfg.oxi_auto_start);
-    cfg.oxi_feed_therapy_only = prefs.getBool("oxi_thronly", cfg.oxi_feed_therapy_only);
-    cfg.oxi_device_type = prefs.getUChar("oxi_devtype", cfg.oxi_device_type);
-    cfg.oxi_device_addr = prefs.getString("oxi_devaddr", cfg.oxi_device_addr);
-    cfg.oxi_interval_ms = prefs.getUShort("oxi_interval", cfg.oxi_interval_ms);
-    cfg.oxi_lframe_continuous = prefs.getBool("oxi_lframe_cont", cfg.oxi_lframe_continuous);
-    cfg.oxi_require_known = prefs.getBool("oxi_req_known", cfg.oxi_require_known);
-
-    cfg.uart_baud       = prefs.getULong("uart_baud", cfg.uart_baud);
-    cfg.uart_cmd_timeout_ms = prefs.getUShort("uart_timeout", cfg.uart_cmd_timeout_ms);
-    cfg.uart_max_retries = prefs.getUChar("uart_retries", cfg.uart_max_retries);
-
-    cfg.allow_transparent_during_therapy = prefs.getBool("allow_transp", cfg.allow_transparent_during_therapy);
-
-    cfg.debug_port      = prefs.getUShort("debug_port", cfg.debug_port);
-    cfg.syslog_enabled  = prefs.getBool("syslog_en", cfg.syslog_enabled);
-    cfg.syslog_host     = prefs.getString("syslog_host", cfg.syslog_host);
-    cfg.syslog_port     = prefs.getUShort("syslog_port", cfg.syslog_port);
-
-    cfg.http_port       = prefs.getUShort("http_port", cfg.http_port);
-    cfg.http_user       = prefs.getString("http_user", cfg.http_user);
-    cfg.http_pass       = prefs.getString("http_pass", cfg.http_pass);
-
-    cfg.ota_password    = prefs.getString("ota_pass", cfg.ota_password);
-    cfg.update_url      = prefs.getString("update_url", cfg.update_url);
-    cfg.ntp_server      = prefs.getString("ntp_server", cfg.ntp_server);
-    cfg.tz              = prefs.getString("tz", cfg.tz);
-    cfg.udp_oxi_port    = prefs.getUShort("udp_oxi_port", cfg.udp_oxi_port);
-    cfg.mitm_mode       = prefs.getUChar("mitm_mode", cfg.mitm_mode);
-
-    cfg.smb_enabled     = prefs.getBool("smb_enable", cfg.smb_enabled);
-    cfg.smb_auto_after_therapy = prefs.getBool("smb_auto", cfg.smb_auto_after_therapy);
-    cfg.smb_endpoint    = prefs.getString("smb_ep", cfg.smb_endpoint);
-    cfg.smb_user        = prefs.getString("smb_user", cfg.smb_user);
-    cfg.smb_password    = prefs.getString("smb_pass", cfg.smb_password);
-
-    cfg.sleephq_enabled = prefs.getBool("shq_enable", cfg.sleephq_enabled);
-    cfg.sleephq_auto_after_therapy = prefs.getBool("shq_auto", cfg.sleephq_auto_after_therapy);
-    cfg.sleephq_client_id = prefs.getString("shq_id", cfg.sleephq_client_id);
-    cfg.sleephq_client_secret = prefs.getString("shq_secret", cfg.sleephq_client_secret);
-    cfg.sleephq_team_id = prefs.getString("shq_team", cfg.sleephq_team_id);
-    cfg.sleephq_device_id = prefs.getString("shq_device", cfg.sleephq_device_id);
     apply_syslog();
 }
 
 void Config::save() {
-    prefs.putString("hostname", cfg.hostname);
-    prefs.putUChar("wifi_mode", cfg.wifi_mode);
-    prefs.putBool("wifi_roam", cfg.wifi_roam);
-    prefs.putString("wifi_country", cfg.wifi_country);
-    prefs.putUShort("tcp_port", cfg.tcp_port);
-    // wifi_nets saved separately via save_wifi_nets()
-
-    prefs.putBool("oxi_enabled", cfg.oxi_enabled);
-    prefs.putBool("oxi_autostart", cfg.oxi_auto_start);
-    prefs.putBool("oxi_thronly", cfg.oxi_feed_therapy_only);
-    prefs.putUChar("oxi_devtype", cfg.oxi_device_type);
-    prefs.putString("oxi_devaddr", cfg.oxi_device_addr);
-    prefs.putUShort("oxi_interval", cfg.oxi_interval_ms);
-    prefs.putBool("oxi_lframe_cont", cfg.oxi_lframe_continuous);
-    prefs.putBool("oxi_req_known", cfg.oxi_require_known);
-
-    prefs.putULong("uart_baud", cfg.uart_baud);
-    prefs.putUShort("uart_timeout", cfg.uart_cmd_timeout_ms);
-    prefs.putUChar("uart_retries", cfg.uart_max_retries);
-
-    prefs.putBool("allow_transp", cfg.allow_transparent_during_therapy);
-
-    prefs.putUShort("debug_port", cfg.debug_port);
-    prefs.putBool("syslog_en", cfg.syslog_enabled);
-    prefs.putString("syslog_host", cfg.syslog_host);
-    prefs.putUShort("syslog_port", cfg.syslog_port);
-
-    prefs.putUShort("http_port", cfg.http_port);
-    prefs.putString("http_user", cfg.http_user);
-    prefs.putString("http_pass", cfg.http_pass);
-
-    prefs.putString("ota_pass", cfg.ota_password);
-    prefs.putString("update_url", cfg.update_url);
-    prefs.putString("ntp_server", cfg.ntp_server);
-    prefs.putString("tz", cfg.tz);
-    prefs.putUShort("udp_oxi_port", cfg.udp_oxi_port);
-    prefs.putUChar("mitm_mode", cfg.mitm_mode);
-
-    prefs.putBool("smb_enable", cfg.smb_enabled);
-    prefs.putBool("smb_auto", cfg.smb_auto_after_therapy);
-    prefs.putString("smb_ep", cfg.smb_endpoint);
-    prefs.putString("smb_user", cfg.smb_user);
-    prefs.putString("smb_pass", cfg.smb_password);
-
-    prefs.putBool("shq_enable", cfg.sleephq_enabled);
-    prefs.putBool("shq_auto", cfg.sleephq_auto_after_therapy);
-    prefs.putString("shq_id", cfg.sleephq_client_id);
-    prefs.putString("shq_secret", cfg.sleephq_client_secret);
-    prefs.putString("shq_team", cfg.sleephq_team_id);
-    prefs.putString("shq_device", cfg.sleephq_device_id);
+    for (const KVEntry &entry : kv_table) {
+        const bool present = prefs.isKey(entry.nvs_key);
+        switch (entry.type) {
+            case KVEntry::STR: {
+                const auto &value = *(String *)entry.ptr;
+                if (!present || prefs.getString(entry.nvs_key, value) != value)
+                    prefs.putString(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U8: {
+                const auto &value = *(uint8_t *)entry.ptr;
+                if (!present || prefs.getUChar(entry.nvs_key, value) != value)
+                    prefs.putUChar(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U16: {
+                const auto &value = *(uint16_t *)entry.ptr;
+                if (!present || prefs.getUShort(entry.nvs_key, value) != value)
+                    prefs.putUShort(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U32: {
+                const auto &value = *(uint32_t *)entry.ptr;
+                if (!present || prefs.getULong(entry.nvs_key, value) != value)
+                    prefs.putULong(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::BOOL: {
+                const auto &value = *(bool *)entry.ptr;
+                if (!present || prefs.getBool(entry.nvs_key, value) != value)
+                    prefs.putBool(entry.nvs_key, value);
+                break;
+            }
+        }
+    }
     apply_syslog();
 }
 
@@ -270,76 +260,30 @@ void Config::invalidate_device_info() {
     cfg.device_srn = "";
 }
 
-struct KVEntry {
-    const char *key;
-    enum { STR, U8, U16, U32, BOOL } type;
-    void *ptr;
-};
 
-#define KV_STR(k, f)  { k, KVEntry::STR,  &cfg.f }
-#define KV_U8(k, f)   { k, KVEntry::U8,   &cfg.f }
-#define KV_U16(k, f)  { k, KVEntry::U16,  &cfg.f }
-#define KV_U32(k, f)  { k, KVEntry::U32,  &cfg.f }
-#define KV_BOOL(k, f) { k, KVEntry::BOOL, &cfg.f }
-
-static const KVEntry kv_table[] = {
-    KV_STR("hostname", hostname),
-    KV_U8("wifi_mode", wifi_mode),
-    KV_BOOL("wifi_roam", wifi_roam),
-    KV_STR("wifi_country", wifi_country),
-    KV_U16("tcp_port", tcp_port),
-    KV_BOOL("oxi_enabled", oxi_enabled),
-    KV_BOOL("oxi_auto_start", oxi_auto_start),
-    KV_BOOL("oxi_feed_therapy_only", oxi_feed_therapy_only),
-    KV_U8("oxi_device_type", oxi_device_type),
-    KV_STR("oxi_device_addr", oxi_device_addr),
-    KV_U16("oxi_interval_ms", oxi_interval_ms),
-    KV_BOOL("oxi_lframe_continuous", oxi_lframe_continuous),
-    KV_BOOL("oxi_require_known", oxi_require_known),
-    KV_U32("uart_baud", uart_baud),
-    KV_U16("uart_cmd_timeout_ms", uart_cmd_timeout_ms),
-    KV_U8("uart_max_retries", uart_max_retries),
-    KV_BOOL("allow_transparent_during_therapy", allow_transparent_during_therapy),
-    KV_U16("debug_port", debug_port),
-    KV_BOOL("syslog_en", syslog_enabled),
-    KV_STR("syslog_host", syslog_host),
-    KV_U16("syslog_port", syslog_port),
-    KV_U16("http_port", http_port),
-    KV_STR("http_user", http_user),
-    KV_STR("http_pass", http_pass),
-    KV_STR("ota_password", ota_password),
-    KV_STR("update_url", update_url),
-    KV_STR("ntp_server", ntp_server),
-    KV_STR("tz", tz),
-    KV_U16("udp_oxi_port", udp_oxi_port),
-    KV_U8("mitm_mode", mitm_mode),
-    KV_BOOL("smb_enabled", smb_enabled),
-    KV_BOOL("smb_auto_after_therapy", smb_auto_after_therapy),
-    KV_STR("smb_endpoint", smb_endpoint),
-    KV_STR("smb_user", smb_user),
-    KV_STR("smb_password", smb_password),
-    KV_BOOL("sleephq_enabled", sleephq_enabled),
-    KV_BOOL("sleephq_auto_after_therapy", sleephq_auto_after_therapy),
-    KV_STR("sleephq_client_id", sleephq_client_id),
-    KV_STR("sleephq_client_secret", sleephq_client_secret),
-    KV_STR("sleephq_team_id", sleephq_team_id),
-    KV_STR("sleephq_device_id", sleephq_device_id),
-    { nullptr, KVEntry::U8, nullptr }
-};
+static void format_value(const KVEntry &entry, String &out) {
+    switch (entry.type) {
+        case KVEntry::STR:  out = *(String *)entry.ptr; break;
+        case KVEntry::U8:   out = String(*(uint8_t *)entry.ptr); break;
+        case KVEntry::U16:  out = String(*(uint16_t *)entry.ptr); break;
+        case KVEntry::U32:  out = String(*(uint32_t *)entry.ptr); break;
+        case KVEntry::BOOL: out = *(bool *)entry.ptr ? "1" : "0"; break;
+    }
+}
 
 bool Config::get_value(const char *key, String &out) {
-    for (const KVEntry *e = kv_table; e->key; e++) {
-        if (strcasecmp(key, e->key) == 0) {
-            switch (e->type) {
-            case KVEntry::STR:  out = *(String*)e->ptr; break;
-            case KVEntry::U8:   out = String(*(uint8_t*)e->ptr); break;
-            case KVEntry::U16:  out = String(*(uint16_t*)e->ptr); break;
-            case KVEntry::U32:  out = String(*(uint32_t*)e->ptr); break;
-            case KVEntry::BOOL: out = (*(bool*)e->ptr) ? "1" : "0"; break;
-            }
+    for (const KVEntry &entry : kv_table) {
+        if (strcasecmp(key, entry.key) == 0) {
+            format_value(entry, out);
             return true;
         }
     }
+    return false;
+}
+
+bool Config::is_sensitive(const char *key) {
+    for (const KVEntry &entry : kv_table)
+        if (strcasecmp(key, entry.key) == 0) return entry.sensitive;
     return false;
 }
 
@@ -356,7 +300,8 @@ bool Config::set_value(const char *key, const char *value) {
         if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) return false;
     }
 
-    for (const KVEntry *e = kv_table; e->key; e++) {
+    for (const KVEntry &entry : kv_table) {
+        const KVEntry *e = &entry;
         if (strcasecmp(key, e->key) == 0) {
             switch (e->type) {
             case KVEntry::STR:  *(String*)e->ptr = value; break;
@@ -373,9 +318,9 @@ bool Config::set_value(const char *key, const char *value) {
 
 void Config::foreach_kv(kv_visitor_fn fn, void *ctx) {
     String val;
-    for (const KVEntry *e = kv_table; e->key; e++) {
-        val = "";
-        get_value(e->key, val);
+    for (const KVEntry &entry : kv_table) {
+        const KVEntry *e = &entry;
+        format_value(entry, val);
         fn(e->key, val, ctx);
     }
 }
@@ -391,7 +336,7 @@ String Config::dump() {
     // KV table entries
     foreach_kv([](const char *key, const String &val, void *p) {
         String v = val;
-        if ((strstr(key, "pass") || strstr(key, "secret")) &&
+        if (Config::is_sensitive(key) &&
             v.length() > 0) v = "****";
         *(String*)p += String(key) + "=" + v + "\n";
     }, &out);

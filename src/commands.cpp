@@ -38,13 +38,6 @@ static String parse_quoted_token(const String &s, int *pos) {
     return out;
 }
 
-static bool config_key_sensitive(const String &key) {
-    String normalized = key;
-    normalized.toLowerCase();
-    return normalized.indexOf("pass") >= 0 ||
-           normalized.indexOf("secret") >= 0;
-}
-
 
 void dispatch_command(const char *line, String &response) {
     String cmd = String(line);
@@ -176,7 +169,7 @@ void dispatch_command(const char *line, String &response) {
                     if (key.equalsIgnoreCase("update_url"))
                         OtaManager::config_changed();
                     response = "OK: " + key + "=" +
-                               (config_key_sensitive(key) && val.length()
+                               (Config::is_sensitive(key.c_str()) && val.length()
                                     ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + key + "'\n";
@@ -186,7 +179,7 @@ void dispatch_command(const char *line, String &response) {
                 String val;
                 if (Config::get_value(sub.c_str(), val)) {
                     response = sub + "=" +
-                               (config_key_sensitive(sub) && val.length()
+                               (Config::is_sensitive(sub.c_str()) && val.length()
                                     ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + sub + "'\n";
