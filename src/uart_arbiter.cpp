@@ -24,6 +24,7 @@ static SemaphoreHandle_t rx_ready = nullptr;
 
 static volatile system_state_t sys_state = SYS_IDLE;
 static qframe_parser_t rx_parser;
+static std::atomic<bool> rx_reset_requested{false};
 
 static portMUX_TYPE rx_frame_mux = portMUX_INITIALIZER_UNLOCKED;
 static qframe_t rx_frame_storage[RX_FRAME_QUEUE_DEPTH];
@@ -50,7 +51,6 @@ static Stream *transparent_bridge = nullptr;
 static portMUX_TYPE transparent_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint16_t transparent_inflight = 0;
 static volatile uint32_t transparent_last_activity = 0;
-static qframe_parser_t transparent_parser;      // shadow parser for BDD sniffing
 static uint32_t transparent_pending_baud = 0;
 static uint32_t transparent_pending_baud_at = 0;
 static uint32_t transparent_reboot_baud_at = 0;
@@ -570,7 +570,9 @@ static void rx_task(void *param) {
         bool transparent = transparent_active;
         Stream *bridge = transparent_bridge;
         if (transparent && bridge) transparent_inflight++;
+        bool reset_parser = rx_reset_requested.exchange(false);
         portEXIT_CRITICAL(&transparent_mux);
+        if (reset_parser) qframe_parser_reset(&rx_parser);
 
         if (transparent) {
             if (!bridge) {
@@ -599,8 +601,8 @@ static void rx_task(void *param) {
                 }
                 // Sniff for BDD R-frame
                 for (int i = 0; i < n; i++) {
-                    if (qframe_parser_feed(&transparent_parser, buf[i])) {
-                        const qframe_t *f = qframe_parser_frame(&transparent_parser);
+                    if (qframe_parser_feed(&rx_parser, buf[i])) {
+                        const qframe_t *f = qframe_parser_frame(&rx_parser);
                         if (f && f->crc_valid) {
                             char pl[48] = {};
                             int plen = f->payload_len < sizeof(pl)-1 ? f->payload_len : sizeof(pl)-1;
@@ -624,7 +626,7 @@ static void rx_task(void *param) {
                             transparent_pending_baud_at = 0;
                             transparent_reboot_baud_at = 0;
                         }
-                        qframe_parser_reset(&transparent_parser);
+                        qframe_parser_reset(&rx_parser);
                     }
                 }
             } else {
@@ -932,7 +934,6 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
     current_baud = baud;
 
     rx_ready = xSemaphoreCreateBinary();
-    qframe_parser_init(&transparent_parser);
     pq_init();
 
     xTaskCreatePinnedToCore(rx_task, "uart_rx", RX_TASK_STACK, nullptr,
@@ -1303,7 +1304,6 @@ void Arbiter::set_cached_rop(int v)         { cached_rop = v; }
 void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
 
 void Arbiter::enter_transparent(Stream *bridge) {
-    qframe_parser_reset(&transparent_parser);
     transparent_tx_reset();
     transparent_pending_baud = 0;
     transparent_pending_baud_at = 0;
@@ -1314,6 +1314,7 @@ void Arbiter::enter_transparent(Stream *bridge) {
     portENTER_CRITICAL(&transparent_mux);
     transparent_bridge = bridge;
     transparent_active = true;
+    rx_reset_requested.store(true);
     portEXIT_CRITICAL(&transparent_mux);
 }
 
@@ -1330,8 +1331,6 @@ void Arbiter::exit_transparent() {
         if (!busy) break;
         vTaskDelay(1);
     }
-    qframe_parser_reset(&rx_parser);
-    qframe_parser_reset(&transparent_parser);
     transparent_tx_reset();
     transparent_pending_baud = 0;
     transparent_pending_baud_at = 0;
@@ -1339,6 +1338,7 @@ void Arbiter::exit_transparent() {
     sys_state = SYS_IDLE;
     portENTER_CRITICAL(&transparent_mux);
     transparent_active = false;
+    rx_reset_requested.store(true);
     portEXIT_CRITICAL(&transparent_mux);
 }
 
@@ -1399,7 +1399,7 @@ void Arbiter::set_baud(uint32_t baud) {
         uart->updateBaudRate(baud);
         // Flush RX hardware buffer (contains garbage from old baud)
         while (uart->available()) uart->read();
-        qframe_parser_reset(&rx_parser);
+        rx_reset_requested.store(true);
         Arbiter::clear_rx_frames();
         Log::logf(CAT_ARB, LOG_INFO, "[ARB] set_baud: %u -> %u\n", current_baud, baud);
         current_baud = baud;
