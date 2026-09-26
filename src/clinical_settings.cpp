@@ -1,4 +1,5 @@
 #include "clinical_settings.h"
+#include "json_util.h"
 #include "clinical_jobs.h"
 #include "settings_defs.h"
 #include "uart_arbiter.h"
@@ -404,10 +405,11 @@ size_t Cursor::read(const Snapshot &snapshot, char *out, size_t capacity) {
         else if (offset_ < length_) {
             c = text_[offset_++];
             if (quoted_) {
-                if (c == '"' || c == '\\') { escape_ = c; c = '\\'; }
-                else if (c == '\n' || c == '\r' || c == '\t') {
-                    escape_ = c == '\n' ? 'n' : c == '\r' ? 'r' : 't'; c = '\\';
-                } else if ((uint8_t)c < 0x20) continue;
+                char encoded[6];
+                size_t count = aircannect::json_escape_char(c, encoded, true);
+                if (!count) continue;
+                c = encoded[0];
+                if (count == 2) escape_ = encoded[1];
             }
         } else {
             text_ = nullptr;

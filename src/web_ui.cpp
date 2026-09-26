@@ -82,16 +82,7 @@ static bool writeSetting(const char *cmd, int value) {
 
 static void jsonQuote(String &out, const char *val) {
     out += '"';
-    while (*val) {
-        if (*val == '"') out += "\\\"";
-        else if (*val == '\\') out += "\\\\";
-        else if (*val == '\n') out += "\\n";
-        else if (*val == '\r') out += "\\r";
-        else if (*val == '\t') out += "\\t";
-        else if ((uint8_t)*val < 0x20) {} // skip other control chars
-        else out += *val;
-        val++;
-    }
+    aircannect::json_escape_append(out, val, val ? strlen(val) : 0, true);
     out += '"';
 }
 
@@ -249,13 +240,9 @@ static void fixedJsonAddString(FixedJson &json, const char *key, const char *val
 
     if (!val) val = "";
     while (*val) {
-        if (*val == '"') fixedJsonAppend(json, "\\\"");
-        else if (*val == '\\') fixedJsonAppend(json, "\\\\");
-        else if (*val == '\n') fixedJsonAppend(json, "\\n");
-        else if (*val == '\r') fixedJsonAppend(json, "\\r");
-        else if (*val == '\t') fixedJsonAppend(json, "\\t");
-        else if ((uint8_t)*val >= 0x20) fixedJsonPut(json, *val);
-        val++;
+        char encoded[6];
+        size_t count = aircannect::json_escape_char(*val++, encoded, true);
+        for (size_t i = 0; i < count; i++) fixedJsonPut(json, encoded[i]);
     }
 
     fixedJsonPut(json, '"');

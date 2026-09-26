@@ -11,38 +11,12 @@ namespace aircannect {
 namespace {
 
 template <typename Out>
-void append_json_escaped_impl(Out &out, const char *value, size_t len) {
-    if (!value) return;
-    for (size_t i = 0; i < len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(*value++);
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04X", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
-                break;
-        }
-    }
-}
-
-template <typename Out>
 void json_add_string_impl(Out &out, const char *key, const char *value, bool comma) {
     if (comma) out += ',';
     out += '"';
     out += key;
     out += "\":\"";
-    append_json_escaped_impl(out, value, value ? strlen(value) : 0);
+    json_escape_append(out, value, value ? strlen(value) : 0);
     out += '"';
 }
 
@@ -159,11 +133,11 @@ bool json_variant_to_uint32(JsonVariantConst value, uint32_t &out) {
 }
 
 void append_json_escaped(std::string &out, const char *value, size_t len) {
-    append_json_escaped_impl(out, value, len);
+    json_escape_append(out, value, len);
 }
 
 void append_json_escaped(std::string &out, std::string_view value) {
-    append_json_escaped_impl(out, value.data(), value.size());
+    json_escape_append(out, value.data(), value.size());
 }
 
 #if AIRCANNECT_JSON_UTIL_HAS_ARDUINO
@@ -188,7 +162,7 @@ void json_add_int(String &out, const char *key, long value, bool comma) {
 #endif
 
 void append_json_escaped(LargeTextBuffer &out, const char *value, size_t len) {
-    append_json_escaped_impl(out, value, len);
+    json_escape_append(out, value, len);
 }
 
 void append_json_float(LargeTextBuffer &out, float value) {
@@ -204,7 +178,7 @@ void json_add_string_view(LargeTextBuffer &out, const char *key, std::string_vie
     out += '"';
     out += key;
     out += "\":\"";
-    append_json_escaped_impl(out, value.data(), value.size());
+    json_escape_append(out, value.data(), value.size());
     out += '"';
 }
 

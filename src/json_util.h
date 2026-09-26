@@ -19,6 +19,39 @@ namespace aircannect {
 
 class LargeTextBuffer;
 
+// WebUI historically omits non-whitespace control characters.
+inline size_t json_escape_char(uint8_t c, char (&out)[6], bool omit_controls = false) {
+    char code = 0;
+    switch (c) {
+        case '"': code = '"'; break;
+        case '\\': code = '\\'; break;
+        case '\n': code = 'n'; break;
+        case '\r': code = 'r'; break;
+        case '\t': code = 't'; break;
+        case '\b': if (!omit_controls) code = 'b'; break;
+        case '\f': if (!omit_controls) code = 'f'; break;
+    }
+    if (code) { out[0] = '\\'; out[1] = code; return 2; }
+    if (c >= 0x20) { out[0] = c; return 1; }
+    if (omit_controls) return 0;
+    static const char hex[] = "0123456789ABCDEF";
+    out[0] = '\\'; out[1] = 'u'; out[2] = '0'; out[3] = '0';
+    out[4] = hex[c >> 4]; out[5] = hex[c & 15];
+    return 6;
+}
+
+template <typename Out>
+void json_escape_append(Out &out, const char *value, size_t len,
+                         bool omit_controls = false) {
+    if (!value) return;
+    for (size_t i = 0; i < len; i++) {
+        char encoded[6];
+        size_t count = json_escape_char(static_cast<uint8_t>(value[i]),
+                                        encoded, omit_controls);
+        for (size_t j = 0; j < count; j++) out += encoded[j];
+    }
+}
+
 class JsonAllocator : public ArduinoJson::Allocator {
 public:
     void *allocate(size_t size) override { return Memory::alloc_large(size); }
