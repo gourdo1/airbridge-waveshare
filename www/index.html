@@ -15,6 +15,8 @@
 .sync-value{overflow-wrap:anywhere;min-width:0;text-align:right}
 .sync-note,.sync-error{font-size:12px;margin:10px 0;color:var(--text-dim)}
 .sync-error{color:var(--red)}
+#p-setup .btn-row{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+#p-setup input,#p-setup select{max-width:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
 .app{display:grid;grid-template-columns:220px 1fr;height:100vh}
 
@@ -153,6 +155,8 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
 /* Responsive */
 @media(max-width:768px){
+  #p-setup .row{flex-direction:column;align-items:stretch;gap:8px}
+  #p-setup .row input{width:100%}
   body{display:flex;flex-direction:column;min-height:0;height:100vh;height:100dvh}
   .app{grid-template-columns:1fr;grid-template-rows:minmax(0,1fr);height:auto;flex:1;min-height:0}
   .sidebar{display:none}
@@ -396,7 +400,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
           <p id="setupNote" class="sync-note"></p>
           <div id="setupNetwork" hidden>
             <div class="sync-note" id="setupWifiStatus" aria-live="polite"></div>
-            <div class="row"><label for="setupSsid">Network name</label><input id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
+            <div class="row"><label for="setupSsid">Network name</label><input type="text" id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
             <div class="row"><label for="setupPass">WiFi password</label><input id="setupPass" type="password" autocomplete="new-password"></div>
             <div class="sync-note">Leave the network name empty to keep saved networks. Your current access point stays available while connecting.</div>
             <a id="setupWifiLink" hidden>Open on the local network</a>
@@ -774,14 +778,16 @@ function setupSteps() {
 
 function setupLock(busy) {
   setupBusy = busy;
-  document.querySelectorAll('#setupActions button, #setupForms input, #setupForms select, #setupNetwork input').forEach(button => { button.disabled = busy; });
+  document.querySelectorAll('#setupActions button, #setupForms input, #setupForms select, #setupForms button, #setupNetwork input').forEach(button => { button.disabled = busy; });
   document.getElementById('setupBack').disabled = busy || setupSteps().indexOf(setupStep) === 0;
 }
 
 function renderSetupDevice() {
   const el = document.getElementById('setupDevice');
-  el.textContent = [lastStatus.pna, lastStatus.srn, lastStatus.system].filter(Boolean).join(' | ') ||
-    'Waiting for cached AirSense status. You can continue and connect it later.';
+  const state = lastStatus.system;
+  const identity = [lastStatus.pna, lastStatus.srn].filter(Boolean).join(' | ');
+  el.textContent = (!state || state === 'ERROR' ? 'AirSense communication not confirmed yet.' :
+    'AirSense status: ' + state + '.') + (identity ? ' ' + identity : '');
 }
 
 function setupNetworkSelected() {
@@ -884,7 +890,8 @@ async function setupMove(direction, skip = false) {
     if (direction > 0) {
       if (!skip && setupStep !== 'airsense') {
         if (!root || !root.children.length) {
-          if (!root || !await loadConfigFields(root, setupStep, 'setupMsg')) return;
+          await renderSetup();
+          return;
         }
         if (setupStep === 'network') {
           const ssid = document.getElementById('setupSsid');
