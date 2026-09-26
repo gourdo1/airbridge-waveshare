@@ -1602,6 +1602,11 @@ void WebUI::push_status_event() {
 
 void WebUI::handle() {
     if (!events || events->count() == 0) return;
+    static uint32_t last_check = 0;
+    uint32_t now = millis();
+    if (uint32_t(now - last_check) < 100) return;
+    last_check = now;
+
     if (snapshot_differs(current_snapshot(), last_published) ||
         millis() - last_status_push >= 10000) {
         WebUI::push_status_event();

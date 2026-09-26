@@ -1,7 +1,6 @@
 #include "tcp_bridge.h"
 #include "uart_arbiter.h"
 #include "debug_log.h"
-#include "web_ui.h"
 #include "app_config.h"
 #include "build_info.h"
 #include "live_stream.h"
@@ -594,12 +593,20 @@ void TcpBridge::init_debug_server(uint16_t port) {
 void TcpBridge::poll_debug_clients() {
     if (!debug_server || xSemaphoreTake(debug_mutex, 0) != pdTRUE) return;
 
+    for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) flush_debug_client(i);
+
+    static uint32_t last_check = 0;
+    uint32_t now = millis();
+    if (uint32_t(now - last_check) < 100) {
+        xSemaphoreGive(debug_mutex);
+        return;
+    }
+    last_check = now;
+
     for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) {
         if (!debug_clients[i].connected()) {
             debug_clients[i].stop();
             debug_pending[i].pos = debug_pending[i].len = 0;
-        } else {
-            flush_debug_client(i);
         }
     }
 
@@ -629,7 +636,8 @@ void TcpBridge::poll_debug_clients() {
     // Drain any input from debug clients (read-only port)
     for (int i = 0; i < DEBUG_MAX_CLIENTS; i++) {
         if (debug_clients[i] && debug_clients[i].connected()) {
-            while (debug_clients[i].available()) debug_clients[i].read();
+            uint8_t ignored[64];
+            debug_clients[i].read(ignored, sizeof(ignored));
         }
     }
     xSemaphoreGive(debug_mutex);
@@ -667,8 +675,6 @@ void TcpBridge::task(void *param) {
         }
 
         if (!client.connected() && !client.available()) {
-            poll_debug_clients();
-            WebUI::handle();
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -695,8 +701,6 @@ void TcpBridge::task(void *param) {
             }
         }
 
-        poll_debug_clients();
-        WebUI::handle();
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }

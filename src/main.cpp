@@ -419,6 +419,8 @@ void loop() {
     OtaManager::handle();
     WiFiSetup::check();
     Log::poll();
+    TcpBridge::poll_debug_clients();
+    WebUI::handle();
 
     // Suspend WiFi scanning during therapy/streaming/oximetry/OTA
     system_state_t sys_st = Arbiter::get_state();
