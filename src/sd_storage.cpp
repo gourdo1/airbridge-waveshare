@@ -139,11 +139,27 @@ bool init_worker() {
     return worker != nullptr;
 }
 
+bool direct_request(Request &request) {
+    // No executor means no auxiliary readers; keep the same ownership token.
+    if (request.kind == Request::Acquire || request.kind == Request::TryAcquire) {
+        TaskHandle_t expected = nullptr;
+        return __atomic_compare_exchange_n(&direct_owner, &expected, request.caller,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    if (request.kind == Request::Release) {
+        TaskHandle_t expected = request.caller;
+        return __atomic_compare_exchange_n(&direct_owner, &expected, nullptr,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    return false;
+}
+
 bool dispatch(Request &request, bool control) {
-    if (!worker || xTaskGetCurrentTaskHandle() == worker) return false;
+    request.caller = xTaskGetCurrentTaskHandle();
+    if (!worker) return direct_request(request);
+    if (request.caller == worker) return false;
     StaticSemaphore_t done_state;
     request.done = xSemaphoreCreateBinaryStatic(&done_state);
-    request.caller = xTaskGetCurrentTaskHandle();
     request.success = false;
     Request *pointer = &request;
     const bool queued = xQueueSend(requests, &pointer, control ? portMAX_DELAY : 0) == pdTRUE;
@@ -167,8 +183,9 @@ static void mount_error(const char *message) {
 
 void init() {
 #if AB_STORAGE_HAS_SDCARD
-    if (!init_worker()) { mount_error("I/O task initialization failed"); return; }
     if (mounted()) return;
+    if (!init_worker())
+        Log::logf(CAT_GENERAL, LOG_WARN, "[SD] auxiliary I/O unavailable; recorder only\n");
 
     bool pins_ok;
     if (AB_SDMMC_WIDTH == 1) {
@@ -271,7 +288,8 @@ void release() {
 #if AB_STORAGE_HAS_SDCARD
     Request request = {};
     request.kind = Request::Release;
-    (void)dispatch(request, true);
+    if (!dispatch(request, true))
+        Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] release by non-owner\n");
 #endif
 }
 
