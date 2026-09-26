@@ -964,19 +964,16 @@ static uart_response_policy_t normalize_policy(uart_response_policy_t policy) {
     return policy;
 }
 
-static uart_transaction_t *queue_transaction(const uint8_t *frame,
-                                             uint16_t frame_len,
+static uart_transaction_t *allocate_transaction(uint16_t frame_len,
                                              cmd_source_t src,
                                              cmd_priority_t prio,
                                              const uart_response_policy_t &policy,
                                              uart_frame_sink_t sink,
-                                             const void *sink_context,
                                              bool auto_release,
                                              size_t context_size = 0,
                                              LcdStep lcd_step = LcdStep::None) {
-    if (!frame || !frame_len || frame_len > QFRAME_MAX_RAW ||
-        !uart_source_allowed(src) || (context_size && !sink_context) ||
-        (sink_context && !context_size) || context_size > 4096) {
+    if (!frame_len || frame_len > QFRAME_MAX_RAW ||
+        !uart_source_allowed(src) || context_size > 4096) {
         return nullptr;
     }
 
@@ -995,11 +992,9 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
     t->lcd_step = lcd_step;
     if (context_size) {
         t->sink_context = t + 1;
-        memcpy(t->sink_context, sink_context, context_size);
     }
     t->ticket_id = __atomic_fetch_add(&next_ticket_id, 1, __ATOMIC_RELAXED);
     t->frame = reinterpret_cast<uint8_t *>(t + 1) + context_size;
-    memcpy(t->frame, frame, frame_len);
     t->frame_len = frame_len;
 
     if (!auto_release) {
@@ -1010,12 +1005,37 @@ static uart_transaction_t *queue_transaction(const uint8_t *frame,
         }
     }
 
-    if (!pq_push(t, lcd_step == LcdStep::None ? portMAX_DELAY : 0)) {
+    return t;
+}
+
+static uart_transaction_t *publish_transaction(uart_transaction_t *t) {
+    if (!t) return nullptr;
+    if (!pq_push(t, t->lcd_step == LcdStep::None ? portMAX_DELAY : 0)) {
         if (t->done) vSemaphoreDelete(t->done);
         free(t);
         return nullptr;
     }
     return t;
+}
+
+static uart_transaction_t *queue_transaction(const uint8_t *frame,
+                                             uint16_t frame_len,
+                                             cmd_source_t src,
+                                             cmd_priority_t prio,
+                                             const uart_response_policy_t &policy,
+                                             uart_frame_sink_t sink,
+                                             const void *sink_context,
+                                             bool auto_release,
+                                             size_t context_size = 0,
+                                             LcdStep lcd_step = LcdStep::None) {
+    if (!frame || (context_size && !sink_context) || (sink_context && !context_size))
+        return nullptr;
+    auto *t = allocate_transaction(frame_len, src, prio, policy, sink,
+                                    auto_release, context_size, lcd_step);
+    if (!t) return nullptr;
+    memcpy(t->frame, frame, frame_len);
+    if (context_size) memcpy(t->sink_context, sink_context, context_size);
+    return publish_transaction(t);
 }
 
 uart_transaction_t *Arbiter::begin_frame(
@@ -1027,11 +1047,15 @@ uart_transaction_t *Arbiter::begin_frame(
                              sink, sink_context, false, context_size);
 }
 
-uart_transaction_t *Arbiter::begin_cmd(
+static uart_transaction_t *create_command(
         const char *cmd, cmd_source_t src, cmd_priority_t prio,
         const uart_response_policy_t &policy,
         uart_frame_sink_t sink, const void *sink_context, size_t context_size) {
-    if (!cmd) return nullptr;
+    if (!cmd || (sink_context && !context_size)) return nullptr;
+    size_t payload_len = strnlen(cmd, QFRAME_MAX_PAYLOAD + 1);
+    if (payload_len > QFRAME_MAX_PAYLOAD) return nullptr;
+    int frame_len = qframe_encoded_size(reinterpret_cast<const uint8_t *>(cmd), payload_len);
+    if (frame_len < 0) return nullptr;
 
 #ifndef FIRMWARE_MIGRATE
     const char *reboot_cmd = transparent_reboot_command(
@@ -1039,11 +1063,21 @@ uart_transaction_t *Arbiter::begin_cmd(
     if (reboot_cmd) CustomSettings::invalidate(reboot_cmd);
 #endif
 
-    uint8_t frame[QFRAME_MAX_RAW];
-    int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
-    if (frame_len < 0) return nullptr;
-    return begin_frame(frame, (uint16_t)frame_len, src, prio, policy,
-                       sink, sink_context, context_size);
+    auto *t = allocate_transaction(frame_len, src, prio, policy, sink, false, context_size);
+    if (!t) return nullptr;
+    qframe_build(QFRAME_TYPE_Q, reinterpret_cast<const uint8_t *>(cmd), payload_len,
+                 t->frame, frame_len);
+    if (sink_context) memcpy(t->sink_context, sink_context, context_size);
+    return t;
+}
+
+uart_transaction_t *Arbiter::begin_cmd(
+        const char *cmd, cmd_source_t src, cmd_priority_t prio,
+        const uart_response_policy_t &policy,
+        uart_frame_sink_t sink, const void *sink_context, size_t context_size) {
+    if (context_size && !sink_context) return nullptr;
+    return publish_transaction(create_command(cmd, src, prio, policy,
+                                               sink, sink_context, context_size));
 }
 
 bool Arbiter::transaction_done(const uart_transaction_t *transaction) {
@@ -1056,10 +1090,7 @@ bool Arbiter::transaction_expired(const uart_transaction_t *transaction) {
                           transaction->policy.overall_timeout_ms;
 }
 
-bool Arbiter::finish_transaction(uart_transaction_t *transaction,
-                                 uart_transaction_result_t *result,
-                                 uint32_t wait_ms, void *context_out,
-                                 size_t context_size) {
+static bool await_transaction(uart_transaction_t *transaction, uint32_t wait_ms) {
     if (!transaction) return false;
 
     if (!__atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE)) {
@@ -1068,7 +1099,14 @@ bool Arbiter::finish_transaction(uart_transaction_t *transaction,
             return false;
         }
     }
+    return true;
+}
 
+bool Arbiter::finish_transaction(uart_transaction_t *transaction,
+                                 uart_transaction_result_t *result,
+                                 uint32_t wait_ms, void *context_out,
+                                 size_t context_size) {
+    if (!await_transaction(transaction, wait_ms)) return false;
     if (result) *result = transaction->result;
     if (context_out && context_size == transaction->context_size)
         memcpy(context_out, transaction->sink_context, context_size);
@@ -1141,27 +1179,38 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     if (resp_buf && resp_len && *resp_len)
         output_capacity = min(output_capacity, (uint16_t)(*resp_len - 1));
     bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
-    struct {
-        single_response_capture_t result;
-        uint8_t payload[QFRAME_MAX_PAYLOAD + 1];
-    } capture = {};
-    capture.result.capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
-    size_t capture_size = sizeof(capture.result) + capture.result.capacity + 1;
-    uart_transaction_result_t result = {};
-    bool completed = transact_cmd(cmd, src, prio, policy,
-                                  capture_single_response, &capture, &result,
-                                  capture_size);
-    bool ok = completed && result.success;
-
-    if (!capture.result.received) {
+    uint16_t capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
+    auto *t = create_command(cmd, src, prio, policy, capture_single_response,
+                              nullptr, sizeof(single_response_capture_t) + capacity + 1);
+    if (!t) {
+        if (resp_len) *resp_len = 0;
+        return false;
+    }
+    auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
+    capture->capacity = capacity;
+    if (!publish_transaction(t)) {
         if (resp_len) *resp_len = 0;
         return false;
     }
 
+    uint32_t elapsed = millis() - t->queued_ms;
+    uint32_t remaining = elapsed < timeout_ms ? timeout_ms - elapsed : 0;
+    if (!await_transaction(t, remaining)) {
+        cancel_transaction(t);
+        if (resp_len) *resp_len = 0;
+        return false;
+    }
+    bool ok = t->result.success;
+    if (!capture->received) {
+        if (resp_len) *resp_len = 0;
+        release_ticket(t);
+        return false;
+    }
+    auto *payload = reinterpret_cast<uint8_t *>(capture + 1);
+
     // BDD baud switching (arbiter mode)
     if (ok && bdd) {
-        uint32_t new_baud = parse_bdd_baud(capture.payload,
-            min(capture.result.length, capture.result.capacity));
+        uint32_t new_baud = parse_bdd_baud(payload, min(capture->length, capture->capacity));
         if (new_baud && new_baud != current_baud) {
             uart->updateBaudRate(new_baud);
             Log::logf(CAT_ARB, LOG_INFO, "[ARB] BDD arbiter: baud %u -> %u\n",
@@ -1170,12 +1219,13 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
         }
     }
 
-    if (resp_buf && capture.result.length > 0) {
-        uint16_t copy_len = min(capture.result.length, output_capacity);
-        memcpy(resp_buf, capture.payload, copy_len);
+    if (resp_buf && capture->length > 0) {
+        uint16_t copy_len = min(capture->length, output_capacity);
+        memcpy(resp_buf, payload, copy_len);
         resp_buf[copy_len] = '\0';
     }
-    if (resp_len) *resp_len = capture.result.length;
+    if (resp_len) *resp_len = capture->length;
+    release_ticket(t);
     return ok;
 }
 

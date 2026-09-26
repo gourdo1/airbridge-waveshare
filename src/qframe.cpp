@@ -154,18 +154,21 @@ bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
 }
 
 
-int qframe_build(uint8_t type, const uint8_t *payload, uint16_t payload_len,
-                 uint8_t *out_buf, uint16_t out_buf_size)
-{
-    if (payload_len > QFRAME_MAX_PAYLOAD) return -1;
-
+int qframe_encoded_size(const uint8_t *payload, uint16_t payload_len) {
+    if (payload_len > QFRAME_MAX_PAYLOAD || (!payload && payload_len)) return -1;
     uint16_t esc_len = 0;
     for (uint16_t i = 0; i < payload_len; i++) {
         esc_len += (payload[i] == QFRAME_SYNC) ? 2 : 1;
     }
 
-    uint16_t total = 1 + 1 + 3 + esc_len + 4;
-    if (total > out_buf_size || total > 0xFFF) return -1;
+    return 1 + 1 + 3 + esc_len + 4;
+}
+
+int qframe_build(uint8_t type, const uint8_t *payload, uint16_t payload_len,
+                 uint8_t *out_buf, uint16_t out_buf_size)
+{
+    int total = qframe_encoded_size(payload, payload_len);
+    if (total < 0 || total > out_buf_size || total > 0xFFF) return -1;
 
     uint16_t pos = 0;
 

@@ -75,6 +75,7 @@ const qframe_t* qframe_parser_frame(const qframe_parser_t *p);
 
 int         qframe_build(uint8_t type, const uint8_t *payload, uint16_t payload_len,
                          uint8_t *out_buf, uint16_t out_buf_size);
+int         qframe_encoded_size(const uint8_t *payload, uint16_t payload_len);
 
 int         qframe_build_cmd(const char *cmd, uint8_t *out_buf, uint16_t out_buf_size);
 
