@@ -919,13 +919,13 @@ static bool write_identification() {
         content_len += static_cast<size_t>(line_len);
     }
     if (!built) {
-        heap_caps_free(content);
+        aircannect::Memory::free(content);
         if (!cancelled) post_error("Identification collection failed");
         return false;
     }
 
     if (post_processing_cancelled()) {
-        heap_caps_free(content);
+        aircannect::Memory::free(content);
         return false;
     }
 
@@ -942,7 +942,7 @@ static bool write_identification() {
     if (old_crc) old_crc.close();
     if (old_target) old_target.close();
     if (unchanged) {
-        heap_caps_free(content);
+        aircannect::Memory::free(content);
         portENTER_CRITICAL(&status_mux);
         status.identification_ready = true;
         portEXIT_CRITICAL(&status_mux);
@@ -966,7 +966,7 @@ static bool write_identification() {
         crc_file.flush();
         crc_file.close();
     }
-    heap_caps_free(content);
+    aircannect::Memory::free(content);
     if (!written || !publish_identification_pair()) {
         storage->remove("/Identification.tgt.part");
         storage->remove("/Identification.crc.part");
@@ -995,7 +995,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
     if (!read_stored_value("THD", session_native_day, therapy_duration) ||
         !therapy_duration.present || therapy_duration.sample_count != 1 ||
         therapy_duration.samples[0] <= 0) {
-        heap_caps_free(samples);
+        aircannect::Memory::free(samples);
         post_error("STR summary not ready");
         return false;
     }
@@ -1075,7 +1075,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         Air10Edf::render_numeric_record(schema, samples, sample_count,
                                         record, capacity, written) &&
         written == Air10Edf::record_size(schema);
-    heap_caps_free(samples);
+    aircannect::Memory::free(samples);
     if (!rendered && !post_processing_cancelled())
         post_error("STR record collection failed");
     return rendered;
@@ -1198,7 +1198,7 @@ static bool str_contains_day(const char *therapy_day) {
             present = valid_str_record(record, record_size, wanted_day);
         }
     }
-    if (record) heap_caps_free(record);
+    if (record) aircannect::Memory::free(record);
     file.close();
     return present;
 }
@@ -1237,8 +1237,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
     uint8_t *header = static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_size));
     uint8_t *work = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     if (!header || !work) {
-        if (header) heap_caps_free(header);
-        if (work) heap_caps_free(work);
+        if (header) aircannect::Memory::free(header);
+        if (work) aircannect::Memory::free(work);
         post_error("STR rewrite buffer allocation failed");
         return false;
     }
@@ -1302,14 +1302,14 @@ static bool update_str_file(const uint8_t *incoming_record) {
         }
         if (!valid) {
             input.close();
-            heap_caps_free(header);
-            heap_caps_free(work);
+            aircannect::Memory::free(header);
+            aircannect::Memory::free(work);
             if (!cancelled) post_error("existing STR validation failed");
             return false;
         }
     } else if (!Air10StrTimeline::begin(session_epoch_day, 0, scan)) {
-        heap_caps_free(header);
-        heap_caps_free(work);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         post_error("STR timeline initialization failed");
         return false;
     }
@@ -1319,8 +1319,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
         !render_str_header(plan.start_day, plan.record_count,
                            header, header_size)) {
         if (input) input.close();
-        heap_caps_free(header);
-        heap_caps_free(work);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         post_error("STR timeline range invalid");
         return false;
     }
@@ -1332,10 +1332,10 @@ static bool update_str_file(const uint8_t *incoming_record) {
         aircannect::Memory::alloc_large(plan.record_count));
     if (!timeline || !present || post_processing_cancelled()) {
         if (input) input.close();
-        if (timeline) heap_caps_free(timeline);
-        if (present) heap_caps_free(present);
-        heap_caps_free(header);
-        heap_caps_free(work);
+        if (timeline) aircannect::Memory::free(timeline);
+        if (present) aircannect::Memory::free(present);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         if (!post_processing_cancelled())
             post_error("STR timeline allocation failed");
         return false;
@@ -1375,10 +1375,10 @@ static bool update_str_file(const uint8_t *incoming_record) {
 
     if (input) input.close();
     if (post_processing_cancelled()) {
-        heap_caps_free(timeline);
-        heap_caps_free(present);
-        heap_caps_free(header);
-        heap_caps_free(work);
+        aircannect::Memory::free(timeline);
+        aircannect::Memory::free(present);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         return false;
     }
     storage->remove(PART);
@@ -1402,19 +1402,19 @@ static bool update_str_file(const uint8_t *incoming_record) {
 
     if (cancelled) {
         storage->remove(PART);
-        heap_caps_free(timeline);
-        heap_caps_free(present);
-        heap_caps_free(header);
-        heap_caps_free(work);
+        aircannect::Memory::free(timeline);
+        aircannect::Memory::free(present);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         return false;
     }
 
     if (!valid || !publish_single_file(PART, FINAL, BACKUP)) {
         storage->remove(PART);
-        heap_caps_free(timeline);
-        heap_caps_free(present);
-        heap_caps_free(header);
-        heap_caps_free(work);
+        aircannect::Memory::free(timeline);
+        aircannect::Memory::free(present);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         post_error("STR publish failed");
         return false;
     }
@@ -1424,10 +1424,10 @@ static bool update_str_file(const uint8_t *incoming_record) {
               plan.start_day, plan.end_day, plan.record_count,
               build_stats.filler_records, build_stats.replaced_records,
               build_stats.discarded_records);
-    heap_caps_free(timeline);
-    heap_caps_free(present);
-    heap_caps_free(header);
-    heap_caps_free(work);
+    aircannect::Memory::free(timeline);
+    aircannect::Memory::free(present);
+    aircannect::Memory::free(header);
+    aircannect::Memory::free(work);
     portENTER_CRITICAL(&status_mux);
     status.str_records = plan.record_count;
     portEXIT_CRITICAL(&status_mux);
@@ -1448,7 +1448,7 @@ static bool update_str_summary() {
                          read_u32_variable("ZEN", after) && before == after &&
                          !post_processing_cancelled() &&
                          update_str_file(record);
-    heap_caps_free(record);
+    aircannect::Memory::free(record);
     return success;
 }
 
@@ -1643,8 +1643,8 @@ static bool recover_partial_output(const char *partial_path) {
     if (input) input.close();
     if (output) output.close();
     if (crc_output) crc_output.close();
-    if (header) heap_caps_free(header);
-    if (buffer) heap_caps_free(buffer);
+    if (header) aircannect::Memory::free(header);
+    if (buffer) aircannect::Memory::free(buffer);
     if (!recovered) {
         storage->remove(edf_recovery_path);
         storage->remove(crc_recovery_path);
@@ -1771,7 +1771,7 @@ static bool reconcile_catalog() {
         } else if (!known_prefixes ||
                    !EdfCatalog::snapshot_prefixes(
                        known_prefixes, bytes, known_count)) {
-            if (known_prefixes) heap_caps_free(known_prefixes);
+            if (known_prefixes) aircannect::Memory::free(known_prefixes);
             known_prefixes = nullptr;
             known_count = 0;
         }
@@ -1779,7 +1779,7 @@ static bool reconcile_catalog() {
 
     fs::File root = storage->open("/DATALOG", FILE_READ);
     if (!root || !root.isDirectory()) {
-        if (known_prefixes) heap_caps_free(known_prefixes);
+        if (known_prefixes) aircannect::Memory::free(known_prefixes);
         return false;
     }
 
@@ -1836,7 +1836,7 @@ static bool reconcile_catalog() {
                 status_error("catalog reconciliation failed");
                 day.close();
                 root.close();
-                if (known_prefixes) heap_caps_free(known_prefixes);
+                if (known_prefixes) aircannect::Memory::free(known_prefixes);
                 return false;
             }
             if (known_prefixes && known_count < prefix_capacity) {
@@ -1851,7 +1851,7 @@ static bool reconcile_catalog() {
         day.close();
     }
     root.close();
-    if (known_prefixes) heap_caps_free(known_prefixes);
+    if (known_prefixes) aircannect::Memory::free(known_prefixes);
     return true;
 }
 
@@ -1984,7 +1984,7 @@ static bool initialize_accumulator(Accumulator &accumulator,
 
 static void release_accumulator(Accumulator &accumulator, bool remove_partial) {
     close_output(accumulator.output, remove_partial);
-    if (accumulator.samples) heap_caps_free(accumulator.samples);
+    if (accumulator.samples) aircannect::Memory::free(accumulator.samples);
     accumulator = {};
 }
 
@@ -2267,7 +2267,7 @@ static void clear_session_memory(bool remove_partial) {
     release_accumulator(sad, remove_partial);
     close_output(eve, remove_partial);
     close_output(csl, remove_partial);
-    if (header_buffer) heap_caps_free(header_buffer);
+    if (header_buffer) aircannect::Memory::free(header_buffer);
     header_buffer = nullptr;
     header_capacity = 0;
 }
@@ -2826,7 +2826,7 @@ void init() {
         if (raw_queue) vQueueDelete(raw_queue);
         if (control_queue) vQueueDelete(control_queue);
         raw_queue = control_queue = nullptr;
-        heap_caps_free(raw_queue_storage);
+        aircannect::Memory::free(raw_queue_storage);
         raw_queue_storage = nullptr;
         return;
     }
@@ -2837,7 +2837,7 @@ void init() {
         status_error("UART listener allocation failed");
         vQueueDelete(raw_queue); vQueueDelete(control_queue);
         raw_queue = control_queue = nullptr;
-        heap_caps_free(raw_queue_storage);
+        aircannect::Memory::free(raw_queue_storage);
         raw_queue_storage = nullptr;
         return;
     }
@@ -2853,7 +2853,7 @@ void init() {
         status_error("task creation failed");
         vQueueDelete(raw_queue); vQueueDelete(control_queue);
         raw_queue = control_queue = nullptr;
-        heap_caps_free(raw_queue_storage);
+        aircannect::Memory::free(raw_queue_storage);
         raw_queue_storage = nullptr;
         return;
     }
