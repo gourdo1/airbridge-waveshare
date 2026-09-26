@@ -2518,33 +2518,31 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
     session_native_day = day;
     uint8_t *identification = nullptr, *record = nullptr;
     size_t identification_size = 0;
-    bool success = collect_str_summary(record, generation);
-    if (success && record)
-        success = collect_identification(identification, identification_size);
+    bool success = collect_identification(identification, identification_size);
+    bool summary_ready = success && collect_str_summary(record, generation);
     success = success && !post_processing_cancelled() &&
         device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
     if (success && SdStorage::try_acquire()) {
-        if (record) {
-            success = write_identification(identification, identification_size) &&
-                      update_str_file(record);
-        }
+        success = write_identification(identification, identification_size);
+        if (success && summary_ready && record)
+            summary_ready = update_str_file(record);
         for (uint32_t i = 0; success && i < catalog.entries; i++) {
             EdfCatalog::Entry entry;
             success = !post_processing_cancelled() && EdfCatalog::read(i, entry);
             if (!success || strcmp(entry.therapy_day, day_text)) continue;
             const uint8_t old_flags = entry.flags;
             const bool latest_entry = !strcmp(entry.file_prefix, latest.file_prefix);
-            if (record) {
-                entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY |
-                               EdfCatalog::ENTRY_STR_READY;
+            entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY;
+            if (summary_ready && record) {
+                entry.flags |= EdfCatalog::ENTRY_STR_READY;
                 if (latest_entry) entry.str_revision++;
-                if (old_flags != entry.flags || latest_entry)
-                    success = EdfCatalog::commit(entry);
-                if (latest_entry) latest = entry;
             }
+            if (old_flags != entry.flags || (summary_ready && record && latest_entry))
+                success = EdfCatalog::commit(entry);
+            if (latest_entry) latest = entry;
             char path[80];
             pending_path(entry.file_prefix, path, sizeof(path));
-            if (success && storage->exists(path)) {
+            if (success && summary_ready && storage->exists(path)) {
                 success = storage->remove(path);
                 if (success) {
                     portENTER_CRITICAL(&status_mux);
@@ -2554,11 +2552,11 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
             }
         }
         SdStorage::release();
-        if (success && record) {
+        if (success && summary_ready && record) {
             summary_export_entry = latest;
             summary_export_pending = true;
         }
-        if (success && !record)
+        if (success && summary_ready && !record)
             Log::logf(CAT_EDF, LOG_INFO, "[EDF] no stored STR for day=%04X ZEN=%lu\n",
                       day, static_cast<unsigned long>(generation));
     } else {
@@ -2566,7 +2564,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
     }
     aircannect::Memory::free(identification);
     aircannect::Memory::free(record);
-    return success;
+    return success && summary_ready;
 }
 
 static void process_pending() {
