@@ -2,7 +2,7 @@
 #include "clinical_jobs.h"
 #include "settings_defs.h"
 #include "uart_arbiter.h"
-#include <esp_heap_caps.h>
+#include "memory_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +72,7 @@ enum Stage : uint8_t {
 Snapshot::~Snapshot() { reset(); }
 
 void Snapshot::reset() {
-    heap_caps_free(values_);
+    aircannect::Memory::free(values_);
     values_ = nullptr;
     count_ = 0;
     length_ = 0;
@@ -155,9 +155,7 @@ int collect(Snapshot &snapshot, bool report) {
     snapshot.count_ = report ? sizeof(REPORT_FIELDS) / sizeof(REPORT_FIELDS[0]) : layout(false);
     size_t bytes = snapshot.storage_bytes();
     if (bytes) {
-        snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!snapshot.values_)
-            snapshot.values_ = static_cast<Value *>(heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        snapshot.values_ = static_cast<Value *>(aircannect::Memory::alloc_large(bytes));
         if (!snapshot.values_) return fail("{\"error\":\"settings_allocation_failed\"}");
     }
     if (report) {

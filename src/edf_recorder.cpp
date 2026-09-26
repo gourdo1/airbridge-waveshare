@@ -26,6 +26,7 @@
 #include "edf_catalog.h"
 #include "export_sync.h"
 #include "live_stream.h"
+#include "memory_manager.h"
 #include "oxi_arbiter.h"
 #include "qframe.h"
 #include "sd_storage.h"
@@ -207,12 +208,6 @@ static bool post_processing_delay(uint32_t delay_ms) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     return !post_processing_cancelled();
-}
-
-static void *allocate_large(size_t bytes) {
-    void *ptr = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ptr) ptr = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-    return ptr;
 }
 
 static int hex_nibble_local(char c) {
@@ -925,7 +920,7 @@ static bool write_identification() {
         "SRN", "SID", "PNA", "PCD", "PCB", "MID", "FGT", "BID",
     };
     uint8_t *content = static_cast<uint8_t *>(
-        allocate_large(IDENTIFICATION_BUFFER_SIZE));
+        aircannect::Memory::alloc_large(IDENTIFICATION_BUFFER_SIZE));
     if (!content) {
         post_error("Identification buffer allocation failed");
         return false;
@@ -1026,7 +1021,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
     const Air10Edf::Schema &schema = Air10Edf::str_schema();
     const size_t sample_count = Air10Edf::numeric_sample_count(schema);
     int16_t *samples = static_cast<int16_t *>(
-        allocate_large(sample_count * sizeof(int16_t)));
+        aircannect::Memory::alloc_large(sample_count * sizeof(int16_t)));
     if (!samples) {
         post_error("STR sample allocation failed");
         return false;
@@ -1226,7 +1221,7 @@ static bool str_contains_day(const char *therapy_day) {
         return false;
     }
 
-    uint8_t *record = static_cast<uint8_t *>(allocate_large(record_size));
+    uint8_t *record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     bool present = false;
     if (record && file.seek(header_size) &&
         file.read(record, record_size) == record_size) {
@@ -1276,8 +1271,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
         post_error("incoming STR record invalid");
         return false;
     }
-    uint8_t *header = static_cast<uint8_t *>(allocate_large(header_size));
-    uint8_t *work = static_cast<uint8_t *>(allocate_large(record_size));
+    uint8_t *header = static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_size));
+    uint8_t *work = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     if (!header || !work) {
         if (header) heap_caps_free(header);
         if (work) heap_caps_free(work);
@@ -1369,9 +1364,9 @@ static bool update_str_file(const uint8_t *incoming_record) {
 
     const size_t timeline_size =
         static_cast<size_t>(plan.record_count) * record_size;
-    uint8_t *timeline = static_cast<uint8_t *>(allocate_large(timeline_size));
+    uint8_t *timeline = static_cast<uint8_t *>(aircannect::Memory::alloc_large(timeline_size));
     uint8_t *present = static_cast<uint8_t *>(
-        allocate_large(plan.record_count));
+        aircannect::Memory::alloc_large(plan.record_count));
     if (!timeline || !present || post_processing_cancelled()) {
         if (input) input.close();
         if (timeline) heap_caps_free(timeline);
@@ -1479,7 +1474,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
 static bool update_str_summary() {
     const size_t record_size =
         Air10Edf::record_size(Air10Edf::str_schema());
-    uint8_t *record = static_cast<uint8_t *>(allocate_large(record_size));
+    uint8_t *record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     if (!record) {
         post_error("STR record allocation failed");
         return false;
@@ -1608,8 +1603,8 @@ static bool recover_partial_output(const char *partial_path) {
             break;
         }
 
-        header = static_cast<uint8_t *>(allocate_large(header_size));
-        buffer = static_cast<uint8_t *>(allocate_large(RECOVERY_BUFFER_SIZE));
+        header = static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_size));
+        buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RECOVERY_BUFFER_SIZE));
         if (!header || !buffer) break;
         memcpy(header, fixed_header, sizeof(fixed_header));
         if (input.read(header + sizeof(fixed_header),
@@ -1805,12 +1800,8 @@ static bool reconcile_catalog() {
     if (prefix_capacity <= SIZE_MAX / 16) {
         const size_t bytes = prefix_capacity * 16;
         if (bytes) {
-            known_prefixes = static_cast<char *>(heap_caps_malloc(
-                bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-            if (!known_prefixes && bytes <= 16 * 1024) {
-                known_prefixes = static_cast<char *>(heap_caps_malloc(
-                    bytes, MALLOC_CAP_8BIT));
-            }
+            known_prefixes = static_cast<char *>(aircannect::Memory::alloc_large(
+                bytes, bytes <= 16 * 1024));
         }
         if (catalog.entries == 0) {
             known_count = 0;
@@ -2020,7 +2011,7 @@ static bool initialize_accumulator(Accumulator &accumulator,
     accumulator = {};
     accumulator.sample_count = Air10Edf::numeric_sample_count(schema);
     accumulator.samples = static_cast<int16_t *>(
-        allocate_large((accumulator.sample_count + 1) * sizeof(int16_t)));
+        aircannect::Memory::alloc_large((accumulator.sample_count + 1) * sizeof(int16_t)));
     if (!accumulator.samples) return false;
     memset(accumulator.samples, 0xFF,
            accumulator.sample_count * sizeof(int16_t));
@@ -2447,7 +2438,7 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
     header_capacity = Air10Edf::header_size(pld_schema);
     const size_t brp_header = Air10Edf::header_size(brp_schema);
     if (brp_header > header_capacity) header_capacity = brp_header;
-    header_buffer = static_cast<uint8_t *>(allocate_large(header_capacity));
+    header_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_capacity));
 
     if (!header_buffer) return false;
 
@@ -2852,13 +2843,12 @@ void init() {
     if (!storage_mutex) { status_error("storage mutex allocation failed"); return; }
 
     raw_queue_capacity = RAW_QUEUE_CAPACITY_PSRAM;
-    raw_queue_storage = static_cast<uint8_t *>(heap_caps_malloc(
-        sizeof(RawFrame) * raw_queue_capacity,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    raw_queue_storage = static_cast<uint8_t *>(aircannect::Memory::alloc_large(
+        sizeof(RawFrame) * raw_queue_capacity, false));
     if (!raw_queue_storage) {
         raw_queue_capacity = RAW_QUEUE_CAPACITY_FALLBACK;
-        raw_queue_storage = static_cast<uint8_t *>(heap_caps_malloc(
-            sizeof(RawFrame) * raw_queue_capacity, MALLOC_CAP_8BIT));
+        raw_queue_storage = static_cast<uint8_t *>(aircannect::Memory::alloc_large(
+            sizeof(RawFrame) * raw_queue_capacity));
     }
     if (!raw_queue_storage) {
         status_error("raw queue allocation failed");

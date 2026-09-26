@@ -5,9 +5,9 @@
 #include "qframe.h"
 #include "uart_arbiter.h"
 #include "clinical_jobs.h"
+#include "memory_manager.h"
 
 #include <Arduino.h>
-#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <string.h>
@@ -83,23 +83,10 @@ bool language_known = false;
 uint32_t invalidation_generation = 1;
 uint32_t loaded_generation = 0;
 
-void *cache_alloc(size_t bytes, bool zero = false) {
-    if (bytes == 0) return nullptr;
-    void *ptr = zero
-        ? heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-        : heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ptr) {
-        ptr = zero
-            ? heap_caps_calloc(1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
-            : heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    return ptr;
-}
-
 void clear_allocations(Metadata &data) {
-    if (data.entries) heap_caps_free(data.entries);
-    if (data.options) heap_caps_free(data.options);
-    if (data.text_pool) heap_caps_free(data.text_pool);
+    aircannect::Memory::free(data.entries);
+    aircannect::Memory::free(data.options);
+    aircannect::Memory::free(data.text_pool);
     data.entries = nullptr;
     data.options = nullptr;
     data.text_pool = nullptr;
@@ -108,12 +95,6 @@ void clear_allocations(Metadata &data) {
     data.option_capacity = 0;
     data.text_size = 0;
     data.text_capacity = 0;
-}
-
-void *cache_resize(void *ptr, size_t bytes) {
-    void *resized = heap_caps_realloc(ptr, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return resized ? resized
-        : heap_caps_realloc(ptr, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 bool reset_cache_locked(cache_state_t state) {
@@ -135,7 +116,7 @@ bool reserve_text_locked(uint16_t required) {
     if (next > UINT16_MAX) next = UINT16_MAX;
     if (next < required) return false;
 
-    char *replacement = static_cast<char *>(cache_resize(current->text_pool, next));
+    char *replacement = static_cast<char *>(aircannect::Memory::realloc_large(current->text_pool, next));
     if (!replacement) return false;
     current->text_pool = replacement;
     current->text_capacity = (uint16_t)next;
@@ -162,7 +143,7 @@ bool reserve_options_locked(uint16_t required) {
     if (next > UINT16_MAX) return false;
 
     cached_option_t *replacement = static_cast<cached_option_t *>(
-        cache_resize(current->options, next * sizeof(cached_option_t)));
+        aircannect::Memory::realloc_large(current->options, next * sizeof(cached_option_t)));
     if (!replacement) return false;
     current->options = replacement;
     current->option_capacity = (uint16_t)next;
@@ -329,7 +310,7 @@ bool discover_locked() {
     }
 
     current->entries = static_cast<cached_entry_t *>(
-        cache_alloc(header.count * sizeof(cached_entry_t), true));
+        aircannect::Memory::calloc_large(header.count, sizeof(cached_entry_t)));
     if (!current->entries) return fail("entry allocation");
     current->entry_count = header.count;
     uint32_t initial_text = 1u + (uint32_t)header.count * 64u;
@@ -400,14 +381,14 @@ bool discover_locked() {
     }
 
     if (current->text_size < current->text_capacity) {
-        char *text = static_cast<char *>(cache_resize(current->text_pool, current->text_size));
+        char *text = static_cast<char *>(aircannect::Memory::realloc_large(current->text_pool, current->text_size));
         if (text) {
             current->text_pool = text;
             current->text_capacity = current->text_size;
         }
     }
     if (current->option_count && current->option_count < current->option_capacity) {
-        auto *options = static_cast<cached_option_t *>(cache_resize(
+        auto *options = static_cast<cached_option_t *>(aircannect::Memory::realloc_large(
             current->options, current->option_count * sizeof(cached_option_t)));
         if (options) {
             current->options = options;

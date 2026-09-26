@@ -155,8 +155,7 @@ static void handleJsonBody(AsyncWebServerRequest *request, uint8_t *data, size_t
     auto *body = static_cast<JsonBody *>(request->_tempObject);
     if (!body && index == 0) {
         size_t bytes = sizeof(JsonBody) + total + 1;
-        body = static_cast<JsonBody *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!body) body = static_cast<JsonBody *>(malloc(bytes));
+        body = static_cast<JsonBody *>(aircannect::Memory::alloc_large(bytes));
         if (!body) {
             request->send(503, "application/json", "{\"error\":\"body_allocation_failed\"}");
             return;

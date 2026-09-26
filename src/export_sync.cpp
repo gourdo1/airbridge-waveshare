@@ -509,12 +509,10 @@ static bool run_smb(const Request &request) {
     }
 
     size_t buffer_size = UPLOAD_BUFFER_PSRAM;
-    uint8_t *buffer = static_cast<uint8_t *>(heap_caps_malloc(
-        buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint8_t *buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(buffer_size, false));
     if (!buffer) {
         buffer_size = UPLOAD_BUFFER_FALLBACK;
-        buffer = static_cast<uint8_t *>(heap_caps_malloc(
-            buffer_size, MALLOC_CAP_8BIT));
+        buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(buffer_size));
     }
     if (!buffer) {
         set_state(State::Error, "upload_buffer_alloc");

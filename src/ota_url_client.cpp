@@ -1,5 +1,6 @@
 #include "ota_url_client.h"
 #include "debug_log.h"
+#include "memory_manager.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -164,10 +165,7 @@ esp_err_t fetch_event(esp_http_client_event_t *event) {
             return ESP_FAIL;
         }
         ctx.expected_size = (size_t)length;
-        ctx.buffer = (uint8_t *)heap_caps_malloc(
-            ctx.expected_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!ctx.buffer)
-            ctx.buffer = (uint8_t *)heap_caps_malloc(ctx.expected_size, MALLOC_CAP_8BIT);
+        ctx.buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(ctx.expected_size));
         if (!ctx.buffer) {
             set_error(*ctx.error, "manifest_alloc_failed");
             return ESP_FAIL;

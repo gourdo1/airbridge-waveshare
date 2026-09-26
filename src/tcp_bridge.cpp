@@ -4,6 +4,7 @@
 #include "app_config.h"
 #include "build_info.h"
 #include "live_stream.h"
+#include "memory_manager.h"
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <WiFiClient.h>
@@ -48,11 +49,7 @@ static uint8_t framed_stream_count = 0;
 static bool framed_queue_init() {
     size_t bytes = FRAMED_TX_DEPTH * sizeof(qframe_t);
     framed_tx_storage = static_cast<uint8_t *>(
-        heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!framed_tx_storage) {
-        framed_tx_storage = static_cast<uint8_t *>(
-            heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
-    }
+        aircannect::Memory::alloc_large(bytes));
     if (!framed_tx_storage) return false;
 
     framed_tx_queue = xQueueCreateStatic(FRAMED_TX_DEPTH, sizeof(qframe_t),
