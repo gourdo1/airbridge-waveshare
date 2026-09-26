@@ -1198,7 +1198,7 @@ static bool str_contains_day(const char *therapy_day) {
             present = valid_str_record(record, record_size, wanted_day);
         }
     }
-    if (record) aircannect::Memory::free(record);
+    aircannect::Memory::free(record);
     file.close();
     return present;
 }
@@ -1237,8 +1237,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
     uint8_t *header = static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_size));
     uint8_t *work = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     if (!header || !work) {
-        if (header) aircannect::Memory::free(header);
-        if (work) aircannect::Memory::free(work);
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
         post_error("STR rewrite buffer allocation failed");
         return false;
     }
@@ -1332,8 +1332,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
         aircannect::Memory::alloc_large(plan.record_count));
     if (!timeline || !present || post_processing_cancelled()) {
         if (input) input.close();
-        if (timeline) aircannect::Memory::free(timeline);
-        if (present) aircannect::Memory::free(present);
+        aircannect::Memory::free(timeline);
+        aircannect::Memory::free(present);
         aircannect::Memory::free(header);
         aircannect::Memory::free(work);
         if (!post_processing_cancelled())
@@ -1643,8 +1643,8 @@ static bool recover_partial_output(const char *partial_path) {
     if (input) input.close();
     if (output) output.close();
     if (crc_output) crc_output.close();
-    if (header) aircannect::Memory::free(header);
-    if (buffer) aircannect::Memory::free(buffer);
+    aircannect::Memory::free(header);
+    aircannect::Memory::free(buffer);
     if (!recovered) {
         storage->remove(edf_recovery_path);
         storage->remove(crc_recovery_path);
@@ -1771,7 +1771,7 @@ static bool reconcile_catalog() {
         } else if (!known_prefixes ||
                    !EdfCatalog::snapshot_prefixes(
                        known_prefixes, bytes, known_count)) {
-            if (known_prefixes) aircannect::Memory::free(known_prefixes);
+            aircannect::Memory::free(known_prefixes);
             known_prefixes = nullptr;
             known_count = 0;
         }
@@ -1779,7 +1779,7 @@ static bool reconcile_catalog() {
 
     fs::File root = storage->open("/DATALOG", FILE_READ);
     if (!root || !root.isDirectory()) {
-        if (known_prefixes) aircannect::Memory::free(known_prefixes);
+        aircannect::Memory::free(known_prefixes);
         return false;
     }
 
@@ -1836,7 +1836,7 @@ static bool reconcile_catalog() {
                 status_error("catalog reconciliation failed");
                 day.close();
                 root.close();
-                if (known_prefixes) aircannect::Memory::free(known_prefixes);
+                aircannect::Memory::free(known_prefixes);
                 return false;
             }
             if (known_prefixes && known_count < prefix_capacity) {
@@ -1851,7 +1851,7 @@ static bool reconcile_catalog() {
         day.close();
     }
     root.close();
-    if (known_prefixes) aircannect::Memory::free(known_prefixes);
+    aircannect::Memory::free(known_prefixes);
     return true;
 }
 
@@ -1984,7 +1984,7 @@ static bool initialize_accumulator(Accumulator &accumulator,
 
 static void release_accumulator(Accumulator &accumulator, bool remove_partial) {
     close_output(accumulator.output, remove_partial);
-    if (accumulator.samples) aircannect::Memory::free(accumulator.samples);
+    aircannect::Memory::free(accumulator.samples);
     accumulator = {};
 }
 
@@ -2267,7 +2267,7 @@ static void clear_session_memory(bool remove_partial) {
     release_accumulator(sad, remove_partial);
     close_output(eve, remove_partial);
     close_output(csl, remove_partial);
-    if (header_buffer) aircannect::Memory::free(header_buffer);
+    aircannect::Memory::free(header_buffer);
     header_buffer = nullptr;
     header_capacity = 0;
 }
