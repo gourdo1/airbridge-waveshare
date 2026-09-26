@@ -6,6 +6,7 @@
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
+#include "device_status.h"
 #include "build_info.h"
 #include "airbridge_ota.h"
 #include <esp_partition.h>
@@ -46,25 +47,21 @@ void dispatch_command(const char *line, String &response) {
     upper.toUpperCase();
 
     if (upper == "STATUS") {
-        system_state_t sys = Arbiter::get_state();
-        oxi_state_t oxi = OxiBle::get_state();
-        oxi_reading_t r;
-        OxiArbiter::snapshot(r);
-
-        Config::refresh_device_info();
+        const auto status = DeviceStatus::snapshot();
+        const auto &r = status.reading;
         auto &cfg = Config::get();
 
         response.reserve(512);
-        response = "system: " + String(system_state_name(sys)) + "\n";
+        response = "system: " + String(system_state_name(status.sys)) + "\n";
         if (!cfg.device_pna.isEmpty())
             response += "device: " + cfg.device_pna + " (" + cfg.device_srn + ")\n";
-        response += "oxi: " + String(oxi_state_name(oxi)) + "\n";
+        response += "oxi: " + String(oxi_state_name(status.oxi)) + "\n";
         if (r.valid) {
             response += "spo2: " + String(r.spo2) + "%\n";
             response += "pulse: " + String(r.pulse_bpm) + " bpm\n";
             response += "age: " + String((millis() - r.timestamp_ms) / 1000) + "s\n";
         }
-        response += "feeding: " + String(OxiArbiter::is_feeding() ? "yes" : "no") + "\n";
+        response += "feeding: " + String(status.feeding ? "yes" : "no") + "\n";
         response += "log_level: " + String(Log::level_name(Log::get_level())) + "\n";
         response += "uart_baud: " + String(Arbiter::get_baud()) + "\n";
         response += "uart_tx: " + String(Arbiter::get_tx_count()) + "\n";

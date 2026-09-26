@@ -1,4 +1,5 @@
 #include "web_ui.h"
+#include "device_status.h"
 #include "web_ui_generated.h"
 #include "uart_arbiter.h"
 #include "oxi_ble.h"
@@ -260,9 +261,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
     if (!out || cap == 0) return 0;
     out[0] = '\0';
 
-    oxi_state_t oxi = OxiBle::get_state();
-    oxi_reading_t r;
-    OxiArbiter::snapshot(r);
+    const auto status = DeviceStatus::snapshot();
+    const auto &r = status.reading;
 #if AB_STORAGE_HAS_SDCARD
     SdStorage::Status sd;
     SdStorage::get_status(sd);
@@ -275,10 +275,6 @@ static size_t buildStatusJson(char *out, size_t cap) {
     ExportSync::SleepHqStatus sleephq_status;
     ExportSync::get_sleephq_status(sleephq_status);
 #endif
-
-    int rop = Arbiter::get_cached_rop();
-    int mhr = Arbiter::get_cached_mhr();
-    system_state_t sys = Arbiter::get_state();
 
     auto &cfg = Config::get();
 
@@ -299,19 +295,19 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonPut(json, '{');
     fixedJsonAddString(json, "version", airbridge_version(), false);
     fixedJsonAddString(json, "built", airbridge_build_date());
-    fixedJsonAddString(json, "system", system_state_name(sys));
-    fixedJsonAddInt(json, "rop", rop);
+    fixedJsonAddString(json, "system", system_state_name(status.sys));
+    fixedJsonAddInt(json, "rop", status.rop);
     fixedJsonAddString(json, "pna", cfg.device_pna.c_str());
     fixedJsonAddString(json, "srn", cfg.device_srn.c_str());
     fixedJsonAddString(json, "esp_time", esp_time);
     fixedJsonAddString(json, "resmed_time", resmed_time);
-    fixedJsonAddString(json, "oxi", oxi_state_name(oxi));
-    fixedJsonAddString(json, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
+    fixedJsonAddString(json, "oxi", oxi_state_name(status.oxi));
+    fixedJsonAddString(json, "feeding", status.feeding ? "yes" : "no");
     fixedJsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
     fixedJsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
     fixedJsonAddInt(json, "heap", ESP.getFreeHeap());
     fixedJsonAddInt(json, "rssi", WiFi.RSSI());
-    fixedJsonAddInt(json, "mhr", mhr);
+    fixedJsonAddInt(json, "mhr", status.mhr);
     fixedJsonAddInt(json, "uptime", millis() / 1000);
 #if AB_STORAGE_HAS_SDCARD
     fixedJsonAddString(json, "sd", !sd.supported ? "unsupported" :
@@ -1524,23 +1520,20 @@ void WebUI::init(uint16_t port) {
     Log::logf(CAT_WEB, LOG_INFO, "[WEB] HTTP server on port %d\n", port);
 }
 
-static String build_status_payload() {
-    system_state_t sys = Arbiter::get_state();
-    oxi_state_t oxi = OxiBle::get_state();
-    oxi_reading_t r;
-    OxiArbiter::snapshot(r);
+static String build_status_payload(const DeviceStatus::Snapshot &status) {
+    const auto &r = status.reading;
 
     String sj;
     sj.reserve(256);
     sj = "{";
-    jsonAddString(sj, "system", system_state_name(sys), false);
-    jsonAddInt(sj, "rop", Arbiter::get_cached_rop());
-    jsonAddInt(sj, "mhr", Arbiter::get_cached_mhr());
-    jsonAddString(sj, "oxi", oxi_state_name(oxi));
+    jsonAddString(sj, "system", system_state_name(status.sys), false);
+    jsonAddInt(sj, "rop", status.rop);
+    jsonAddInt(sj, "mhr", status.mhr);
+    jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
     char oxi_addr[32];
     OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
     jsonAddString(sj, "oxi_addr", oxi_addr);
-    jsonAddString(sj, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
+    jsonAddString(sj, "feeding", status.feeding ? "yes" : "no");
     jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
     jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
     jsonAddInt(sj, "heap", ESP.getFreeHeap());
@@ -1561,15 +1554,15 @@ struct PublishedStatusSnapshot {
 };
 static PublishedStatusSnapshot last_published;
 
-static PublishedStatusSnapshot current_snapshot() {
+static PublishedStatusSnapshot current_snapshot(
+        const DeviceStatus::Snapshot &status = DeviceStatus::snapshot()) {
     PublishedStatusSnapshot s;
-    s.rop     = Arbiter::get_cached_rop();
-    s.mhr     = Arbiter::get_cached_mhr();
-    s.sys     = Arbiter::get_state();
-    s.oxi     = OxiBle::get_state();
-    s.feeding = OxiArbiter::is_feeding();
-    oxi_reading_t r;
-    OxiArbiter::snapshot(r);
+    s.rop     = status.rop;
+    s.mhr     = status.mhr;
+    s.sys     = status.sys;
+    s.oxi     = status.oxi;
+    s.feeding = status.feeding;
+    const auto &r = status.reading;
     s.spo2    = r.valid ? r.spo2 : -1;
     s.pulse   = r.valid ? r.pulse_bpm : -1;
     return s;
@@ -1590,9 +1583,10 @@ static uint32_t last_status_push = 0;
 
 void WebUI::push_status_event() {
     if (!events || events->count() == 0) return;
-    last_published = current_snapshot();
+    const auto status = DeviceStatus::snapshot();
+    last_published = current_snapshot(status);
     last_status_push = millis();
-    String sj = build_status_payload();
+    String sj = build_status_payload(status);
     events->send(sj.c_str(), "status", millis());
 }
 
