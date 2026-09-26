@@ -939,6 +939,7 @@ async function setupMove(direction, skip = false) {
       }
       if (setupStep === 'access') {
         const changes = skip ? {} : collectConfigChanges(root);
+        if (!confirmAccessChange(root, changes)) return;
         // Do not issue authenticated background requests across a login change.
         if (evtSrc) { evtSrc.close(); evtSrc = null; }
         const r = await api('/api/onboarding', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
@@ -1517,6 +1518,13 @@ function renderConfigFields(root, d) {
   }
 }
 
+function confirmAccessChange(root, changes) {
+  if (!Object.hasOwn(changes, 'http_user') && !Object.hasOwn(changes, 'http_pass')) return true;
+  const user = root.querySelector('[data-key="http_user"]');
+  if (!user || user.value || changes.http_pass) return true;
+  return confirm('An empty username and password disable Web UI authentication. Save these access settings?');
+}
+
 function collectConfigChanges(root) {
   const changes = {};
   const fields = root.querySelectorAll('[data-key]');
@@ -1577,6 +1585,7 @@ async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
   const fields = root.querySelectorAll('[data-key]');
   const msgEl = document.getElementById(messageId);
   if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return true; }
+  if (!confirmAccessChange(root, changes)) return false;
   root.dataset.saving = '1';
   try {
     const r = await api('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
