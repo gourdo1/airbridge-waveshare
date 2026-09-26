@@ -5,6 +5,7 @@ namespace WiFiSetup {
     bool init();
     void check();
     void request_reconfigure(bool network, bool clock);
+    void profiles_changed();
     bool is_connected();
     bool time_synced();
     bool set_fallback_time(int year, int month, int day, int hour, int min, int sec, bool force = false);

@@ -1520,7 +1520,7 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
         }
     }
 
-    if (ok) WiFiSetup::request_reconfigure(true, false);
+    if (ok) WiFiSetup::profiles_changed();
 
     String json = "{";
     jsonAddString(json, "ok", ok ? "true" : "false", false);

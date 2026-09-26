@@ -523,6 +523,10 @@ void WiFiSetup::request_reconfigure(bool network, bool clock) {
                                  std::memory_order_release);
 }
 
+void WiFiSetup::profiles_changed() {
+    reconfigure_pending.fetch_or(4, std::memory_order_release);
+}
+
 static void apply_network_config() {
     const auto &cfg = Config::get();
     if (wf_state == WF_SMARTCONFIG) WiFi.stopSmartConfig();
@@ -564,16 +568,43 @@ static void apply_network_config() {
     sta_disconnected = false;
     for (uint8_t i = 0; i < cfg.wifi_net_count; i++) {
         if (!cfg.wifi_nets[i].enabled) continue;
-        begin_connect(i, false);
+        start_scan();
+        set_state(WF_SCANNING);
         return;
     }
     enter_ap_fallback();
+}
+
+static void apply_profile_changes() {
+    wifi_config_t current = {};
+    if (WiFi.status() == WL_CONNECTED &&
+        esp_wifi_get_config(WIFI_IF_STA, &current) == ESP_OK) {
+        const auto &cfg = Config::get();
+        const size_t ssid_len = strnlen(reinterpret_cast<const char *>(current.sta.ssid),
+                                        sizeof(current.sta.ssid));
+        const size_t pass_len = strnlen(reinterpret_cast<const char *>(current.sta.password),
+                                        sizeof(current.sta.password));
+        for (uint8_t i = 0; i < cfg.wifi_net_count; i++) {
+            const auto &net = cfg.wifi_nets[i];
+            if (!net.enabled || net.ssid.length() != ssid_len || net.pass.length() != pass_len ||
+                memcmp(net.ssid.c_str(), current.sta.ssid, ssid_len) ||
+                memcmp(net.pass.c_str(), current.sta.password, pass_len)) continue;
+            connect_idx = i;
+            if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
+            clear_scan();
+            scan_candidate_count = 0;
+            set_state(WF_CONNECTED);
+            return;
+        }
+    }
+    apply_network_config();
 }
 
 void WiFiSetup::check() {
     if (!roaming_suspended) {
         const uint8_t pending = reconfigure_pending.exchange(0, std::memory_order_acq_rel);
         if (pending & 1) apply_network_config();
+        else if (pending & 4) apply_profile_changes();
         if (pending & 2) {
             const auto &cfg = Config::get();
             setenv("TZ", cfg.tz.isEmpty() ? "UTC0" : cfg.tz.c_str(), 1);
