@@ -141,7 +141,6 @@ static bool storage_ready = false;
 static uint32_t next_storage_ms = 0;
 
 static fs::FS *storage = nullptr;
-static SemaphoreHandle_t storage_mutex = nullptr;
 static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
 static char pending_cursor[16] = {};
@@ -166,6 +165,35 @@ static char recording_id[81] = {};
 static char start_date[9] = {};
 static char start_time[9] = {};
 static char session_directory[40] = {};
+static Progress *progress = nullptr;
+static bool progress_live = false;
+
+static void publish_progress(bool active, bool new_segment = false) {
+    if (!progress) return;
+    Progress next = {};
+    next.active = active;
+    if (active) {
+        memcpy(next.directory, session_directory, sizeof(next.directory));
+        memcpy(next.prefix, status.file_prefix, sizeof(next.prefix));
+        memcpy(next.recording_id, recording_id, sizeof(next.recording_id));
+        memcpy(next.start_date, start_date, sizeof(next.start_date));
+        memcpy(next.start_time, start_time, sizeof(next.start_time));
+        size_t index = 0;
+        for (const OutputFile *file : {&brp.output, &pld.output, &sad.output, &eve, &csl}) {
+            FileProgress &out = next.files[index++];
+            if (!file->open || file->failed || !file->schema) continue;
+            out.schema = file->schema;
+            out.records = file->records;
+            out.readable_bytes = file->records ? Air10Edf::header_size(*file->schema) +
+                uint64_t(file->records) * Air10Edf::record_size(*file->schema) : 0;
+        }
+    }
+    portENTER_CRITICAL(&status_mux);
+    next.revision = progress->revision + 1;
+    next.segment = progress->segment + (new_segment ? 1 : 0);
+    *progress = next;
+    portEXIT_CRITICAL(&status_mux);
+}
 static uint16_t session_epoch_day = 0;
 static uint16_t session_mid = 0;
 static uint16_t session_vid = 0;
@@ -1907,11 +1935,13 @@ static bool append_output_record(OutputFile &output,
         output.file.close();
         output.open = false;
         status_error("SD record write failed", output.schema->suffix);
+        if (progress_live) publish_progress(true);
         return false;
     }
     output.rest_crc = crc32_ieee_update(output.rest_crc, data, len);
     output.records++;
     output.file.flush();
+    if (progress_live) publish_progress(true);
     return true;
 }
 
@@ -2467,7 +2497,7 @@ static void start_session(const ControlEvent &event) {
     const uint32_t mask_on_ms = therapy_on_capture_ms;
     portEXIT_CRITICAL(&status_mux);
     if (int32_t(event.captured_ms - mask_on_ms) < 0) return;
-    if (!acquire_storage()) {
+    if (!SdStorage::acquire()) {
         status_error("storage busy at recording start");
         return;
     }
@@ -2479,7 +2509,7 @@ static void start_session(const ControlEvent &event) {
     portEXIT_CRITICAL(&status_mux);
     if (!make_paths_and_metadata(event, mid, vid)) {
         recording_storage_owned = false;
-        release_storage();
+        SdStorage::release();
         return;
     }
     resolve_schemas(mid, vid);
@@ -2494,7 +2524,7 @@ static void start_session(const ControlEvent &event) {
         status_error("session buffer or file initialization failed");
         clear_session_memory(true);
         recording_storage_owned = false;
-        release_storage();
+        SdStorage::release();
         return;
     }
 
@@ -2506,7 +2536,7 @@ static void start_session(const ControlEvent &event) {
         clear_session_memory(true);
         discard_pending();
         recording_storage_owned = false;
-        release_storage();
+        SdStorage::release();
         return;
     }
 
@@ -2527,6 +2557,8 @@ static void start_session(const ControlEvent &event) {
 
     strcpy(wave_tag, "TCE");
     capture_active = true;
+    progress_live = true;
+    publish_progress(true, true);
     acquire_streams();
     Log::logf(CAT_EDF, LOG_INFO,
               "[EDF] recording %s/%s MID=%u VID=%u\n",
@@ -2544,6 +2576,8 @@ static void update_record_status() {
 }
 
 static void close_segment(uint32_t ended_ms, bool rollover, bool known_end = true) {
+    progress_live = false;
+    publish_progress(false);
     bool complete = !known_end || save_pending(true, ended_ms, rollover);
     complete = write_current_record(brp) && complete;
     complete = write_current_record(pld) && complete;
@@ -2598,12 +2632,14 @@ static bool advance_segment(uint32_t captured_ms) {
         portENTER_CRITICAL(&status_mux);
         status.active = false;
         portEXIT_CRITICAL(&status_mux);
-        if (recording_storage_owned) release_storage();
+        if (recording_storage_owned) SdStorage::release();
         recording_storage_owned = false;
         status_error("noon segment initialization failed");
         return false;
     }
     reset_session_state(event, true);
+    progress_live = true;
+    publish_progress(true, true);
     Log::logf(CAT_EDF, LOG_INFO, "[EDF] noon rollover %s/%s\n",
               status.therapy_day, status.file_prefix);
     return true;
@@ -2629,7 +2665,7 @@ static void stop_session(const ControlEvent &event) {
     status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
     SdStorage::refresh_usage();
-    if (recording_storage_owned) release_storage();
+    if (recording_storage_owned) SdStorage::release();
     recording_storage_owned = false;
     next_pending_ms = 0;
     next_start_ms = 0;
@@ -2637,9 +2673,10 @@ static void stop_session(const ControlEvent &event) {
 
 static void process_pending() {
     if (status.active || post_processing_cancelled() ||
+        (next_pending_ms && !status.pending_str) ||
         Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0 ||
         (next_pending_ms && int32_t(millis() - next_pending_ms) < 0) ||
-        !acquire_storage()) return;
+        !SdStorage::acquire()) return;
     next_pending_ms = millis() + 30000;
     EdfPending::Record selected;
     char selected_path[80] = {};
@@ -2709,7 +2746,7 @@ static void process_pending() {
     status.post_processing = false;
     if (success && status.pending_str) status.pending_str--;
     portEXIT_CRITICAL(&status_mux);
-    release_storage();
+    SdStorage::release();
     if (success) {
         next_pending_ms = 0;
         (void)ExportSync::request_post_therapy(entry);
@@ -2722,8 +2759,8 @@ static bool prepare_storage() {
     const system_state_t state = Arbiter::get_state();
     if (state != SYS_IDLE && state != SYS_THERAPY) return false;
     next_storage_ms = millis() + 5000;
-    if (!acquire_storage()) return false;
-    SdStorage::init();
+    if (!SdStorage::mounted()) SdStorage::init();
+    if (!SdStorage::acquire()) return false;
     storage = SdStorage::filesystem();
     if (storage) {
         recover_partial_outputs();
@@ -2737,7 +2774,7 @@ static bool prepare_storage() {
             storage_ready = reconcile_catalog();
         }
     }
-    release_storage();
+    SdStorage::release();
     if (storage_ready) ExportSync::init();
     return storage_ready;
 }
@@ -2802,8 +2839,11 @@ static void recorder_task(void *) {
 
 void init() {
     if (status.ready) return;
-    if (!storage_mutex) storage_mutex = xSemaphoreCreateMutex();
-    if (!storage_mutex) { status_error("storage mutex allocation failed"); return; }
+    if (!progress) {
+        progress = static_cast<Progress *>(aircannect::Memory::alloc_large(sizeof(Progress)));
+        if (!progress) { status_error("progress allocation failed"); return; }
+        *progress = {};
+    }
 
     raw_queue_capacity = RAW_QUEUE_CAPACITY_PSRAM;
     raw_queue_storage = static_cast<uint8_t *>(aircannect::Memory::alloc_large(
@@ -2906,11 +2946,12 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
-bool acquire_storage() {
-    return storage_mutex && xSemaphoreTake(storage_mutex, 0) == pdTRUE;
+void get_progress(Progress &out) {
+    portENTER_CRITICAL(&status_mux);
+    out = progress ? *progress : Progress{};
+    portEXIT_CRITICAL(&status_mux);
 }
 
-void release_storage() { xSemaphoreGive(storage_mutex); }
 
 }  // namespace EdfRecorder
 
@@ -2919,10 +2960,9 @@ void release_storage() { xSemaphoreGive(storage_mutex); }
 namespace EdfRecorder {
 
 void init() {}
-bool acquire_storage() { return true; }
-void release_storage() {}
 void therapy_started() {}
 void therapy_ended() {}
+void get_progress(Progress &out) { out = {}; }
 
 void get_status(Status &out) {
     out = {};

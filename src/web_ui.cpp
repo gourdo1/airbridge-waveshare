@@ -13,6 +13,7 @@
 #include "live_web_consumer.h"
 #include "crc.h"
 #include "sd_storage.h"
+#include "storage_browser.h"
 #include "edf_recorder.h"
 #include "edf_catalog.h"
 #include "export_sync.h"
@@ -1606,6 +1607,99 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
     request->send(200, "application/json", json);
 }
 
+#if AB_STORAGE_HAS_SDCARD
+class StorageResponse : public AsyncAbstractResponse {
+public:
+    StorageResponse(std::shared_ptr<StorageBrowser::Transfer> transfer,
+                    StorageBrowser::Kind kind, uint64_t size) : transfer_(std::move(transfer)) {
+        _code = 200;
+        _contentType = kind == StorageBrowser::Kind::List ? "application/json" :
+            kind == StorageBrowser::Kind::Archive ? "application/zip" : "application/octet-stream";
+        _contentLength = size;
+        _chunked = kind == StorageBrowser::Kind::Archive;
+        _sendContentLength = !_chunked;
+    }
+    ~StorageResponse() override { transfer_->cancel(); }
+    bool _sourceValid() const override { return !transfer_->failed(); }
+    size_t _fillBuffer(uint8_t *out, size_t capacity) override {
+        const size_t count = transfer_->read(out, capacity);
+        return count || transfer_->finished() ? count : RESPONSE_TRY_AGAIN;
+    }
+private:
+    std::shared_ptr<StorageBrowser::Transfer> transfer_;
+};
+
+static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind) {
+    if (!checkAuth(request)) return;
+    StorageBrowser::Request operation = {};
+    operation.kind = kind;
+    const String path = request->hasParam("path") ? request->getParam("path")->value() : "/";
+    if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path)) {
+        request->send(400, "application/json", "{\"error\":\"path_too_long\"}");
+        return;
+    }
+    strcpy(operation.path, path.c_str());
+    if (request->hasParam("offset")) {
+        const String value = request->getParam("offset")->value();
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long offset = strtoul(value.c_str(), &end, 10);
+        if (!value.length() || value[0] == '-' || errno || *end || offset > UINT32_MAX) {
+            request->send(400, "application/json", "{\"error\":\"invalid_offset\"}");
+            return;
+        }
+        operation.offset = offset;
+    }
+    size_t length = 0;
+    for (size_t i = 0; i < request->params(); i++) {
+        const auto *param = request->getParam(i);
+        if (param->name() != "item") continue;
+        const String &name = param->value();
+        if (name.isEmpty() || name.indexOf('\n') >= 0 ||
+            length + name.length() + 2 > sizeof(operation.selection)) {
+            request->send(400, "application/json", "{\"error\":\"invalid_selection\"}");
+            return;
+        }
+        if (length) operation.selection[length++] = '\n';
+        memcpy(operation.selection + length, name.c_str(), name.length() + 1);
+        length += name.length();
+    }
+    String disposition;
+    if (kind != StorageBrowser::Kind::List) {
+        disposition = "attachment; filename*=UTF-8''";
+        const char *name = kind == StorageBrowser::Kind::Archive ? "airbridge.zip" : strrchr(path.c_str(), '/') + 1;
+        for (; *name; name++) {
+            char encoded[4];
+            snprintf(encoded, sizeof(encoded), "%%%02X", static_cast<unsigned char>(*name));
+            disposition += encoded;
+        }
+    }
+    auto paused = request->pause();
+    std::weak_ptr<StorageBrowser::Transfer> active;
+    const bool started = StorageBrowser::start(operation,
+        [paused, kind, disposition](int code, const char *error,
+                                  std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
+            auto request = paused.lock();
+            if (!request) { if (transfer) transfer->cancel(); return; }
+            if (error) {
+                String body = "{\"error\":";
+                jsonQuote(body, error);
+                body += '}';
+                request->send(code, "application/json", body);
+                return;
+            }
+            auto *response = new(std::nothrow) StorageResponse(transfer, kind, size);
+            if (!response) { transfer->cancel(); request->send(503); return; }
+            if (disposition.length()) response->addHeader("Content-Disposition", disposition);
+            request->send(response);
+        }, active);
+    if (started) request->onDisconnect([active]() {
+        if (auto transfer = active.lock()) transfer->cancel();
+    });
+    if (!started) request->send(409, "application/json", "{\"error\":\"storage_busy_or_invalid_request\"}");
+}
+#endif
+
 void WebUI::init(uint16_t port) {
     if (port == 0) return;
     ClinicalJobs::init(saveSettings);
@@ -1643,6 +1737,17 @@ void WebUI::init(uint16_t port) {
     http->on("/api/export", HTTP_GET, handleExportStatus);
     http->on("/api/export/smb", HTTP_POST, handleSmbSync);
     http->on("/api/export/sleephq", HTTP_POST, handleSleepHqSync);
+#if AB_STORAGE_HAS_SDCARD
+    http->on("/api/storage/list", HTTP_GET, [](AsyncWebServerRequest *r) {
+        handleStorage(r, StorageBrowser::Kind::List);
+    });
+    http->on("/api/storage/download", HTTP_GET, [](AsyncWebServerRequest *r) {
+        handleStorage(r, StorageBrowser::Kind::File);
+    });
+    http->on("/api/storage/archive", HTTP_GET, [](AsyncWebServerRequest *r) {
+        handleStorage(r, StorageBrowser::Kind::Archive);
+    });
+#endif
     http->on("/api/live", HTTP_GET, handleLive);
     http->on("/api/upload", HTTP_POST, handleUploadDone, handleUploadChunk);
     http->on("/api/ble", HTTP_GET, handleBleStatus);

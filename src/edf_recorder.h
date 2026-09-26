@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "air10_edf.h"
 
 namespace EdfRecorder {
 
@@ -26,12 +27,30 @@ struct Status {
     char last_error[64];
 };
 
+struct FileProgress {
+    const Air10Edf::Schema *schema;
+    uint32_t records;
+    uint64_t readable_bytes;
+};
+
+// A frozen description, not permission to open live files. Only complete,
+// flushed records are included; the on-card header still has count zero.
+struct Progress {
+    uint32_t revision;
+    uint32_t segment;
+    bool active;
+    char directory[40];
+    char prefix[16];
+    char recording_id[81];
+    char start_date[9];
+    char start_time[9];
+    FileProgress files[5];
+};
+
 void init();
 void therapy_started();
 void therapy_ended();
 void get_status(Status &out);
-// Serialize background export with recording, metadata updates and SD recovery.
-bool acquire_storage();
-void release_storage();
+void get_progress(Progress &out);
 
 }  // namespace EdfRecorder

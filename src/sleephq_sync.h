@@ -1,12 +1,12 @@
 #pragma once
 
-#include <FS.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "background_operation_control.h"
 #include "edf_catalog.h"
 #include "sleephq_protocol.h"
+#include "sd_storage.h"
 
 namespace SleepHqSync {
 
@@ -30,9 +30,9 @@ struct Progress {
 using ProgressCallback = void (*)(void *context, const Progress &progress);
 
 bool configured(const Config &config);
-bool complete(fs::FS &storage, const Config &config,
+bool complete(SdStorage::Session &storage, const Config &config,
               const EdfCatalog::Entry &entry);
-bool sync_session(fs::FS &storage, const Config &config,
+bool sync_session(SdStorage::Session &storage, const Config &config,
                   const EdfCatalog::Entry &entry,
                   aircannect::BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback,

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <type_traits>
 
 namespace fs {
 class FS;
@@ -50,5 +51,58 @@ bool mounted();
 fs::FS *filesystem();
 void refresh_usage();
 void get_status(Status &out);
+
+// Recorder/recovery only. Waits for current local I/O, never for a network
+// consumer; acquisition invalidates all previously admitted background work.
+bool acquire();
+void release();
+
+class Session {
+public:
+    // One auxiliary operation at a time. Copies borrow the token; the owner
+    // must end it after closing its Readers. Recorder acquisition revokes it.
+    bool begin();
+    void end();
+    bool valid() const;
+
+    // Blocking task API, not for HTTP/RX callbacks. The operation must finish
+    // one bounded filesystem step and must not retain File objects or do UART
+    // or network work. Caller context remains alive until completion.
+    bool run(bool (*operation)(fs::FS &, void *), void *context) const;
+    template <typename F> bool run(F &&operation) const {
+        return run([](fs::FS &fs, void *context) {
+            return (*static_cast<typename std::remove_reference<F>::type *>(context))(fs);
+        }, &operation);
+    }
+
+private:
+    uint32_t generation_ = 0;
+};
+
+class Reader {
+public:
+    struct Entry {
+        char name[256];
+        uint64_t size;
+        int64_t modified;
+        bool directory;
+    };
+    Reader() = default;
+    ~Reader() { close(); }
+    Reader(const Reader &) = delete;
+    Reader &operator=(const Reader &) = delete;
+    bool open(const Session &session, const char *path, bool directory = false);
+    bool next(Entry &entry, bool &end);
+    size_t read(uint8_t *data, size_t length);
+    void close();
+    uint64_t size() const { return size_; }
+    explicit operator bool() const { return handle_ != 0; }
+
+private:
+    Session session_;
+    uint32_t handle_ = 0;
+    uint64_t size_ = 0;
+    uint64_t offset_ = 0;
+};
 
 }  // namespace SdStorage

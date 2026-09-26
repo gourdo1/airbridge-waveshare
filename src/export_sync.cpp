@@ -19,7 +19,6 @@
 #include "background_operation_control.h"
 #include "crc.h"
 #include "debug_log.h"
-#include "edf_recorder.h"
 #include "memory_manager.h"
 #include "sd_storage.h"
 #include "sleephq_sync.h"
@@ -72,7 +71,7 @@ static SleepHqStatus sleephq_status = {true, State::Disabled};
 static portMUX_TYPE sleephq_status_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t request_queue = nullptr;
 static TaskHandle_t export_task_handle = nullptr;
-static fs::FS *storage = nullptr;
+static SdStorage::Session storage;
 static volatile uint32_t abort_generation = 1;
 static uint32_t status_revision = 0;
 
@@ -135,7 +134,7 @@ static void publish_sleephq_progress(
 
 static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
-    return !run || generation_aborted(run->generation);
+    return !run || generation_aborted(run->generation) || !storage.valid();
 }
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
@@ -267,9 +266,8 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
                           size_t buffer_size, RunContext &run,
                           char *error, size_t error_size) {
     note_seen();
-    fs::File input = storage->open(local_path, FILE_READ);
-    if (!input || input.isDirectory()) {
-        if (input) input.close();
+    SdStorage::Reader input;
+    if (!input.open(storage, local_path)) {
         snprintf(error, error_size, "local_open:%s", local_path);
         return false;
     }
@@ -386,30 +384,31 @@ static bool write_state_marker(const SmbConfig &config,
             static_cast<int>(sizeof(partial))) {
         return false;
     }
-    if (!storage->exists(directory) && !storage->mkdir(directory)) return false;
-    storage->remove(partial);
     uint8_t marker[12] = {'A', 'B', 'S', 'M', 1, entry.flags, 0, 0};
     marker[8] = static_cast<uint8_t>(entry.finalized_epoch);
     marker[9] = static_cast<uint8_t>(entry.finalized_epoch >> 8);
     marker[10] = static_cast<uint8_t>(entry.finalized_epoch >> 16);
     marker[11] = static_cast<uint8_t>(entry.finalized_epoch >> 24);
-    fs::File file = storage->open(partial, FILE_WRITE);
-    const bool written = file && file.write(marker, sizeof(marker)) ==
-                                    sizeof(marker);
-    if (file) {
-        file.flush();
-        file.close();
-    }
-    if (!written) {
-        storage->remove(partial);
-        return false;
-    }
-    if (storage->exists(path)) storage->remove(path);
-    if (!storage->rename(partial, path)) {
-        storage->remove(partial);
-        return false;
-    }
-    return true;
+    return storage.run([&](fs::FS &fs) {
+        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
+        fs.remove(partial);
+        fs::File file = fs.open(partial, FILE_WRITE);
+        const bool written = file && file.write(marker, sizeof(marker)) == sizeof(marker);
+        if (file) {
+            file.flush();
+            file.close();
+        }
+        if (!written) {
+            fs.remove(partial);
+            return false;
+        }
+        if (fs.exists(path)) fs.remove(path);
+        if (!fs.rename(partial, path)) {
+            fs.remove(partial);
+            return false;
+        }
+        return true;
+    });
 }
 
 static bool state_marker_exists(const SmbConfig &config,
@@ -418,7 +417,8 @@ static bool state_marker_exists(const SmbConfig &config,
     char path[80];
     if (!state_marker_path(config, entry, directory, sizeof(directory),
                            path, sizeof(path))) return false;
-    fs::File file = storage->open(path, FILE_READ);
+    SdStorage::Reader file;
+    if (!file.open(storage, path)) return false;
     uint8_t marker[12];
     const bool valid = file && file.size() == sizeof(marker) &&
         file.read(marker, sizeof(marker)) == sizeof(marker) &&
@@ -462,7 +462,10 @@ static bool sync_root_files(StorageSmbClient &client,
         "/Identification.tgt", "/Identification.crc", "/STR.edf",
     };
     for (const char *path : paths) {
-        if (!storage->exists(path)) continue;
+        bool exists = false;
+        if (!storage.run([&](fs::FS &fs) { exists = fs.exists(path); return true; }))
+            return false;
+        if (!exists) continue;
         if (!sync_smb_file(client, path, true, buffer, buffer_size,
                            run, error, error_size)) return false;
     }
@@ -546,7 +549,7 @@ static bool run_smb(const Request &request) {
     if (success) {
         for (uint32_t i = catalog.entries; success && i > 0; i--) {
             EdfCatalog::Entry entry;
-            if (!EdfCatalog::read(i - 1, entry)) {
+            if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i - 1, entry); })) {
                 copy_text(error, sizeof(error), "catalog_read");
                 success = false;
                 break;
@@ -663,14 +666,14 @@ static bool run_sleephq(const Request &request) {
     bool success = true;
     for (uint32_t i = catalog.entries; success && i > 0; i--) {
         EdfCatalog::Entry entry;
-        if (!EdfCatalog::read(i - 1, entry)) {
+        if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i - 1, entry); })) {
             copy_text(error, sizeof(error), "catalog_read");
             success = false;
             break;
         }
         if (!export_ready(entry)) continue;
         success = SleepHqSync::sync_session(
-            *storage, config, entry, run.operation, progress,
+            storage, config, entry, run.operation, progress,
             publish_sleephq_progress, nullptr, error, sizeof(error));
     }
 
@@ -699,8 +702,8 @@ static void run_logged(const Request &request, const char *name,
     bool success = run(request);
     T result;
     snapshot(result);
-    if (!success && generation_aborted(request.generation)) {
-        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted by therapy\n", name);
+    if (!success && (generation_aborted(request.generation) || !storage.valid())) {
+        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted by storage change or therapy\n", name);
     } else if (!success) {
         Log::logf(CAT_EXPORT, LOG_WARN, "[%s] Sync failed: %s\n", name, result.last_error);
     } else if (result.state == State::Disabled) {
@@ -729,20 +732,17 @@ static void export_task(void *) {
         }
         if (generation_aborted(request.generation)) continue;
 
-        bool leased = false;
+        bool admitted = false;
         while (!generation_aborted(request.generation)) {
             if (Arbiter::get_state() == SYS_IDLE &&
-                Arbiter::get_cached_rop() == 0 && EdfRecorder::acquire_storage()) {
-                leased = true;
+                Arbiter::get_cached_rop() == 0 && storage.begin()) {
+                admitted = true;
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (!leased) continue;
-        if (generation_aborted(request.generation)) {
-            EdfRecorder::release_storage();
-            continue;
-        }
+        if (!admitted) continue;
+        if (generation_aborted(request.generation)) { storage.end(); continue; }
 
         if (request.kind == RequestKind::ManualSmb) {
             run_logged(request, "SMB", run_smb, get_status);
@@ -756,7 +756,7 @@ static void export_task(void *) {
                 config.sleephq_enabled && config.sleephq_auto_after_therapy)
                 run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
         }
-        EdfRecorder::release_storage();
+        storage.end();
     }
 }
 
@@ -776,8 +776,6 @@ const char *state_name(State value) {
 
 void init() {
     if (request_queue || !SdStorage::mounted()) return;
-    storage = SdStorage::filesystem();
-    if (!storage) return;
     request_queue = xQueueCreate(4, sizeof(Request));
     BaseType_t created = pdFAIL;
     if (request_queue && aircannect::Memory::psram_available()) {

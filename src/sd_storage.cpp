@@ -1,6 +1,7 @@
 #include "sd_storage.h"
 
 #include <Arduino.h>
+#include <algorithm>
 #include <string.h>
 
 #include "board.h"
@@ -9,6 +10,10 @@
 #if AB_STORAGE_HAS_SDCARD
 #include <SD_MMC.h>
 #include <FS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include "memory_manager.h"
+#include "uart_arbiter.h"
 #endif
 
 namespace SdStorage {
@@ -23,6 +28,128 @@ static Status status = {
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #if AB_STORAGE_HAS_SDCARD
+namespace {
+struct Request {
+    enum Kind { Run, Acquire, Release, Close, Begin, End } kind;
+    bool (*operation)(fs::FS &, void *);
+    void *context;
+    uint32_t generation;
+    SemaphoreHandle_t done;
+    bool success;
+    TaskHandle_t caller;
+    uint32_t reader_id;
+};
+
+QueueHandle_t requests = nullptr;
+uint32_t generation = 1;
+uint32_t active_session = 0;
+uint32_t recorder_waiting = 0;
+TaskHandle_t worker = nullptr;
+TaskHandle_t direct_owner = nullptr;
+
+struct OpenFile {
+    fs::File file;
+    uint32_t id = 0;
+};
+OpenFile readers[2];
+uint32_t next_reader = 0;
+
+void close_readers() {
+    for (OpenFile &reader : readers) {
+        reader.file.close();
+        reader.id = 0;
+    }
+}
+
+OpenFile *find_reader(uint32_t id) {
+    for (OpenFile &reader : readers)
+        if (reader.id == id) return &reader;
+    return nullptr;
+}
+
+bool background_allowed(uint32_t expected) {
+    return expected && expected == __atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
+        Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0;
+}
+
+void process_request(Request &value) {
+    Request *request = &value;
+    request->success = false;
+    if (request->kind == Request::Begin) {
+        if (!direct_owner && !active_session && mounted() &&
+            !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
+            Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0) {
+            if (++generation == 0) ++generation;
+            __atomic_store_n(&active_session, generation, __ATOMIC_RELEASE);
+            request->generation = generation;
+            request->success = true;
+        }
+    } else if (request->kind == Request::End) {
+        if (active_session == request->generation) {
+            close_readers();
+            __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+        }
+        request->success = true;
+    } else if (request->kind == Request::Acquire) {
+        if (!direct_owner) {
+            close_readers();
+            __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&direct_owner, request->caller, __ATOMIC_RELEASE);
+            request->success = true;
+        }
+    } else if (request->kind == Request::Close) {
+        OpenFile *reader = find_reader(request->reader_id);
+        if (reader) { reader->file.close(); reader->id = 0; }
+        request->success = true;
+    } else if (request->kind == Request::Release) {
+        if (direct_owner == request->caller) {
+            __atomic_store_n(&direct_owner, nullptr, __ATOMIC_RELEASE);
+            request->success = true;
+        }
+    } else if (!direct_owner && background_allowed(request->generation) && mounted()) {
+        request->success = request->operation(SD_MMC, request->context);
+    }
+}
+
+void io_task(void *) {
+    Request *request;
+    while (true) {
+        if (xQueueReceive(requests, &request, portMAX_DELAY) != pdTRUE) continue;
+        process_request(*request);
+        xSemaphoreGive(request->done);
+    }
+}
+
+bool init_worker() {
+    if (worker) return true;
+    if (!requests) requests = xQueueCreate(4, sizeof(Request *));
+    if (!requests) return false;
+    BaseType_t created = pdFAIL;
+    if (aircannect::Memory::psram_available())
+        created = xTaskCreatePinnedToCoreWithCaps(io_task, "sd_io", 4096,
+            nullptr, 1, &worker, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS)
+        created = xTaskCreatePinnedToCore(io_task, "sd_io", 4096,
+            nullptr, 1, &worker, 0);
+    if (created != pdPASS) worker = nullptr;
+    return worker != nullptr;
+}
+
+bool dispatch(Request &request, bool control) {
+    if (!worker || xTaskGetCurrentTaskHandle() == worker) return false;
+    StaticSemaphore_t done_state;
+    request.done = xSemaphoreCreateBinaryStatic(&done_state);
+    request.caller = xTaskGetCurrentTaskHandle();
+    request.success = false;
+    Request *pointer = &request;
+    const bool queued = xQueueSend(requests, &pointer, control ? portMAX_DELAY : 0) == pdTRUE;
+    if (queued) xSemaphoreTake(request.done, portMAX_DELAY);
+    vSemaphoreDelete(request.done);
+    return queued && request.success;
+}
+}  // namespace
+
 bool write_exact(fs::File &file, const uint8_t *data, size_t size) {
     return file && file.write(data, size) == size;
 }
@@ -37,6 +164,7 @@ static void mount_error(const char *message) {
 
 void init() {
 #if AB_STORAGE_HAS_SDCARD
+    if (!init_worker()) { mount_error("I/O task initialization failed"); return; }
     if (mounted()) return;
 
     bool pins_ok;
@@ -111,6 +239,150 @@ void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
     portEXIT_CRITICAL(&status_mux);
+}
+
+bool acquire() {
+#if AB_STORAGE_HAS_SDCARD
+    __atomic_add_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
+    Request request = {};
+    request.kind = Request::Acquire;
+    const bool taken = dispatch(request, true);
+    __atomic_sub_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
+    return taken;
+#else
+    return false;
+#endif
+}
+
+void release() {
+#if AB_STORAGE_HAS_SDCARD
+    Request request = {};
+    request.kind = Request::Release;
+    (void)dispatch(request, true);
+#endif
+}
+
+bool Session::begin() {
+#if AB_STORAGE_HAS_SDCARD
+    Request request = {};
+    request.kind = Request::Begin;
+    if (!dispatch(request, false)) return false;
+    generation_ = request.generation;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Session::end() {
+#if AB_STORAGE_HAS_SDCARD
+    if (!generation_) return;
+    Request request = {};
+    request.kind = Request::End;
+    request.generation = generation_;
+    (void)dispatch(request, true);
+    generation_ = 0;
+#endif
+}
+
+bool Session::valid() const {
+#if AB_STORAGE_HAS_SDCARD
+    return worker && mounted() && background_allowed(generation_);
+#else
+    return false;
+#endif
+}
+
+bool Session::run(bool (*operation)(fs::FS &, void *), void *context) const {
+#if AB_STORAGE_HAS_SDCARD
+    if (!operation || !valid() || xTaskGetCurrentTaskHandle() == worker) return false;
+    Request request = {};
+    request.kind = Request::Run;
+    request.operation = operation;
+    request.context = context;
+    request.generation = generation_;
+    return dispatch(request, false);
+#else
+    return false;
+#endif
+}
+
+bool Reader::open(const Session &session, const char *path, bool directory) {
+    close();
+#if AB_STORAGE_HAS_SDCARD
+    if (!path) return false;
+    const bool opened = session.run([&](fs::FS &fs) {
+        OpenFile *slot = nullptr;
+        for (OpenFile &reader : readers) if (!reader.id) { slot = &reader; break; }
+        if (!slot) return false;
+        fs::File file = fs.open(path, FILE_READ);
+        if (!file || file.isDirectory() != directory) return false;
+        size_ = file.size();
+        if (++next_reader == 0) ++next_reader;
+        slot->id = handle_ = next_reader;
+        slot->file = file;
+        return true;
+    });
+    if (!opened) return false;
+    session_ = session;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Reader::next(Entry &entry, bool &end) {
+    end = false;
+#if AB_STORAGE_HAS_SDCARD
+    if (!handle_) return false;
+    return session_.run([&](fs::FS &) {
+        OpenFile *reader = find_reader(handle_);
+        if (!reader || !reader->file.isDirectory()) return false;
+        fs::File file = reader->file.openNextFile();
+        if (!file) { end = true; return true; }
+        const char *name = file.name();
+        if (!name || strlen(name) >= sizeof(entry.name)) return false;
+        strcpy(entry.name, name);
+        entry.directory = file.isDirectory();
+        entry.size = file.size();
+        entry.modified = file.getLastWrite();
+        return true;
+    });
+#else
+    return false;
+#endif
+}
+
+size_t Reader::read(uint8_t *data, size_t length) {
+    size_t total = 0;
+#if AB_STORAGE_HAS_SDCARD
+    if (!*this || !data) return 0;
+    while (total < length && offset_ < size_) {
+        const size_t count = std::min<size_t>(4096,
+            std::min<uint64_t>(length - total, size_ - offset_));
+        const bool read = session_.run([&](fs::FS &) {
+            OpenFile *reader = find_reader(handle_);
+            return reader && reader->file.read(data + total, count) == count;
+        });
+        if (!read) break;
+        total += count;
+        offset_ += count;
+    }
+#endif
+    return total;
+}
+
+void Reader::close() {
+#if AB_STORAGE_HAS_SDCARD
+    if (handle_) {
+        Request request = {};
+        request.kind = Request::Close;
+        request.reader_id = handle_;
+        (void)dispatch(request, true);
+    }
+#endif
+    handle_ = 0;
+    size_ = offset_ = 0;
 }
 
 }  // namespace SdStorage

@@ -1,5 +1,6 @@
 #include "sleephq_sync.h"
 #include "sd_storage.h"
+#include <FS.h>
 
 #include <Arduino.h>
 #include <stdio.h>
@@ -47,6 +48,7 @@ struct Journal {
 };
 
 enum class JournalLoad : uint8_t {
+    Unavailable,
     Missing,
     Valid,
     Invalid,
@@ -67,16 +69,15 @@ struct FileSpec {
 };
 
 struct FileReader {
-    fs::FS *storage;
-    fs::File file;
+    SdStorage::Session *storage;
+    SdStorage::Reader file;
     char path[128];
     uint64_t size;
 
     bool open() {
         if (file) file.close();
         if (!storage) return false;
-        file = storage->open(path, FILE_READ);
-        if (!file || file.isDirectory() || file.size() != size) {
+        if (!file.open(*storage, path) || file.size() != size) {
             if (file) file.close();
             return false;
         }
@@ -248,32 +249,44 @@ static bool decode_journal(const uint8_t *data, Journal &journal) {
     return true;
 }
 
-static JournalLoad load_journal(fs::FS &storage, const StatePaths &paths,
+static JournalLoad load_journal(SdStorage::Session &access, const StatePaths &paths,
                                 Journal &journal) {
-    recover_journal(storage, paths);
-    if (!storage.exists(paths.journal)) return JournalLoad::Missing;
-    uint8_t data[JOURNAL_SIZE];
-    fs::File file = storage.open(paths.journal, FILE_READ);
-    const bool valid = file && file.size() == sizeof(data) &&
-                       file.read(data, sizeof(data)) == sizeof(data) &&
-                       decode_journal(data, journal);
-    if (file) file.close();
-    return valid ? JournalLoad::Valid : JournalLoad::Invalid;
+    JournalLoad result = JournalLoad::Missing;
+    const bool loaded = access.run([&](fs::FS &storage) {
+        recover_journal(storage, paths);
+        if (!storage.exists(paths.journal)) return true;
+        uint8_t data[JOURNAL_SIZE];
+        fs::File file = storage.open(paths.journal, FILE_READ);
+        if (!file) return false;
+        bool valid = false;
+        if (file.size() == sizeof(data)) {
+            if (file.read(data, sizeof(data)) != sizeof(data)) return false;
+            valid = decode_journal(data, journal);
+        }
+        result = valid ? JournalLoad::Valid : JournalLoad::Invalid;
+        return true;
+    });
+    return loaded ? result : JournalLoad::Unavailable;
 }
 
-static bool write_journal(fs::FS &storage, const StatePaths &paths,
+static bool write_journal(SdStorage::Session &access, const StatePaths &paths,
                           const Journal &journal) {
     uint8_t data[JOURNAL_SIZE];
     encode_journal(journal, data);
-    return ensure_state_directory(storage, paths) &&
-           replace_file(storage, paths.journal, paths.journal_part,
-                        paths.journal_backup, data, sizeof(data));
+    return access.run([&](fs::FS &storage) {
+        return ensure_state_directory(storage, paths) &&
+               replace_file(storage, paths.journal, paths.journal_part,
+                            paths.journal_backup, data, sizeof(data));
+    });
 }
 
-static void remove_journal(fs::FS &storage, const StatePaths &paths) {
-    storage.remove(paths.journal);
-    storage.remove(paths.journal_part);
-    storage.remove(paths.journal_backup);
+static bool remove_journal(SdStorage::Session &access, const StatePaths &paths) {
+    return access.run([&](fs::FS &storage) {
+        storage.remove(paths.journal);
+        storage.remove(paths.journal_part);
+        storage.remove(paths.journal_backup);
+        return true;
+    });
 }
 
 static bool marker_path(const StatePaths &paths,
@@ -308,12 +321,13 @@ static void encode_marker(const EdfCatalog::Entry &entry, uint8_t *data) {
     SdStorage::put_le32(data + 12, crc32_ieee(data, 12));
 }
 
-static bool marker_valid(fs::FS &storage, const StatePaths &paths,
+static bool marker_valid(SdStorage::Session &storage, const StatePaths &paths,
                          const EdfCatalog::Entry &entry) {
     char path[80];
     if (!marker_path(paths, entry, path, sizeof(path))) return false;
     uint8_t data[MARKER_SIZE];
-    fs::File file = storage.open(path, FILE_READ);
+    SdStorage::Reader file;
+    if (!file.open(storage, path)) return false;
     const bool valid = file && file.size() == sizeof(data) &&
         file.read(data, sizeof(data)) == sizeof(data) &&
         memcmp(data, "ABSD", 4) == 0 && data[4] == JOURNAL_VERSION &&
@@ -323,7 +337,7 @@ static bool marker_valid(fs::FS &storage, const StatePaths &paths,
     return valid;
 }
 
-static bool write_marker(fs::FS &storage, const StatePaths &paths,
+static bool write_marker(SdStorage::Session &access, const StatePaths &paths,
                          const EdfCatalog::Entry &entry) {
     char path[80];
     char part[88];
@@ -332,8 +346,10 @@ static bool write_marker(fs::FS &storage, const StatePaths &paths,
                      backup, sizeof(backup))) return false;
     uint8_t data[MARKER_SIZE];
     encode_marker(entry, data);
-    return ensure_state_directory(storage, paths) &&
-           replace_file(storage, path, part, backup, data, sizeof(data));
+    return access.run([&](fs::FS &storage) {
+        return ensure_state_directory(storage, paths) &&
+               replace_file(storage, path, part, backup, data, sizeof(data));
+    });
 }
 
 static EdfCatalog::Entry journal_entry(const Journal &journal) {
@@ -417,7 +433,7 @@ static bool status_needs_process(const char *status) {
            strcasecmp(status, "uploading") == 0;
 }
 
-static bool finish_import(fs::FS &storage, const StatePaths &paths,
+static bool finish_import(SdStorage::Session &storage, const StatePaths &paths,
                           const Journal &journal, Progress &progress,
                           ProgressCallback callback, void *callback_context,
                           char *error, size_t error_size) {
@@ -432,7 +448,7 @@ static bool finish_import(fs::FS &storage, const StatePaths &paths,
     return true;
 }
 
-static bool poll_import(fs::FS &storage, const StatePaths &paths,
+static bool poll_import(SdStorage::Session &storage, const StatePaths &paths,
                         SleepHqClient &client, Journal &journal,
                         BackgroundOperationControl &operation,
                         Progress &progress, ProgressCallback callback,
@@ -504,7 +520,7 @@ static bool poll_import(fs::FS &storage, const StatePaths &paths,
     }
 }
 
-static bool run_journal(fs::FS &storage, const StatePaths &paths,
+static bool run_journal(SdStorage::Session &storage, const StatePaths &paths,
                         SleepHqClient &client, Journal &journal,
                         BackgroundOperationControl &operation,
                         Progress &progress, ProgressCallback callback,
@@ -529,8 +545,8 @@ static bool run_journal(fs::FS &storage, const StatePaths &paths,
             progress.files_seen++;
             publish(progress, callback, callback_context);
 
-            fs::File input = storage.open(spec.local_path, FILE_READ);
-            if (!input || input.isDirectory()) {
+            SdStorage::Reader input;
+            if (!input.open(storage, spec.local_path)) {
                 if (input) input.close();
                 if (spec.required) {
                     snprintf(error, error_size, "local_missing:%s",
@@ -615,14 +631,14 @@ bool configured(const Config &config) {
     return config.client_id[0] && config.client_secret[0];
 }
 
-bool complete(fs::FS &storage, const Config &config,
+bool complete(SdStorage::Session &storage, const Config &config,
               const EdfCatalog::Entry &entry) {
     StatePaths paths = {};
     return configured(config) && build_state_paths(config, paths) &&
            marker_valid(storage, paths, entry);
 }
 
-bool sync_session(fs::FS &storage, const Config &config,
+bool sync_session(SdStorage::Session &storage, const Config &config,
                   const EdfCatalog::Entry &entry,
                   BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback,
@@ -634,7 +650,7 @@ bool sync_session(fs::FS &storage, const Config &config,
 
     StatePaths paths = {};
     if (!build_state_paths(config, paths) ||
-        !ensure_state_directory(storage, paths)) {
+        !storage.run([&](fs::FS &fs) { return ensure_state_directory(fs, paths); })) {
         set_error(error, error_size, "state_directory");
         return false;
     }
@@ -656,6 +672,10 @@ bool sync_session(fs::FS &storage, const Config &config,
 
     Journal journal = {};
     const JournalLoad loaded = load_journal(storage, paths, journal);
+    if (loaded == JournalLoad::Unavailable) {
+        set_error(error, error_size, "storage_unavailable");
+        return false;
+    }
     if (loaded == JournalLoad::Invalid) {
         Log::logf(CAT_EXPORT, LOG_WARN,
                   "[SLEEPHQ] discarded invalid inflight journal\n");

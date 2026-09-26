@@ -144,6 +144,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 @keyframes slideIn{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:translateX(0)}}
 
 /* Spinner */
+.storage-row{display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
+.storage-row a{color:var(--accent);overflow-wrap:anywhere;cursor:pointer}
+.storage-row small{display:block;color:var(--text-dim);margin-top:4px}
+#storagePath{overflow-wrap:anywhere}
 .spinner{display:none;border:3px solid #333;border-top:3px solid var(--accent);border-radius:50%;width:20px;height:20px;animation:spin 0.8s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 
@@ -187,6 +191,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
       <a class="nav-item" data-tab="bluetooth"><span class="icon">&#9829;</span> Oximetry</a>
       <a class="nav-item" data-tab="console"><span class="icon">&#9002;</span> Console</a>
       <a class="nav-item" data-tab="sync" hidden><span class="icon">&#8644;</span> Sync</a>
+      <a class="nav-item" data-tab="storage" hidden><span class="icon">&#9635;</span> Storage</a>
       <a class="nav-item" data-tab="device"><span class="icon">&#9881;</span> Config</a>
       <a class="nav-item" data-tab="ota"><span class="icon">&#8679;</span> OTA Upload</a>
     </nav>
@@ -449,6 +454,27 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         <div class="card-grid" id="syncCards" hidden></div>
       </div>
 
+      <div class="pane" id="p-storage">
+        <div class="card">
+          <div class="card-header"><span class="label">SD card</span><span id="storageState">--</span></div>
+          <div id="storageUsage" class="hint"></div>
+          <h3 id="storagePath">/</h3>
+          <div class="btn-group">
+            <button class="btn" id="storageUp" onclick="storageUp()">Up</button>
+            <button class="btn" id="storageRefresh" onclick="loadStorage()">Refresh</button>
+            <button class="btn" id="storageZip" onclick="storageDownload('archive')">Download folder ZIP</button>
+            <button class="btn" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
+          </div>
+          <div id="storageMessage" role="status" aria-live="polite"></div>
+          <div id="storageEntries"></div>
+          <div class="btn-group">
+            <button class="btn" id="storagePrev" onclick="loadStorage(storagePath, storageOffset - 32)">Previous</button>
+            <span id="storagePage"></span>
+            <button class="btn" id="storageNext" onclick="loadStorage(storagePath, storageOffset + 32)">Next</button>
+          </div>
+        </div>
+      </div>
+
       <!-- OTA UPLOAD -->
       <div class="pane" id="p-ota">
 
@@ -557,6 +583,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
   <a class="bnav-item" data-tab="bluetooth"><span class="icon">&#9829;</span>Oxi</a>
   <a class="bnav-item" data-tab="console"><span class="icon">&#9002;</span>CLI</a>
   <a class="bnav-item" data-tab="sync" hidden><span class="icon">&#8644;</span>Sync</a>
+  <a class="bnav-item" data-tab="storage" hidden><span class="icon">&#9635;</span>Storage</a>
   <a class="bnav-item" data-tab="device"><span class="icon">&#9881;</span>Config</a>
   <a class="bnav-item" data-tab="ota"><span class="icon">&#8679;</span>OTA</a>
 </nav>
@@ -944,7 +971,7 @@ async function setupMove(direction, skip = false) {
 }
 
 // Navigation
-const tabNames = ['status','report','clinical','bluetooth','console','device','sync','ota'];
+const tabNames = ['status','report','clinical','bluetooth','console','device','sync','storage','ota'];
 
 function showTab(id) {
   if (setupBusy) return;
@@ -998,6 +1025,7 @@ function showTab(id) {
 // Wire up nav clicks
 document.querySelectorAll('.nav-item, .bnav-item').forEach(n => {
   n.addEventListener('click', () => showTab(n.dataset.tab));
+  if (n.dataset.tab === 'storage') n.addEventListener('click', () => loadStorage());
 });
 
 async function api(url, opts) {
@@ -1030,6 +1058,7 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
+  renderStorageStatus(d);
   // Topbar - update from any push, even without full status
   var el;
   el = document.getElementById('topHeap'); if (el && d.heap) el.textContent = (d.heap/1024).toFixed(1) + ' KB free';
@@ -1650,6 +1679,95 @@ function renderExports() {
     text('availability', unavailable || (state.state === 'pending' ? 'Queued; waiting for export worker' : ''));
     card.querySelector('[data-sync="start"]').disabled = !!unavailable || busy || syncRequests.size > 0;
   }
+}
+
+let storagePath = '/', storageOffset = 0, storageMore = false, storageLoading = false;
+const storageSelection = new Set();
+
+function renderStorageStatus(data) {
+  if (data.sd === undefined) return;
+  const supported = data.sd !== 'unsupported';
+  document.querySelectorAll('[data-tab="storage"]').forEach(link => { link.hidden = !supported; });
+  document.getElementById('storageState').textContent = !supported ? 'Not supported' :
+    data.sd === 'mounted' ? 'Mounted' : 'Card unavailable';
+  document.getElementById('storageUsage').textContent = data.sd === 'mounted' ?
+    (data.sd_used_mb || 0) + ' MiB used / ' + (data.sd_total_mb || 0) + ' MiB total' : '';
+}
+
+function storageControls() {
+  document.getElementById('storageRefresh').disabled = storageLoading;
+  document.getElementById('storageUp').disabled = storageLoading || storagePath === '/';
+  document.getElementById('storagePrev').disabled = storageLoading || !storageOffset;
+  document.getElementById('storageNext').disabled = storageLoading || !storageMore;
+  document.getElementById('storageZip').disabled = storageLoading;
+  document.getElementById('storageSelected').disabled = storageLoading || !storageSelection.size;
+}
+
+function storageChild(name) { return (storagePath === '/' ? '' : storagePath) + '/' + name; }
+
+async function loadStorage(path = storagePath, offset = storageOffset) {
+  if (storageLoading) return;
+  storageLoading = true;
+  storageControls();
+  const message = document.getElementById('storageMessage');
+  message.textContent = 'Reading directory...';
+  try {
+    const response = await api('/api/storage/list?path=' + encodeURIComponent(path) + '&offset=' + offset);
+    if (!response) return;
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Directory unavailable');
+    storagePath = data.path;
+    storageOffset = offset;
+    storageMore = data.more;
+    storageSelection.clear();
+    document.getElementById('storagePath').textContent = storagePath;
+    const entries = document.getElementById('storageEntries');
+    entries.replaceChildren();
+    for (const entry of data.entries) {
+      const row = document.createElement('div'); row.className = 'storage-row';
+      const check = document.createElement('input'); check.type = 'checkbox';
+      check.setAttribute('aria-label', 'Select ' + entry.name);
+      check.onchange = () => { if (check.checked) storageSelection.add(entry.name); else storageSelection.delete(entry.name); storageControls(); };
+      const content = document.createElement('div');
+      const link = document.createElement('a'); link.textContent = entry.name + (entry.directory ? '/' : '');
+      link.href = entry.directory ? '#storage' : '/api/storage/download?path=' + encodeURIComponent(storageChild(entry.name));
+      if (entry.directory) link.onclick = event => { event.preventDefault(); loadStorage(storageChild(entry.name), 0); };
+      else link.download = entry.name;
+      const detail = document.createElement('small');
+      detail.textContent = (entry.directory ? 'Folder' : entry.size.toLocaleString() + ' bytes') +
+        (entry.modified ? ' | ' + new Date(entry.modified * 1000).toLocaleString() : '');
+      content.append(link, detail);
+      const action = document.createElement('button'); action.className = 'btn';
+      action.textContent = entry.directory ? 'ZIP' : 'Download';
+      action.onclick = () => storageDownload(entry.directory ? 'archive' : 'download', entry.name);
+      row.append(check, content, action); entries.append(row);
+    }
+    document.getElementById('storagePage').textContent = 'Page ' + (offset / 32 + 1);
+    message.textContent = data.entries.length ? '' : 'This directory is empty.';
+  } catch (error) {
+    message.textContent = error.message + '. Files are available in standby; recording takes priority.';
+  } finally { storageLoading = false; storageControls(); }
+}
+
+function storageUp() {
+  const slash = storagePath.lastIndexOf('/');
+  loadStorage(slash > 0 ? storagePath.slice(0, slash) : '/', 0);
+}
+
+function storageDownload(kind, name = null, selected = false) {
+  let url = '/api/storage/' + kind + '?path=' + encodeURIComponent(name === null ? storagePath : storageChild(name));
+  if (selected) {
+    if (!storageSelection.size) return;
+    const names = [...storageSelection];
+    if (new TextEncoder().encode(names.join('\n')).length >= 2048) {
+      document.getElementById('storageMessage').textContent = 'Select fewer entries or download the whole folder.';
+      return;
+    }
+    for (const item of names) url += '&item=' + encodeURIComponent(item);
+  }
+  const link = document.createElement('a'); link.href = url;
+  link.download = kind === 'archive' ? 'airbridge.zip' : name;
+  document.body.append(link); link.click(); link.remove();
 }
 
 function applyExports(data) {
@@ -2283,6 +2401,7 @@ async function startUI() {
   if (window.location.pathname === '/wizard' || ht === 'setup' ||
       (status && !status.onboarding_complete && !deferred)) await startSetup();
   else showTab(tabNames.includes(ht) ? ht : 'status');
+  if (ht === 'storage' && !setupActive()) loadStorage();
   initSSE();
 }
 startUI();
