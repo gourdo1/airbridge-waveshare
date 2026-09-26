@@ -1,4 +1,6 @@
 #include "clinical_settings.h"
+#include "hex_util.h"
+#include <limits.h>
 #include "json_util.h"
 #include "clinical_jobs.h"
 #include "settings_defs.h"
@@ -86,15 +88,13 @@ void Snapshot::reset() {
 bool read_raw(const char *cmd, int &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout) return false;
-    char req[16];
-    snprintf(req, sizeof(req), "G S #%s", cmd);
-    char resp[64] = {};
-    uint16_t resp_len = sizeof(resp);
-    if (!Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL, resp, &resp_len, timeout))
-        return false;
-    const char *v = qframe_response_value(resp);
-    value = v ? (int)strtol(v, nullptr, 16) : -1;
-    return value >= 0;
+    char text[9];
+    uint32_t raw;
+    if (!Arbiter::get_var(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL,
+                          text, sizeof(text), timeout) ||
+        !aircannect::parse_hex(text, strlen(text), raw) || raw > INT_MAX) return false;
+    value = static_cast<int>(raw);
+    return true;
 }
 
 bool known_stock(const char *cmd) { return var_lookup(cmd) != nullptr; }

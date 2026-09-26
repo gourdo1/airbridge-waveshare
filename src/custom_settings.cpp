@@ -180,12 +180,12 @@ bool read_language(uint32_t &language) {
 }
 
 bool read_raw_locked(const cached_entry_t &entry, uint32_t &value) {
-    char command[16];
-    snprintf(command, sizeof(command), "G S #%s", entry.name);
-    char response[64];
-    const char *response_value = nullptr;
-    return query_value(command, response, sizeof(response), response_value) == QUERY_OK &&
-           CustomSettingsProtocol::parse_hex_value(response_value, value);
+    uint16_t timeout = ClinicalJobs::timeout_ms();
+    if (!timeout || loaded_generation != generation()) return false;
+    char text[9];
+    return Arbiter::get_var(entry.name, CMD_SRC_TCP, CMD_PRIO_NORMAL,
+                            text, sizeof(text), timeout) &&
+           CustomSettingsProtocol::parse_hex_value(text, value);
 }
 
 bool add_enum_option_locked(cached_entry_t &entry, uint8_t value,

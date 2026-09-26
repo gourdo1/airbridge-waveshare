@@ -256,9 +256,8 @@ static bool command_value(const char *command, char *out, size_t capacity,
 
 static bool read_variable(const char *name, char *out, size_t capacity,
                           uint16_t timeout_ms = POLL_TIMEOUT_MS) {
-    char command[16];
-    snprintf(command, sizeof(command), "G S #%s", name);
-    return command_value(command, out, capacity, timeout_ms);
+    return Arbiter::get_var(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                            out, capacity, timeout_ms);
 }
 
 struct StoredCapture {

@@ -66,6 +66,10 @@ namespace Arbiter {
                   char *resp_buf, uint16_t *resp_len,
                   uint16_t timeout_ms = 0);  // 0 = use cfg.uart_cmd_timeout_ms
 
+    // Return only the scalar value; a truncated value is a failed read.
+    bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
+                 char *out, uint16_t capacity, uint16_t timeout_ms = 0);
+
     bool send_frame(const uint8_t *frame, uint16_t frame_len,
                     cmd_source_t src, cmd_priority_t prio);
 

@@ -114,6 +114,15 @@ static void publish_device_time(const char *text) {
     portEXIT_CRITICAL(&device_time_mux);
 }
 
+static bool read_resmed_clock(Air10Clock::Calendar &calendar, uint16_t timeout = 0) {
+    char dac[9], tic[7];
+    bool got_dac = Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                    dac, sizeof(dac), timeout);
+    bool got_tic = Arbiter::get_var("TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                    tic, sizeof(tic), timeout);
+    return got_dac && got_tic && Air10Clock::parse_calendar(dac, tic, calendar);
+}
+
 static void poll_device_time() {
     portENTER_CRITICAL(&device_time_mux);
     bool due = device_time[0] == '-' ||
@@ -121,31 +130,20 @@ static void poll_device_time() {
     portEXIT_CRITICAL(&device_time_mux);
     if (!due) return;
 
-    char dac[32] = {}, tic[32] = {}, text[20] = "--";
-    uint16_t dac_len = sizeof(dac), tic_len = sizeof(tic);
-    bool got_dac = Arbiter::send_cmd("G S #DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                    dac, &dac_len, HEALTH_TIMEOUT_MS);
-    bool got_tic = Arbiter::send_cmd("G S #TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                    tic, &tic_len, HEALTH_TIMEOUT_MS);
-    const char *dv = qframe_response_value(dac), *tv = qframe_response_value(tic);
-    if (got_dac && got_tic && dv && tv && strlen(dv) >= 8 && strlen(tv) >= 6) {
-        int dd, mm, yyyy, hh, mn, ss;
-        if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
-            sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
-            snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
-                     yyyy, mm, dd, hh, mn);
-        }
-    }
+    char text[20] = "--";
+    Air10Clock::Calendar t;
+    if (read_resmed_clock(t, HEALTH_TIMEOUT_MS))
+        snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+                 t.year, t.month, t.day, t.hour, t.minute);
     publish_device_time(text);
 }
 
 static void poll_device_uptime() {
     char response[48] = {};
-    uint16_t length = sizeof(response);
-    if (!Arbiter::send_cmd("G S #STK", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                           response, &length, HEALTH_TIMEOUT_MS)) return;
+    if (!Arbiter::get_var("STK", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
+                          response, sizeof(response), HEALTH_TIMEOUT_MS)) return;
     uint32_t ticks = 0;
-    if (!DeviceUptime::parse(qframe_response_value(response), ticks) ||
+    if (!DeviceUptime::parse(response, ticks) ||
         !device_uptime.observe(ticks, millis())) return;
 
     Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] AirSense restart detected by STK\n");
@@ -164,13 +162,12 @@ static void poll_device_uptime() {
 
 static void poll_mhr() {
     char mhr_resp[32] = {};
-    uint16_t mhr_len = sizeof(mhr_resp);
-    if (!Arbiter::send_cmd("G S #MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                           mhr_resp, &mhr_len)) {
+    if (!Arbiter::get_var("MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                          mhr_resp, sizeof(mhr_resp))) {
         // UART unhappy; leave cache alone and retry next opportunity.
         return;
     }
-    const char *mv = qframe_response_value(mhr_resp);
+    const char *mv = mhr_resp;
     int new_mhr = mv ? (int)strtol(mv, nullptr, 16) : -1;
     int prev_mhr = Arbiter::get_cached_mhr();
     Arbiter::set_cached_mhr(new_mhr);
@@ -187,16 +184,15 @@ static bool mhr_poll_due() {
 
 static void poll_therapy_state() {
     char resp[64] = {};
-    uint16_t resp_len = sizeof(resp);
 
     uint32_t t0 = millis();
     Log::logf(CAT_HEALTH, LOG_DEBUG, "[HEALTH] ROP poll start t=%lu\n", t0);
-    bool ok = Arbiter::send_cmd("G S #ROP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                                resp, &resp_len, HEALTH_TIMEOUT_MS);
+    bool ok = Arbiter::get_var("ROP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
+                               resp, sizeof(resp), HEALTH_TIMEOUT_MS);
     if (ok) {
         consecutive_timeouts = 0;
 
-        const char *rv = qframe_response_value(resp);
+        const char *rv = resp;
         airsense_present = rv && (strcmp(rv, "0000") == 0 || strcmp(rv, "0001") == 0);
         if (airsense_present) {
             airsense_seen_ms = millis();
@@ -248,10 +244,8 @@ static void attempt_recovery() {
     if (Arbiter::get_state() != SYS_ERROR) return;
 
     char resp[32] = {};
-    uint16_t resp_len = sizeof(resp);
-
-    bool ok = Arbiter::send_cmd("G S #BLS", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                                resp, &resp_len);
+    bool ok = Arbiter::get_var("BLS", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
+                               resp, sizeof(resp));
     if (ok) {
         Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Device responded, clearing error\n");
         consecutive_timeouts = 0;
@@ -377,23 +371,13 @@ bool push_time_to_resmed() {
 }
 
 bool pull_time_from_resmed(bool force) {
-    char dac_resp[32] = {}, tic_resp[32] = {};
-    uint16_t dac_len = sizeof(dac_resp), tic_len = sizeof(tic_resp);
-    Arbiter::send_cmd("G S #DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, dac_resp, &dac_len);
-    Arbiter::send_cmd("G S #TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, tic_resp, &tic_len);
-    const char *dv = qframe_response_value(dac_resp);
-    const char *tv = qframe_response_value(tic_resp);
-    if (dv && tv && strlen(dv) >= 8 && strlen(tv) >= 6) {
-        int dd, mm, yyyy, hh, mn, ss;
-        if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
-            sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
-            if (!WiFiSetup::set_fallback_time(yyyy, mm, dd, hh, mn, ss, force)) return false;
-            Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Time from ResMed: %04d-%02d-%02d %02d:%02d:%02d\n",
-                      yyyy, mm, dd, hh, mn, ss);
-            return true;
-        }
-    }
-    return false;
+    Air10Clock::Calendar t;
+    if (!read_resmed_clock(t) ||
+        !WiFiSetup::set_fallback_time(t.year, t.month, t.day,
+                                      t.hour, t.minute, t.second, force)) return false;
+    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Time from ResMed: %04d-%02d-%02d %02d:%02d:%02d\n",
+              t.year, t.month, t.day, t.hour, t.minute, t.second);
+    return true;
 }
 
 static void sync_resmed_clock() {

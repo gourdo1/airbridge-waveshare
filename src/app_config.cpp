@@ -255,28 +255,14 @@ AirBridgeConfig& Config::get() {
 
 
 void Config::refresh_device_info() {
-    char resp[64] = {};
-    uint16_t len;
+    char value[64];
+    if (cfg.device_pna.isEmpty() &&
+        Arbiter::get_var("PNA", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value)))
+        cfg.device_pna = value;
 
-    if (cfg.device_pna.isEmpty()) {
-        len = sizeof(resp);
-        memset(resp, 0, sizeof(resp));
-        if (Arbiter::send_cmd("G S #PNA", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                               resp, &len)) {
-            const char *v = qframe_response_value(resp);
-            if (v) cfg.device_pna = v;
-        }
-    }
-
-    if (cfg.device_srn.isEmpty()) {
-        len = sizeof(resp);
-        memset(resp, 0, sizeof(resp));
-        if (Arbiter::send_cmd("G S #SRN", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                               resp, &len)) {
-            const char *v = qframe_response_value(resp);
-            if (v) cfg.device_srn = v;
-        }
-    }
+    if (cfg.device_srn.isEmpty() &&
+        Arbiter::get_var("SRN", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value)))
+        cfg.device_srn = value;
 }
 
 void Config::invalidate_device_info() {
