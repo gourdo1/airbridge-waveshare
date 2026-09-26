@@ -6,6 +6,7 @@
 #include "uart_arbiter.h"
 #include "clinical_jobs.h"
 #include "memory_manager.h"
+#include "hex_util.h"
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -171,21 +172,13 @@ bool error_is(const char *value, const char *code) {
     return value && code && strcmp(value, code) == 0;
 }
 
-bool read_language(uint32_t &language) {
-    char response[48];
-    const char *value = nullptr;
-    if (query_value("G S #LAN", response, sizeof(response), value) != QUERY_OK)
-        return false;
-    return CustomSettingsProtocol::parse_hex_value(value, language);
-}
-
-bool read_raw_locked(const cached_entry_t &entry, uint32_t &value) {
+bool read_raw_locked(const char *name, uint32_t &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout || loaded_generation != generation()) return false;
     char text[9];
-    return Arbiter::get_var(entry.name, CMD_SRC_TCP, CMD_PRIO_NORMAL,
+    return Arbiter::get_var(name, CMD_SRC_TCP, CMD_PRIO_NORMAL,
                             text, sizeof(text), timeout) &&
-           CustomSettingsProtocol::parse_hex_value(text, value);
+           aircannect::parse_hex(text, strlen(text), value);
 }
 
 bool add_enum_option_locked(cached_entry_t &entry, uint8_t value,
@@ -226,7 +219,7 @@ bool discover_enum_options_locked(cached_entry_t &entry,
     uint8_t total = 0;
     bool total_known = false;
     uint32_t current = 0;
-    if (read_raw_locked(entry, current) && current <= 0xff) {
+    if (read_raw_locked(entry.name, current) && current <= 0xff) {
         CustomSettingsProtocol::enum_option_t option = {};
         const char *error_value = nullptr;
         query_result_t result = query_enum_option(
@@ -242,7 +235,7 @@ bool discover_enum_options_locked(cached_entry_t &entry,
 
     if (!total_known) {
         for (uint8_t index = 0; index < MAX_ENUM_OPTIONS; index++) {
-                CustomSettingsProtocol::enum_option_t option = {};
+            CustomSettingsProtocol::enum_option_t option = {};
             const char *error_value = nullptr;
             query_result_t result = query_enum_option(
                 entry.name, index, response, sizeof(response), option,
@@ -417,7 +410,7 @@ bool ensure_loaded_locked() {
     }
     if (cache_state == CACHE_READY) {
         uint32_t language = 0;
-        if (read_language(language)) {
+        if (read_raw_locked("LAN", language)) {
             if (language_known && language != cached_language) {
                 Log::logf(CAT_WEB, LOG_INFO,
                           "[SETTINGS] LAN changed, refreshing custom registry\n");
@@ -440,7 +433,7 @@ bool ensure_loaded_locked() {
 
     if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
     uint32_t language = 0;
-    language_known = read_language(language);
+    language_known = read_raw_locked("LAN", language);
     if (language_known) cached_language = language;
 
     if (!discover_locked()) {
@@ -540,7 +533,7 @@ bool MetadataLease::option(uint16_t index, uint8_t option_index, option_view_t &
 
 bool MetadataLease::read_raw(uint16_t index, uint32_t &value) const {
     if (index >= count() || generation() != CustomSettings::generation()) return false;
-    return read_raw_locked(metadata_->entries[index], value);
+    return read_raw_locked(metadata_->entries[index].name, value);
 }
 
 void reclaim() {

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <atomic>
+#include <limits.h>
 #include "app_config.h"
 #include "build_info.h"
 #include "debug_log.h"
@@ -23,6 +24,7 @@
 #include "clinical_jobs.h"
 #include "device_uptime.h"
 #include "air10_clock.h"
+#include "hex_util.h"
 #include "board.h"
 #if defined(AB_BOARD_WROOM_S3)
 #include "hal/usb_serial_jtag_ll.h"
@@ -167,8 +169,9 @@ static void poll_mhr() {
         // UART unhappy; leave cache alone and retry next opportunity.
         return;
     }
-    const char *mv = mhr_resp;
-    int new_mhr = mv ? (int)strtol(mv, nullptr, 16) : -1;
+    uint32_t raw;
+    if (!aircannect::parse_hex(mhr_resp, strlen(mhr_resp), raw) || raw > INT_MAX) return;
+    int new_mhr = static_cast<int>(raw);
     int prev_mhr = Arbiter::get_cached_mhr();
     Arbiter::set_cached_mhr(new_mhr);
     last_mhr_poll = millis();

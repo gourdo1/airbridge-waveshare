@@ -6,7 +6,7 @@
 namespace CustomSettingsProtocol {
 namespace {
 
-bool hex_digit(char c, uint8_t &out) {
+bool upper_nibble(char c, uint8_t &out) {
     uint32_t value;
     if (!aircannect::parse_hex(&c, 1, value, true)) return false;
     out = value;
@@ -183,7 +183,7 @@ bool parse_numeric_caps(const char *value, numeric_caps_t &out) {
 bool parse_enum_flags(const char *value, uint8_t &flags) {
     if (!value || value[0] == '\0' || value[1] != '\0') return false;
     uint8_t nibble = 0;
-    if (!hex_digit(value[0], nibble)) return false;
+    if (!upper_nibble(value[0], nibble)) return false;
     flags = nibble;
     return true;
 }
