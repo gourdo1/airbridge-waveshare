@@ -2,6 +2,7 @@
 
 #include "uart_arbiter.h"
 #include "oxi_arbiter.h"
+#include "oxi_ble.h"
 
 namespace DeviceStatus {
 

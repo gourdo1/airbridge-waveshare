@@ -1542,40 +1542,21 @@ static String build_status_payload(const DeviceStatus::Snapshot &status) {
     return sj;
 }
 
-struct PublishedStatusSnapshot {
-    int             rop      = INT_MIN;
-    int             mhr      = INT_MIN;
-    system_state_t  sys      = (system_state_t)0xFF;
-    oxi_state_t     oxi      = (oxi_state_t)0xFF;
-    bool            feeding  = false;
-    int             spo2     = INT_MIN;
-    int             pulse    = INT_MIN;
+static DeviceStatus::Snapshot last_published = {
+    SYS_IDLE, OXI_DISABLED, {}, INT_MIN, INT_MIN, false
 };
-static PublishedStatusSnapshot last_published;
 
-static PublishedStatusSnapshot current_snapshot(
-        const DeviceStatus::Snapshot &status = DeviceStatus::snapshot()) {
-    PublishedStatusSnapshot s;
-    s.rop     = status.rop;
-    s.mhr     = status.mhr;
-    s.sys     = status.sys;
-    s.oxi     = status.oxi;
-    s.feeding = status.feeding;
-    const auto &r = status.reading;
-    s.spo2    = r.valid ? r.spo2 : -1;
-    s.pulse   = r.valid ? r.pulse_bpm : -1;
-    return s;
-}
-
-static bool snapshot_differs(const PublishedStatusSnapshot &a,
-                             const PublishedStatusSnapshot &b) {
+static bool snapshot_differs(const DeviceStatus::Snapshot &a,
+                             const DeviceStatus::Snapshot &b) {
     return a.rop     != b.rop     ||
            a.mhr     != b.mhr     ||
            a.sys     != b.sys     ||
            a.oxi     != b.oxi     ||
            a.feeding != b.feeding ||
-           a.spo2    != b.spo2    ||
-           a.pulse   != b.pulse;
+           (a.reading.valid ? a.reading.spo2 : -1) !=
+               (b.reading.valid ? b.reading.spo2 : -1) ||
+           (a.reading.valid ? a.reading.pulse_bpm : -1) !=
+               (b.reading.valid ? b.reading.pulse_bpm : -1);
 }
 
 static uint32_t last_status_push = 0;
@@ -1583,7 +1564,7 @@ static uint32_t last_status_push = 0;
 void WebUI::push_status_event() {
     if (!events || events->count() == 0) return;
     const auto status = DeviceStatus::snapshot();
-    last_published = current_snapshot(status);
+    last_published = status;
     last_status_push = millis();
     String sj = build_status_payload(status);
     events->send(sj.c_str(), "status", millis());
@@ -1596,7 +1577,7 @@ void WebUI::handle() {
     if (uint32_t(now - last_check) < 100) return;
     last_check = now;
 
-    if (snapshot_differs(current_snapshot(), last_published) ||
+    if (snapshot_differs(DeviceStatus::snapshot(), last_published) ||
         millis() - last_status_push >= 10000) {
         WebUI::push_status_event();
     }
