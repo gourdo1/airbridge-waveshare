@@ -8,6 +8,7 @@
 namespace StorageBrowser {
 
 enum class Kind { List, File, Archive };
+enum class StartResult { Started, BadRequest, Busy, Unavailable };
 
 struct Request {
     Kind kind;
@@ -30,6 +31,6 @@ using Ready = std::function<void(int code, const char *error,
 
 // One browser operation, including its response lifetime. Ready runs outside
 // the SD executor. Size zero for archives denotes HTTP chunked transfer.
-bool start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active);
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active);
 
 }  // namespace StorageBrowser

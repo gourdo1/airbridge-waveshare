@@ -325,14 +325,14 @@ void produce(void *context) {
 }
 }  // namespace
 
-bool start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active) {
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active) {
     if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
         !memchr(request.selection, 0, sizeof(request.selection)))
-        return false;
+        return StartResult::BadRequest;
     bool expected = false;
-    if (!busy.compare_exchange_strong(expected, true)) return false;
+    if (!busy.compare_exchange_strong(expected, true)) return StartResult::Busy;
     void *memory = aircannect::Memory::alloc_large(sizeof(Job));
-    if (!memory) { busy.store(false); return false; }
+    if (!memory) { busy.store(false); return StartResult::Unavailable; }
     auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
         value->~Job();
         free(value);
@@ -346,9 +346,9 @@ bool start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active)
         job->capacity = INTERNAL_RING_BYTES;
         job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
     }
-    if (!job->ring) return false;
+    if (!job->ring) return StartResult::Unavailable;
     auto *context = new(std::nothrow) std::shared_ptr<Job>(job);
-    if (!context) return false;
+    if (!context) return StartResult::Unavailable;
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
@@ -356,8 +356,8 @@ bool start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active)
     if (created != pdPASS)
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
             context, 1, nullptr, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (created != pdPASS) { delete context; return false; }
-    return true;
+    if (created != pdPASS) { delete context; return StartResult::Unavailable; }
+    return StartResult::Started;
 }
 }  // namespace StorageBrowser
 #endif

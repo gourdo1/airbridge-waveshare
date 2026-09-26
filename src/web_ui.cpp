@@ -1635,7 +1635,7 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
     operation.kind = kind;
     const String path = request->hasParam("path") ? request->getParam("path")->value() : "/";
     if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path)) {
-        request->send(400, "application/json", "{\"error\":\"path_too_long\"}");
+        request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
         return;
     }
     strcpy(operation.path, path.c_str());
@@ -1676,7 +1676,7 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
     }
     auto paused = request->pause();
     std::weak_ptr<StorageBrowser::Transfer> active;
-    const bool started = StorageBrowser::start(operation,
+    const auto result = StorageBrowser::start(operation,
         [paused, kind, disposition](int code, const char *error,
                                   std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
             auto request = paused.lock();
@@ -1693,10 +1693,14 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
             if (disposition.length()) response->addHeader("Content-Disposition", disposition);
             request->send(response);
         }, active);
-    if (started) request->onDisconnect([active]() {
+    if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
         if (auto transfer = active.lock()) transfer->cancel();
     });
-    if (!started) request->send(409, "application/json", "{\"error\":\"storage_busy_or_invalid_request\"}");
+    else if (result == StorageBrowser::StartResult::BadRequest)
+        request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
+    else if (result == StorageBrowser::StartResult::Busy)
+        request->send(409, "application/json", "{\"error\":\"storage_busy\"}");
+    else request->send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
 }
 #endif
 

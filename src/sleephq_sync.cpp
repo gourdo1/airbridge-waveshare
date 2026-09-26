@@ -547,7 +547,6 @@ static bool run_journal(SdStorage::Session &storage, const StatePaths &paths,
 
             SdStorage::Reader input;
             if (!input.open(storage, spec.local_path)) {
-                if (input) input.close();
                 if (spec.required) {
                     snprintf(error, error_size, "local_missing:%s",
                              spec.local_path);
