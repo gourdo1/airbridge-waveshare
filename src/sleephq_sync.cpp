@@ -1,4 +1,5 @@
 #include "sleephq_sync.h"
+#include "sd_storage.h"
 
 #include <Arduino.h>
 #include <stdio.h>

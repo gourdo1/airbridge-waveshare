@@ -18,6 +18,7 @@ struct Status {
     char error[48];
 };
 
+// Binary storage records use little-endian fields regardless of alignment.
 inline uint16_t get_le16(const uint8_t *data) {
     return static_cast<uint16_t>(data[0]) |
            static_cast<uint16_t>(data[1]) << 8;
@@ -42,8 +43,6 @@ inline void put_le32(uint8_t *data, uint32_t value) {
     data[3] = static_cast<uint8_t>(value >> 24);
 }
 
-
-// Binary storage records use little-endian fields regardless of alignment.
 bool write_exact(fs::File &file, const uint8_t *data, size_t size);
 
 void init();
