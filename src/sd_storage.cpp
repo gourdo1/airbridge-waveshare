@@ -67,19 +67,22 @@ OpenFile *find_reader(uint32_t id) {
     return nullptr;
 }
 
+bool background_allowed() {
+    const auto state = Arbiter::get_state();
+    return !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
+        (state == SYS_IDLE || state == SYS_ERROR) && Arbiter::get_cached_rop() != 1;
+}
+
 bool background_allowed(uint32_t expected) {
     return expected && expected == __atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
-        !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
-        Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0;
+        background_allowed();
 }
 
 void process_request(Request &value) {
     Request *request = &value;
     request->success = false;
     if (request->kind == Request::Begin) {
-        if (!direct_owner && !active_session && mounted() &&
-            !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
-            Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0) {
+        if (!direct_owner && !active_session && mounted() && background_allowed()) {
             if (++generation == 0) ++generation;
             __atomic_store_n(&active_session, generation, __ATOMIC_RELEASE);
             request->generation = generation;
