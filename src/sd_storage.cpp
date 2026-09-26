@@ -30,7 +30,7 @@ static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 #if AB_STORAGE_HAS_SDCARD
 namespace {
 struct Request {
-    enum Kind { Run, Acquire, Release, Close, Begin, End } kind;
+    enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End } kind;
     bool (*operation)(fs::FS &, void *);
     void *context;
     uint32_t generation;
@@ -91,8 +91,8 @@ void process_request(Request &value) {
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
         }
         request->success = true;
-    } else if (request->kind == Request::Acquire) {
-        if (!direct_owner) {
+    } else if (request->kind == Request::Acquire || request->kind == Request::TryAcquire) {
+        if (!direct_owner && (request->kind == Request::Acquire || !active_session)) {
             close_readers();
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&direct_owner, request->caller, __ATOMIC_RELEASE);
@@ -249,6 +249,16 @@ bool acquire() {
     const bool taken = dispatch(request, true);
     __atomic_sub_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
     return taken;
+#else
+    return false;
+#endif
+}
+
+bool try_acquire() {
+#if AB_STORAGE_HAS_SDCARD
+    Request request = {};
+    request.kind = Request::TryAcquire;
+    return dispatch(request, false);
 #else
     return false;
 #endif

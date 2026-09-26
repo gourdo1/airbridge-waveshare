@@ -55,6 +55,8 @@ void get_status(Status &out);
 // Recorder/recovery only. Waits for current local I/O, never for a network
 // consumer; acquisition invalidates all previously admitted background work.
 bool acquire();
+// Maintenance never revokes an auxiliary session.
+bool try_acquire();
 void release();
 
 class Session {

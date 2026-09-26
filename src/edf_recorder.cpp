@@ -905,19 +905,19 @@ static bool publish_identification_pair() {
     return true;
 }
 
-static bool write_identification() {
+static bool collect_identification(uint8_t *&content, size_t &content_len) {
     static const char *const tags[] = {
         "IMF", "VIR", "RIR", "PVR", "PVD", "CID", "RID", "VID",
         "SRN", "SID", "PNA", "PCD", "PCB", "MID", "FGT", "BID",
     };
-    uint8_t *content = static_cast<uint8_t *>(
+    content = static_cast<uint8_t *>(
         aircannect::Memory::alloc_large(IDENTIFICATION_BUFFER_SIZE));
     if (!content) {
         post_error("Identification buffer allocation failed");
         return false;
     }
 
-    size_t content_len = 0;
+    content_len = 0;
     bool built = true;
     bool cancelled = false;
     for (const char *tag : tags) {
@@ -947,16 +947,13 @@ static bool write_identification() {
         content_len += static_cast<size_t>(line_len);
     }
     if (!built) {
-        aircannect::Memory::free(content);
         if (!cancelled) post_error("Identification collection failed");
         return false;
     }
+    return !post_processing_cancelled();
+}
 
-    if (post_processing_cancelled()) {
-        aircannect::Memory::free(content);
-        return false;
-    }
-
+static bool write_identification(const uint8_t *content, size_t content_len) {
     const uint32_t crc = crc32_ieee(content, content_len);
     bool unchanged = false;
     fs::File old_crc = storage->open("/Identification.crc", FILE_READ);
@@ -970,7 +967,6 @@ static bool write_identification() {
     if (old_crc) old_crc.close();
     if (old_target) old_target.close();
     if (unchanged) {
-        aircannect::Memory::free(content);
         portENTER_CRITICAL(&status_mux);
         status.identification_ready = true;
         portEXIT_CRITICAL(&status_mux);
@@ -994,7 +990,6 @@ static bool write_identification() {
         crc_file.flush();
         crc_file.close();
     }
-    aircannect::Memory::free(content);
     if (!written || !publish_identification_pair()) {
         storage->remove("/Identification.tgt.part");
         storage->remove("/Identification.crc.part");
@@ -1462,22 +1457,19 @@ static bool update_str_file(const uint8_t *incoming_record) {
     return true;
 }
 
-static bool update_str_summary() {
+static bool collect_str_summary(uint8_t *&record) {
     const size_t record_size =
         Air10Edf::record_size(Air10Edf::str_schema());
-    uint8_t *record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
+    record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
     if (!record) {
         post_error("STR record allocation failed");
         return false;
     }
     uint32_t before = 0, after = 0;
-    const bool success = read_u32_variable("ZEN", before) &&
+    return read_u32_variable("ZEN", before) &&
                          fetch_str_record(record, record_size) &&
                          read_u32_variable("ZEN", after) && before == after &&
-                         !post_processing_cancelled() &&
-                         update_str_file(record);
-    aircannect::Memory::free(record);
-    return success;
+                         !post_processing_cancelled();
 }
 
 static bool session_files_complete_at(const char *directory,
@@ -2676,7 +2668,7 @@ static void process_pending() {
         (next_pending_ms && !status.pending_str) ||
         Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0 ||
         (next_pending_ms && int32_t(millis() - next_pending_ms) < 0) ||
-        !SdStorage::acquire()) return;
+        !SdStorage::try_acquire()) return;
     next_pending_ms = millis() + 30000;
     EdfPending::Record selected;
     char selected_path[80] = {};
@@ -2708,6 +2700,8 @@ static void process_pending() {
     portEXIT_CRITICAL(&status_mux);
     bool success = false;
     EdfCatalog::Entry entry;
+    const bool have_entry = selected_path[0] && EdfCatalog::find(selected.prefix, entry);
+    SdStorage::release();
     if (selected_path[0]) {
         memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
         char srn[24] = {};
@@ -2716,7 +2710,7 @@ static void process_pending() {
             post_error("STR pending clock requires review");
         } else if (!read_variable("SRN", srn, sizeof(srn)) || strcmp(srn, selected.srn)) {
             post_error("STR pending device unavailable or different");
-        } else if (EdfCatalog::find(selected.prefix, entry)) {
+        } else if (have_entry) {
             session_clock = {};
             session_clock.native_valid = true;
             session_clock.native_start = selected.native_start;
@@ -2724,17 +2718,26 @@ static void process_pending() {
             session_native_day = selected.native_day; session_epoch_day = selected.export_day;
             session_mid = selected.mid; session_vid = selected.vid;
             memcpy(session_srn, selected.srn, sizeof(session_srn));
-            success = wait_for_final_str_save(selected) &&
-                      !post_processing_cancelled() && write_identification() &&
-                      update_str_summary();
-            if (success) {
-                entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
-                success = EdfCatalog::commit(entry);
+            uint8_t *identification = nullptr, *record = nullptr;
+            size_t identification_size = 0;
+            const bool ready = wait_for_final_str_save(selected) &&
+                collect_identification(identification, identification_size) &&
+                collect_str_summary(record) && !post_processing_cancelled();
+            if (ready && SdStorage::try_acquire()) {
+                success = write_identification(identification, identification_size) &&
+                    update_str_file(record);
+                if (success) {
+                    entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
+                    success = EdfCatalog::commit(entry);
+                }
+                if (success && !storage->remove(selected_path)) {
+                    post_error("STR pending completion cleanup failed");
+                    success = false;
+                }
+                SdStorage::release();
             }
-            if (success && !storage->remove(selected_path)) {
-                post_error("STR pending completion cleanup failed");
-                success = false;
-            }
+            aircannect::Memory::free(identification);
+            aircannect::Memory::free(record);
         } else {
             post_error("STR pending session files incomplete");
         }
@@ -2746,7 +2749,6 @@ static void process_pending() {
     status.post_processing = false;
     if (success && status.pending_str) status.pending_str--;
     portEXIT_CRITICAL(&status_mux);
-    SdStorage::release();
     if (success) {
         next_pending_ms = 0;
         (void)ExportSync::request_post_therapy(entry);
@@ -2760,7 +2762,7 @@ static bool prepare_storage() {
     if (state != SYS_IDLE && state != SYS_THERAPY) return false;
     next_storage_ms = millis() + 5000;
     if (!SdStorage::mounted()) SdStorage::init();
-    if (!SdStorage::acquire()) return false;
+    if (!SdStorage::try_acquire()) return false;
     storage = SdStorage::filesystem();
     if (storage) {
         recover_partial_outputs();
