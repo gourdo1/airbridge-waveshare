@@ -27,7 +27,7 @@ typedef struct {
 #define MAX_SCAN_RESULTS 8
 
 struct oxi_scan_result_t {
-    String addr;
+    char addr[18];
     String name;
     int rssi;
     uint8_t addr_type;

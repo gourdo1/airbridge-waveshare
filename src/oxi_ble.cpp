@@ -11,6 +11,7 @@
 #include <atomic>
 #include <esp_heap_caps.h>
 #include <new>
+#include <strings.h>
 #include "nvs_optional.h"
 
 #define OXI_TASK_STACK      4096
@@ -678,14 +679,25 @@ static bool has_oxyii_manufacturer(const NimBLEAdvertisedDevice *dev) {
     return false;
 }
 
+static bool has_oximeter_name(const char *name) {
+    static const char *const prefixes[] = {
+        "Nonin", "O2 ", "O2Ring", "O2M", "S8-AW", "T8520_", "CheckMe",
+        "CheckO2", "SleepU", "SleepO2", "WearO2", "KidsO2", "BabyO2",
+        "OxyLink", "WS20", "ACCARE",
+    };
+    for (const char *prefix : prefixes)
+        if (strncasecmp(name, prefix, strlen(prefix)) == 0) return true;
+    return false;
+}
+
 class OxiScanCB : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
-        String name = dev->getName().c_str();
-        String addr = dev->getAddress().toString().c_str();
+        std::string name = dev->getName();
+        std::string addr = dev->getAddress().toString();
         // Passive advertisements need not contain a name or service UUID.
         bool known = is_device_known(addr.c_str(), dev->getAddress().getType());
         bool is_oxi = has_oxyii_manufacturer(dev) ||
-                       known || addr.equalsIgnoreCase(Config::get().oxi_device_addr) ||
+                       known || strcasecmp(addr.c_str(), Config::get().oxi_device_addr.c_str()) == 0 ||
                        dev->isAdvertisingService(PLX_SERVICE_UUID) ||
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
@@ -693,37 +705,20 @@ class OxiScanCB : public NimBLEScanCallbacks {
                        dev->isAdvertisingService(OXYII_SERVICE_UUID) ||
                        dev->isAdvertisingService(WS20A_NOTIFY_SERVICE_UUID) ||
                        dev->isAdvertisingService(WS20A_WRITE_SERVICE_UUID) ||
-                       name.startsWith("Nonin") ||
-                       name.startsWith("O2 ") ||
-                       name.startsWith("O2Ring") ||
-                       name.startsWith("O2M") ||
-                       name.startsWith("S8-AW") ||
-                       name.startsWith("T8520_") ||
-                       name.startsWith("CheckMe") ||
-                       name.startsWith("Checkme") ||
-                       name.startsWith("CheckO2") ||
-                       name.startsWith("SleepU") ||
-                       name.startsWith("SleepO2") ||
-                       name.startsWith("WearO2") ||
-                       name.startsWith("KidsO2") ||
-                       name.startsWith("BabyO2") ||
-                       name.startsWith("OxyLink") ||
-                       name.startsWith("Oxylink") ||
-                       name.startsWith("WS20") ||
-                       name.startsWith("ACCARE") ||
-                       name.startsWith("Accare");
+                       has_oximeter_name(name.c_str());
 
         if (is_oxi && scan_mutex && xSemaphoreTake(scan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (scan_result_count < MAX_SCAN_RESULTS) {
-                scan_results[scan_result_count].addr = dev->getAddress().toString().c_str();
-                scan_results[scan_result_count].name = name;
+                snprintf(scan_results[scan_result_count].addr,
+                         sizeof(scan_results[scan_result_count].addr), "%s", addr.c_str());
+                scan_results[scan_result_count].name = name.c_str();
                 scan_results[scan_result_count].rssi = dev->getRSSI();
                 scan_results[scan_result_count].addr_type = dev->getAddress().getType();
                 scan_result_count++;
             }
             xSemaphoreGive(scan_mutex);
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Found: %s (%s) RSSI=%d\n",
-                          name.c_str(), dev->getAddress().toString().c_str(), dev->getRSSI());
+                          name.c_str(), addr.c_str(), dev->getRSSI());
         }
     }
 
@@ -1124,7 +1119,7 @@ void OxiBle::task(void *param) {
                     bool found = false;
                     if (target.length() > 0) {
                         for (int i = 0; i < scan_result_count; i++) {
-                            if (scan_results[i].addr.equalsIgnoreCase(target)) {
+                            if (strcasecmp(scan_results[i].addr, target.c_str()) == 0) {
                                 found = true;
                                 Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Target %s found in scan\n", target.c_str());
                                 break;
@@ -1133,14 +1128,14 @@ void OxiBle::task(void *param) {
                         if (!found) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Target %s not in scan results\n", target.c_str());
                     } else {
                         for (int i = 0; i < scan_result_count; i++) {
-                            bool known = is_device_known(scan_results[i].addr.c_str(),
+                            bool known = is_device_known(scan_results[i].addr,
                                                          scan_results[i].addr_type);
                             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] %s %s known=%d\n",
-                                      scan_results[i].name.c_str(), scan_results[i].addr.c_str(), known);
+                                      scan_results[i].name.c_str(), scan_results[i].addr, known);
                             if (cfg.oxi_require_known) {
                                 if (known) { target = scan_results[i].addr; found = true; break; }
                             } else {
-                                if (scan_results[i].name.startsWith("Nonin")) {
+                                if (strncasecmp(scan_results[i].name.c_str(), "Nonin", 5) == 0) {
                                     if (known) { target = scan_results[i].addr; found = true; break; }
                                 } else {
                                     target = scan_results[i].addr;
@@ -1219,7 +1214,7 @@ void OxiBle::task(void *param) {
                 uint8_t atype = 1;
                 String dev_name = "";
                 for (int i = 0; i < scan_result_count; i++) {
-                    if (scan_results[i].addr.equalsIgnoreCase(addr)) {
+                    if (strcasecmp(scan_results[i].addr, addr.c_str()) == 0) {
                         atype = scan_results[i].addr_type;
                         dev_name = scan_results[i].name;
                         break;
@@ -1228,7 +1223,8 @@ void OxiBle::task(void *param) {
 
                 NimBLEAddress bleAddr(std::string(addr.c_str()), atype);
                 // Bonded Nonin may omit its name from passive advertisements.
-                device_needs_encryption = dev_name.startsWith("Nonin") || NimBLEDevice::isBonded(bleAddr);
+                device_needs_encryption = strncasecmp(dev_name.c_str(), "Nonin", 5) == 0 ||
+                                          NimBLEDevice::isBonded(bleAddr);
                 bool connected = false;
 
                 for (int attempt = 1; attempt <= max_attempts; attempt++) {

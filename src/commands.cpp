@@ -117,9 +117,14 @@ void dispatch_command(const char *line, String &response) {
             if (count == 0) {
                 response = "(no oximeters found)\n";
             } else {
-                for (int i = 0; i < count; i++)
-                    response += devs[i].addr + " " + devs[i].name +
-                                " RSSI=" + String(devs[i].rssi) + "\n";
+                for (int i = 0; i < count; i++) {
+                    response += devs[i].addr;
+                    response += ' ';
+                    response += devs[i].name;
+                    response += " RSSI=";
+                    response += devs[i].rssi;
+                    response += '\n';
+                }
             }
         } else if (sub.startsWith("CONNECT")) {
             String addr = cmd.substring(12);  // "OXI CONNECT <addr>"

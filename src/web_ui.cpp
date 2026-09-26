@@ -950,7 +950,7 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
     for (int i = 0; i < scan_count; i++) {
         if (i > 0) json += ',';
         json += "{";
-        jsonAddString(json, "addr", devs[i].addr.c_str(), false);
+        jsonAddString(json, "addr", devs[i].addr, false);
         jsonAddString(json, "name", devs[i].name.c_str());
         jsonAddInt(json, "rssi", devs[i].rssi);
         json += "}";
