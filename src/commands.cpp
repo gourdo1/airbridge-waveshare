@@ -149,8 +149,8 @@ void dispatch_command(const char *line, String &response) {
         if (subUpper == "DUMP" || sub.length() == 0) {
             response = Config::dump();
         } else if (subUpper == "SAVE") {
-            Config::save();
-            response = "OK: config saved to NVS\n";
+            response = Config::save() ? "OK: config saved to NVS\n" :
+                                        "ERROR: NVS save failed\n";
         } else if (subUpper == "RESET") {
             Config::reset_defaults();
             OtaManager::config_changed();

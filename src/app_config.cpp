@@ -4,6 +4,8 @@
 #include "network_hints.h"
 #include "debug_log.h"
 #include <Preferences.h>
+#include <nvs.h>
+#include <initializer_list>
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 
@@ -13,6 +15,8 @@
 static Preferences prefs;
 static AirBridgeConfig cfg;
 static uint32_t config_revision = 0;
+static bool onboarding_done = false;
+static bool onboarding_stored = false;
 
 struct KVEntry {
     const char *key;
@@ -146,9 +150,10 @@ static void load_wifi_nets() {
             cfg.wifi_nets[0].pass = prefs.getString("wifi_pass", "");
             cfg.wifi_nets[0].enabled = true;
             cfg.wifi_net_count = 1;
-            Config::save_wifi_nets();
-            prefs.remove("wifi_ssid");
-            prefs.remove("wifi_pass");
+            if (Config::save_wifi_nets()) {
+                prefs.remove("wifi_ssid");
+                prefs.remove("wifi_pass");
+            }
         }
     }
 }
@@ -161,8 +166,10 @@ static void apply_syslog() {
 }
 
 void Config::load() {
+    bool legacy = prefs.isKey("wifi_ssid");
     for (const KVEntry &entry : kv_table) {
         if (!prefs.isKey(entry.nvs_key)) continue;
+        legacy = true;
         switch (entry.type) {
             case KVEntry::STR: {
                 auto &value = *(String *)entry.ptr;
@@ -191,42 +198,68 @@ void Config::load() {
             }
         }
     }
+    // Classify old installations before migration or any new settings are saved.
+    nvs_handle_t networks;
+    if (nvs_open("wnet", NVS_READONLY, &networks) == ESP_OK) {
+        uint8_t count = 0;
+        if (nvs_get_u8(networks, "count", &count) == ESP_OK && count > 0)
+            legacy = true;
+        nvs_close(networks);
+    }
+    onboarding_stored = prefs.isKey("onboard");
+    onboarding_done = onboarding_stored ? prefs.getBool("onboard", false) : legacy;
+    if (!onboarding_stored)
+        onboarding_stored = prefs.putBool("onboard", onboarding_done) == 1;
     load_wifi_nets();
     apply_syslog();
 }
 
-void Config::save() {
-    for (const KVEntry &entry : kv_table) {
-        switch (entry.type) {
-            case KVEntry::STR: {
-                const auto &value = *(String *)entry.ptr;
-                prefs.putString(entry.nvs_key, value);
-                break;
-            }
-            case KVEntry::U8: {
-                const auto &value = *(uint8_t *)entry.ptr;
-                prefs.putUChar(entry.nvs_key, value);
-                break;
-            }
-            case KVEntry::U16: {
-                const auto &value = *(uint16_t *)entry.ptr;
-                prefs.putUShort(entry.nvs_key, value);
-                break;
-            }
-            case KVEntry::U32: {
-                const auto &value = *(uint32_t *)entry.ptr;
-                prefs.putULong(entry.nvs_key, value);
-                break;
-            }
-            case KVEntry::BOOL: {
-                const auto &value = *(bool *)entry.ptr;
-                prefs.putBool(entry.nvs_key, value);
-                break;
-            }
-        }
+static esp_err_t store_value(nvs_handle_t handle, const KVEntry &entry) {
+    switch (entry.type) {
+        case KVEntry::STR: return nvs_set_str(handle, entry.nvs_key, ((String *)entry.ptr)->c_str());
+        case KVEntry::U8: return nvs_set_u8(handle, entry.nvs_key, *(uint8_t *)entry.ptr);
+        case KVEntry::U16: return nvs_set_u16(handle, entry.nvs_key, *(uint16_t *)entry.ptr);
+        case KVEntry::U32: return nvs_set_u32(handle, entry.nvs_key, *(uint32_t *)entry.ptr);
+        case KVEntry::BOOL: return nvs_set_u8(handle, entry.nvs_key, *(bool *)entry.ptr);
     }
+    return ESP_ERR_INVALID_ARG;
+}
+
+static bool store_onboarding_marker() {
+    if (!onboarding_stored)
+        onboarding_stored = prefs.putBool("onboard", onboarding_done) == 1;
+    return onboarding_stored;
+}
+
+bool Config::save() {
+    if (!store_onboarding_marker()) return false;
+    nvs_handle_t handle;
+    if (nvs_open("airbridge", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t error = ESP_OK;
+    for (const KVEntry &entry : kv_table) {
+        error = store_value(handle, entry);
+        if (error != ESP_OK) break;
+    }
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
     apply_syslog();
     __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+    return error == ESP_OK;
+}
+
+bool Config::onboarding_complete() {
+    return onboarding_done;
+}
+
+bool Config::complete_onboarding(const char *user, const char *password) {
+    if (user) cfg.http_user = user;
+    if (password) cfg.http_pass = password;
+    if ((user || password) && !save()) return false;
+    if (prefs.putBool("onboard", true) != 1) return false;
+    onboarding_done = true;
+    onboarding_stored = true;
+    __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+    return true;
 }
 
 uint32_t Config::revision() {
@@ -235,6 +268,8 @@ uint32_t Config::revision() {
 
 void Config::reset_defaults() {
     prefs.clear();
+    onboarding_done = false;
+    onboarding_stored = false;
     apply_defaults();
     save();
 }
@@ -316,7 +351,10 @@ bool Config::set_value(const char *key, const char *value) {
 }
 
 bool Config::parse_section(const char *name, Section &out) {
-    if (strcmp(name, "smb") == 0) out = Section::Smb;
+    if (strcmp(name, "network") == 0) out = Section::Network;
+    else if (strcmp(name, "time") == 0) out = Section::Time;
+    else if (strcmp(name, "access") == 0) out = Section::Access;
+    else if (strcmp(name, "smb") == 0) out = Section::Smb;
     else if (strcmp(name, "sleephq") == 0) out = Section::SleepHq;
     else return false;
     return true;
@@ -329,6 +367,12 @@ void Config::foreach_kv(kv_visitor_fn fn, void *ctx, Section section) {
             continue;
         if (section == Section::SleepHq && strncmp(entry.key, "sleephq_", 8) != 0)
             continue;
+        if (section == Section::Network && strcmp(entry.key, "hostname") != 0 &&
+            strcmp(entry.key, "wifi_mode") != 0) continue;
+        if (section == Section::Time && strcmp(entry.key, "tz") != 0 &&
+            strcmp(entry.key, "ntp_server") != 0) continue;
+        if (section == Section::Access && strcmp(entry.key, "http_user") != 0 &&
+            strcmp(entry.key, "http_pass") != 0) continue;
         format_value(entry, val);
         fn(entry.key, val, entry.sensitive, ctx);
     }
@@ -352,29 +396,34 @@ String Config::dump() {
 }
 
 
-void Config::save_wifi_nets() {
-    Preferences wp;
-    wp.begin("wnet", false);
-    wp.putUChar("count", cfg.wifi_net_count);
-    for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
+bool Config::save_wifi_nets() {
+    if (!store_onboarding_marker()) return false;
+    nvs_handle_t handle;
+    if (nvs_open("wnet", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t error = ESP_OK;
+    for (int i = 0; i < WIFI_MAX_NETWORKS && error == ESP_OK; i++) {
         char key[14];
+        snprintf(key, sizeof(key), "ssid_%d", i);
         if (i < cfg.wifi_net_count) {
-            snprintf(key, sizeof(key), "ssid_%d", i);
-            wp.putString(key, cfg.wifi_nets[i].ssid);
+            error = nvs_set_str(handle, key, cfg.wifi_nets[i].ssid.c_str());
             snprintf(key, sizeof(key), "pass_%d", i);
-            wp.putString(key, cfg.wifi_nets[i].pass);
+            if (error == ESP_OK) error = nvs_set_str(handle, key, cfg.wifi_nets[i].pass.c_str());
             snprintf(key, sizeof(key), "ena_%d", i);
-            wp.putBool(key, cfg.wifi_nets[i].enabled);
+            if (error == ESP_OK) error = nvs_set_u8(handle, key, cfg.wifi_nets[i].enabled);
         } else {
-            snprintf(key, sizeof(key), "ssid_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
-            snprintf(key, sizeof(key), "pass_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
-            snprintf(key, sizeof(key), "ena_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
+            for (const char *prefix : {"ssid", "pass", "ena"}) {
+                snprintf(key, sizeof(key), "%s_%d", prefix, i);
+                error = nvs_erase_key(handle, key);
+                if (error == ESP_ERR_NVS_NOT_FOUND) error = ESP_OK;
+                if (error != ESP_OK) break;
+            }
         }
     }
-    wp.end();
+    // Publish the slot count only after all new entries have been written.
+    if (error == ESP_OK) error = nvs_set_u8(handle, "count", cfg.wifi_net_count);
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
+    return error == ESP_OK;
 }
 
 bool Config::add_network(const char *ssid, const char *pass) {
@@ -384,8 +433,7 @@ bool Config::add_network(const char *ssid, const char *pass) {
     cfg.wifi_nets[idx].pass = pass ? pass : "";
     cfg.wifi_nets[idx].enabled = true;
     cfg.wifi_net_count++;
-    save_wifi_nets();
-    return true;
+    return save_wifi_nets();
 }
 
 bool Config::remove_network(uint8_t idx) {

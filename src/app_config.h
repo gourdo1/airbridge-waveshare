@@ -80,13 +80,16 @@ struct AirBridgeConfig {
 };
 
 namespace Config {
-    enum class Section : uint8_t { All, Smb, SleepHq };
+    enum class Section : uint8_t { All, Network, Time, Access, Smb, SleepHq };
 
     void init();
     void load();
-    void save();
+    bool save();
     uint32_t revision();
     void reset_defaults();
+
+    bool onboarding_complete();
+    bool complete_onboarding(const char *user, const char *password);
 
     AirBridgeConfig& get();
 
@@ -106,5 +109,5 @@ namespace Config {
 
     bool add_network(const char *ssid, const char *pass);
     bool remove_network(uint8_t idx);
-    void save_wifi_nets();
+    bool save_wifi_nets();
 }
