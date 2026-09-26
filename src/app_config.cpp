@@ -107,11 +107,46 @@ void Config::init() {
     prefs.begin("airbridge", false);
 }
 
+struct StoredNetworks {
+    uint8_t version, count;
+    struct Entry { uint8_t enabled; char ssid[33], pass[65]; } entries[WIFI_MAX_NETWORKS];
+};
+static_assert(sizeof(StoredNetworks) == 398, "WiFi profile layout");
+
+static bool decode_wifi_nets(const StoredNetworks &stored) {
+    if (stored.version != 1 || stored.count > WIFI_MAX_NETWORKS) return false;
+    for (uint8_t i = 0; i < stored.count; i++) {
+        const auto &entry = stored.entries[i];
+        if (entry.enabled > 1 || !entry.ssid[0] ||
+            !memchr(entry.ssid, 0, sizeof(entry.ssid)) ||
+            !memchr(entry.pass, 0, sizeof(entry.pass))) return false;
+    }
+    cfg.wifi_net_count = stored.count;
+    for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+        const bool present = i < stored.count;
+        cfg.wifi_nets[i].ssid = present ? stored.entries[i].ssid : "";
+        cfg.wifi_nets[i].pass = present ? stored.entries[i].pass : "";
+        cfg.wifi_nets[i].enabled = present && stored.entries[i].enabled;
+    }
+    return true;
+}
+
 static void load_wifi_nets() {
     Preferences wp;
     // writable: we may need to scrub legacy bssid_<i>/chan_<i> keys after
     // migrating them to NetworkHints.
     wp.begin("wnet", false);
+    if (wp.isKey("profiles")) {
+        StoredNetworks stored = {};
+        if (wp.getBytesLength("profiles") != sizeof(stored) ||
+            wp.getBytes("profiles", &stored, sizeof(stored)) != sizeof(stored) ||
+            !decode_wifi_nets(stored)) {
+            cfg.wifi_net_count = 0;
+            Log::logf(CAT_WIFI, LOG_ERROR, "[WIFI] invalid saved profiles\n");
+        }
+        wp.end();
+        return;
+    }
     cfg.wifi_net_count = wp.getUChar("count", 0);
     if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) cfg.wifi_net_count = WIFI_MAX_NETWORKS;
     for (int i = 0; i < cfg.wifi_net_count; i++) {
@@ -121,7 +156,7 @@ static void load_wifi_nets() {
         snprintf(key, sizeof(key), "pass_%d", i);
         cfg.wifi_nets[i].pass = wp.getString(key, "");
         snprintf(key, sizeof(key), "ena_%d", i);
-        cfg.wifi_nets[i].enabled = wp.getBool(key, true);
+        cfg.wifi_nets[i].enabled = wp.getBool(key, true) && cfg.wifi_nets[i].ssid.length() > 0;
 
         // Legacy hint keys: bssid_<i> + chan_<i> used to live here. Migrate
         // any populated values into NetworkHints, then nuke the old keys.
@@ -403,29 +438,21 @@ String Config::dump() {
 
 bool Config::save_wifi_nets() {
     if (!store_onboarding_marker()) return false;
+    if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) return false;
+    StoredNetworks stored = {};
+    stored.version = 1;
+    stored.count = cfg.wifi_net_count;
+    for (uint8_t i = 0; i < stored.count; i++) {
+        const auto &net = cfg.wifi_nets[i];
+        if (!net.ssid.length() || net.ssid.length() >= sizeof(stored.entries[i].ssid) ||
+            net.pass.length() >= sizeof(stored.entries[i].pass)) return false;
+        stored.entries[i].enabled = net.enabled;
+        strcpy(stored.entries[i].ssid, net.ssid.c_str());
+        strcpy(stored.entries[i].pass, net.pass.c_str());
+    }
     nvs_handle_t handle;
     if (nvs_open("wnet", NVS_READWRITE, &handle) != ESP_OK) return false;
-    esp_err_t error = ESP_OK;
-    for (int i = 0; i < WIFI_MAX_NETWORKS && error == ESP_OK; i++) {
-        char key[14];
-        snprintf(key, sizeof(key), "ssid_%d", i);
-        if (i < cfg.wifi_net_count) {
-            error = nvs_set_str(handle, key, cfg.wifi_nets[i].ssid.c_str());
-            snprintf(key, sizeof(key), "pass_%d", i);
-            if (error == ESP_OK) error = nvs_set_str(handle, key, cfg.wifi_nets[i].pass.c_str());
-            snprintf(key, sizeof(key), "ena_%d", i);
-            if (error == ESP_OK) error = nvs_set_u8(handle, key, cfg.wifi_nets[i].enabled);
-        } else {
-            for (const char *prefix : {"ssid", "pass", "ena"}) {
-                snprintf(key, sizeof(key), "%s_%d", prefix, i);
-                error = nvs_erase_key(handle, key);
-                if (error == ESP_ERR_NVS_NOT_FOUND) error = ESP_OK;
-                if (error != ESP_OK) break;
-            }
-        }
-    }
-    // Publish the slot count only after all new entries have been written.
-    if (error == ESP_OK) error = nvs_set_u8(handle, "count", cfg.wifi_net_count);
+    esp_err_t error = nvs_set_blob(handle, "profiles", &stored, sizeof(stored));
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
     return error == ESP_OK;
