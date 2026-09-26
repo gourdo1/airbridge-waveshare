@@ -397,13 +397,13 @@ void dispatch_command(const char *line, String &response) {
             else if (Config::add_network(ssid.c_str(), pass.c_str()))
                 response = "OK: added '" + ssid + "'\n";
             else
-                response = "ERR: list full\n";
+                response = "ERR: list full or NVS save failed\n";
         } else if (sub.startsWith("REMOVE ")) {
             int idx = sub.substring(7).toInt();
             if (Config::remove_network((uint8_t)idx))
                 response = "OK: removed slot " + String(idx) + "\n";
             else
-                response = "ERR: invalid index\n";
+                response = "ERR: invalid index or NVS save failed\n";
         } else {
             response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N|HINTS|HINTS CLEAR]\n"
                        "     ADD: use \"quotes\" if SSID or password contains spaces\n";

@@ -295,6 +295,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonPut(json, '{');
     fixedJsonAddString(json, "version", airbridge_version(), false);
     fixedJsonAddString(json, "built", airbridge_build_date());
+    fixedJsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
     fixedJsonAddString(json, "system", system_state_name(status.sys));
     fixedJsonAddInt(json, "rop", status.rop);
     fixedJsonAddString(json, "pna", cfg.device_pna.c_str());
@@ -1144,7 +1145,6 @@ static void handleBleAction(AsyncWebServerRequest *request) {
     }
 
     String json = "{";
-    if (ok) WiFiSetup::request_reconfigure(true, false);
     jsonAddString(json, "ok", ok ? "true" : "false", false);
     jsonAddString(json, "result", result.c_str());
     json += '}';
@@ -1449,6 +1449,7 @@ static void handleWifiGet(AsyncWebServerRequest *request) {
     jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
     jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
     jsonAddInt(json, "net_idx", WiFiSetup::connected_net_idx());
+    jsonAddString(json, "ip", WiFiSetup::is_connected() ? WiFi.localIP().toString().c_str() : "");
     jsonAddString(json, "roam", cfg.wifi_roam ? "1" : "0");
 
     json += ",\"networks\":[";
@@ -1518,11 +1519,37 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
         }
     }
 
+    if (ok) WiFiSetup::request_reconfigure(true, false);
+
     String json = "{";
     jsonAddString(json, "ok", ok ? "true" : "false", false);
     jsonAddString(json, "result", result.c_str());
     json += '}';
     request->send(200, "application/json", json);
+}
+
+static void handleOnboardingComplete(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    String body;
+    if (!getBody(request, body)) return;
+    struct Access {
+        String user, password;
+        bool has_user = false, has_password = false, invalid = false;
+    } access;
+    if (!json_foreach_kv(body, [](const char *key, const char *value, void *ctx) {
+        auto &a = *static_cast<Access *>(ctx);
+        if (!strcmp(key, "http_user")) { a.user = value; a.has_user = true; }
+        else if (!strcmp(key, "http_pass")) { a.password = value; a.has_password = true; }
+        else a.invalid = true;
+    }, &access) || access.invalid) {
+        request->send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
+        return;
+    }
+    const bool ok = Config::complete_onboarding(
+        access.has_user ? access.user.c_str() : nullptr,
+        access.has_password ? access.password.c_str() : nullptr);
+    request->send(ok ? 200 : 500, "application/json",
+                  ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"nvs_save_failed\"}");
 }
 
 static void handleReboot(AsyncWebServerRequest *request) {
@@ -1606,6 +1633,8 @@ void WebUI::init(uint16_t port) {
     http->addHandler(live_events);
 
     http->on("/", HTTP_GET, handleRoot);
+    http->on("/wizard", HTTP_GET, handleRoot);
+    http->on("/api/onboarding", HTTP_POST, handleOnboardingComplete, NULL, handleJsonBody);
     http->on("/api/status", HTTP_GET, handleStatus);
     http->on("/api/settings", HTTP_GET, handleGetSettings);
     http->on("/api/settings", HTTP_POST, handlePostSettings, NULL, handleJsonBody);

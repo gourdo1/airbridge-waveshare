@@ -248,15 +248,20 @@ bool Config::save() {
 }
 
 bool Config::onboarding_complete() {
-    return onboarding_done;
+    return __atomic_load_n(&onboarding_done, __ATOMIC_ACQUIRE);
 }
 
 bool Config::complete_onboarding(const char *user, const char *password) {
+    const String previous_user = cfg.http_user;
+    const String previous_password = cfg.http_pass;
     if (user) cfg.http_user = user;
     if (password) cfg.http_pass = password;
-    if ((user || password) && !save()) return false;
-    if (prefs.putBool("onboard", true) != 1) return false;
-    onboarding_done = true;
+    if (((user || password) && !save()) || prefs.putBool("onboard", true) != 1) {
+        cfg.http_user = previous_user;
+        cfg.http_pass = previous_password;
+        return false;
+    }
+    __atomic_store_n(&onboarding_done, true, __ATOMIC_RELEASE);
     onboarding_stored = true;
     __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
     return true;
@@ -448,6 +453,5 @@ bool Config::remove_network(uint8_t idx) {
     cfg.wifi_nets[cfg.wifi_net_count].ssid = "";
     cfg.wifi_nets[cfg.wifi_net_count].pass = "";
     cfg.wifi_nets[cfg.wifi_net_count].enabled = false;
-    save_wifi_nets();
-    return true;
+    return save_wifi_nets();
 }

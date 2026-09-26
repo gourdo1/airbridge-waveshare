@@ -544,6 +544,7 @@ static void apply_network_config() {
     if (cfg.wifi_mode == WIFI_MODE_AP_ONLY) {
         WiFi.mode(WIFI_AP);
         if (!had_ap) WiFi.softAP(ap_ssid_str().c_str(), "airbridge");
+        apply_country_code();
         set_state(WF_OFF);
         return;
     }
@@ -783,6 +784,7 @@ void WiFiSetup::check() {
     }
 
     case WF_AP_FALLBACK:
+        if (!cfg.wifi_net_count) break;
         if (millis() - last_ap_retry >= AP_RETRY_INTERVAL_MS) {
             last_ap_retry = millis();
             Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] AP fallback: retrying scan\n");
@@ -796,12 +798,12 @@ void WiFiSetup::check() {
             WiFi.stopSmartConfig();
             Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] SmartConfig: got '%s'\n", WiFi.SSID().c_str());
             // add to list, replace oldest if full
-            if (!Config::add_network(WiFi.SSID().c_str(), WiFi.psk().c_str())) {
-                // full, shift all down
-                Config::remove_network(0);
-                Config::add_network(WiFi.SSID().c_str(), WiFi.psk().c_str());
-                Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] SmartConfig: replaced oldest network\n");
+            if (cfg.wifi_net_count == WIFI_MAX_NETWORKS) {
+                if (!Config::remove_network(0))
+                    Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] SmartConfig: NVS removal failed\n");
             }
+            if (!Config::add_network(WiFi.SSID().c_str(), WiFi.psk().c_str()))
+                Log::logf(CAT_WIFI, LOG_WARN, "[WIFI] SmartConfig: NVS save failed\n");
             cfg.wifi_mode = WIFI_MODE_AUTO;
             Config::save();
 
