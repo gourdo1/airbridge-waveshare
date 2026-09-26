@@ -656,29 +656,6 @@ static bool decoded_value32(const StreamSchema &schema,
     return false;
 }
 
-static void put_le32(uint8_t *dst, uint32_t value) {
-    dst[0] = static_cast<uint8_t>(value);
-    dst[1] = static_cast<uint8_t>(value >> 8);
-    dst[2] = static_cast<uint8_t>(value >> 16);
-    dst[3] = static_cast<uint8_t>(value >> 24);
-}
-
-static bool write_exact(fs::File &file, const uint8_t *data, size_t len) {
-    return file && file.write(data, len) == len;
-}
-
-static uint16_t read_le16(const uint8_t *data) {
-    return static_cast<uint16_t>(data[0]) |
-           static_cast<uint16_t>(data[1]) << 8;
-}
-
-static uint32_t read_le32(const uint8_t *data) {
-    return static_cast<uint32_t>(data[0]) |
-           static_cast<uint32_t>(data[1]) << 8 |
-           static_cast<uint32_t>(data[2]) << 16 |
-           static_cast<uint32_t>(data[3]) << 24;
-}
-
 static void epoch_day_to_civil(uint16_t epoch_day, int &year,
                                unsigned &month, unsigned &day) {
     int z = static_cast<int>(epoch_day) + 719468;
@@ -740,7 +717,7 @@ static bool write_pending(const EdfPending::Record &record) {
     EdfPending::encode(record, bytes);
     storage->remove(part);
     fs::File file = storage->open(part, FILE_WRITE);
-    if (!file || !write_exact(file, bytes, sizeof(bytes))) return false;
+    if (!file || !SdStorage::write_exact(file, bytes, sizeof(bytes))) return false;
     file.flush(); file.close();
     return publish_single_file(part, path, backup);
 }
@@ -961,7 +938,7 @@ static bool write_identification() {
     if (old_crc && old_target && old_target.size() == content_len &&
         old_crc.read(old_crc_value, sizeof(old_crc_value)) ==
             sizeof(old_crc_value)) {
-        unchanged = read_le32(old_crc_value) == crc;
+        unchanged = SdStorage::get_le32(old_crc_value) == crc;
     }
     if (old_crc) old_crc.close();
     if (old_target) old_target.close();
@@ -978,10 +955,10 @@ static bool write_identification() {
     fs::File target = storage->open("/Identification.tgt.part", FILE_WRITE);
     fs::File crc_file = storage->open("/Identification.crc.part", FILE_WRITE);
     uint8_t crc_bytes[4];
-    put_le32(crc_bytes, crc);
+    SdStorage::put_le32(crc_bytes, crc);
     const bool written = target && crc_file &&
-                         write_exact(target, content, content_len) &&
-                         write_exact(crc_file, crc_bytes, sizeof(crc_bytes));
+                         SdStorage::write_exact(target, content, content_len) &&
+                         SdStorage::write_exact(crc_file, crc_bytes, sizeof(crc_bytes));
     if (target) {
         target.flush();
         target.close();
@@ -1135,12 +1112,12 @@ static bool render_str_header(uint16_t first_day, uint32_t records,
 
 static bool valid_str_record(const uint8_t *record, size_t size) {
     return record && size >= 4 &&
-           read_le16(record + size - 2) == crc16_ccitt(record, size - 2);
+           SdStorage::get_le16(record + size - 2) == crc16_ccitt(record, size - 2);
 }
 
 static bool valid_str_record(const uint8_t *record, size_t size,
                              uint16_t expected_day) {
-    return record && read_le16(record) == expected_day &&
+    return record && SdStorage::get_le16(record) == expected_day &&
            valid_str_record(record, size);
 }
 
@@ -1212,7 +1189,7 @@ static bool str_contains_day(const char *therapy_day) {
     bool present = false;
     if (record && file.seek(header_size) &&
         file.read(record, record_size) == record_size) {
-        const uint16_t first_day = read_le16(record);
+        const uint16_t first_day = SdStorage::get_le16(record);
         const uint32_t offset = wanted_day >= first_day
             ? static_cast<uint32_t>(wanted_day - first_day) : UINT32_MAX;
         if (valid_str_record(record, record_size, first_day) &&
@@ -1320,7 +1297,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
                 break;
             }
             if (!valid_str_record(work, record_size) ||
-                !Air10StrTimeline::scan_record(scan, i, read_le16(work))) {
+                !Air10StrTimeline::scan_record(scan, i, SdStorage::get_le16(work))) {
                 valid = false;
             }
         }
@@ -1380,7 +1357,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
         uint16_t day = 0;
         if (input.read(work, record_size) != record_size ||
             !valid_str_record(work, record_size) ||
-            !Air10StrTimeline::record_day(scan, i, read_le16(work), day) ||
+            !Air10StrTimeline::record_day(scan, i, SdStorage::get_le16(work), day) ||
             !set_str_record_day(day, work, record_size) ||
             !Air10StrTimeline::place_record(plan, timeline_buffer, day, work,
                                             record_size, build_stats)) {
@@ -1407,7 +1384,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
     }
     storage->remove(PART);
     output = storage->open(PART, FILE_WRITE);
-    if (!valid || !output || !write_exact(output, header, header_size))
+    if (!valid || !output || !SdStorage::write_exact(output, header, header_size))
         valid = false;
 
     for (uint32_t i = 0; valid && i < plan.record_count; i++) {
@@ -1417,7 +1394,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
             break;
         }
         const uint8_t *record = timeline + static_cast<size_t>(i) * record_size;
-        if (!write_exact(output, record, record_size)) valid = false;
+        if (!SdStorage::write_exact(output, record, record_size)) valid = false;
     }
     if (output) {
         output.flush();
@@ -1624,7 +1601,7 @@ static bool recover_partial_output(const char *partial_path) {
             break;
 
         output = storage->open(edf_recovery_path, FILE_WRITE);
-        if (!output || !write_exact(output, header, header_size)) break;
+        if (!output || !SdStorage::write_exact(output, header, header_size)) break;
         uint32_t rest_crc = crc32_ieee_update(
             crc32_ieee_initial(), header + 256, header_size - 256);
         size_t remaining = complete_bytes;
@@ -1632,7 +1609,7 @@ static bool recover_partial_output(const char *partial_path) {
             const size_t chunk = remaining < RECOVERY_BUFFER_SIZE
                                      ? remaining : RECOVERY_BUFFER_SIZE;
             if (input.read(buffer, chunk) != chunk ||
-                !write_exact(output, buffer, chunk)) {
+                !SdStorage::write_exact(output, buffer, chunk)) {
                 remaining = SIZE_MAX;
                 break;
             }
@@ -1644,10 +1621,10 @@ static bool recover_partial_output(const char *partial_path) {
         output.close();
 
         uint8_t sidecar[8];
-        put_le32(sidecar, crc32_ieee(header, 256));
-        put_le32(sidecar + 4, crc32_ieee_finish(rest_crc));
+        SdStorage::put_le32(sidecar, crc32_ieee(header, 256));
+        SdStorage::put_le32(sidecar + 4, crc32_ieee_finish(rest_crc));
         crc_output = storage->open(crc_recovery_path, FILE_WRITE);
-        if (!crc_output || !write_exact(crc_output, sidecar, sizeof(sidecar)))
+        if (!crc_output || !SdStorage::write_exact(crc_output, sidecar, sizeof(sidecar)))
             break;
         crc_output.flush();
         crc_output.close();
@@ -1913,7 +1890,7 @@ static bool open_output(OutputFile &output, const Air10Edf::Schema &schema) {
 
     size_t header_len = 0;
     if (!render_output_header(output, 0, header_len) ||
-        !write_exact(output.file, header_buffer, header_len)) {
+        !SdStorage::write_exact(output.file, header_buffer, header_len)) {
         output.file.close();
         return false;
     }
@@ -1926,7 +1903,7 @@ static bool open_output(OutputFile &output, const Air10Edf::Schema &schema) {
 static bool append_output_record(OutputFile &output,
                                  const uint8_t *data, size_t len) {
     if (output.failed || !output.open) return false;
-    if (!write_exact(output.file, data, len)) {
+    if (!SdStorage::write_exact(output.file, data, len)) {
         output.failed = true;
         output.file.close();
         output.open = false;
@@ -1944,7 +1921,7 @@ static bool finalize_output(OutputFile &output) {
     size_t header_len = 0;
     if (!render_output_header(output, output.records, header_len) ||
         !output.file.seek(0) ||
-        !write_exact(output.file, header_buffer, header_len)) {
+        !SdStorage::write_exact(output.file, header_buffer, header_len)) {
         status_error("EDF header finalization failed", output.schema->suffix);
         output.file.close();
         output.open = false;
@@ -1955,13 +1932,13 @@ static bool finalize_output(OutputFile &output) {
     output.open = false;
 
     uint8_t sidecar[8];
-    put_le32(sidecar, crc32_ieee(header_buffer, 256));
-    put_le32(sidecar + 4, crc32_ieee_finish(output.rest_crc));
+    SdStorage::put_le32(sidecar, crc32_ieee(header_buffer, 256));
+    SdStorage::put_le32(sidecar + 4, crc32_ieee_finish(output.rest_crc));
     char partial_path[128], final_path[128];
     output_path(output, "crc.part", partial_path);
     output_path(output, "crc", final_path);
     fs::File crc_file = storage->open(partial_path, FILE_WRITE);
-    if (!crc_file || !write_exact(crc_file, sidecar, sizeof(sidecar))) {
+    if (!crc_file || !SdStorage::write_exact(crc_file, sidecar, sizeof(sidecar))) {
         if (crc_file) crc_file.close();
         status_error("CRC sidecar write failed", output.schema->suffix);
         return false;

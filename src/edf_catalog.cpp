@@ -39,34 +39,6 @@ static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t mutex = nullptr;
 static fs::FS *storage = nullptr;
 
-static uint16_t get_le16(const uint8_t *data) {
-    return static_cast<uint16_t>(data[0]) |
-           static_cast<uint16_t>(data[1]) << 8;
-}
-
-static uint32_t get_le32(const uint8_t *data) {
-    return static_cast<uint32_t>(data[0]) |
-           static_cast<uint32_t>(data[1]) << 8 |
-           static_cast<uint32_t>(data[2]) << 16 |
-           static_cast<uint32_t>(data[3]) << 24;
-}
-
-static void put_le16(uint8_t *data, uint16_t value) {
-    data[0] = static_cast<uint8_t>(value);
-    data[1] = static_cast<uint8_t>(value >> 8);
-}
-
-static void put_le32(uint8_t *data, uint32_t value) {
-    data[0] = static_cast<uint8_t>(value);
-    data[1] = static_cast<uint8_t>(value >> 8);
-    data[2] = static_cast<uint8_t>(value >> 16);
-    data[3] = static_cast<uint8_t>(value >> 24);
-}
-
-static bool write_exact(fs::File &file, const uint8_t *data, size_t size) {
-    return file && file.write(data, size) == size;
-}
-
 static void set_error(const char *message) {
     portENTER_CRITICAL(&status_mux);
     status.ready = false;
@@ -99,25 +71,25 @@ static bool valid_entry(const Entry &entry) {
 
 static void encode_header(const Header &header, uint8_t *out) {
     memcpy(out, "ABEC", 4);
-    put_le16(out + 4, CATALOG_VERSION);
-    put_le16(out + 6, HEADER_SIZE);
-    put_le16(out + 8, ENTRY_SIZE);
-    put_le16(out + 10, 0);
-    put_le32(out + 12, header.count);
-    put_le32(out + 16, header.generation);
-    put_le32(out + HEADER_SIZE - 4, header.entries_crc);
+    SdStorage::put_le16(out + 4, CATALOG_VERSION);
+    SdStorage::put_le16(out + 6, HEADER_SIZE);
+    SdStorage::put_le16(out + 8, ENTRY_SIZE);
+    SdStorage::put_le16(out + 10, 0);
+    SdStorage::put_le32(out + 12, header.count);
+    SdStorage::put_le32(out + 16, header.generation);
+    SdStorage::put_le32(out + HEADER_SIZE - 4, header.entries_crc);
 }
 
 static bool decode_header(const uint8_t *data, Header &header) {
     if (memcmp(data, "ABEC", 4) != 0 ||
-        get_le16(data + 4) != CATALOG_VERSION ||
-        get_le16(data + 6) != HEADER_SIZE ||
-        get_le16(data + 8) != ENTRY_SIZE) {
+        SdStorage::get_le16(data + 4) != CATALOG_VERSION ||
+        SdStorage::get_le16(data + 6) != HEADER_SIZE ||
+        SdStorage::get_le16(data + 8) != ENTRY_SIZE) {
         return false;
     }
-    header.count = get_le32(data + 12);
-    header.generation = get_le32(data + 16);
-    header.entries_crc = get_le32(data + HEADER_SIZE - 4);
+    header.count = SdStorage::get_le32(data + 12);
+    header.generation = SdStorage::get_le32(data + 16);
+    header.entries_crc = SdStorage::get_le32(data + HEADER_SIZE - 4);
     return header.count <= MAX_ENTRIES;
 }
 
@@ -126,7 +98,7 @@ static void encode_entry(const Entry &entry, uint8_t *out) {
     memcpy(out, entry.therapy_day, 8);
     memcpy(out + 8, entry.file_prefix, 15);
     out[23] = entry.flags;
-    put_le32(out + 24, entry.finalized_epoch);
+    SdStorage::put_le32(out + 24, entry.finalized_epoch);
 }
 
 static bool decode_entry(const uint8_t *data, Entry &entry) {
@@ -134,7 +106,7 @@ static bool decode_entry(const uint8_t *data, Entry &entry) {
     memcpy(entry.therapy_day, data, 8);
     memcpy(entry.file_prefix, data + 8, 15);
     entry.flags = data[23];
-    entry.finalized_epoch = get_le32(data + 24);
+    entry.finalized_epoch = SdStorage::get_le32(data + 24);
     return valid_entry(entry);
 }
 
@@ -165,7 +137,7 @@ static bool write_empty_catalog() {
     uint8_t bytes[HEADER_SIZE];
     encode_header(header, bytes);
     fs::File file = storage->open(CATALOG_PATH, FILE_WRITE);
-    if (!file || !write_exact(file, bytes, sizeof(bytes))) {
+    if (!file || !SdStorage::write_exact(file, bytes, sizeof(bytes))) {
         if (file) file.close();
         return false;
     }
@@ -289,7 +261,7 @@ bool commit(const Entry &entry) {
         0,
     };
     uint8_t header_bytes[HEADER_SIZE] = {};
-    if (!output || !write_exact(output, header_bytes, sizeof(header_bytes)))
+    if (!output || !SdStorage::write_exact(output, header_bytes, sizeof(header_bytes)))
         success = false;
 
     uint32_t crc = crc32_ieee_initial();
@@ -302,7 +274,7 @@ bool commit(const Entry &entry) {
         }
         if (strcmp(decoded.file_prefix, entry.file_prefix) == 0)
             encode_entry(entry, bytes);
-        if (!write_exact(output, bytes, sizeof(bytes))) {
+        if (!SdStorage::write_exact(output, bytes, sizeof(bytes))) {
             success = false;
             break;
         }
@@ -310,13 +282,13 @@ bool commit(const Entry &entry) {
     }
     if (success && !found) {
         encode_entry(entry, bytes);
-        success = write_exact(output, bytes, sizeof(bytes));
+        success = SdStorage::write_exact(output, bytes, sizeof(bytes));
         if (success) crc = crc32_ieee_update(crc, bytes, sizeof(bytes));
     }
     new_header.entries_crc = crc32_ieee_finish(crc);
     encode_header(new_header, header_bytes);
     if (success && (!output.seek(0) ||
-                    !write_exact(output, header_bytes, sizeof(header_bytes)))) {
+                    !SdStorage::write_exact(output, header_bytes, sizeof(header_bytes)))) {
         success = false;
     }
     if (output) {

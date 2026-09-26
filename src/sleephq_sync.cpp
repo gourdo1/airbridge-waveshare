@@ -97,30 +97,6 @@ struct FileReader {
     }
 };
 
-static uint16_t get_le16(const uint8_t *data) {
-    return static_cast<uint16_t>(data[0]) |
-           static_cast<uint16_t>(data[1]) << 8;
-}
-
-static uint32_t get_le32(const uint8_t *data) {
-    return static_cast<uint32_t>(data[0]) |
-           static_cast<uint32_t>(data[1]) << 8 |
-           static_cast<uint32_t>(data[2]) << 16 |
-           static_cast<uint32_t>(data[3]) << 24;
-}
-
-static void put_le16(uint8_t *data, uint16_t value) {
-    data[0] = static_cast<uint8_t>(value);
-    data[1] = static_cast<uint8_t>(value >> 8);
-}
-
-static void put_le32(uint8_t *data, uint32_t value) {
-    data[0] = static_cast<uint8_t>(value);
-    data[1] = static_cast<uint8_t>(value >> 8);
-    data[2] = static_cast<uint8_t>(value >> 16);
-    data[3] = static_cast<uint8_t>(value >> 24);
-}
-
 static void set_error(char *out, size_t out_size, const char *error) {
     copy_cstr(out, out_size, error ? error : "sleephq_sync_failed");
 }
@@ -228,14 +204,14 @@ static void encode_journal(const Journal &journal, uint8_t *data) {
     data[4] = JOURNAL_VERSION;
     data[5] = journal.phase;
     data[6] = journal.flags;
-    put_le16(data + 8, journal.uploaded_mask);
-    put_le16(data + 10, FILE_COUNT);
-    put_le32(data + 12, journal.import_id);
-    put_le32(data + 16, journal.team_id);
-    put_le32(data + 20, journal.finalized_epoch);
+    SdStorage::put_le16(data + 8, journal.uploaded_mask);
+    SdStorage::put_le16(data + 10, FILE_COUNT);
+    SdStorage::put_le32(data + 12, journal.import_id);
+    SdStorage::put_le32(data + 16, journal.team_id);
+    SdStorage::put_le32(data + 20, journal.finalized_epoch);
     memcpy(data + 24, journal.therapy_day, 8);
     memcpy(data + 32, journal.file_prefix, 15);
-    put_le32(data + JOURNAL_CRC_OFFSET,
+    SdStorage::put_le32(data + JOURNAL_CRC_OFFSET,
              crc32_ieee(data, JOURNAL_CRC_OFFSET));
 }
 
@@ -248,9 +224,9 @@ static bool valid_digits(const char *text, size_t length) {
 static bool decode_journal(const uint8_t *data, Journal &journal) {
     if (memcmp(data, "ABSQ", 4) != 0 || data[4] != JOURNAL_VERSION ||
         (data[5] != PHASE_UPLOADING && data[5] != PHASE_PROCESSING) ||
-        get_le16(data + 10) != FILE_COUNT || !get_le32(data + 12) ||
-        !get_le32(data + 16) ||
-        get_le32(data + JOURNAL_CRC_OFFSET) !=
+        SdStorage::get_le16(data + 10) != FILE_COUNT || !SdStorage::get_le32(data + 12) ||
+        !SdStorage::get_le32(data + 16) ||
+        SdStorage::get_le32(data + JOURNAL_CRC_OFFSET) !=
             crc32_ieee(data, JOURNAL_CRC_OFFSET) ||
         !valid_digits(reinterpret_cast<const char *>(data + 24), 8) ||
         !valid_digits(reinterpret_cast<const char *>(data + 32), 8) ||
@@ -262,10 +238,10 @@ static bool decode_journal(const uint8_t *data, Journal &journal) {
     memset(&journal, 0, sizeof(journal));
     journal.phase = data[5];
     journal.flags = data[6];
-    journal.uploaded_mask = get_le16(data + 8);
-    journal.import_id = get_le32(data + 12);
-    journal.team_id = get_le32(data + 16);
-    journal.finalized_epoch = get_le32(data + 20);
+    journal.uploaded_mask = SdStorage::get_le16(data + 8);
+    journal.import_id = SdStorage::get_le32(data + 12);
+    journal.team_id = SdStorage::get_le32(data + 16);
+    journal.finalized_epoch = SdStorage::get_le32(data + 20);
     memcpy(journal.therapy_day, data + 24, 8);
     memcpy(journal.file_prefix, data + 32, 15);
     return true;
@@ -327,8 +303,8 @@ static void encode_marker(const EdfCatalog::Entry &entry, uint8_t *data) {
     memcpy(data, "ABSD", 4);
     data[4] = JOURNAL_VERSION;
     data[5] = entry.flags;
-    put_le32(data + 8, entry.finalized_epoch);
-    put_le32(data + 12, crc32_ieee(data, 12));
+    SdStorage::put_le32(data + 8, entry.finalized_epoch);
+    SdStorage::put_le32(data + 12, crc32_ieee(data, 12));
 }
 
 static bool marker_valid(fs::FS &storage, const StatePaths &paths,
@@ -340,8 +316,8 @@ static bool marker_valid(fs::FS &storage, const StatePaths &paths,
     const bool valid = file && file.size() == sizeof(data) &&
         file.read(data, sizeof(data)) == sizeof(data) &&
         memcmp(data, "ABSD", 4) == 0 && data[4] == JOURNAL_VERSION &&
-        data[5] == entry.flags && get_le32(data + 8) == entry.finalized_epoch &&
-        get_le32(data + 12) == crc32_ieee(data, 12);
+        data[5] == entry.flags && SdStorage::get_le32(data + 8) == entry.finalized_epoch &&
+        SdStorage::get_le32(data + 12) == crc32_ieee(data, 12);
     if (file) file.close();
     return valid;
 }

@@ -8,6 +8,7 @@
 
 #if AB_STORAGE_HAS_SDCARD
 #include <SD_MMC.h>
+#include <FS.h>
 #endif
 
 namespace SdStorage {
@@ -22,6 +23,10 @@ static Status status = {
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #if AB_STORAGE_HAS_SDCARD
+bool write_exact(fs::File &file, const uint8_t *data, size_t size) {
+    return file && file.write(data, size) == size;
+}
+
 static void mount_error(const char *message) {
     portENTER_CRITICAL(&status_mux);
     strncpy(status.error, message, sizeof(status.error) - 1);
