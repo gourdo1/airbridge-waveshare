@@ -15,7 +15,7 @@ ESP32 bridge for ResMed AirSense 10 CPAP.
 
 | Board | PlatformIO env |
 |-------|----------------|
-| Waveshare ESP32-S3-LCD-1.54 | `waveshare-s3-lcd154` |
+| Waveshare ESP32-S3-LCD-1.54 | `waveshare-s3-lcd154` (UART pads), `waveshare-s3-lcd154-i2cpads` (SCL/SDA pads) |
 | M5Stamp Pico | `m5stamp-pico` |
 | XIAO ESP32S3 Plus | `xiao-esp32s3-plus`, `xiao-esp32s3-plus-sdmmc4` |
 

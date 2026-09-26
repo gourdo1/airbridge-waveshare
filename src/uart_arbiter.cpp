@@ -2,7 +2,11 @@
 #include "app_config.h"
 #include "debug_log.h"
 #include "live_stream.h"
+#include "board.h"
 #include <freertos/queue.h>
+#if AB_AS10_TX_OPEN_DRAIN
+#include <esp_private/gpio.h>   // gpio_od_enable(): sets open-drain without touching pin routing
+#endif
 
 #define ARBITER_QUEUE_DEPTH     8
 #define ARBITER_TASK_STACK      4096
@@ -671,6 +675,15 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud
     uart = &serial;
     uart->setRxBufferSize(RX_BUF_SIZE);
     uart->begin(baud, SERIAL_8N1, rx_pin, tx_pin);
+#if AB_AS10_TX_OPEN_DRAIN
+    // Must come after begin(): it routes the UART signal to the pin, and this
+    // only flips the pad driver. Baud changes (updateBaudRate) keep it.
+    if (gpio_od_enable((gpio_num_t)tx_pin) == ESP_OK) {
+        Log::logf(CAT_ARB, LOG_INFO, "[ARB] TX GPIO%d set open-drain\n", tx_pin);
+    } else {
+        Log::logf(CAT_ARB, LOG_ERROR, "[ARB] TX GPIO%d open-drain setup failed\n", tx_pin);
+    }
+#endif
     current_baud = baud;
 
     rx_ready = xSemaphoreCreateBinary();

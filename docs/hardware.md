@@ -93,6 +93,34 @@ GPIO43/44 are the ESP32-S3 UART0 pins, so this target runs the console (logs,
 `$` commands, provisioning) over the native USB-C port instead. Nothing but
 AirSense traffic is sent on GPIO43 once the firmware is running.
 
+### Alternate wiring: SCL/SDA pads
+
+If the ESP_TXD/ESP_RXD pads are damaged, use the `waveshare-s3-lcd154-i2cpads`
+build target (and `waveshare-s3-lcd154-i2cpads-ota` for WiFi updates) and wire
+the AirSense to the SCL/SDA pads instead:
+
+| Signal | Waveshare pad | GPIO |
+|--------|---------------|------|
+| AirSense Tx -> AirBridge RX | SCL | GPIO41 |
+| AirSense Rx <- AirBridge TX | SDA | GPIO42 |
+| AirSense GND | GND | - |
+
+Don't swap these. SCL/SDA are the board's I2C bus, shared with the IMU, the
+audio codecs and (touch variant) the touch controller, with 4.7k pull-ups.
+The firmware never uses that bus, but those chips still listen to it:
+
+- I2C chips never drive SCL, so the AirSense's output on SCL is never fought.
+- An I2C chip can pull SDA low to acknowledge. AirBridge therefore drives
+  SDA open-drain and relies on the 4.7k pull-up for the high level, so
+  nothing can short.
+- The touch controller is held in reset (GPIO47) to take it off the bus.
+- Rarely, when both sides transmit at once and the bits happen to match a
+  chip's address, a chip may corrupt a byte. Commands fail their checksum and
+  are retried, and a lost oximetry sample is replaced half a second later.
+
+A side benefit: GPIO41/42 aren't the ESP32-S3 console pins, so the boot text
+described below never reaches the AirSense on this wiring.
+
 ### Power
 
 Set the step-down converter to **3.3V** and feed it into the board's **3V3

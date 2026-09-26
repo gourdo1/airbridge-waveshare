@@ -10,6 +10,18 @@
 #define AB_AS10_RX_GPIO 36      // input-only on M5Stamp Pico
 #endif
 
+// Drive the AirSense TX pin open-drain (relies on an external pull-up). For
+// wiring where TX shares a line with other open-drain devices, e.g. I2C.
+#ifndef AB_AS10_TX_OPEN_DRAIN
+#define AB_AS10_TX_OPEN_DRAIN 0
+#endif
+
+// Touch controller reset; held low at boot to keep it off a shared I2C bus
+// (-1 = leave alone)
+#ifndef AB_TOUCH_RST_GPIO
+#define AB_TOUCH_RST_GPIO -1
+#endif
+
 #ifndef AB_LED_GPIO
 #define AB_LED_GPIO 27
 #endif

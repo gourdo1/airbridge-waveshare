@@ -182,6 +182,10 @@ void setup() {
     pinMode(AB_LCD_BL_GPIO, OUTPUT);          // keep panel dark until it is initialized
     digitalWrite(AB_LCD_BL_GPIO, LOW);
 #endif
+#if AB_TOUCH_RST_GPIO >= 0
+    pinMode(AB_TOUCH_RST_GPIO, OUTPUT);       // hold touch controller in reset,
+    digitalWrite(AB_TOUCH_RST_GPIO, LOW);     // off the shared I2C bus
+#endif
 
     Serial.begin(115200);
     delay(500);
