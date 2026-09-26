@@ -605,20 +605,29 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     String body;
     if (!getBody(request, body)) return;
     String previous_update_url = Config::get().update_url;
-    int count = 0;
+    struct Changes { int count = 0; bool network = false; bool clock = false; } changes;
     if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
-        if (Config::set_value(key, val)) (*(int*)p)++;
-    }, &count)) {
+        auto &changes = *static_cast<Changes *>(p);
+        if (!Config::set_value(key, val)) return;
+        changes.count++;
+        if (!strcasecmp(key, "hostname") || !strcasecmp(key, "wifi_mode") ||
+            !strcasecmp(key, "wifi_country")) changes.network = true;
+        if (!strcasecmp(key, "tz") || !strcasecmp(key, "ntp_server")) changes.clock = true;
+    }, &changes)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
     }
 
-    if (count > 0) Config::save();
+    if (changes.count > 0 && !Config::save()) {
+        request->send(500, "application/json", "{\"ok\":false,\"error\":\"nvs_save_failed\"}");
+        return;
+    }
+    WiFiSetup::request_reconfigure(changes.network, changes.clock);
     if (Config::get().update_url != previous_update_url)
         OtaManager::config_changed();
 
     String json = "{\"ok\":true,\"saved\":";
-    json += String(count);
+    json += String(changes.count);
     json += '}';
     request->send(200, "application/json", json);
 }
@@ -1135,6 +1144,7 @@ static void handleBleAction(AsyncWebServerRequest *request) {
     }
 
     String json = "{";
+    if (ok) WiFiSetup::request_reconfigure(true, false);
     jsonAddString(json, "ok", ok ? "true" : "false", false);
     jsonAddString(json, "result", result.c_str());
     json += '}';
@@ -1466,13 +1476,13 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
     String action, ssid, pass;
     int idx = -1;
 
-    struct wifi_kv_ctx { String *action; String *ssid; String *pass; int *idx; };
-    wifi_kv_ctx wctx = {&action, &ssid, &pass, &idx};
+    struct wifi_kv_ctx { String *action; String *ssid; String *pass; int *idx; bool pass_set; };
+    wifi_kv_ctx wctx = {&action, &ssid, &pass, &idx, false};
     if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         wifi_kv_ctx *c = (wifi_kv_ctx *)p;
         if (strcmp(key, "action") == 0) *c->action = val;
         else if (strcmp(key, "ssid") == 0) *c->ssid = val;
-        else if (strcmp(key, "pass") == 0) *c->pass = val;
+        else if (strcmp(key, "pass") == 0) { *c->pass = val; c->pass_set = true; }
         else if (strcmp(key, "idx") == 0) *c->idx = atol(val);
     }, &wctx)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
@@ -1485,14 +1495,14 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
     if (action == "add") {
         if (ssid.length() > 0) {
             ok = Config::add_network(ssid.c_str(), pass.c_str());
-            result = ok ? "network added" : "list full (max 4)";
+            result = ok ? "network added" : "list full or NVS save failed";
         } else {
             result = "ssid required";
         }
     } else if (action == "remove") {
         if (idx >= 0) {
             ok = Config::remove_network((uint8_t)idx);
-            result = ok ? "network removed" : "invalid index";
+            result = ok ? "network removed" : "invalid index or NVS save failed";
         } else {
             result = "idx required";
         }
@@ -1500,10 +1510,9 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
         auto &cfg = Config::get();
         if (idx >= 0 && idx < cfg.wifi_net_count) {
             if (ssid.length() > 0) cfg.wifi_nets[idx].ssid = ssid;
-            if (pass.length() > 0) cfg.wifi_nets[idx].pass = pass;
-            Config::save_wifi_nets();
-            ok = true;
-            result = "network updated";
+            if (wctx.pass_set) cfg.wifi_nets[idx].pass = pass;
+            ok = Config::save_wifi_nets();
+            result = ok ? "network updated" : "NVS save failed";
         } else {
             result = "invalid index";
         }

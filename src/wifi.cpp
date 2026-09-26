@@ -57,6 +57,7 @@ static uint8_t connect_retries = 0;
 static uint32_t last_roam_check = 0;
 static uint8_t low_rssi_count = 0;
 static bool roaming_suspended = false;
+static std::atomic<uint8_t> reconfigure_pending{0};
 
 #define AP_RETRY_INTERVAL_MS    30000
 static uint32_t last_ap_retry = 0;
@@ -517,7 +518,73 @@ bool WiFiSetup::init() {
     return true;
 }
 
+void WiFiSetup::request_reconfigure(bool network, bool clock) {
+    reconfigure_pending.fetch_or((network ? 1 : 0) | (clock ? 2 : 0),
+                                 std::memory_order_release);
+}
+
+static void apply_network_config() {
+    const auto &cfg = Config::get();
+    if (wf_state == WF_SMARTCONFIG) WiFi.stopSmartConfig();
+    if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
+    clear_scan();
+    got_ip = false;
+    sta_disconnected = false;
+    hint_refresh_pending = false;
+    pending_ap_teardown = false;
+    scan_candidate_count = 0;
+    connect_idx = 0xFF;
+
+    if (cfg.wifi_mode == WIFI_MODE_OFF) {
+        WiFi.mode(WIFI_OFF);
+        set_state(WF_OFF);
+        return;
+    }
+    const bool had_ap = WiFi.getMode() & WIFI_AP;
+    if (cfg.wifi_mode == WIFI_MODE_AP_ONLY) {
+        WiFi.mode(WIFI_AP);
+        if (!had_ap) WiFi.softAP(ap_ssid_str().c_str(), "airbridge");
+        set_state(WF_OFF);
+        return;
+    }
+
+    // Keep the AP and its clients while joining STA; normal quiet teardown
+    // takes over after a successful AUTO connection.
+    if (cfg.wifi_mode == WIFI_MODE_STA_ONLY) {
+        WiFi.mode(WIFI_STA);
+    } else {
+        WiFi.mode(WIFI_AP_STA);
+        if (!had_ap) WiFi.softAP(ap_ssid_str().c_str(), "airbridge");
+    }
+    WiFi.setHostname(cfg.hostname.c_str());
+    apply_country_code();
+    stop_sta_attempt();
+    got_ip = false;
+    sta_disconnected = false;
+    for (uint8_t i = 0; i < cfg.wifi_net_count; i++) {
+        if (!cfg.wifi_nets[i].enabled) continue;
+        begin_connect(i, false);
+        return;
+    }
+    enter_ap_fallback();
+}
+
 void WiFiSetup::check() {
+    if (!roaming_suspended) {
+        const uint8_t pending = reconfigure_pending.exchange(0, std::memory_order_acq_rel);
+        if (pending & 1) apply_network_config();
+        if (pending & 2) {
+            const auto &cfg = Config::get();
+            setenv("TZ", cfg.tz.isEmpty() ? "UTC0" : cfg.tz.c_str(), 1);
+            tzset();
+            ntp_done = false;
+            if (WiFi.status() == WL_CONNECTED) {
+                sync_ntp();
+                ntp_done = true;
+            }
+        }
+    }
+
     auto &cfg = Config::get();
     uint32_t elapsed = millis() - state_entered_ms;
 
