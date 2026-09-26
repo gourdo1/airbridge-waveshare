@@ -74,6 +74,7 @@ static QueueHandle_t request_queue = nullptr;
 static TaskHandle_t export_task_handle = nullptr;
 static fs::FS *storage = nullptr;
 static volatile uint32_t abort_generation = 1;
+static uint32_t status_revision = 0;
 
 static bool generation_aborted(uint32_t generation) {
     return generation !=
@@ -100,6 +101,7 @@ static void set_state(State state, const char *error = nullptr) {
     if (error) copy_text(status.last_error, sizeof(status.last_error), error);
     else if (state != State::Error) status.last_error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static void set_sleephq_state(State state, const char *error = nullptr) {
@@ -112,6 +114,7 @@ static void set_sleephq_state(State state, const char *error = nullptr) {
         sleephq_status.last_error[0] = 0;
     }
     portEXIT_CRITICAL(&sleephq_status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static void publish_sleephq_progress(
@@ -127,6 +130,7 @@ static void publish_sleephq_progress(
     copy_text(sleephq_status.import_status,
               sizeof(sleephq_status.import_status), progress.import_status);
     portEXIT_CRITICAL(&sleephq_status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static bool run_aborted(void *context) {
@@ -240,12 +244,14 @@ static void note_seen() {
     portENTER_CRITICAL(&status_mux);
     status.files_seen++;
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static void note_skipped() {
     portENTER_CRITICAL(&status_mux);
     status.files_skipped++;
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static void note_uploaded(uint64_t bytes) {
@@ -253,6 +259,7 @@ static void note_uploaded(uint64_t bytes) {
     status.files_uploaded++;
     status.bytes_uploaded += bytes;
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 }
 
 static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
@@ -500,6 +507,7 @@ static bool run_smb(const Request &request) {
               request.kind == RequestKind::PostTherapy
                   ? request.entry.therapy_day : "");
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -548,6 +556,7 @@ static bool run_smb(const Request &request) {
             copy_text(status.current_day, sizeof(status.current_day),
                       entry.therapy_day);
             portEXIT_CRITICAL(&status_mux);
+            __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
             success = sync_session_files(client, entry, buffer, buffer_size,
                                          run, error, sizeof(error));
             if (success && !write_state_marker(config, entry)) {
@@ -574,6 +583,7 @@ static bool run_smb(const Request &request) {
     status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
     status.current_day[0] = 0;
     portEXIT_CRITICAL(&status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
     set_state(State::Idle);
     return true;
 }
@@ -631,6 +641,7 @@ static bool run_sleephq(const Request &request) {
               request.kind == RequestKind::PostTherapy
                   ? request.entry.therapy_day : "");
     portEXIT_CRITICAL(&sleephq_status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
 
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -674,6 +685,7 @@ static bool run_sleephq(const Request &request) {
     sleephq_status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
     sleephq_status.current_day[0] = 0;
     portEXIT_CRITICAL(&sleephq_status_mux);
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
     set_sleephq_state(State::Idle);
     return true;
 }
@@ -847,6 +859,10 @@ bool request_manual_sleephq() {
     return true;
 }
 
+uint32_t revision() {
+    return __atomic_load_n(&status_revision, __ATOMIC_ACQUIRE);
+}
+
 void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
@@ -867,6 +883,7 @@ namespace ExportSync {
 
 const char *state_name(State) { return "unsupported"; }
 void init() {}
+uint32_t revision() { return 0; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
 bool request_manual_smb() { return false; }

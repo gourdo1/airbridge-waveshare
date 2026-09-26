@@ -46,6 +46,7 @@ void therapy_started();
 bool request_post_therapy(const EdfCatalog::Entry &entry);
 bool request_manual_smb();
 bool request_manual_sleephq();
+uint32_t revision();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
 const char *state_name(State state);

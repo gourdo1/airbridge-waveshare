@@ -12,6 +12,7 @@
 
 static Preferences prefs;
 static AirBridgeConfig cfg;
+static uint32_t config_revision = 0;
 
 struct KVEntry {
     const char *key;
@@ -225,6 +226,11 @@ void Config::save() {
         }
     }
     apply_syslog();
+    __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+}
+
+uint32_t Config::revision() {
+    return __atomic_load_n(&config_revision, __ATOMIC_ACQUIRE);
 }
 
 void Config::reset_defaults() {

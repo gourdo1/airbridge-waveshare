@@ -85,6 +85,7 @@ namespace Config {
     void init();
     void load();
     void save();
+    uint32_t revision();
     void reset_defaults();
 
     AirBridgeConfig& get();

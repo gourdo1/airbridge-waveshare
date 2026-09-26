@@ -623,6 +623,103 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     request->send(200, "application/json", json);
 }
 
+
+#if AB_STORAGE_HAS_SDCARD
+template <typename T>
+static void appendExportStatus(String &json, const T &status, bool enabled,
+                               bool configured, bool automatic, const char *endpoint) {
+    const bool active = status.state == ExportSync::State::Pending ||
+                        status.state == ExportSync::State::Working;
+    const auto state = active ? status.state : !enabled ? ExportSync::State::Disabled :
+        status.state == ExportSync::State::Disabled ? ExportSync::State::Idle : status.state;
+    json += '{';
+    jsonAddString(json, "state", ExportSync::state_name(state), false);
+    jsonAddBool(json, "enabled", enabled);
+    jsonAddBool(json, "configured", configured);
+    jsonAddBool(json, "automatic", automatic);
+    jsonAddString(json, "endpoint", endpoint);
+    jsonAddUInt32(json, "files_seen", status.files_seen);
+    jsonAddUInt32(json, "files_uploaded", status.files_uploaded);
+    jsonAddUInt32(json, "files_skipped", status.files_skipped);
+    char bytes[48];
+    snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
+             static_cast<unsigned long long>(status.bytes_uploaded));
+    json += bytes;
+    jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
+    jsonAddString(json, "current_day", status.current_day);
+    jsonAddString(json, "error", status.last_error);
+}
+
+struct ExportPublication {
+    uint32_t config;
+    uint32_t sync;
+    system_state_t system;
+    int rop;
+    bool mounted;
+    bool online;
+};
+
+static ExportPublication exportPublication() {
+    return {Config::revision(), ExportSync::revision(), Arbiter::get_state(),
+            Arbiter::get_cached_rop(), SdStorage::mounted(),
+            WiFi.status() == WL_CONNECTED};
+}
+#endif
+
+static String buildExportsJson() {
+#if AB_STORAGE_HAS_SDCARD
+    const auto published = exportPublication();
+    ExportSync::Status smb;
+    ExportSync::SleepHqStatus sleephq;
+    ExportSync::get_status(smb);
+    ExportSync::get_sleephq_status(sleephq);
+    const auto &cfg = Config::get();
+    String json = "{\"supported\":true";
+    jsonAddBool(json, "sd_mounted", published.mounted);
+    jsonAddBool(json, "idle", published.system == SYS_IDLE && published.rop == 0);
+    jsonAddBool(json, "online", published.online);
+    jsonAddUInt32(json, "config_revision", published.config);
+    json += ",\"smb\":";
+    appendExportStatus(json, smb, cfg.smb_enabled, !cfg.smb_endpoint.isEmpty(),
+                       cfg.smb_auto_after_therapy, cfg.smb_endpoint.c_str());
+    json += "},\"sleephq\":";
+    appendExportStatus(json, sleephq, cfg.sleephq_enabled,
+                       !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty(),
+                       cfg.sleephq_auto_after_therapy, "SleepHQ");
+    jsonAddString(json, "team_id", cfg.sleephq_team_id.c_str());
+    jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
+    jsonAddUInt32(json, "import_id", sleephq.import_id);
+    jsonAddString(json, "import_status", sleephq.import_status);
+    json += "}}";
+    return json;
+#else
+    return "{\"supported\":false}";
+#endif
+}
+
+static void handleExportStatus(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    auto *response = request->beginResponse(200, "application/json", buildExportsJson());
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
+#if AB_STORAGE_HAS_SDCARD
+static bool export_client_connected = false;
+
+static void publishExports() {
+    static ExportPublication last = {};
+    const auto current = exportPublication();
+    const bool connected = __atomic_exchange_n(&export_client_connected, false, __ATOMIC_ACQ_REL);
+    if (!connected && current.config == last.config && current.sync == last.sync &&
+        current.system == last.system && current.rop == last.rop &&
+        current.mounted == last.mounted && current.online == last.online) return;
+    last = current;
+    const String json = buildExportsJson();
+    events->send(json.c_str(), "exports", millis());
+}
+#endif
+
 static void handleSmbSync(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
     if (Arbiter::get_cached_rop() == 1) {
@@ -1484,6 +1581,11 @@ void WebUI::init(uint16_t port) {
         if (checkAuth(request)) next();
     };
     events->addMiddleware(authenticate_events);
+#if AB_STORAGE_HAS_SDCARD
+    events->onConnect([](AsyncEventSourceClient *) {
+        __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
+    });
+#endif
     live_events->addMiddleware(authenticate_events);
     live_events->onConnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::acquire();
@@ -1500,6 +1602,7 @@ void WebUI::init(uint16_t port) {
     http->on("/api/settings", HTTP_POST, handlePostSettings, NULL, handleJsonBody);
     http->on("/api/config", HTTP_GET, handleGetConfig);
     http->on("/api/config", HTTP_POST, handlePostConfig, NULL, handleJsonBody);
+    http->on("/api/export", HTTP_GET, handleExportStatus);
     http->on("/api/export/smb", HTTP_POST, handleSmbSync);
     http->on("/api/export/sleephq", HTTP_POST, handleSleepHqSync);
     http->on("/api/live", HTTP_GET, handleLive);
@@ -1583,6 +1686,9 @@ void WebUI::handle() {
     uint32_t now = millis();
     if (uint32_t(now - last_check) < 100) return;
     last_check = now;
+#if AB_STORAGE_HAS_SDCARD
+    publishExports();
+#endif
 
     if (snapshot_differs(DeviceStatus::snapshot(), last_published) ||
         millis() - last_status_push >= 10000) {
