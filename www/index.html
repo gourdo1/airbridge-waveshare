@@ -1634,11 +1634,10 @@ function createSyncCards() {
     card.className = 'card';
     card.id = id + 'SyncCard';
     card.innerHTML = `<div class="card-header"><span class="label">${name}</span><span class="badge" data-sync="state">--</span></div>
-      <div class="time-row"><span class="label">Endpoint</span><span class="value sync-value" data-sync="endpoint">--</span></div>
-      <div class="time-row"><span class="label">Automatic sync</span><span class="value" data-sync="automatic">--</span></div>
-      <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">--</span></div>
-      <div class="time-row"><span class="label">Current day</span><span class="value" data-sync="day">--</span></div>
-      <div class="time-row"><span class="label">Latest run</span><span class="value sync-value" data-sync="files">--</span></div>
+      <div class="time-row"><span class="label">Endpoint</span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
+      <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">&mdash;</span></div>
+      <div class="time-row"><span class="label">Therapy day</span><span class="value" data-sync="day">&mdash;</span></div>
+      <div class="time-row"><span class="label">Files</span><span class="value sync-value" data-sync="files">&mdash;</span></div>
       <div class="sync-note" data-sync="import"></div>
       <div class="sync-note" data-sync="availability"></div>
       <div class="sync-error" data-sync="error"></div>
@@ -1675,18 +1674,20 @@ function renderExports() {
     text('state', state.state);
     text('endpoint', id === 'smb' ? state.endpoint || 'Not configured' :
       'SleepHQ' + (state.team_id ? ' / Team ' + state.team_id : '') + (state.device_id ? ' / Device ' + state.device_id : ''));
-    text('automatic', state.automatic ? 'After therapy and at startup' : 'Manual');
-    text('last', state.last_sync_epoch ? new Date(state.last_sync_epoch * 1000).toLocaleString() : 'No successful sync this boot');
-    text('day', state.current_day || '--');
-    text('files', state.files_uploaded + ' uploaded, ' + state.files_skipped + ' skipped / ' + state.files_seen + ' seen');
+    text('last', state.last_sync_epoch ? new Date(state.last_sync_epoch * 1000).toLocaleString() : '\u2014');
+    text('day', state.state === 'working' && state.current_day ?
+      state.current_day.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3') : '\u2014');
+    const hasFiles = state.state === 'working' || state.last_sync_epoch ||
+      state.files_seen || state.files_uploaded || state.files_skipped;
+    text('files', hasFiles ? state.files_uploaded + ' uploaded, ' + state.files_skipped + ' skipped' : '\u2014');
     text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
     text('error', state.error || '');
     const unavailable = !exportsFresh ? 'Status unavailable; reconnecting' :
-      !data.sd_mounted ? 'SD card unavailable' : !state.enabled ? 'Disabled' :
+      !state.enabled ? '' : !data.sd_mounted ? 'SD card unavailable' :
       !state.configured ? 'Configure this endpoint first' : !data.idle ? 'Waiting for AirSense standby' :
       !data.online ? 'Waiting for WiFi' : '';
-    text('availability', unavailable || (state.state === 'pending' ? 'Queued; waiting for export worker' : ''));
-    card.querySelector('[data-sync="start"]').disabled = !!unavailable || busy || syncRequests.size > 0;
+    text('availability', unavailable);
+    card.querySelector('[data-sync="start"]').disabled = !state.enabled || !!unavailable || busy || syncRequests.size > 0;
   }
 }
 
