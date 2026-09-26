@@ -76,9 +76,12 @@ static void serial_poll() {
 
 // Health monitoring:
 //   ROP/STK every 10s to detect therapy state and device restarts
+//   DAC/TIC every minute for the status clock
 //   MHR every 30 min and once on therapy stop
 #define HEALTH_POLL_INTERVAL_MS     10000
 #define HEALTH_TIMEOUT_MS           500
+#define DEVICE_TIME_POLL_INTERVAL_MS 60000
+#define DEVICE_TIME_MAX_AGE_MS       (DEVICE_TIME_POLL_INTERVAL_MS + 3 * HEALTH_POLL_INTERVAL_MS)
 #define MHR_POLL_INTERVAL_MS        (30UL * 60 * 1000)
 
 static uint32_t last_health_poll = 0;
@@ -98,7 +101,7 @@ void Air10Clock::status_time(char (&out)[20]) {
     system_state_t state = Arbiter::get_state();
     portENTER_CRITICAL(&device_time_mux);
     bool fresh = (state == SYS_IDLE || state == SYS_THERAPY) &&
-        uint32_t(millis() - device_time_ms) < 3 * HEALTH_POLL_INTERVAL_MS;
+        uint32_t(millis() - device_time_ms) < DEVICE_TIME_MAX_AGE_MS;
     memcpy(out, device_time, sizeof(out));
     portEXIT_CRITICAL(&device_time_mux);
     if (!fresh) strcpy(out, "--");
@@ -112,6 +115,12 @@ static void publish_device_time(const char *text) {
 }
 
 static void poll_device_time() {
+    portENTER_CRITICAL(&device_time_mux);
+    bool due = device_time[0] == '-' ||
+        uint32_t(millis() - device_time_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
+    portEXIT_CRITICAL(&device_time_mux);
+    if (!due) return;
+
     char dac[32] = {}, tic[32] = {}, text[20] = "--";
     uint16_t dac_len = sizeof(dac), tic_len = sizeof(tic);
     bool got_dac = Arbiter::send_cmd("G S #DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
@@ -346,6 +355,7 @@ bool push_time_to_resmed() {
                   resp[0] ? "rejected (use TIMESYNC to retry)" : "timeout", resp);
         return false;
     }
+    publish_device_time("--");
     resp[0] = '\0';
     resp_len = sizeof(resp);
     bool ok_tic = Arbiter::send_cmd(tic_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
