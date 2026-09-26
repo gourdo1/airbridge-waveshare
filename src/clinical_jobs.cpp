@@ -117,6 +117,11 @@ void init(Handler callback) {
 }
 
 void tick() {
+    static uint32_t last_cleanup_ms = 0;
+    uint32_t now = millis();
+    if (uint32_t(now - last_cleanup_ms) < 1000) return;
+    last_cleanup_ms = now;
+
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
     for (Job &job : jobs)
         if (job.state == Complete && reusable(job)) reset_job(job);
