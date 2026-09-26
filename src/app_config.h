@@ -80,6 +80,8 @@ struct AirBridgeConfig {
 };
 
 namespace Config {
+    enum class Section : uint8_t { All, Smb, SleepHq };
+
     void init();
     void load();
     void save();
@@ -98,7 +100,8 @@ namespace Config {
 
     typedef void (*kv_visitor_fn)(const char *key, const String &val,
                                   bool sensitive, void *ctx);
-    void foreach_kv(kv_visitor_fn fn, void *ctx);
+    bool parse_section(const char *name, Section &out);
+    void foreach_kv(kv_visitor_fn fn, void *ctx, Section section = Section::All);
 
     bool add_network(const char *ssid, const char *pass);
     bool remove_network(uint8_t idx);

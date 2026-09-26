@@ -309,9 +309,20 @@ bool Config::set_value(const char *key, const char *value) {
     return false;
 }
 
-void Config::foreach_kv(kv_visitor_fn fn, void *ctx) {
+bool Config::parse_section(const char *name, Section &out) {
+    if (strcmp(name, "smb") == 0) out = Section::Smb;
+    else if (strcmp(name, "sleephq") == 0) out = Section::SleepHq;
+    else return false;
+    return true;
+}
+
+void Config::foreach_kv(kv_visitor_fn fn, void *ctx, Section section) {
     String val;
     for (const KVEntry &entry : kv_table) {
+        if (section == Section::Smb && strncmp(entry.key, "smb_", 4) != 0)
+            continue;
+        if (section == Section::SleepHq && strncmp(entry.key, "sleephq_", 8) != 0)
+            continue;
         format_value(entry, val);
         fn(entry.key, val, entry.sensitive, ctx);
     }

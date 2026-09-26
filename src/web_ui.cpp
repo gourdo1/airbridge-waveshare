@@ -579,6 +579,13 @@ static void handleReport(AsyncWebServerRequest *request) { handleClinicalJob(req
 static void handleGetConfig(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
+    Config::Section section = Config::Section::All;
+    if (request->hasParam("section") &&
+        !Config::parse_section(request->getParam("section")->value().c_str(), section)) {
+        request->send(400, "application/json", "{\"error\":\"unknown_section\"}");
+        return;
+    }
+
     String json = "{";
     struct { String *json; bool first; } ctx = {&json, true};
     Config::foreach_kv([](const char *key, const String &val, bool sensitive, void *p) {
@@ -586,7 +593,7 @@ static void handleGetConfig(AsyncWebServerRequest *request) {
         if (!c->first) *c->json += ',';
         c->first = false;
         jsonAddString(*c->json, key, sensitive ? "" : val.c_str(), false);
-    }, &ctx);
+    }, &ctx, section);
     json += '}';
     request->send(200, "application/json", json);
 }
