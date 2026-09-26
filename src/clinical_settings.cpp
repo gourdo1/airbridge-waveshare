@@ -99,6 +99,16 @@ bool read_raw(const char *cmd, int &value) {
 
 bool known_stock(const char *cmd) { return var_lookup(cmd) != nullptr; }
 
+void mode_label(int mode, char *out, size_t capacity) {
+    const char *label = var_lookup("MOP")->enum_options;
+    if (mode < 0 || mode >= MODE_COUNT) {
+        snprintf(out, capacity, "%s", "");
+        return;
+    }
+    while (mode-- > 0) label = strchr(label, ',') + 1;
+    snprintf(out, capacity, "%.*s", static_cast<int>(strcspn(label, ",")), label);
+}
+
 int collect(Snapshot &snapshot, bool report) {
     snapshot.reset();
     snapshot.report_ = report;

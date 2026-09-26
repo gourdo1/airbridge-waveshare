@@ -12,6 +12,7 @@ struct Snapshot {
     oxi_reading_t reading;
     int rop;
     int mhr;
+    int mop;
     bool feeding;
 };
 
@@ -23,6 +24,8 @@ inline Snapshot snapshot() {
     OxiArbiter::snapshot(out.reading);
     out.rop = Arbiter::get_cached_rop();
     out.mhr = Arbiter::get_cached_mhr();
+    out.mop = out.sys == SYS_IDLE || out.sys == SYS_THERAPY
+        ? Arbiter::get_cached_mop() : -1;
     out.feeding = OxiArbiter::is_feeding();
     return out;
 }

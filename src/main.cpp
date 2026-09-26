@@ -78,6 +78,7 @@ static void serial_poll() {
 
 // Health monitoring:
 //   ROP/STK every 10s to detect therapy state and device restarts
+//   MOP on the same pass for the published therapy mode
 //   DAC/TIC every minute for the status clock
 //   MHR every 30 min and once on therapy stop
 #define HEALTH_POLL_INTERVAL_MS     10000
@@ -165,6 +166,7 @@ static void poll_device_uptime() {
     clock_sync_pending = true;
     clock_sync_attempted = false;
     Arbiter::set_cached_mhr(-1);
+    Arbiter::set_cached_mop(-1);
     EdfRecorder::device_restarted();
     if (Arbiter::get_state() == SYS_THERAPY) {
         Arbiter::set_state(SYS_IDLE);
@@ -194,6 +196,15 @@ static bool mhr_poll_due() {
     return millis() - last_mhr_poll >= MHR_POLL_INTERVAL_MS;
 }
 
+static void poll_therapy_mode() {
+    char response[9];
+    uint32_t raw;
+    const bool valid = Arbiter::get_var("MOP", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                       response, sizeof(response), HEALTH_TIMEOUT_MS) &&
+        aircannect::parse_hex(response, strlen(response), raw) && raw <= INT_MAX;
+    Arbiter::set_cached_mop(valid ? static_cast<int>(raw) : -1);
+}
+
 static void poll_therapy_state() {
     char resp[64] = {};
 
@@ -210,6 +221,7 @@ static void poll_therapy_state() {
             airsense_seen_ms = millis();
             poll_device_uptime();
             Config::refresh_device_info();
+            poll_therapy_mode();
             poll_device_time();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = Arbiter::get_cached_rop();
@@ -249,7 +261,10 @@ static void poll_therapy_state() {
             }
         }
     }
-    if (!airsense_present) publish_device_time("--");
+    if (!airsense_present) {
+        publish_device_time("--");
+        Arbiter::set_cached_mop(-1);
+    }
 }
 
 static void attempt_recovery() {

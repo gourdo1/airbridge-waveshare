@@ -299,6 +299,9 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
     fixedJsonAddString(json, "system", system_state_name(status.sys));
     fixedJsonAddInt(json, "rop", status.rop);
+    char mode[24];
+    ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
+    fixedJsonAddString(json, "mode", mode);
     fixedJsonAddString(json, "pna", cfg.device_pna.c_str());
     fixedJsonAddString(json, "srn", cfg.device_srn.c_str());
     fixedJsonAddString(json, "esp_time", esp_time);
@@ -1816,6 +1819,16 @@ static String build_status_payload(const DeviceStatus::Snapshot &status) {
     jsonAddString(sj, "system", system_state_name(status.sys), false);
     jsonAddInt(sj, "rop", status.rop);
     jsonAddInt(sj, "mhr", status.mhr);
+    char mode[24];
+    ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
+    jsonAddString(sj, "mode", mode);
+#if AB_STORAGE_HAS_SDCARD
+    SdStorage::Status sd;
+    SdStorage::get_status(sd);
+    jsonAddString(sj, "sd", sd.mounted ? "mounted" : "unavailable");
+    jsonAddInt(sj, "sd_total_mb", sd.card_bytes / (1024 * 1024));
+    jsonAddInt(sj, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+#endif
     jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
     char oxi_addr[32];
     OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
@@ -1831,13 +1844,14 @@ static String build_status_payload(const DeviceStatus::Snapshot &status) {
 }
 
 static DeviceStatus::Snapshot last_published = {
-    SYS_IDLE, OXI_DISABLED, {}, INT_MIN, INT_MIN, false
+    SYS_IDLE, OXI_DISABLED, {}, INT_MIN, INT_MIN, INT_MIN, false
 };
 
 static bool snapshot_differs(const DeviceStatus::Snapshot &a,
                              const DeviceStatus::Snapshot &b) {
     return a.rop     != b.rop     ||
            a.mhr     != b.mhr     ||
+           a.mop     != b.mop     ||
            a.sys     != b.sys     ||
            a.oxi     != b.oxi     ||
            a.feeding != b.feeding ||

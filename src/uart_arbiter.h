@@ -146,8 +146,10 @@ namespace Arbiter {
 
     int  get_cached_rop();
     int  get_cached_mhr();
+    int  get_cached_mop();
     void set_cached_rop(int value);
     void set_cached_mhr(int value);
+    void set_cached_mop(int value);
 
     // Queue a copied LCD request without waiting for UART; false = not queued.
     bool lcd_message(const char *msg, uint32_t timeout_ms = 0);  // 0 = persistent

@@ -1330,10 +1330,13 @@ bool Arbiter::wait_idle(uint16_t timeout_ms) {
 
 static volatile int cached_rop = -1;
 static volatile int cached_mhr = -1;
+static volatile int cached_mop = -1;
 int  Arbiter::get_cached_rop()              { return cached_rop; }
 int  Arbiter::get_cached_mhr()              { return cached_mhr; }
+int  Arbiter::get_cached_mop()              { return cached_mop; }
 void Arbiter::set_cached_rop(int v)         { cached_rop = v; }
 void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
+void Arbiter::set_cached_mop(int v)         { cached_mop = v; }
 
 void Arbiter::enter_transparent(Stream *bridge) {
     transparent_tx_reset();

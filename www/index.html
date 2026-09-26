@@ -57,6 +57,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
 .card-header .label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim)}
 .card-title{font-size:18px;font-weight:600;margin-bottom:4px}
+.storage-meter{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:4px}
+.storage-meter-fill{height:100%;background:var(--accent);width:0}
+#dashStorageSummary{font-size:12px;text-align:right}
 
 /* Badges */
 .badge{display:inline-block;font-size:10px;font-weight:700;padding:3px 10px;border-radius:12px;letter-spacing:0.5px;text-transform:uppercase}
@@ -246,6 +249,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
               <span class="value" id="dashSrn">--</span>
             </div>
             <div class="time-row">
+              <span class="label">Therapy mode</span>
+              <span class="value" id="dashMode">--</span>
+            </div>
+            <div class="time-row">
               <span class="label">Motor Hours</span>
               <span class="value" id="dashMhr">--</span>
             </div>
@@ -258,7 +265,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
           <div class="card">
             <div class="card-header">
-              <span class="label">Clock</span>
+              <span class="label">System</span>
             </div>
             <div class="time-row">
               <span class="label">AirBridge Time</span>
@@ -272,6 +279,13 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('ntp_sync')">Ntp Sync</button>
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')">Sync to Resmed</button>
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')">Sync from Resmed</button>
+            </div>
+            <div class="time-row">
+              <span class="label">SD card</span>
+              <span class="value" id="dashStorageSummary">--</span>
+            </div>
+            <div class="storage-meter" id="dashStorageMeter" role="meter" aria-label="SD card usage" aria-valuemin="0" aria-valuemax="100" hidden>
+              <div class="storage-meter-fill" id="dashStorageFill"></div>
             </div>
           </div>
         </div>
@@ -1082,6 +1096,8 @@ function updateWifiBars(el, rssi) {
 
 function renderStatus(d) {
   renderStorageStatus(d);
+  renderDashboardStorage(d);
+  if (d.mode !== undefined) document.getElementById('dashMode').textContent = d.mode || '--';
   // Topbar - update from any push, even without full status
   var el;
   el = document.getElementById('topHeap'); if (el && d.heap) el.textContent = (d.heap/1024).toFixed(1) + ' KB free';
@@ -1715,6 +1731,29 @@ function renderExports() {
 
 let storagePath = '/', storageOffset = 0, storageMore = false, storageLoading = false;
 const storageSelection = new Set();
+
+function renderDashboardStorage(data) {
+  const summary = document.getElementById('dashStorageSummary');
+  const meter = document.getElementById('dashStorageMeter');
+  const fill = document.getElementById('dashStorageFill');
+  if (data.sd === undefined && data.version === undefined) return;
+  const total = Number(data.sd_total_mb), used = Number(data.sd_used_mb);
+  const mounted = data.sd === 'mounted' && Number.isFinite(total) && total > 0 &&
+    Number.isFinite(used) && used >= 0;
+  meter.hidden = !mounted;
+  if (!mounted) {
+    summary.textContent = !data.sd || data.sd === 'unsupported' ? 'Not supported' : 'Card unavailable';
+    fill.style.width = '0%';
+    meter.removeAttribute('aria-valuenow');
+    return;
+  }
+  const format = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GiB' : Math.round(mb) + ' MiB';
+  const percent = Math.min(100, used / total * 100);
+  summary.textContent = format(used) + ' used / ' + format(Math.max(0, total - used)) + ' free';
+  fill.style.width = percent.toFixed(1) + '%';
+  meter.setAttribute('aria-valuenow', percent.toFixed(1));
+  meter.title = percent.toFixed(1) + '% used of ' + format(total);
+}
 
 function renderStorageStatus(data) {
   if (data.sd === undefined) return;

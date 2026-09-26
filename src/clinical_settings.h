@@ -64,5 +64,6 @@ private:
 int collect(Snapshot &snapshot, bool report = false);  // Worker only.
 bool read_raw(const char *cmd, int &value);
 bool known_stock(const char *cmd);
+void mode_label(int mode, char *out, size_t capacity);
 
 }  // namespace ClinicalSettings
