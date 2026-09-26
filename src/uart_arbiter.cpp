@@ -1171,8 +1171,9 @@ static bool capture_single_response(const qframe_t *frame, void *context) {
 }
 
 static bool capture_variable(const qframe_t *frame, void *context) {
+    // A rejected value is not a sink failure: the matched R/E is terminal.
     if (frame->type != QFRAME_TYPE_R || frame->payload_len <= 11 ||
-        memcmp(frame->payload + 8, " = ", 3) != 0) return false;
+        memcmp(frame->payload + 8, " = ", 3) != 0) return true;
     return capture_response(frame, context, 11);
 }
 
