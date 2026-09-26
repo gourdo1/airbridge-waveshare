@@ -154,9 +154,8 @@ static void known_clear() {
 }
 
 // Check if a device is "known" (either NimBLE-bonded or in our known list)
-static bool is_device_known(const char *addr, uint8_t addr_type) {
-    NimBLEAddress ba(std::string(addr), addr_type);
-    if (NimBLEDevice::isBonded(ba)) return true;
+static bool is_device_known(const char *addr, const NimBLEAddress &address) {
+    if (NimBLEDevice::isBonded(address)) return true;
     return known_contains(addr);
 }
 
@@ -693,11 +692,15 @@ static bool has_oximeter_name(const char *name) {
 class OxiScanCB : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
         std::string name = dev->getName();
-        std::string addr = dev->getAddress().toString();
+        const auto &address = dev->getAddress();
+        const uint8_t *bytes = address.getVal();
+        char addr[18];
+        snprintf(addr, sizeof(addr), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0]);
         // Passive advertisements need not contain a name or service UUID.
-        bool known = is_device_known(addr.c_str(), dev->getAddress().getType());
+        bool known = is_device_known(addr, address);
         bool is_oxi = has_oxyii_manufacturer(dev) ||
-                       known || strcasecmp(addr.c_str(), Config::get().oxi_device_addr.c_str()) == 0 ||
+                       known || strcasecmp(addr, Config::get().oxi_device_addr.c_str()) == 0 ||
                        dev->isAdvertisingService(PLX_SERVICE_UUID) ||
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
@@ -710,15 +713,15 @@ class OxiScanCB : public NimBLEScanCallbacks {
         if (is_oxi && scan_mutex && xSemaphoreTake(scan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (scan_result_count < MAX_SCAN_RESULTS) {
                 snprintf(scan_results[scan_result_count].addr,
-                         sizeof(scan_results[scan_result_count].addr), "%s", addr.c_str());
+                         sizeof(scan_results[scan_result_count].addr), "%s", addr);
                 scan_results[scan_result_count].name = name.c_str();
                 scan_results[scan_result_count].rssi = dev->getRSSI();
-                scan_results[scan_result_count].addr_type = dev->getAddress().getType();
+                scan_results[scan_result_count].addr_type = address.getType();
                 scan_result_count++;
             }
             xSemaphoreGive(scan_mutex);
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Found: %s (%s) RSSI=%d\n",
-                          name.c_str(), addr.c_str(), dev->getRSSI());
+                          name.c_str(), addr, dev->getRSSI());
         }
     }
 
@@ -1128,8 +1131,9 @@ void OxiBle::task(void *param) {
                         if (!found) Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Target %s not in scan results\n", target.c_str());
                     } else {
                         for (int i = 0; i < scan_result_count; i++) {
-                            bool known = is_device_known(scan_results[i].addr,
-                                                         scan_results[i].addr_type);
+                            NimBLEAddress address(std::string(scan_results[i].addr),
+                                                    scan_results[i].addr_type);
+                            bool known = is_device_known(scan_results[i].addr, address);
                             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] %s %s known=%d\n",
                                       scan_results[i].name.c_str(), scan_results[i].addr, known);
                             if (cfg.oxi_require_known) {
