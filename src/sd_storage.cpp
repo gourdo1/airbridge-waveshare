@@ -349,6 +349,7 @@ bool Reader::open(const Session &session, const char *path, bool directory) {
         fs::File file = fs.open(path, FILE_READ);
         if (!file || file.isDirectory() != directory) return false;
         size_ = file.size();
+        modified_ = file.getLastWrite();
         if (++next_reader == 0) ++next_reader;
         slot->id = handle_ = next_reader;
         slot->file = file;

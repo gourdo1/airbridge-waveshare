@@ -7,6 +7,7 @@
 #include <atomic>
 #include <new>
 #include <string.h>
+#include <time.h>
 #include "crc.h"
 #include "json_util.h"
 #include "large_text_buffer.h"
@@ -42,6 +43,7 @@ struct ZipEntry {
     uint32_t size;
     uint32_t crc;
     uint32_t offset;
+    uint32_t modified;
     bool directory;
 };
 
@@ -98,11 +100,11 @@ public:
         return true;
     }
 
-    bool add(const char *path, uint64_t size, bool directory) {
+    bool add(const char *path, uint64_t size, bool directory, int64_t modified = 0) {
         if (size > UINT32_MAX || entry_count == UINT16_MAX || strlen(path) >= 256)
             return false;
         if (entry_count == entry_capacity) {
-            const size_t next = entry_capacity + 16;
+            const size_t next = std::min<size_t>(UINT16_MAX, entry_capacity ? entry_capacity * 2 : 16);
             void *grown = aircannect::Memory::realloc_large(entries,
                 next * sizeof(ZipEntry), next * sizeof(ZipEntry) <= 16384);
             if (!grown) return false;
@@ -114,6 +116,13 @@ public:
         strcpy(entry.path, path);
         entry.size = size;
         entry.directory = directory;
+        time_t stamp = modified;
+        struct tm date = {};
+        entry.modified = 33u << 16;
+        if (modified > 0 && localtime_r(&stamp, &date) && date.tm_year >= 80 && date.tm_year <= 207)
+            entry.modified = uint32_t(date.tm_year - 80) << 25 | uint32_t(date.tm_mon + 1) << 21 |
+                uint32_t(date.tm_mday) << 16 | uint32_t(date.tm_hour) << 11 |
+                uint32_t(date.tm_min) << 5 | uint32_t(date.tm_sec / 2);
         return true;
     }
 };
@@ -151,7 +160,7 @@ bool collect(Job &job) {
     if (!*selection) {
         SdStorage::Reader file;
         if (file.open(job.session, job.request.path))
-            return job.add(job.request.path, file.size(), false);
+            return job.add(job.request.path, file.size(), false, file.modified());
         if (!job.add(job.request.path, 0, true)) return false;
     } else {
         while (*selection) {
@@ -164,7 +173,8 @@ bool collect(Job &job) {
             if (written < 0 || size_t(written) >= sizeof(path) || !valid_path(path)) return false;
             SdStorage::Reader file;
             const bool regular = file.open(job.session, path);
-            if (!job.add(path, regular ? file.size() : 0, !regular)) return false;
+            if (!job.add(path, regular ? file.size() : 0, !regular,
+                         regular ? file.modified() : 0)) return false;
             selection = end ? end + 1 : selection + length;
         }
     }
@@ -184,22 +194,36 @@ bool collect(Job &job) {
             const int written = snprintf(path, sizeof(path), "%s%s%s", parent,
                 strcmp(parent, "/") ? "/" : "", entry.name);
             if (written < 0 || size_t(written) >= sizeof(path) ||
-                !valid_path(path) || !job.add(path, entry.size, entry.directory)) return false;
+                !valid_path(path) || !job.add(path, entry.size, entry.directory, entry.modified)) return false;
         }
     }
     return true;
 }
 
+constexpr size_t COPY_BYTES = 1024;
+
+uint64_t zip_data_size(uint32_t size) {
+    return uint64_t(size) + 5 * (size ? (uint64_t(size) + COPY_BYTES - 1) / COPY_BYTES : 1);
+}
+
 bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr) {
-    uint8_t buffer[1024];
+    uint8_t buffer[COPY_BYTES];
     uint64_t remaining = file.size();
     uint32_t crc = crc32_ieee_initial();
-    while (remaining) {
+    do {
         const size_t count = std::min<uint64_t>(sizeof(buffer), remaining);
+        if (checksum) {
+            // Raw DEFLATE stored block: one pass, no compression workspace.
+            uint8_t block[5];
+            block[0] = remaining <= count ? 1 : 0;
+            SdStorage::put_le16(block + 1, count);
+            SdStorage::put_le16(block + 3, uint16_t(~count));
+            if (!job.emit(block, sizeof(block))) return false;
+        }
         if (file.read(buffer, count) != count || !job.emit(buffer, count)) return false;
         if (checksum) crc = crc32_ieee_update(crc, buffer, count);
         remaining -= count;
-    }
+    } while (remaining);
     if (checksum) *checksum = crc32_ieee_finish(crc);
     return true;
 }
@@ -214,13 +238,15 @@ bool archive(Job &job) {
         if (entry.directory) continue;
         const char *name = entry.path + 1;
         const size_t length = strlen(name);
-        if (position + 30 + length + entry.size + 16 > UINT32_MAX) return false;
+        const uint64_t compressed_size = zip_data_size(entry.size);
+        if (position + 30 + length + compressed_size + 16 > UINT32_MAX) return false;
         entry.offset = position;
         uint8_t header[30] = {};
         put_le32(header, 0x04034b50);
         put_le16(header + 4, 20);
         put_le16(header + 6, 0x0808); // UTF-8 names, trailing data descriptor.
-        put_le16(header + 12, 33); // DOS 1980-01-01 when timestamp is unavailable.
+        put_le16(header + 8, 8);
+        put_le32(header + 10, entry.modified);
         put_le16(header + 26, length);
         if (!job.emit(header, sizeof(header)) ||
             !job.emit(reinterpret_cast<const uint8_t *>(name), length)) return false;
@@ -230,10 +256,10 @@ bool archive(Job &job) {
         uint8_t descriptor[16];
         put_le32(descriptor, 0x08074b50);
         put_le32(descriptor + 4, entry.crc);
-        put_le32(descriptor + 8, entry.size);
+        put_le32(descriptor + 8, compressed_size);
         put_le32(descriptor + 12, entry.size);
         if (!job.emit(descriptor, sizeof(descriptor))) return false;
-        position += sizeof(header) + length + entry.size + sizeof(descriptor);
+        position += sizeof(header) + length + compressed_size + sizeof(descriptor);
         files++;
     }
     const uint32_t central_offset = position;
@@ -248,9 +274,10 @@ bool archive(Job &job) {
         put_le16(header + 4, 20);
         put_le16(header + 6, 20);
         put_le16(header + 8, 0x0808);
-        put_le16(header + 14, 33);
+        put_le16(header + 10, 8);
+        put_le32(header + 12, entry.modified);
         put_le32(header + 16, entry.crc);
-        put_le32(header + 20, entry.size);
+        put_le32(header + 20, zip_data_size(entry.size));
         put_le32(header + 24, entry.size);
         put_le16(header + 28, length);
         put_le32(header + 42, entry.offset);

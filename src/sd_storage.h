@@ -98,12 +98,14 @@ public:
     size_t read(uint8_t *data, size_t length);
     void close();
     uint64_t size() const { return size_; }
+    int64_t modified() const { return modified_; }
     explicit operator bool() const { return handle_ != 0; }
 
 private:
     Session session_;
     uint32_t handle_ = 0;
     uint64_t size_ = 0;
+    int64_t modified_ = 0;
     uint64_t offset_ = 0;
 };
 
