@@ -116,13 +116,22 @@ static void publish_device_time(const char *text) {
     portEXIT_CRITICAL(&device_time_mux);
 }
 
-static bool read_resmed_clock(Air10Clock::Calendar &calendar, uint16_t timeout = 0) {
-    char dac[9], tic[7];
-    bool got_dac = Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                    dac, sizeof(dac), timeout);
-    bool got_tic = Arbiter::get_var("TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                    tic, sizeof(tic), timeout);
-    return got_dac && got_tic && Air10Clock::parse_calendar(dac, tic, calendar);
+bool Air10Clock::read(Calendar &out, uint16_t timeout_ms, uint32_t *captured_ms) {
+    for (uint8_t attempt = 0; attempt < 2; attempt++) {
+        char before[9], tic[7], after[9];
+        if (!Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                              before, sizeof(before), timeout_ms) ||
+            !Arbiter::get_var("TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                              tic, sizeof(tic), timeout_ms)) return false;
+        const uint32_t sampled_ms = millis();
+        if (!Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                              after, sizeof(after), timeout_ms)) return false;
+        if (strcmp(before, after) != 0) continue;
+        if (!parse_calendar(before, tic, out)) return false;
+        if (captured_ms) *captured_ms = sampled_ms;
+        return true;
+    }
+    return false;
 }
 
 static void poll_device_time() {
@@ -134,7 +143,7 @@ static void poll_device_time() {
 
     char text[20] = "--";
     Air10Clock::Calendar t;
-    if (read_resmed_clock(t, HEALTH_TIMEOUT_MS))
+    if (Air10Clock::read(t, HEALTH_TIMEOUT_MS))
         snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
                  t.year, t.month, t.day, t.hour, t.minute);
     publish_device_time(text);
@@ -216,6 +225,7 @@ static void poll_therapy_state() {
                 Arbiter::set_state(SYS_IDLE);
                 Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy ended\n");
                 EdfRecorder::therapy_ended();
+                Air10Clock::request_sync();
                 poll_mhr();
             }
 
@@ -324,12 +334,12 @@ void setup() {
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }
 
-void reset_resmed_time_sync() {
+void Air10Clock::request_sync() {
     clock_sync_pending = true;
     clock_sync_attempted = false;
 }
 
-bool push_time_to_resmed() {
+static bool push_time_to_resmed() {
     if (!WiFiSetup::time_synced()) return false;
 
     struct tm t;
@@ -375,7 +385,7 @@ bool push_time_to_resmed() {
 
 bool pull_time_from_resmed(bool force) {
     Air10Clock::Calendar t;
-    if (!read_resmed_clock(t) ||
+    if (!Air10Clock::read(t) ||
         !WiFiSetup::set_fallback_time(t.year, t.month, t.day,
                                       t.hour, t.minute, t.second, force)) return false;
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Time from ResMed: %04d-%02d-%02d %02d:%02d:%02d\n",
@@ -386,15 +396,8 @@ bool pull_time_from_resmed(bool force) {
 static void sync_resmed_clock() {
     if (!clock_sync_pending || !airsense_present || !WiFiSetup::time_synced()) return;
     if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
-    system_state_t st = Arbiter::get_state();
-    if (st != SYS_IDLE && st != SYS_THERAPY) return;
-#if AB_STORAGE_HAS_SDCARD
-    EdfRecorder::Status recorder;
-    EdfRecorder::get_status(recorder);
-    // Keep the native STR clock stable until the session summary is collected.
-    if (recorder.ready && (st == SYS_THERAPY || recorder.active ||
-                           recorder.post_processing)) return;
-#endif
+    if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return;
+    if (!EdfRecorder::clock_write_allowed()) return;
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;

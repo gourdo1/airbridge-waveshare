@@ -11,7 +11,6 @@ struct Status {
     bool active;
     bool post_processing;
     bool identification_ready;
-    uint32_t started_epoch;
     uint32_t raw_dropped;
     uint32_t write_errors;
     uint32_t brp_records;
@@ -50,6 +49,7 @@ struct Progress {
 void init();
 void therapy_started();
 void therapy_ended();
+bool clock_write_allowed();
 void get_status(Status &out);
 void get_progress(Progress &out);
 

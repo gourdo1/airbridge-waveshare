@@ -12,6 +12,7 @@
 #include <esp_partition.h>
 #include <time.h>
 #include "wifi_setup.h"
+#include "air10_clock.h"
 #include "network_hints.h"
 #include "live_stream.h"
 #include "live_pmd.h"
@@ -256,8 +257,7 @@ void dispatch_command(const char *line, String &response) {
     }
 
     if (upper == "TIMESYNC") {
-        extern void reset_resmed_time_sync();
-        reset_resmed_time_sync();
+        Air10Clock::request_sync();
         response = "OK: resmed clock sync will retry\n";
         return;
     }

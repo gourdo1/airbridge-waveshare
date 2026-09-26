@@ -32,7 +32,6 @@
 #include "qframe.h"
 #include "sd_storage.h"
 #include "uart_arbiter.h"
-#include "wifi_setup.h"
 
 namespace EdfRecorder {
 namespace {
@@ -49,7 +48,6 @@ constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
 constexpr uint16_t STR_GENERATION_POLL_MS = 100;
 constexpr uint16_t MASK_OFF_TOLERANCE_MINUTES = 1;
 constexpr uint32_t STR_FINAL_SAVE_TIMEOUT_MS = 60000;
-constexpr uint32_t CLOCK_VALID_AFTER = 1700000000UL;
 constexpr int16_t EDF_MISSING = -1;
 constexpr size_t RECOVERY_HEADER_MAX = 8192;
 constexpr size_t RECOVERY_BUFFER_SIZE = 4096;
@@ -73,9 +71,7 @@ enum class ControlKind : uint8_t {
 
 struct ControlEvent {
     ControlKind kind;
-    uint32_t epoch;
     uint32_t captured_ms;
-    bool trusted_time;
     bool confirmed_end = false;
 };
 
@@ -143,6 +139,7 @@ static uint32_t next_storage_ms = 0;
 static fs::FS *storage = nullptr;
 static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
+static bool pending_scanned = false;
 static char pending_cursor[16] = {};
 static StreamSchema stream_schemas[STREAM_COUNT];
 static LiveStream::internal_handle_t stream_leases[STREAM_COUNT];
@@ -194,7 +191,6 @@ static void publish_progress(bool active, bool new_segment = false) {
     *progress = next;
     portEXIT_CRITICAL(&status_mux);
 }
-static uint16_t session_epoch_day = 0;
 static uint16_t session_mid = 0;
 static uint16_t session_vid = 0;
 static char session_srn[24] = {};
@@ -367,34 +363,12 @@ static bool read_u32_variable(const char *name, uint32_t &value) {
            parse_hex_value(text, strlen(text), value);
 }
 
-static int32_t civil_epoch_day(int year, unsigned month, unsigned day) {
-    year -= month <= 2;
-    const int era = (year >= 0 ? year : year - 399) / 400;
-    const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
-    const unsigned day_of_year =
-        (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 -
-                                year_of_era / 100 + day_of_year;
-    return era * 146097 + static_cast<int>(day_of_era) - 719468;
-}
-
-static bool read_native_clock(int64_t &civil, uint32_t &captured_ms) {
-    for (uint8_t attempt = 0; attempt < 2; attempt++) {
-        uint32_t day_before = 0, day_after = 0, uti = 0;
-        if (!read_u32_variable("UDT", day_before)) return false;
-        const uint32_t started = millis();
-        if (!read_u32_variable("UTI", uti)) return false;
-        captured_ms = started + static_cast<uint32_t>(millis() - started) / 2;
-        if (!read_u32_variable("UDT", day_after)) return false;
-        if (day_before == day_after)
-            return Air10Clock::decode(day_before, uti, civil);
-    }
-    return false;
-}
-
 static bool wait_for_final_str_save(const EdfPending::Record &pending) {
     if ((pending.flags & EdfPending::END_KNOWN) &&
-        pending.native_end < pending.native_start) return false;
+        pending.native_end < pending.native_start) {
+        post_error("native clock moved before session start");
+        return false;
+    }
     const uint16_t expected_off = pending.flags & EdfPending::END_KNOWN
         ? static_cast<uint16_t>(min(int64_t(1440),
             (pending.native_end - (int64_t(pending.native_day) * 86400 + 43200)) / 60))
@@ -423,9 +397,9 @@ static bool wait_for_final_str_save(const EdfPending::Record &pending) {
             Air10Stored::Value mask_on = {};
             Air10Stored::Value mask_off = {};
             const bool have_mask_on = read_stored_value(
-                "ONT", session_native_day, mask_on);
+                "ONT", pending.native_day, mask_on);
             const bool have_mask_off = read_stored_value(
-                "OFT", session_native_day, mask_off);
+                "OFT", pending.native_day, mask_off);
             uint32_t generation_after = 0;
             const bool have_after = read_u32_variable("ZEN", generation_after);
             if (have_before && have_after && generation_before == generation_after &&
@@ -751,25 +725,26 @@ static bool write_pending(const EdfPending::Record &record) {
 
 static bool save_pending(bool ended, uint32_t ended_ms, bool segment_end = false) {
     EdfPending::Record pending;
-    pending.flags = session_clock.native_valid ? EdfPending::NATIVE_VALID : 0;
     pending.native_day = session_native_day;
-    pending.export_day = session_epoch_day;
     pending.native_start = session_clock.native_start;
     pending.mask_start = session_mask_start;
-    pending.export_start = session_clock.export_start;
     pending.mid = session_mid; pending.vid = session_vid;
     memcpy(pending.srn, session_srn, sizeof(pending.srn));
     memcpy(pending.prefix, status.file_prefix, sizeof(pending.prefix));
     memcpy(pending.day, status.therapy_day, sizeof(pending.day));
     if (ended) {
-        pending.flags |= EdfPending::END_KNOWN;
-        if (segment_end) pending.flags |= EdfPending::SEGMENT_END;
-        pending.native_end = session_clock.native_at(ended_ms);
-        int64_t native_now = 0;
+        Air10Clock::Calendar native_now;
         uint32_t clock_ms = 0;
-        if (!segment_end && read_native_clock(native_now, clock_ms) &&
-            !session_clock.stable(native_now, clock_ms))
-            pending.flags |= EdfPending::CLOCK_CHANGED;
+        if (segment_end) {
+            pending.flags = EdfPending::END_KNOWN | EdfPending::SEGMENT_END;
+            pending.native_end = session_clock.native_at(ended_ms);
+        } else if (Air10Clock::read(native_now, POLL_TIMEOUT_MS, &clock_ms)) {
+            pending.flags = EdfPending::END_KNOWN;
+            pending.native_end = Air10Clock::civil_seconds(native_now) -
+                uint32_t(clock_ms - ended_ms) / 1000;
+        } else {
+            post_error("native end clock unavailable; awaiting closed STR interval");
+        }
     }
     if (!write_pending(pending)) {
         post_error("STR pending journal write failed");
@@ -1075,21 +1050,6 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         }
         memcpy(samples + offset, value.samples,
                expected * sizeof(int16_t));
-        if (strcmp(tag, "LSD") == 0) {
-            samples[offset] = static_cast<int16_t>(session_epoch_day);
-        } else if (strcmp(tag, "ONT") == 0 || strcmp(tag, "OFT") == 0) {
-            for (uint16_t i = 0; i < expected; i++) {
-                uint16_t corrected = 0;
-                if (!session_clock.mask_minute(
-                        static_cast<uint16_t>(samples[offset + i]), corrected)) {
-                    post_error("STR clock correction crosses therapy-day boundary");
-                    complete = false;
-                    break;
-                }
-                samples[offset + i] = static_cast<int16_t>(corrected);
-            }
-            if (!complete) break;
-        }
         offset += expected;
     }
 
@@ -1154,7 +1114,7 @@ static bool parse_edf_start_day(const uint8_t *text, uint16_t &epoch_day) {
     const unsigned short_year = (text[6] - '0') * 10 + text[7] - '0';
     const int year = short_year >= 85 ? 1900 + short_year
                                       : 2000 + short_year;
-    const int32_t parsed = civil_epoch_day(year, month, day);
+    const int32_t parsed = Air10Clock::civil_epoch_day(year, month, day);
     int check_year = 0;
     unsigned check_month = 0;
     unsigned check_day = 0;
@@ -1178,7 +1138,7 @@ static bool parse_therapy_day(const char *text, uint16_t &epoch_day) {
     const unsigned month = (text[4] - '0') * 10 + text[5] - '0';
     const unsigned day = (text[6] - '0') * 10 + text[7] - '0';
     if (month < 1 || month > 12 || day < 1 || day > 31) return false;
-    const int32_t parsed = civil_epoch_day(year, month, day);
+    const int32_t parsed = Air10Clock::civil_epoch_day(year, month, day);
     if (parsed < 0 || parsed > UINT16_MAX) return false;
     epoch_day = static_cast<uint16_t>(parsed);
     return true;
@@ -1253,7 +1213,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
     const size_t record_size = Air10Edf::record_size(schema);
     if (post_processing_cancelled()) return false;
     if (!valid_str_record(incoming_record, record_size,
-                          session_epoch_day)) {
+                          session_native_day)) {
         post_error("incoming STR record invalid");
         return false;
     }
@@ -1289,7 +1249,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
             input.size() != header_size + existing_records * record_size ||
             !Air10StrTimeline::begin(header_start_day, existing_records,
                                      scan) ||
-            !render_str_header(session_epoch_day, 0, header, header_size)) {
+            !render_str_header(session_native_day, 0, header, header_size)) {
             valid = false;
         }
 
@@ -1330,7 +1290,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
             if (!cancelled) post_error("existing STR validation failed");
             return false;
         }
-    } else if (!Air10StrTimeline::begin(session_epoch_day, 0, scan)) {
+    } else if (!Air10StrTimeline::begin(session_native_day, 0, scan)) {
         aircannect::Memory::free(header);
         aircannect::Memory::free(work);
         post_error("STR timeline initialization failed");
@@ -1338,7 +1298,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
     }
 
     Air10StrTimeline::Plan plan;
-    if (!Air10StrTimeline::make_plan(scan, session_epoch_day, plan) ||
+    if (!Air10StrTimeline::make_plan(scan, session_native_day, plan) ||
         !render_str_header(plan.start_day, plan.record_count,
                            header, header_size)) {
         if (input) input.close();
@@ -1388,7 +1348,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
     }
     if (valid &&
         (!Air10StrTimeline::place_record(
-             plan, timeline_buffer, session_epoch_day, incoming_record,
+             plan, timeline_buffer, session_native_day, incoming_record,
              record_size, build_stats) ||
          !Air10StrTimeline::fill_missing(
              plan, timeline_buffer, record_size, render_empty_str_record,
@@ -2170,8 +2130,9 @@ static uint32_t csr_onset(const RawFrame &raw, int32_t event_time) {
     const uint32_t arrival = relative_ms(raw.captured_ms) / 1000;
     if (!session_clock.native_valid || event_time < 0 || event_time >= 86400)
         return arrival;
+    // CET counts seconds from noon; the calendar anchor starts at midnight.
     int32_t candidate = static_cast<int32_t>(event_time) -
-                        static_cast<int32_t>(session_clock.native_start % 86400);
+                        static_cast<int32_t>((session_clock.native_start + 43200) % 86400);
     while (candidate < 0) candidate += 86400;
     while (candidate + 43200 < static_cast<int32_t>(arrival)) candidate += 86400;
     while (candidate > static_cast<int32_t>(arrival) + 43200) candidate -= 86400;
@@ -2297,43 +2258,26 @@ static void clear_session_memory(bool remove_partial) {
 static bool anchor_session_clock(const ControlEvent &event) {
     session_clock = {};
     session_clock.captured_ms = event.captured_ms;
-    int64_t native_now = 0;
+    Air10Clock::Calendar native_now;
     uint32_t clock_ms = 0;
-    session_clock.native_valid = read_native_clock(native_now, clock_ms);
-    if (session_clock.native_valid) {
-        session_clock.native_start = native_now -
-            static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
-        session_native_day = Air10Clock::therapy_day(session_clock.native_start);
-        portENTER_CRITICAL(&status_mux);
-        const uint32_t mask_on_ms = therapy_on_capture_ms;
-        portEXIT_CRITICAL(&status_mux);
-        session_mask_start = max(int64_t(session_native_day) * 86400 + 43200,
-            session_clock.native_start - uint32_t(event.captured_ms - mask_on_ms) / 1000);
-    } else {
-        session_native_day = 0;
-        session_mask_start = 0;
-    }
-    const bool trusted_time = event.trusted_time && event.epoch >= CLOCK_VALID_AFTER;
-    if (!trusted_time && !session_clock.native_valid && event.epoch < CLOCK_VALID_AFTER) {
-        status_error("clock is not set");
+    session_clock.native_valid = Air10Clock::read(native_now, POLL_TIMEOUT_MS, &clock_ms);
+    if (!session_clock.native_valid) {
+        status_error("native clock unavailable");
         return false;
     }
-    time_t start_epoch = event.epoch;
-    struct tm start_tm;
-    localtime_r(&start_epoch, &start_tm);
-    if (!trusted_time && session_clock.native_valid) {
-        start_epoch = static_cast<time_t>(session_clock.native_start);
-        gmtime_r(&start_epoch, &start_tm);
+    session_clock.native_start = Air10Clock::civil_seconds(native_now) -
+        static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
+    const int64_t day = (session_clock.native_start - 43200) / 86400;
+    if (day < 0x1000 || day >= 0xffff) {
+        status_error("therapy day is outside Air10 range");
+        return false;
     }
-    session_clock.export_start = static_cast<int64_t>(civil_epoch_day(
-        start_tm.tm_year + 1900, start_tm.tm_mon + 1, start_tm.tm_mday)) * 86400 +
-        start_tm.tm_hour * 3600 + start_tm.tm_min * 60 + start_tm.tm_sec;
-    Log::logf(CAT_EDF, LOG_INFO,
-              "[EDF] clock=%s native=%u correction=%llds\n",
-              trusted_time ? "NTP" : session_clock.native_valid ? "ResMed" : "ESP fallback",
-              session_clock.native_valid,
-              session_clock.native_valid
-                  ? session_clock.export_start - session_clock.native_start : 0LL);
+    session_native_day = static_cast<uint16_t>(day);
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t mask_on_ms = therapy_on_capture_ms;
+    portEXIT_CRITICAL(&status_mux);
+    session_mask_start = max(int64_t(session_native_day) * 86400 + 43200,
+        session_clock.native_start - uint32_t(event.captured_ms - mask_on_ms) / 1000);
     return true;
 }
 
@@ -2341,7 +2285,7 @@ static bool make_paths_and_metadata(const ControlEvent &event,
                                     uint16_t &mid, uint16_t &vid,
                                     bool rollover = false) {
     if (!rollover && !anchor_session_clock(event)) return false;
-    const time_t civil = static_cast<time_t>(session_clock.export_start);
+    const time_t civil = static_cast<time_t>(session_clock.native_start);
     struct tm start_tm;
     gmtime_r(&civil, &start_tm);
     snprintf(start_date, sizeof(start_date), "%02d.%02d.%02d",
@@ -2399,14 +2343,6 @@ static bool make_paths_and_metadata(const ControlEvent &event,
         vid = parse_hex_value(vid_text, strlen(vid_text), parsed)
                   ? static_cast<uint16_t>(parsed) : 0;
     }
-    const int32_t epoch_day = civil_epoch_day(therapy_tm.tm_year + 1900,
-                                               therapy_tm.tm_mon + 1,
-                                               therapy_tm.tm_mday);
-    if (epoch_day < 0 || epoch_day > UINT16_MAX) {
-        status_error("therapy day is outside Air10 range");
-        return false;
-    }
-    session_epoch_day = static_cast<uint16_t>(epoch_day);
     session_mid = mid;
     session_vid = vid;
     strncpy(session_srn, srn, sizeof(session_srn) - 1);
@@ -2473,7 +2409,7 @@ static bool begin_segment_files(const Air10Edf::Schema &brp_schema,
 
 static void reset_session_state(const ControlEvent &event, bool rollover = false) {
     session_start_capture_ms = event.captured_ms;
-    segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.export_start);
+    segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.native_start);
     wave_clock = {};
     last_pld_slot = UINT32_MAX;
     last_oxi_slot = UINT32_MAX;
@@ -2536,7 +2472,6 @@ static void start_session(const ControlEvent &event) {
     recording_therapy_on_ms = mask_on_ms;
     status.active = true;
     status.post_processing = false;
-    status.started_epoch = event.epoch;
     status.raw_dropped = 0;
     status.write_errors = 0;
     status.post_errors = 0;
@@ -2606,12 +2541,11 @@ static bool advance_segment(uint32_t captured_ms) {
     const uint32_t seconds = segment_duration_ms / 1000;
     close_segment(boundary, true);
     session_clock.native_start += seconds;
-    session_clock.export_start += seconds;
     session_clock.captured_ms = boundary;
     session_native_day = Air10Clock::therapy_day(session_clock.native_start);
     session_mask_start = max(session_mask_start,
         int64_t(session_native_day) * 86400 + 43200);
-    ControlEvent event = {ControlKind::Start, 0, boundary, false};
+    ControlEvent event = {ControlKind::Start, boundary};
     uint16_t mid = session_mid, vid = session_vid;
     const StreamSchema *schema = find_schema("TCE");
     const bool tcv = schema && schema_has_field(*schema, "TCV");
@@ -2696,6 +2630,7 @@ static void process_pending() {
     dir.close();
     portENTER_CRITICAL(&status_mux);
     status.pending_str = count;
+    pending_scanned = true;
     status.post_processing = selected_path[0] != 0;
     portEXIT_CRITICAL(&status_mux);
     bool success = false;
@@ -2705,17 +2640,13 @@ static void process_pending() {
     if (selected_path[0]) {
         memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
         char srn[24] = {};
-        if (!(selected.flags & EdfPending::NATIVE_VALID) ||
-            (selected.flags & EdfPending::CLOCK_CHANGED)) {
-            post_error("STR pending clock requires review");
-        } else if (!read_variable("SRN", srn, sizeof(srn)) || strcmp(srn, selected.srn)) {
+        if (!read_variable("SRN", srn, sizeof(srn)) || strcmp(srn, selected.srn)) {
             post_error("STR pending device unavailable or different");
         } else if (have_entry) {
             session_clock = {};
             session_clock.native_valid = true;
             session_clock.native_start = selected.native_start;
-            session_clock.export_start = selected.export_start;
-            session_native_day = selected.native_day; session_epoch_day = selected.export_day;
+            session_native_day = selected.native_day;
             session_mid = selected.mid; session_vid = selected.vid;
             memcpy(session_srn, selected.srn, sizeof(session_srn));
             uint8_t *identification = nullptr, *record = nullptr;
@@ -2786,8 +2717,7 @@ static void retry_recording() {
         !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
         Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1 ||
         (next_start_ms && int32_t(millis() - next_start_ms) < 0)) return;
-    const ControlEvent event = {ControlKind::Start,
-        static_cast<uint32_t>(time(nullptr)), millis(), WiFiSetup::time_synced()};
+    const ControlEvent event = {ControlKind::Start, millis()};
     start_session(event);
 }
 
@@ -2917,20 +2847,14 @@ void therapy_started() {
     __atomic_store_n(&therapy_wanted, true, __ATOMIC_RELEASE);
     __atomic_store_n(&therapy_start_pending, true, __ATOMIC_RELEASE);
     if (!status.ready || !control_queue) return;
-    const bool trusted_time = WiFiSetup::time_synced();
-    ControlEvent event = {ControlKind::Start,
-                          static_cast<uint32_t>(time(nullptr)), captured_ms,
-                          trusted_time};
+    ControlEvent event = {ControlKind::Start, captured_ms};
     if (xQueueSend(control_queue, &event, 0) != pdTRUE) {
         status_error("control queue full at therapy start");
     }
 }
 
 void therapy_ended() {
-    const bool trusted_time = WiFiSetup::time_synced();
-    ControlEvent event = {ControlKind::Stop,
-                          static_cast<uint32_t>(time(nullptr)), millis(),
-                          trusted_time,
+    ControlEvent event = {ControlKind::Stop, millis(),
                           Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0};
     portENTER_CRITICAL(&status_mux);
     latest_stop = event;
@@ -2940,6 +2864,15 @@ void therapy_ended() {
     if (!status.ready || !control_queue) return;
     if (xQueueSend(control_queue, &event, 0) != pdTRUE)
         status_error("control queue full at therapy stop");
+}
+
+bool clock_write_allowed() {
+    const bool mounted = SdStorage::mounted();
+    portENTER_CRITICAL(&status_mux);
+    const bool allowed = (pending_scanned || !mounted) && !status.active &&
+                         !status.post_processing && !status.pending_str;
+    portEXIT_CRITICAL(&status_mux);
+    return allowed;
 }
 
 void get_status(Status &out) {
@@ -2964,6 +2897,7 @@ namespace EdfRecorder {
 void init() {}
 void therapy_started() {}
 void therapy_ended() {}
+bool clock_write_allowed() { return true; }
 void get_progress(Progress &out) { out = {}; }
 
 void get_status(Status &out) {
