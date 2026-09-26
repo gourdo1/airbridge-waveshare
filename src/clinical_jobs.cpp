@@ -155,7 +155,7 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
     return count;
 }
 
-bool submit(Kind kind, const String &body, uint32_t &id) {
+bool submit(Kind kind, String &&body, uint32_t &id) {
     if (!mutex || body.length() > MAX_BODY_SIZE || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
@@ -180,13 +180,7 @@ bool submit(Kind kind, const String &body, uint32_t &id) {
     }
     reset_job(*available);
     available->kind = kind;
-    available->body = body;
-    if (available->body.length() != body.length()) {
-        reset_job(*available);
-        xSemaphoreGive(mutex);
-        Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Request allocation failed\n");
-        return false;
-    }
+    available->body = std::move(body);
     available->id = next_id++;
     if (!next_id) next_id = 1;
     available->queued_ms = millis();

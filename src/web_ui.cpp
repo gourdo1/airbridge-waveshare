@@ -51,7 +51,7 @@ static bool checkAuth(AsyncWebServerRequest *request) {
 
 // iterate json string key-value pairs
 // calls fn(key, val) for each pair. Only handles string values.
-typedef void (*json_kv_fn)(const String &key, const String &val, void *ctx);
+typedef void (*json_kv_fn)(const char *key, const char *val, void *ctx);
 static bool parseJsonObject(const String &body, JsonDocument &doc) {
     return !deserializeJson(doc, body) && doc.is<JsonObject>();
 }
@@ -414,36 +414,44 @@ static int saveSettings(const String &body, String &json) {
     }
 
     struct { int count; String errors; bool lan_changed; } ctx = {0, "", false};
-    bool parsed = json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    bool parsed = json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         auto *c = (decltype(ctx)*)p;
         char *end = nullptr;
         errno = 0;
-        int64_t raw = strtoll(val.c_str(), &end, 10);
-        if (end == val.c_str() || *end != '\0' || errno == ERANGE ||
+        int64_t raw = strtoll(val, &end, 10);
+        if (end == val || *end != '\0' || errno == ERANGE ||
             raw < INT32_MIN || raw > UINT32_MAX) {
-            c->errors += key + ":invalid_number,";
+            c->errors += key;
+            c->errors += ":invalid_number,";
             return;
         }
-        if (CustomSettings::contains(key.c_str())) {
-            if (CustomSettings::write_raw(key.c_str(), (uint32_t)raw)) {
+        if (CustomSettings::contains(key)) {
+            if (CustomSettings::write_raw(key, (uint32_t)raw)) {
                 c->count++;
             } else {
-                c->errors += key + ":fail,";
-                Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Custom write #%.3s failed\n", key.c_str());
+                c->errors += key;
+                c->errors += ":fail,";
+                Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Custom write #%.3s failed\n", key);
             }
             return;
         }
-        if (!ClinicalSettings::known_stock(key.c_str())) { c->errors += key + ":unknown,"; return; }
-        if (raw < INT16_MIN || raw > UINT16_MAX) {
-            c->errors += key + ":invalid_number,";
+        if (!ClinicalSettings::known_stock(key)) {
+            c->errors += key;
+            c->errors += ":unknown,";
             return;
         }
-        if (writeSetting(key.c_str(), (int)raw)) {
+        if (raw < INT16_MIN || raw > UINT16_MAX) {
+            c->errors += key;
+            c->errors += ":invalid_number,";
+            return;
+        }
+        if (writeSetting(key, (int)raw)) {
             c->count++;
-            if (key == "LAN") c->lan_changed = true;
+            if (strcmp(key, "LAN") == 0) c->lan_changed = true;
         } else {
-            c->errors += key + ":fail,";
-            Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Stock write #%.3s failed\n", key.c_str());
+            c->errors += key;
+            c->errors += ":fail,";
+            Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] Stock write #%.3s failed\n", key);
         }
     }, &ctx);
     if (!parsed) {
@@ -573,7 +581,7 @@ static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind
     uint32_t id = 0;
     String body;
     if (write && !getBody(request, body)) return;
-    if (!ClinicalJobs::submit(kind, body, id)) {
+    if (!ClinicalJobs::submit(kind, std::move(body), id)) {
         request->send(503, "application/json", "{\"error\":\"settings_busy\"}");
         return;
     }
@@ -609,8 +617,8 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     if (!getBody(request, body)) return;
     String previous_update_url = Config::get().update_url;
     int count = 0;
-    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
-        if (Config::set_value(key.c_str(), val.c_str())) (*(int*)p)++;
+    if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
+        if (Config::set_value(key, val)) (*(int*)p)++;
     }, &count)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
@@ -968,10 +976,10 @@ static void handleBleAction(AsyncWebServerRequest *request) {
     if (!getBody(request, body)) return;
     String action, addr;
     struct { String *action; String *addr; } ctx = {&action, &addr};
-    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         auto *c = (decltype(ctx)*)p;
-        if (key == "action") *c->action = val;
-        else if (key == "addr") *c->addr = val;
+        if (strcmp(key, "action") == 0) *c->action = val;
+        else if (strcmp(key, "addr") == 0) *c->addr = val;
     }, &ctx)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
@@ -1374,12 +1382,12 @@ static void handleWifiPost(AsyncWebServerRequest *request) {
 
     struct wifi_kv_ctx { String *action; String *ssid; String *pass; int *idx; };
     wifi_kv_ctx wctx = {&action, &ssid, &pass, &idx};
-    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
+    if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         wifi_kv_ctx *c = (wifi_kv_ctx *)p;
-        if (key == "action") *c->action = val;
-        else if (key == "ssid") *c->ssid = val;
-        else if (key == "pass") *c->pass = val;
-        else if (key == "idx") *c->idx = val.toInt();
+        if (strcmp(key, "action") == 0) *c->action = val;
+        else if (strcmp(key, "ssid") == 0) *c->ssid = val;
+        else if (strcmp(key, "pass") == 0) *c->pass = val;
+        else if (strcmp(key, "idx") == 0) *c->idx = atol(val);
     }, &wctx)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
@@ -1447,8 +1455,8 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
     String body;
     if (!getBody(request, body)) return;
     String action;
-    if (!json_foreach_kv(body, [](const String &key, const String &val, void *p) {
-        if (key == "action") *(String*)p = val;
+    if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
+        if (strcmp(key, "action") == 0) *(String*)p = val;
     }, &action)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;

@@ -12,7 +12,7 @@ void init(Handler handler);
 void tick();  // Nonblocking result/cache cleanup from the main loop.
 // Results outlive HTTP requests: 30 s unread, at least 2 s after completion
 // once delivered. Callers must not resubmit writes after a polling failure.
-bool submit(Kind kind, const String &body, uint32_t &id);
+bool submit(Kind kind, String &&body, uint32_t &id);
 
 // Pins the immutable values and metadata until the HTTP response is destroyed.
 class Result {
