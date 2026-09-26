@@ -89,10 +89,13 @@ static bool framed_enqueue(const qframe_t *frame, void *context) {
 
 static bool framed_enqueue_text(uint8_t type, const char *text) {
     if (!text) return false;
-    qframe_t frame = {};
+    qframe_t frame;
     frame.type = type;
     frame.payload_len = min(strlen(text), (size_t)QFRAME_MAX_PAYLOAD);
+    frame.declared_len = 0;
+    frame.crc_received = frame.crc_computed = 0;
     memcpy(frame.payload, text, frame.payload_len);
+    if (frame.payload_len < QFRAME_MAX_PAYLOAD) frame.payload[frame.payload_len] = '\0';
     frame.crc_valid = true;
     return framed_enqueue(&frame, nullptr);
 }

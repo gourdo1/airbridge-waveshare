@@ -305,7 +305,7 @@ static rx_push_result_t rx_queue_push(const qframe_t *frame) {
     epoch = rx_frame_epoch;
     portEXIT_CRITICAL(&rx_frame_mux);
 
-    memcpy(&rx_frame_storage[slot], frame, sizeof(qframe_t));
+    qframe_copy(&rx_frame_storage[slot], frame);
 
     portENTER_CRITICAL(&rx_frame_mux);
     if (epoch != rx_frame_epoch) {
@@ -330,7 +330,7 @@ static bool rx_queue_pop(qframe_t *out) {
         uint8_t slot = rx_frame_queue[rx_frame_tail];
         rx_frame_tail = (rx_frame_tail + 1) % RX_FRAME_QUEUE_DEPTH;
         rx_frame_count--;
-        if (out) memcpy(out, &rx_frame_storage[slot], sizeof(qframe_t));
+        if (out) qframe_copy(out, &rx_frame_storage[slot]);
         rx_frame_slot_state[slot] = RX_SLOT_FREE;
         ok = true;
     }

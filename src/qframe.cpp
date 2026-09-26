@@ -33,6 +33,18 @@ const qframe_t* qframe_parser_frame(const qframe_parser_t *p) {
     return (p->state == QFP_COMPLETE) ? &p->frame : NULL;
 }
 
+void qframe_copy(qframe_t *out, const qframe_t *frame) {
+    out->type = frame->type;
+    out->payload_len = frame->payload_len;
+    out->declared_len = frame->declared_len;
+    out->crc_received = frame->crc_received;
+    out->crc_computed = frame->crc_computed;
+    out->crc_valid = frame->crc_valid;
+    memcpy(out->payload, frame->payload, frame->payload_len);
+    if (frame->payload_len < QFRAME_MAX_PAYLOAD)
+        out->payload[frame->payload_len] = '\0';
+}
+
 bool qframe_parser_feed(qframe_parser_t *p, uint8_t byte) {
     if ((p->state == QFP_COMPLETE || p->state == QFP_ERROR) && byte == QFRAME_SYNC) {
         qframe_parser_reset(p);

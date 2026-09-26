@@ -73,6 +73,9 @@ bool        qframe_parser_feed(qframe_parser_t *p, uint8_t byte);
 
 const qframe_t* qframe_parser_frame(const qframe_parser_t *p);
 
+// Copy a bounded frame without copying unused payload capacity.
+void        qframe_copy(qframe_t *out, const qframe_t *frame);
+
 int         qframe_build(uint8_t type, const uint8_t *payload, uint16_t payload_len,
                          uint8_t *out_buf, uint16_t out_buf_size);
 int         qframe_encoded_size(const uint8_t *payload, uint16_t payload_len);
