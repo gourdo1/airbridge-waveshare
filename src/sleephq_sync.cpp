@@ -29,7 +29,7 @@ using aircannect::sleephq_classify_import_status;
 constexpr uint8_t JOURNAL_VERSION = 1;
 constexpr size_t JOURNAL_SIZE = 64;
 constexpr size_t JOURNAL_CRC_OFFSET = JOURNAL_SIZE - 4;
-constexpr size_t MARKER_SIZE = 16;
+constexpr size_t MARKER_SIZE = 20;
 constexpr size_t FILE_COUNT = 13;
 constexpr uint8_t PHASE_UPLOADING = 1;
 constexpr uint8_t PHASE_PROCESSING = 2;
@@ -43,6 +43,7 @@ struct Journal {
     uint32_t import_id;
     uint32_t team_id;
     uint32_t finalized_epoch;
+    uint32_t str_revision;
     char therapy_day[9];
     char file_prefix[16];
 };
@@ -213,6 +214,7 @@ static void encode_journal(const Journal &journal, uint8_t *data) {
     SdStorage::put_le32(data + 20, journal.finalized_epoch);
     memcpy(data + 24, journal.therapy_day, 8);
     memcpy(data + 32, journal.file_prefix, 15);
+    SdStorage::put_le32(data + 48, journal.str_revision);
     SdStorage::put_le32(data + JOURNAL_CRC_OFFSET,
              crc32_ieee(data, JOURNAL_CRC_OFFSET));
 }
@@ -244,6 +246,7 @@ static bool decode_journal(const uint8_t *data, Journal &journal) {
     journal.import_id = SdStorage::get_le32(data + 12);
     journal.team_id = SdStorage::get_le32(data + 16);
     journal.finalized_epoch = SdStorage::get_le32(data + 20);
+    journal.str_revision = SdStorage::get_le32(data + 48);
     memcpy(journal.therapy_day, data + 24, 8);
     memcpy(journal.file_prefix, data + 32, 15);
     return true;
@@ -318,21 +321,25 @@ static void encode_marker(const EdfCatalog::Entry &entry, uint8_t *data) {
     data[4] = JOURNAL_VERSION;
     data[5] = entry.flags;
     SdStorage::put_le32(data + 8, entry.finalized_epoch);
-    SdStorage::put_le32(data + 12, crc32_ieee(data, 12));
+    SdStorage::put_le32(data + 12, entry.str_revision);
+    SdStorage::put_le32(data + 16, crc32_ieee(data, 16));
 }
 
 static bool marker_valid(SdStorage::Session &storage, const StatePaths &paths,
-                         const EdfCatalog::Entry &entry) {
+                         const EdfCatalog::Entry &entry, bool include_str = true) {
     char path[80];
     if (!marker_path(paths, entry, path, sizeof(path))) return false;
     uint8_t data[MARKER_SIZE];
     SdStorage::Reader file;
     if (!file.open(storage, path)) return false;
-    const bool valid = file && file.size() == sizeof(data) &&
-        file.read(data, sizeof(data)) == sizeof(data) &&
+    const size_t size = file.size();
+    const bool valid = (size == sizeof(data) || size == 16) &&
+        file.read(data, size) == size &&
         memcmp(data, "ABSD", 4) == 0 && data[4] == JOURNAL_VERSION &&
         data[5] == entry.flags && SdStorage::get_le32(data + 8) == entry.finalized_epoch &&
-        SdStorage::get_le32(data + 12) == crc32_ieee(data, 12);
+        SdStorage::get_le32(data + size - 4) == crc32_ieee(data, size - 4) &&
+        (!include_str || (size == 16 ? 0 : SdStorage::get_le32(data + 12)) ==
+                         entry.str_revision);
     if (file) file.close();
     return valid;
 }
@@ -360,6 +367,7 @@ static EdfCatalog::Entry journal_entry(const Journal &journal) {
               journal.file_prefix);
     entry.flags = journal.flags;
     entry.finalized_epoch = journal.finalized_epoch;
+    entry.str_revision = journal.str_revision;
     return entry;
 }
 
@@ -621,6 +629,7 @@ static bool same_entry(const Journal &journal,
                        const EdfCatalog::Entry &entry) {
     return strcmp(journal.file_prefix, entry.file_prefix) == 0 &&
            journal.finalized_epoch == entry.finalized_epoch &&
+           journal.str_revision == entry.str_revision &&
            journal.flags == entry.flags;
 }
 
@@ -718,11 +727,18 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
     }
     operation.note_progress(millis());
 
+    journal = {};
+    // A new STR generation does not invalidate the immutable detailed files.
+    if (marker_valid(storage, paths, entry, false)) {
+        journal.uploaded_mask = ((1u << FILE_COUNT) - 1) & ~7u;
+        progress.files_skipped += FILE_COUNT - 3;
+    }
     journal.phase = PHASE_UPLOADING;
     journal.flags = entry.flags;
     journal.import_id = import.id;
     journal.team_id = team_id;
     journal.finalized_epoch = entry.finalized_epoch;
+    journal.str_revision = entry.str_revision;
     copy_cstr(journal.therapy_day, sizeof(journal.therapy_day),
               entry.therapy_day);
     copy_cstr(journal.file_prefix, sizeof(journal.file_prefix),

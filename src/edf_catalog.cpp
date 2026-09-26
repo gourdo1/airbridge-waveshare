@@ -99,6 +99,7 @@ static void encode_entry(const Entry &entry, uint8_t *out) {
     memcpy(out + 8, entry.file_prefix, 15);
     out[23] = entry.flags;
     SdStorage::put_le32(out + 24, entry.finalized_epoch);
+    SdStorage::put_le32(out + 28, entry.str_revision);
 }
 
 static bool decode_entry(const uint8_t *data, Entry &entry) {
@@ -107,6 +108,7 @@ static bool decode_entry(const uint8_t *data, Entry &entry) {
     memcpy(entry.file_prefix, data + 8, 15);
     entry.flags = data[23];
     entry.finalized_epoch = SdStorage::get_le32(data + 24);
+    entry.str_revision = SdStorage::get_le32(data + 28);
     return valid_entry(entry);
 }
 

@@ -16,6 +16,7 @@ struct Entry {
     char file_prefix[16];
     uint8_t flags;
     uint32_t finalized_epoch;
+    uint32_t str_revision;
 };
 
 struct Status {
