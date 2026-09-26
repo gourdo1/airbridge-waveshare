@@ -85,13 +85,13 @@ static const KVEntry kv_table[] = {
 
 
 static void reset_value(const KVEntry &entry) {
-        switch (entry.type) {
-            case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
-            case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
-            case KVEntry::U16:  *(uint16_t *)entry.ptr = entry.initial.number; break;
-            case KVEntry::U32:  *(uint32_t *)entry.ptr = entry.initial.number; break;
-            case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
-        }
+    switch (entry.type) {
+        case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
+        case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
+        case KVEntry::U16:  *(uint16_t *)entry.ptr = entry.initial.number; break;
+        case KVEntry::U32:  *(uint32_t *)entry.ptr = entry.initial.number; break;
+        case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
+    }
 }
 
 static void apply_defaults() {
@@ -133,7 +133,7 @@ static bool decode_wifi_nets(const StoredNetworks &stored) {
     return true;
 }
 
-static void load_wifi_nets() {
+static void load_wifi_nets(bool migrate = true) {
     Preferences wp;
     // writable: we may need to scrub legacy bssid_<i>/chan_<i> keys after
     // migrating them to NetworkHints.
@@ -187,7 +187,7 @@ static void load_wifi_nets() {
             cfg.wifi_nets[0].pass = prefs.getString("wifi_pass", "");
             cfg.wifi_nets[0].enabled = true;
             cfg.wifi_net_count = 1;
-            if (Config::save_wifi_nets()) {
+            if (migrate && Config::save_wifi_nets()) {
                 prefs.remove("wifi_ssid");
                 prefs.remove("wifi_pass");
             }
@@ -446,25 +446,26 @@ String Config::dump() {
 
 
 bool Config::save_wifi_nets() {
-    if (!store_onboarding_marker()) return false;
-    if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) return false;
+    const auto failed = []() { load_wifi_nets(false); return false; };
+    if (!store_onboarding_marker()) return failed();
+    if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) return failed();
     StoredNetworks stored = {};
     stored.version = 1;
     stored.count = cfg.wifi_net_count;
     for (uint8_t i = 0; i < stored.count; i++) {
         const auto &net = cfg.wifi_nets[i];
         if (!net.ssid.length() || net.ssid.length() >= sizeof(stored.entries[i].ssid) ||
-            net.pass.length() >= sizeof(stored.entries[i].pass)) return false;
+            net.pass.length() >= sizeof(stored.entries[i].pass)) return failed();
         stored.entries[i].enabled = net.enabled;
         strcpy(stored.entries[i].ssid, net.ssid.c_str());
         strcpy(stored.entries[i].pass, net.pass.c_str());
     }
     nvs_handle_t handle;
-    if (nvs_open("wnet", NVS_READWRITE, &handle) != ESP_OK) return false;
+    if (nvs_open("wnet", NVS_READWRITE, &handle) != ESP_OK) return failed();
     esp_err_t error = nvs_set_blob(handle, "profiles", &stored, sizeof(stored));
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
-    return error == ESP_OK;
+    return error == ESP_OK ? true : failed();
 }
 
 bool Config::add_network(const char *ssid, const char *pass) {
