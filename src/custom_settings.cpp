@@ -218,7 +218,8 @@ query_result_t query_enum_option(const char *name, uint8_t index,
     return result;
 }
 
-bool discover_enum_options_locked(cached_entry_t &entry) {
+bool discover_enum_options_locked(cached_entry_t &entry,
+                                   char (&response)[QFRAME_MAX_PAYLOAD + 1]) {
     entry.option_start = current->option_count;
     entry.option_count = 0;
 
@@ -226,7 +227,6 @@ bool discover_enum_options_locked(cached_entry_t &entry) {
     bool total_known = false;
     uint32_t current = 0;
     if (read_raw_locked(entry, current) && current <= 0xff) {
-        char response[QFRAME_MAX_PAYLOAD + 1];
         CustomSettingsProtocol::enum_option_t option = {};
         const char *error_value = nullptr;
         query_result_t result = query_enum_option(
@@ -242,8 +242,7 @@ bool discover_enum_options_locked(cached_entry_t &entry) {
 
     if (!total_known) {
         for (uint8_t index = 0; index < MAX_ENUM_OPTIONS; index++) {
-            char response[QFRAME_MAX_PAYLOAD + 1];
-            CustomSettingsProtocol::enum_option_t option = {};
+                CustomSettingsProtocol::enum_option_t option = {};
             const char *error_value = nullptr;
             query_result_t result = query_enum_option(
                 entry.name, index, response, sizeof(response), option,
@@ -262,7 +261,6 @@ bool discover_enum_options_locked(cached_entry_t &entry) {
     if (total > MAX_ENUM_OPTIONS) return false;
 
     for (uint8_t index = 0; index < total; index++) {
-        char response[QFRAME_MAX_PAYLOAD + 1];
         CustomSettingsProtocol::enum_option_t option = {};
         const char *error_value = nullptr;
         query_result_t result = query_enum_option(
@@ -376,7 +374,7 @@ bool discover_locked() {
             if (!CustomSettingsProtocol::parse_enum_flags(value, entry.flags))
                 return fail("enum capabilities");
             entry.width = 4;
-            if (!discover_enum_options_locked(entry)) return fail("enum options");
+            if (!discover_enum_options_locked(entry, response)) return fail("enum options");
         }
     }
 
