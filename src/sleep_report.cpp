@@ -95,7 +95,9 @@ int collect_day(Snapshot &out, Budget budget) {
         return fail(out, "report_history_unsupported", 422);
     if (result == Air10Stored::ReadResult::Failed)
         return fail(out, "report_read_failed");
-    out.present = value.present && value.sample_count == 1 && uint16_t(value.samples[0]) != 0xFFFF;
+    if (value.present && value.sample_count != 1)
+        return fail(out, "report_invalid_samples");
+    out.present = value.present && uint16_t(value.samples[0]) != 0xFFFF;
     if (out.present && uint16_t(value.samples[0]) != day)
         return fail(out, "report_day_mismatch");
     if (out.present) {
@@ -154,7 +156,7 @@ int collect_period(Snapshot &out, Budget budget) {
             if (result == Scalar::Failed) code = fail(out, "report_read_failed");
             else if (result == Scalar::Ok) out.values[i] = current;
         }
-        out.present = out.values[0] != MISSING && out.values[0] != 0;
+        out.present = out.values[0] != 0;  // Missing DRD does not prove no therapy.
     }
     if (read_scalar("SEP", current, budget(0)) != Scalar::Ok)
         return fail(out, changed ? "report_restore_failed" : "report_read_failed");

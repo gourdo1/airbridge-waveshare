@@ -25,7 +25,7 @@ struct Field {
 };
 
 constexpr uint32_t MISSING = UINT32_MAX;
-constexpr size_t MAX_FIELDS = 18;
+constexpr size_t MAX_FIELDS = 16;
 struct Snapshot {
     Request request;
     uint16_t day = 0, current_day = 0, days = 0;
