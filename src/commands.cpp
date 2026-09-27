@@ -279,14 +279,13 @@ void dispatch_command(const char *line, String &response) {
             if (sleephq_status.last_error[0])
                 response += " error=" + String(sleephq_status.last_error);
             response += "\n";
-        } else if (sub == "SMB") {
-            response = ExportSync::request_manual_smb()
-                ? "OK: SMB sync queued\n"
-                : "ERR: SMB sync is disabled or unavailable\n";
-        } else if (sub == "SLEEPHQ") {
-            response = ExportSync::request_manual_sleephq()
-                ? "OK: SleepHQ sync queued\n"
-                : "ERR: SleepHQ sync is disabled or unavailable\n";
+        } else if (sub == "SMB" || sub == "SLEEPHQ") {
+            const char *error = nullptr;
+            const bool smb = sub == "SMB";
+            const bool queued = smb ? ExportSync::request_manual_smb(false, &error)
+                                    : ExportSync::request_manual_sleephq(false, &error);
+            response = queued ? (smb ? "OK: SMB sync queued\n" : "OK: SleepHQ sync queued\n")
+                              : String("ERR: ") + error + "\n";
         } else {
             response = "ERR: use EXPORT STATUS, EXPORT SMB, or "
                        "EXPORT SLEEPHQ\n";

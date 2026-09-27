@@ -964,16 +964,17 @@ static void handleExportRequest(AsyncWebServerRequest *request, bool smb) {
         request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_action\"}");
         return;
     }
-    if (Arbiter::get_cached_rop() == 1) {
-        request->send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"therapy_active\"}");
-        return;
+    const char *error = nullptr;
+    const bool queued = smb ? ExportSync::request_manual_smb(action == "check", &error)
+                            : ExportSync::request_manual_sleephq(action == "check", &error);
+    if (queued) {
+        request->send(202, "application/json", "{\"ok\":true,\"state\":\"pending\"}");
+    } else {
+        String response = "{\"ok\":false";
+        jsonAddString(response, "error", error);
+        response += '}';
+        request->send(409, "application/json", response);
     }
-    const bool queued = smb ? ExportSync::request_manual_smb(action == "check")
-                            : ExportSync::request_manual_sleephq(action == "check");
-    request->send(queued ? 202 : 409, "application/json",
-                  queued ? "{\"ok\":true,\"state\":\"pending\"}" :
-                           "{\"ok\":false,\"error\":\"unavailable\"}");
 }
 
 

@@ -82,8 +82,8 @@ struct PublicationStamp {
 void init();
 void therapy_started();
 bool request_post_therapy(const EdfCatalog::Entry &entry);
-bool request_manual_smb(bool check = false);
-bool request_manual_sleephq(bool check = false);
+bool request_manual_smb(bool check = false, const char **error = nullptr);
+bool request_manual_sleephq(bool check = false, const char **error = nullptr);
 void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
 PublicationStamp publication_stamp();

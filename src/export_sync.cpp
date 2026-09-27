@@ -1040,6 +1040,8 @@ const char *state_name(State value) {
     return "unknown";
 }
 
+static const char *enqueue_request(bool smb, bool check);
+
 void init() {
     if (request_queue || !SdStorage::mounted()) return;
     request_queue = xQueueCreate(4, sizeof(Request));
@@ -1066,11 +1068,11 @@ void init() {
                           ? State::Idle : State::Disabled);
     if (Config::get().smb_enabled &&
         Config::get().smb_auto_after_therapy) {
-        (void)request_manual_smb();
+        (void)enqueue_request(true, false);
     }
     if (Config::get().sleephq_enabled &&
         Config::get().sleephq_auto_after_therapy) {
-        (void)request_manual_sleephq();
+        (void)enqueue_request(false, false);
     }
 }
 
@@ -1110,19 +1112,12 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     return true;
 }
 
-static bool request_manual(bool smb, bool check) {
-    if (!request_queue || Arbiter::get_cached_rop() == 1 ||
-        __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE) ||
-        (!check && !(smb ? Config::get().smb_enabled : Config::get().sleephq_enabled))) return false;
-    if (check) {
-        Status a;
-        SleepHqStatus b;
-        get_status(a);
-        get_sleephq_status(b);
-        if (a.state == State::Pending || a.state == State::Working ||
-            b.state == State::Pending || b.state == State::Working ||
-            __atomic_exchange_n(&check_pending, true, __ATOMIC_ACQ_REL)) return false;
-    }
+static const char *enqueue_request(bool smb, bool check) {
+    if (!request_queue) return "unavailable";
+    if (Arbiter::get_cached_rop() == 1) return "not_idle";
+    if (__atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
+    if (check && __atomic_exchange_n(&check_pending, true, __ATOMIC_ACQ_REL))
+        return "busy";
     Request request = {};
     request.kind = check ? (smb ? RequestKind::CheckSmb : RequestKind::CheckSleepHq)
                          : (smb ? RequestKind::ManualSmb : RequestKind::ManualSleepHq);
@@ -1139,13 +1134,25 @@ static bool request_manual(bool smb, bool check) {
             __atomic_store_n(&check_pending, false, __ATOMIC_RELEASE);
         } else if (smb) set_state(State::Error, "queue_full");
         else set_sleephq_state(State::Error, "queue_full");
-        return false;
+        return "queue_full";
     }
-    return true;
+    return nullptr;
 }
 
-bool request_manual_smb(bool check) { return request_manual(true, check); }
-bool request_manual_sleephq(bool check) { return request_manual(false, check); }
+static bool request_manual(bool smb, bool check, const char **error) {
+    const char *reason = action_blocked(smb, check);
+    if (!reason) reason = enqueue_request(smb, check);
+    if (error) *error = reason;
+    return !reason;
+}
+
+bool request_manual_smb(bool check, const char **error) {
+    return request_manual(true, check, error);
+}
+
+bool request_manual_sleephq(bool check, const char **error) {
+    return request_manual(false, check, error);
+}
 
 void request_backlog_refresh(bool files_changed) {
     if (files_changed) __atomic_store_n(&backlog_files_changed, true, __ATOMIC_RELEASE);
@@ -1247,8 +1254,14 @@ PublicationStamp publication_stamp() { return {}; }
 bool busy() { return false; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
-bool request_manual_smb(bool) { return false; }
-bool request_manual_sleephq(bool) { return false; }
+bool request_manual_smb(bool, const char **error) {
+    if (error) *error = "unsupported";
+    return false;
+}
+bool request_manual_sleephq(bool, const char **error) {
+    if (error) *error = "unsupported";
+    return false;
+}
 void request_backlog_refresh(bool) {}
 
 void get_status(Status &out) {
