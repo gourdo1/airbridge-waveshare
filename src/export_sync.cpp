@@ -1093,6 +1093,8 @@ void get_status(Status &out) {
     out = status;
     portEXIT_CRITICAL(&status_mux);
     out.state = configured_state(out.state, Config::get().smb_enabled);
+    out.has_files = out.state == State::Working || out.last_sync_epoch ||
+        out.files_seen || out.files_uploaded || out.files_skipped;
     if (out.check.config_revision != Config::revision()) out.check = {};
     validate_backlog(out.backlog);
 }
@@ -1102,6 +1104,8 @@ void get_sleephq_status(SleepHqStatus &out) {
     out = sleephq_status;
     portEXIT_CRITICAL(&sleephq_status_mux);
     out.state = configured_state(out.state, Config::get().sleephq_enabled);
+    out.has_files = out.state == State::Working || out.last_sync_epoch ||
+        out.files_seen || out.files_uploaded || out.files_skipped;
     if (out.check.config_revision != Config::revision()) out.check = {};
     validate_backlog(out.backlog);
 }
@@ -1126,6 +1130,15 @@ const char *action_blocked(bool smb, bool check) {
     return nullptr;
 }
 
+const char *backlog_state(const Backlog &backlog, bool smb) {
+    const auto &cfg = Config::get();
+    if (smb ? cfg.smb_endpoint.isEmpty() :
+        cfg.sleephq_client_id.isEmpty() || cfg.sleephq_client_secret.isEmpty())
+        return "unconfigured";
+    if (!backlog.known) return backlog.error[0] ? "error" : "unknown";
+    return !backlog.files && backlog.sessions ? "confirming" : "ready";
+}
+
 }  // namespace ExportSync
 
 #else
@@ -1133,6 +1146,7 @@ const char *action_blocked(bool smb, bool check) {
 namespace ExportSync {
 
 const char *action_blocked(bool, bool) { return "unsupported"; }
+const char *backlog_state(const Backlog &, bool) { return "unsupported"; }
 
 const char *state_name(State) { return "unsupported"; }
 void init() {}

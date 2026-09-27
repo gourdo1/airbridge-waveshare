@@ -37,6 +37,7 @@ struct Status {
     bool supported;
     State state;
     uint32_t files_seen;
+    bool has_files;
     uint32_t files_uploaded;
     uint32_t files_skipped;
     uint64_t bytes_uploaded;
@@ -51,6 +52,7 @@ struct SleepHqStatus {
     bool supported;
     State state;
     uint32_t files_seen;
+    bool has_files;
     uint32_t files_uploaded;
     uint32_t files_skipped;
     uint64_t bytes_uploaded;
@@ -73,6 +75,7 @@ uint32_t revision();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
 const char *action_blocked(bool smb, bool check);
+const char *backlog_state(const Backlog &backlog, bool smb);
 const char *state_name(State state);
 const char *check_state_name(CheckState state);
 

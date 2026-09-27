@@ -699,85 +699,121 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
 }
 
 
+enum ExportFields : uint8_t {
+    EXPORT_RUN = 1, EXPORT_CHECK = 2, EXPORT_BACKLOG = 4,
+    EXPORT_META = 8, EXPORT_ACTIONS = 16, EXPORT_ALL = 31,
+};
+
 #if AB_STORAGE_HAS_SDCARD
 template <typename T>
 static void appendExportStatus(String &json, const T &status, bool enabled,
                                bool configured, bool automatic, const char *endpoint,
-                               bool smb, bool full) {
+                               bool smb, bool full, uint8_t fields = EXPORT_ALL) {
     json += '{';
     jsonAddString(json, "state", ExportSync::state_name(status.state), false);
-    jsonAddBool(json, "configured", configured);
     if (full) {
+        jsonAddBool(json, "configured", configured);
         jsonAddBool(json, "enabled", enabled);
         jsonAddBool(json, "automatic", automatic);
-    }
-    if (smb || full) jsonAddString(json, "endpoint", endpoint);
-    jsonAddString(json, "sync_blocked", ExportSync::action_blocked(smb, false));
-    jsonAddString(json, "check_blocked", ExportSync::action_blocked(smb, true));
-    jsonAddUInt32(json, "files_seen", status.files_seen);
-    jsonAddUInt32(json, "files_uploaded", status.files_uploaded);
-    jsonAddUInt32(json, "files_skipped", status.files_skipped);
-    if (full) {
+        jsonAddUInt32(json, "files_seen", status.files_seen);
+        jsonAddBool(json, "backlog_known", status.backlog.known);
+        jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         char bytes[48];
         snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
                  static_cast<unsigned long long>(status.bytes_uploaded));
         json += bytes;
     }
-    jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
-    jsonAddString(json, "current_day", status.current_day);
-    jsonAddString(json, "error", status.last_error);
-    jsonAddString(json, "check_state", ExportSync::check_state_name(status.check.state));
-    jsonAddString(json, "check_error", status.check.error);
-    jsonAddBool(json, "backlog_known", status.backlog.known);
-    jsonAddUInt32(json, "backlog_files", status.backlog.files);
-    jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
-    jsonAddUInt32(json, "backlog_waiting", status.backlog.waiting_sessions);
-    jsonAddString(json, "backlog_error", status.backlog.error);
+    if ((fields & EXPORT_META) && (smb || full)) jsonAddString(json, "endpoint", endpoint);
+    if (fields & EXPORT_ACTIONS) {
+        jsonAddString(json, "sync_blocked", ExportSync::action_blocked(smb, false));
+        jsonAddString(json, "check_blocked", ExportSync::action_blocked(smb, true));
+    }
+    if (fields & EXPORT_RUN) {
+        jsonAddBool(json, "has_files", status.has_files);
+        jsonAddUInt32(json, "files_uploaded", status.files_uploaded);
+        jsonAddUInt32(json, "files_skipped", status.files_skipped);
+        jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
+        jsonAddString(json, "current_day", status.current_day);
+        jsonAddString(json, "error", status.last_error);
+    }
+    if (fields & EXPORT_CHECK) {
+        jsonAddString(json, "check_state", ExportSync::check_state_name(status.check.state));
+        jsonAddString(json, "check_error", status.check.error);
+    }
+    if (fields & EXPORT_BACKLOG) {
+        jsonAddString(json, "backlog_state", ExportSync::backlog_state(status.backlog, smb));
+        jsonAddUInt32(json, "backlog_files", status.backlog.files);
+        jsonAddUInt32(json, "backlog_waiting", status.backlog.waiting_sessions);
+        jsonAddString(json, "backlog_error", status.backlog.error);
+    }
 }
 
 struct ExportPublication {
-    uint32_t config;
-    uint32_t sync;
-    system_state_t system;
-    int rop;
-    bool mounted;
-    bool online;
+    ExportSync::Status smb = {};
+    ExportSync::SleepHqStatus shq = {};
+    String endpoint, team, device;
+    const char *blocked[4] = {};
+    const char *backlog[2] = {};
+    uint32_t revision = 1;
+    uint8_t fields[2] = {EXPORT_ALL, EXPORT_ALL};
 };
 
-static ExportPublication exportPublication() {
-    return {Config::revision(), ExportSync::revision(), Arbiter::get_state(),
-            Arbiter::get_cached_rop(), SdStorage::mounted(),
-            WiFi.status() == WL_CONNECTED};
+template <typename T>
+static uint8_t exportChanges(const T &a, const T &b) {
+    uint8_t fields = 0;
+    if (a.state != b.state || a.has_files != b.has_files ||
+        a.files_uploaded != b.files_uploaded || a.files_skipped != b.files_skipped ||
+        a.last_sync_epoch != b.last_sync_epoch || strcmp(a.current_day, b.current_day) ||
+        strcmp(a.last_error, b.last_error)) fields |= EXPORT_RUN;
+    if (a.check.state != b.check.state || strcmp(a.check.error, b.check.error))
+        fields |= EXPORT_CHECK;
+    if (a.backlog.files != b.backlog.files ||
+        a.backlog.waiting_sessions != b.backlog.waiting_sessions ||
+        strcmp(a.backlog.error, b.backlog.error)) fields |= EXPORT_BACKLOG;
+    return fields;
 }
 #endif
 
-static String buildExportsJson(bool full = true) {
+static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL,
+                               uint8_t shq_fields = EXPORT_ALL) {
 #if AB_STORAGE_HAS_SDCARD
-    const auto published = exportPublication();
     ExportSync::Status smb;
     ExportSync::SleepHqStatus sleephq;
     ExportSync::get_status(smb);
     ExportSync::get_sleephq_status(sleephq);
     const auto &cfg = Config::get();
-    String json = "{\"supported\":true";
+    String json = full || (smb_fields == EXPORT_ALL && shq_fields == EXPORT_ALL)
+        ? "{\"supported\":true" : "{";
     if (full) {
-        jsonAddBool(json, "sd_mounted", published.mounted);
-        jsonAddBool(json, "idle", published.system == SYS_IDLE && published.rop == 0);
-        jsonAddBool(json, "online", published.online);
+        jsonAddBool(json, "sd_mounted", SdStorage::mounted());
+        jsonAddBool(json, "idle", Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0);
+        jsonAddBool(json, "online", WiFi.status() == WL_CONNECTED);
+        jsonAddUInt32(json, "config_revision", Config::revision());
     }
-    jsonAddUInt32(json, "config_revision", published.config);
-    json += ",\"smb\":";
-    appendExportStatus(json, smb, cfg.smb_enabled, !cfg.smb_endpoint.isEmpty(),
-                       cfg.smb_auto_after_therapy, cfg.smb_endpoint.c_str(), true, full);
-    json += "},\"sleephq\":";
-    appendExportStatus(json, sleephq, cfg.sleephq_enabled,
-                       !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty(),
-                       cfg.sleephq_auto_after_therapy, "SleepHQ", false, full);
-    jsonAddString(json, "team_id", cfg.sleephq_team_id.c_str());
-    jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
-    jsonAddUInt32(json, "import_id", sleephq.import_id);
-    jsonAddString(json, "import_status", sleephq.import_status);
-    json += "}}";
+    if (smb_fields) {
+        if (json.length() > 1) json += ',';
+        json += "\"smb\":";
+        appendExportStatus(json, smb, cfg.smb_enabled, !cfg.smb_endpoint.isEmpty(),
+                           cfg.smb_auto_after_therapy, cfg.smb_endpoint.c_str(), true, full, smb_fields);
+        json += '}';
+    }
+    if (shq_fields) {
+        if (json.length() > 1) json += ',';
+        json += "\"sleephq\":";
+        appendExportStatus(json, sleephq, cfg.sleephq_enabled,
+                           !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty(),
+                           cfg.sleephq_auto_after_therapy, "SleepHQ", false, full, shq_fields);
+        if (shq_fields & EXPORT_META) {
+            jsonAddString(json, "team_id", cfg.sleephq_team_id.c_str());
+            jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
+        }
+        if (shq_fields & EXPORT_RUN) {
+            jsonAddUInt32(json, "import_id", sleephq.import_id);
+            jsonAddString(json, "import_status", sleephq.import_status);
+        }
+        json += '}';
+    }
+    json += '}';
     return json;
 #else
     return "{\"supported\":false}";
@@ -793,17 +829,51 @@ static void handleExportStatus(AsyncWebServerRequest *request) {
 
 #if AB_STORAGE_HAS_SDCARD
 static void publishExports() {
-    static ExportPublication last = {};
-    static uint32_t revision = 1;
-    const auto current = exportPublication();
-    if (current.config != last.config || current.sync != last.sync ||
-        current.system != last.system || current.rop != last.rop ||
-        current.mounted != last.mounted || current.online != last.online) {
-        last = current;
-        if (!++revision) ++revision;
+    static ExportPublication *last = nullptr;
+    if (!last) {
+        void *memory = aircannect::Memory::alloc_large(sizeof(ExportPublication));
+        if (!memory) return;
+        last = new (memory) ExportPublication;
     }
-    publishState(EventTopic::Exports, revision, "exports", [](bool) {
-        return buildExportsJson(false);
+    ExportSync::Status smb;
+    ExportSync::SleepHqStatus shq;
+    ExportSync::get_status(smb);
+    ExportSync::get_sleephq_status(shq);
+    uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
+    if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status))
+        fields[1] |= EXPORT_RUN;
+    const auto &cfg = Config::get();
+    if (last->endpoint != cfg.smb_endpoint) {
+        last->endpoint = cfg.smb_endpoint;
+        fields[0] |= EXPORT_META;
+    }
+    if (last->team != cfg.sleephq_team_id || last->device != cfg.sleephq_device_id) {
+        last->team = cfg.sleephq_team_id;
+        last->device = cfg.sleephq_device_id;
+        fields[1] |= EXPORT_META;
+    }
+    for (uint8_t i = 0; i < 4; ++i) {
+        const char *reason = ExportSync::action_blocked(i < 2, i % 2);
+        if (reason == last->blocked[i]) continue;
+        last->blocked[i] = reason;
+        fields[i / 2] |= EXPORT_ACTIONS;
+    }
+    const char *backlog[] = {ExportSync::backlog_state(smb.backlog, true),
+                             ExportSync::backlog_state(shq.backlog, false)};
+    for (uint8_t i = 0; i < 2; ++i) {
+        if (backlog[i] == last->backlog[i]) continue;
+        last->backlog[i] = backlog[i];
+        fields[i] |= EXPORT_BACKLOG;
+    }
+    if (fields[0] || fields[1]) {
+        last->smb = smb;
+        last->shq = shq;
+        memcpy(last->fields, fields, sizeof(fields));
+        if (!++last->revision) ++last->revision;
+    }
+    publishState(EventTopic::Exports, last->revision, "exports", [&](bool full) {
+        return buildExportsJson(false, full ? EXPORT_ALL : last->fields[0],
+                                full ? EXPORT_ALL : last->fields[1]);
     });
 }
 #endif
