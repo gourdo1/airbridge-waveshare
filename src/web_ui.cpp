@@ -73,15 +73,31 @@ template <typename Build>
 static void publishState(EventTopic topic, uint32_t revision,
                          const char *name, Build build) {
     const size_t index = static_cast<size_t>(topic);
-    String payload[2];
+    AsyncEvent_SharedData_t payload[2];
     for (auto &entry : event_clients) {
         std::lock_guard<std::recursive_mutex> lock(event_clients_mutex);
         if (!entry.client || entry.revision[index] == revision ||
             entry.client->packetsWaiting() >= SSE_MAX_QUEUED_MESSAGES) continue;
         const bool full = !entry.revision[index] || entry.revision[index] + 1 != revision;
-        String &json = payload[full];
-        if (json.isEmpty()) json = build(full);
-        if (!json.isEmpty() && entry.client->send(json.c_str(), name, millis()))
+        auto &message = payload[full];
+        if (!message) {
+            String json = build(full);
+            if (json.isEmpty()) continue;
+            char header[64];
+            snprintf(header, sizeof(header), "event: %s\nid: %lu\ndata: ",
+                     name, static_cast<unsigned long>(millis()));
+            // Builders emit single-line JSON. Share the encoded frame across
+            // client queues rather than copying it for each recipient.
+            message = std::make_shared<String>();
+            if (!message->reserve(strlen(header) + json.length() + 2)) {
+                message.reset();
+                continue;
+            }
+            *message += header;
+            *message += json;
+            *message += "\n\n";
+        }
+        if (entry.client->write(message))
             entry.revision[index] = revision;
     }
 }
@@ -2054,6 +2070,19 @@ enum StatusFields : uint8_t {
     STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_ALL = 31,
 };
 
+static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
+                             const DeviceStatus::Snapshot &b) {
+    uint8_t fields = 0;
+    if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
+        fields |= STATUS_THERAPY;
+    if (a.oxi != b.oxi || a.feeding != b.feeding ||
+        a.reading.valid != b.reading.valid ||
+        (a.reading.valid && (a.reading.spo2 != b.reading.spo2 ||
+                            a.reading.pulse_bpm != b.reading.pulse_bpm)))
+        fields |= STATUS_OXI;
+    return fields;
+}
+
 static String build_status_payload(const DeviceStatus::Snapshot &status,
                                    uint8_t fields = STATUS_ALL) {
     const auto &r = status.reading;
@@ -2125,18 +2154,12 @@ static void publishStatus() {
     static char source_id[32] = {};
     static uint8_t pending_fields = STATUS_ALL;
     const auto status = DeviceStatus::snapshot();
-    const auto &a = status;
-    const auto &b = last_published;
     const uint32_t now = millis();
     char current_source[sizeof(source_id)];
     OxiArbiter::get_source_id(current_source, sizeof(current_source));
-    uint8_t fields = 0;
-    if (status_requested || a.rop != b.rop || a.sys != b.sys ||
-        a.mhr != b.mhr || a.mop != b.mop) fields |= STATUS_THERAPY;
-    if (a.oxi != b.oxi || a.feeding != b.feeding || strcmp(source_id, current_source) ||
-        a.reading.valid != b.reading.valid ||
-        (a.reading.valid && (a.reading.spo2 != b.reading.spo2 ||
-                            a.reading.pulse_bpm != b.reading.pulse_bpm)) ||
+    uint8_t fields = statusChanges(status, last_published);
+    if (status_requested) fields |= STATUS_THERAPY;
+    if ((fields & STATUS_OXI) || strcmp(source_id, current_source) ||
         OxiBle::revision() != ble_revision ||
         (now - oxi_at >= 2000 && live_events && live_events->count())) {
         fields |= STATUS_OXI;
