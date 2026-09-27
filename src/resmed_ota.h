@@ -2,7 +2,6 @@
 #include <Arduino.h>
 #include <esp_partition.h>
 
-typedef void (*flash_progress_cb)(size_t sent, size_t total, const char *phase);
 
 enum blx_patch_t {
     BLX_PATCH_NONE,         // stock bootloader, integrity checks enabled

@@ -51,7 +51,6 @@ namespace OxiBle {
     bool restore_memory(uint32_t timeout_ms);
 
     oxi_state_t get_state();
-    bool state_changed();
 
     void task(void *param);
 

@@ -48,8 +48,7 @@ static const NimBLEUUID WS20A_WRITE_UUID((uint16_t)0xFFE9);
 
 static TaskHandle_t oxi_task_handle = nullptr;
 static volatile oxi_state_t state = OXI_DISABLED;
-static volatile bool state_dirty = false;
-static inline void set_state(oxi_state_t s) { state = s; state_dirty = true; }
+static inline void set_state(oxi_state_t s) { state = s; }
 static volatile bool scan_requested = false;
 static volatile bool active_scan_requested = false;
 typedef enum { CONN_NONE, CONN_AUTO, CONN_USER } connect_mode_t;
@@ -1471,7 +1470,6 @@ bool OxiBle::restore_memory(uint32_t timeout_ms) {
 }
 
 oxi_state_t OxiBle::get_state()            { return state; }
-bool OxiBle::state_changed()               { bool d = state_dirty; state_dirty = false; return d; }
 
 int OxiBle::get_scan_results(oxi_scan_result_t *out, int max) {
     if (!out || max <= 0) return 0;
