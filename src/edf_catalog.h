@@ -32,6 +32,8 @@ bool commit(const Entry &entry);
 bool read(uint32_t index, Entry &entry);
 bool find(const char *file_prefix, Entry &entry);
 bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count);
+// Caller releases the matching entries with Memory::free, including on errors.
+bool snapshot_day(const char *day, Entry *&out, uint32_t &count);
 void get_status(Status &out);
 
 }  // namespace EdfCatalog

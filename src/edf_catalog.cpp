@@ -14,6 +14,7 @@
 
 #include "crc.h"
 #include "debug_log.h"
+#include "memory_manager.h"
 #include "sd_storage.h"
 
 namespace EdfCatalog {
@@ -112,7 +113,7 @@ static bool decode_entry(const uint8_t *data, Entry &entry) {
     return valid_entry(entry);
 }
 
-static bool read_valid_header(fs::File &file, Header &header) {
+static bool read_header(fs::File &file, Header &header) {
     uint8_t bytes[HEADER_SIZE];
     if (!file || file.size() < HEADER_SIZE ||
         file.read(bytes, sizeof(bytes)) != sizeof(bytes) ||
@@ -121,6 +122,11 @@ static bool read_valid_header(fs::File &file, Header &header) {
         return false;
     }
 
+    return true;
+}
+
+static bool read_valid_header(fs::File &file, Header &header) {
+    if (!read_header(file, header)) return false;
     uint8_t entry[ENTRY_SIZE];
     uint32_t crc = crc32_ieee_initial();
     for (uint32_t i = 0; i < header.count; i++) {
@@ -393,6 +399,47 @@ bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count) {
     return success;
 }
 
+bool snapshot_day(const char *day, Entry *&out, uint32_t &count) {
+    out = nullptr;
+    count = 0;
+    if (!status.ready || !mutex || !day || !valid_digits(day, 8) ||
+        xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+
+    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
+    Header header = {};
+    bool success = read_header(file, header);
+    uint32_t capacity = 0;
+    uint32_t crc = crc32_ieee_initial();
+    uint8_t bytes[ENTRY_SIZE];
+    for (uint32_t i = 0; success && i < header.count; i++) {
+        Entry entry;
+        success = file.read(bytes, sizeof(bytes)) == sizeof(bytes) &&
+                  decode_entry(bytes, entry);
+        if (!success) break;
+        crc = crc32_ieee_update(crc, bytes, sizeof(bytes));
+        if (strcmp(entry.therapy_day, day)) continue;
+        if (count == capacity) {
+            const uint32_t next = capacity ? capacity * 2 : 4;
+            // A typical day needs only a few entries; large days require PSRAM.
+            void *grown = aircannect::Memory::realloc_large(
+                out, next * sizeof(Entry), next <= 32);
+            if (!grown) { success = false; break; }
+            out = static_cast<Entry *>(grown);
+            capacity = next;
+        }
+        out[count++] = entry;
+    }
+    success = success && crc32_ieee_finish(crc) == header.entries_crc;
+    if (file) file.close();
+    xSemaphoreGive(mutex);
+    if (!success) {
+        aircannect::Memory::free(out);
+        out = nullptr;
+        count = 0;
+    }
+    return success;
+}
+
 void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
@@ -410,6 +457,11 @@ bool commit(const Entry &) { return false; }
 bool read(uint32_t, Entry &) { return false; }
 bool find(const char *, Entry &) { return false; }
 bool snapshot_prefixes(char *, size_t, uint32_t &count) {
+    count = 0;
+    return false;
+}
+bool snapshot_day(const char *, Entry *&out, uint32_t &count) {
+    out = nullptr;
     count = 0;
     return false;
 }
