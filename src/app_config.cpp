@@ -18,6 +18,23 @@ static uint32_t config_revision = 0;
 static bool onboarding_done = false;
 static bool onboarding_stored = false;
 
+// Also consumed by generate_web_ui.py; field membership lives in kv_table.
+static const struct {
+    Config::Section section;
+    const char *name;
+    const char *label;
+} config_sections[] = {
+    {Config::Section::Network, "network", "Network"},
+    {Config::Section::Access, "access", "Web access"},
+    {Config::Section::Time, "time", "Time"},
+    {Config::Section::Oximetry, "oximetry", "Oximetry"},
+    {Config::Section::Uart, "uart", "AirSense UART"},
+    {Config::Section::Smb, "smb", "SMB"},
+    {Config::Section::SleepHq, "sleephq", "SleepHQ"},
+    {Config::Section::Updates, "updates", "Firmware updates"},
+    {Config::Section::Logging, "logging", "Logging"},
+};
+
 struct KVEntry {
     const char *key;
     const char *nvs_key;
@@ -30,57 +47,58 @@ struct KVEntry {
         constexpr Default(uint32_t value) : number(value) {}
     } initial;
     bool sensitive;
+    Config::Section section;
 };
 
-#define KV_STR(k, n, f, d) {k, n, KVEntry::STR, &cfg.f, {d}, false}
-#define KV_SECRET(k, n, f, d) {k, n, KVEntry::STR, &cfg.f, {d}, true}
-#define KV_U8(k, n, f, d) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false}
-#define KV_U16(k, n, f, d) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false}
-#define KV_U32(k, n, f, d) {k, n, KVEntry::U32, &cfg.f, {uint32_t(d)}, false}
-#define KV_BOOL(k, n, f, d) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false}
+#define KV_STR(k, n, f, d, s) {k, n, KVEntry::STR, &cfg.f, {d}, false, Config::Section::s}
+#define KV_SECRET(k, n, f, d, s) {k, n, KVEntry::STR, &cfg.f, {d}, true, Config::Section::s}
+#define KV_U8(k, n, f, d, s) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+#define KV_U16(k, n, f, d, s) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+#define KV_U32(k, n, f, d, s) {k, n, KVEntry::U32, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+#define KV_BOOL(k, n, f, d, s) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 
 static const KVEntry kv_table[] = {
-    KV_STR("hostname", "hostname", hostname, DEFAULT_HOSTNAME),
-    KV_U8("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY),
-    KV_BOOL("wifi_roam", "wifi_roam", wifi_roam, true),
-    KV_STR("wifi_country", "wifi_country", wifi_country, "01"),
-    KV_U16("tcp_port", "tcp_port", tcp_port, CFG_DEFAULT_TCP_PORT),
-    KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true),
-    KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true),
-    KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false),
-    KV_U8("oxi_device_type", "oxi_devtype", oxi_device_type, 0),
-    KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, ""),
-    KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500),
-    KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true),
-    KV_BOOL("oxi_require_known", "oxi_req_known", oxi_require_known, false),
-    KV_U32("uart_baud", "uart_baud", uart_baud, CFG_DEFAULT_BAUD),
-    KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500),
-    KV_U8("uart_max_retries", "uart_retries", uart_max_retries, 3),
-    KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false),
-    KV_U16("debug_port", "debug_port", debug_port, 8023),
-    KV_BOOL("syslog_en", "syslog_en", syslog_enabled, false),
-    KV_STR("syslog_host", "syslog_host", syslog_host, ""),
-    KV_U16("syslog_port", "syslog_port", syslog_port, 514),
-    KV_U16("http_port", "http_port", http_port, 80),
-    KV_STR("http_user", "http_user", http_user, "admin"),
-    KV_SECRET("http_pass", "http_pass", http_pass, "airbridge"),
-    KV_SECRET("ota_password", "ota_pass", ota_password, "airbridge"),
-    KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL),
-    KV_STR("ntp_server", "ntp_server", ntp_server, ""),
-    KV_STR("tz", "tz", tz, "UTC0"),
-    KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025),
-    KV_U8("mitm_mode", "mitm_mode", mitm_mode, 0),
-    KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false),
-    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true),
-    KV_STR("smb_endpoint", "smb_ep", smb_endpoint, ""),
-    KV_STR("smb_user", "smb_user", smb_user, ""),
-    KV_SECRET("smb_password", "smb_pass", smb_password, ""),
-    KV_BOOL("sleephq_enabled", "shq_enable", sleephq_enabled, false),
-    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true),
-    KV_STR("sleephq_client_id", "shq_id", sleephq_client_id, ""),
-    KV_SECRET("sleephq_client_secret", "shq_secret", sleephq_client_secret, ""),
-    KV_STR("sleephq_team_id", "shq_team", sleephq_team_id, ""),
-    KV_STR("sleephq_device_id", "shq_device", sleephq_device_id, ""),
+    KV_STR("hostname", "hostname", hostname, DEFAULT_HOSTNAME, Network),
+    KV_U8("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY, Network),
+    KV_BOOL("wifi_roam", "wifi_roam", wifi_roam, true, Network),
+    KV_STR("wifi_country", "wifi_country", wifi_country, "01", Network),
+    KV_U16("tcp_port", "tcp_port", tcp_port, CFG_DEFAULT_TCP_PORT, Uart),
+    KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true, Oximetry),
+    KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true, Oximetry),
+    KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false, Oximetry),
+    KV_U8("oxi_device_type", "oxi_devtype", oxi_device_type, 0, Oximetry),
+    KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, "", Oximetry),
+    KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
+    KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
+    KV_BOOL("oxi_require_known", "oxi_req_known", oxi_require_known, false, Oximetry),
+    KV_U32("uart_baud", "uart_baud", uart_baud, CFG_DEFAULT_BAUD, Uart),
+    KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500, Uart),
+    KV_U8("uart_max_retries", "uart_retries", uart_max_retries, 3, Uart),
+    KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false, Uart),
+    KV_U16("debug_port", "debug_port", debug_port, 8023, Logging),
+    KV_BOOL("syslog_en", "syslog_en", syslog_enabled, false, Logging),
+    KV_STR("syslog_host", "syslog_host", syslog_host, "", Logging),
+    KV_U16("syslog_port", "syslog_port", syslog_port, 514, Logging),
+    KV_U16("http_port", "http_port", http_port, 80, Access),
+    KV_STR("http_user", "http_user", http_user, "admin", Access),
+    KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
+    KV_SECRET("ota_password", "ota_pass", ota_password, "airbridge", Updates),
+    KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
+    KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
+    KV_STR("tz", "tz", tz, "UTC0", Time),
+    KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025, Oximetry),
+    KV_U8("mitm_mode", "mitm_mode", mitm_mode, 0, Uart),
+    KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false, Smb),
+    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb),
+    KV_STR("smb_endpoint", "smb_ep", smb_endpoint, "", Smb),
+    KV_STR("smb_user", "smb_user", smb_user, "", Smb),
+    KV_SECRET("smb_password", "smb_pass", smb_password, "", Smb),
+    KV_BOOL("sleephq_enabled", "shq_enable", sleephq_enabled, false, SleepHq),
+    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true, SleepHq),
+    KV_STR("sleephq_client_id", "shq_id", sleephq_client_id, "", SleepHq),
+    KV_SECRET("sleephq_client_secret", "shq_secret", sleephq_client_secret, "", SleepHq),
+    KV_STR("sleephq_team_id", "shq_team", sleephq_team_id, "", SleepHq),
+    KV_STR("sleephq_device_id", "shq_device", sleephq_device_id, "", SleepHq),
 };
 
 
@@ -400,28 +418,18 @@ bool Config::set_value(const char *key, const char *value) {
 }
 
 bool Config::parse_section(const char *name, Section &out) {
-    if (strcmp(name, "network") == 0) out = Section::Network;
-    else if (strcmp(name, "time") == 0) out = Section::Time;
-    else if (strcmp(name, "access") == 0) out = Section::Access;
-    else if (strcmp(name, "smb") == 0) out = Section::Smb;
-    else if (strcmp(name, "sleephq") == 0) out = Section::SleepHq;
-    else return false;
-    return true;
+    for (const auto &entry : config_sections) {
+        if (strcmp(name, entry.name) != 0) continue;
+        out = entry.section;
+        return true;
+    }
+    return false;
 }
 
 void Config::foreach_kv(kv_visitor_fn fn, void *ctx, Section section) {
     String val;
     for (const KVEntry &entry : kv_table) {
-        if (section == Section::Smb && strncmp(entry.key, "smb_", 4) != 0)
-            continue;
-        if (section == Section::SleepHq && strncmp(entry.key, "sleephq_", 8) != 0)
-            continue;
-        if (section == Section::Network && strcmp(entry.key, "hostname") != 0 &&
-            strcmp(entry.key, "wifi_mode") != 0) continue;
-        if (section == Section::Time && strcmp(entry.key, "tz") != 0 &&
-            strcmp(entry.key, "ntp_server") != 0) continue;
-        if (section == Section::Access && strcmp(entry.key, "http_user") != 0 &&
-            strcmp(entry.key, "http_pass") != 0) continue;
+        if (section != Section::All && entry.section != section) continue;
         format_value(entry, val);
         fn(entry.key, val, entry.sensitive, ctx);
     }

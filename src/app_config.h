@@ -80,7 +80,9 @@ struct AirBridgeConfig {
 };
 
 namespace Config {
-    enum class Section : uint8_t { All, Network, Time, Access, Smb, SleepHq };
+    enum class Section : uint8_t {
+        All, Network, Access, Time, Oximetry, Uart, Smb, SleepHq, Updates, Logging
+    };
 
     void init();
     void load();

@@ -4,6 +4,7 @@ Pre-build script: minify JavaScript, compact HTML and gzip into a build header.
 
 import gzip
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,35 @@ def load_js_minifier():
 js_minify = load_js_minifier()
 
 
+def fill_config_sections(html, source):
+    # These two declarative C++ tables are shared with Config's HTTP filter.
+    sections = {}
+    rows = source.split('} config_sections[] = {', 1)[1].split('};', 1)[0]
+    for row in rows.splitlines():
+        if not row.strip():
+            continue
+        match = re.fullmatch(r'\s*\{Config::Section::(\w+), "([^"]+)", "([^"]+)"\},\s*', row)
+        if not match:
+            raise ValueError(f'unsupported config section: {row}')
+        symbol, name, label = match.groups()
+        sections[symbol] = {'id': name, 'label': label, 'keys': []}
+
+    rows = source.split('static const KVEntry kv_table[] = {', 1)[1].split('};', 1)[0]
+    for row in rows.splitlines():
+        if not row.strip():
+            continue
+        match = re.fullmatch(r'\s*KV_\w+\("([^"]+)".*?, (\w+)\),\s*', row)
+        if not match:
+            raise ValueError(f'unsupported config field: {row}')
+        key, section = match.groups()
+        sections[section]['keys'].append(key)
+
+    marker = '/* CONFIG_SECTIONS */ []'
+    if html.count(marker) != 1:
+        raise ValueError('expected one Config sections placeholder')
+    return html.replace(marker, json.dumps(list(sections.values()), separators=(',', ':')))
+
+
 def minify_html(html):
     # Regex minification corrupts JS strings, regex literals and line comments.
     # Minify JS separately and exclude raw-text blocks from HTML whitespace edits.
@@ -60,6 +90,7 @@ def generate_header(project_dir, output_dir):
         print(f"[web_ui] WARNING: {html_path} not found")
         return
     raw = Path(html_path).read_text(encoding="utf-8")
+    raw = fill_config_sections(raw, Path(project_dir, 'src', 'app_config.cpp').read_text(encoding='utf-8'))
     minified = minify_html(raw)
     compressed = gzip.compress(minified.encode("utf-8"), compresslevel=9, mtime=0)
     lines = [
