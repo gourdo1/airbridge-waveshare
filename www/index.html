@@ -162,6 +162,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .storage-row a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .storage-row small{display:block;color:var(--text-dim);margin-top:4px;font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere;line-height:1.5}
 .storage-row .storage-download{width:38px;height:34px;padding:0;font-size:20px;line-height:1}
+.storage-entry-actions{display:flex;gap:8px;align-items:center}
 #storageMessage{font-size:12px;color:var(--text-dim);line-height:1.5}
 #storageMessage:not(:empty){margin:10px 0}
 .storage-pagination{display:flex;align-items:center;gap:8px;margin-top:12px}
@@ -195,6 +196,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
   #storagePath{flex-basis:100%}
   .storage-actions .btn{width:100%}
   .storage-row{gap:8px;padding:10px}
+  .storage-entry-actions{grid-column:2 / -1;justify-content:flex-end}
 }
 </style>
 </head>
@@ -500,6 +502,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
           <div class="storage-actions">
             <button class="btn" id="storageZip" onclick="storageDownload('archive')">Download folder ZIP</button>
             <button class="btn btn-accent" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
+            <button class="btn btn-danger" id="storageDelete" onclick="storageDelete()">Delete selected</button>
           </div>
           <div id="storageMessage" role="status" aria-live="polite"></div>
           <div id="storageEntries"></div>
@@ -1772,6 +1775,8 @@ function storageControls() {
   document.getElementById('storageNext').disabled = storageLoading || !storageMore;
   document.getElementById('storageZip').disabled = storageLoading;
   document.getElementById('storageSelected').disabled = storageLoading || !storageSelection.size;
+  document.getElementById('storageDelete').disabled = storageLoading || !storageSelection.size;
+  document.querySelectorAll('#storageEntries button, #storageEntries input').forEach(el => { el.disabled = storageLoading; });
 }
 
 function storageChild(name) { return (storagePath === '/' ? '' : storagePath) + '/' + name; }
@@ -1815,7 +1820,12 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
       action.title = (entry.directory ? 'Download folder ZIP: ' : 'Download: ') + entry.name;
       action.setAttribute('aria-label', action.title);
       action.onclick = () => storageDownload(entry.directory ? 'archive' : 'download', entry.name);
-      row.append(check, content, action); entries.append(row);
+      const rename = document.createElement('button'); rename.className = 'btn';
+      rename.textContent = 'Rename'; rename.setAttribute('aria-label', 'Rename ' + entry.name);
+      rename.onclick = () => storageRename(entry.name);
+      const actions = document.createElement('div'); actions.className = 'storage-entry-actions';
+      actions.append(rename, action);
+      row.append(check, content, actions); entries.append(row);
     }
     document.getElementById('storagePage').textContent = 'Page ' + (offset / 32 + 1);
     message.textContent = data.entries.length ? '' : 'This directory is empty.';
@@ -1830,6 +1840,7 @@ function storageUp() {
 }
 
 function storageDownload(kind, name = null, selected = false) {
+  if (storageLoading) return;
   let url = '/api/storage/' + kind + '?path=' + encodeURIComponent(name === null ? storagePath : storageChild(name));
   if (selected) {
     if (!storageSelection.size) return;
@@ -1843,6 +1854,53 @@ function storageDownload(kind, name = null, selected = false) {
   const link = document.createElement('a'); link.href = url;
   link.download = kind === 'archive' ? 'airbridge.zip' : name;
   document.body.append(link); link.click(); link.remove();
+}
+
+async function storageMutate(kind, body) {
+  if (storageLoading) return;
+  storageLoading = true;
+  storageControls();
+  const message = document.getElementById('storageMessage');
+  message.textContent = kind === 'delete' ? 'Deleting...' : 'Renaming...';
+  let result;
+  try {
+    const response = await api('/api/storage/' + kind, {method:'POST', body});
+    if (!response) return;
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error((data.error || 'Operation failed') +
+        (data.changed ? ' (' + data.changed + ' entries changed)' : ''));
+    }
+    result = kind === 'delete' ? 'Deleted.' : 'Renamed.';
+  } catch (error) {
+    result = error.message;
+  } finally {
+    storageLoading = false;
+    storageControls();
+  }
+  // A failed or interrupted recursive delete may already have removed files.
+  await loadStorage(storagePath, 0);
+  message.textContent = result;
+}
+
+async function storageRename(name) {
+  if (storageLoading) return;
+  const replacement = prompt('New name for ' + name + ':', name);
+  if (replacement === null || replacement === name) return;
+  if (!replacement || /[\/\\\r\n]/.test(replacement) || replacement === '.' || replacement === '..') {
+    document.getElementById('storageMessage').textContent = 'Enter a name, not a path.';
+    return;
+  }
+  await storageMutate('rename', new URLSearchParams({path:storageChild(name), name:replacement}));
+}
+
+async function storageDelete() {
+  if (storageLoading || !storageSelection.size) return;
+  const names = [...storageSelection];
+  if (!confirm('Permanently delete these entries and all folder contents?\n\n' + names.join('\n'))) return;
+  const body = new URLSearchParams({path:storagePath});
+  for (const name of names) body.append('item', name);
+  await storageMutate('delete', body);
 }
 
 function applyExports(data) {

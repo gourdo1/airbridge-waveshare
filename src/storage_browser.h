@@ -7,13 +7,13 @@
 
 namespace StorageBrowser {
 
-enum class Kind { List, File, Archive };
+enum class Kind { List, File, Archive, Rename, Delete };
 enum class StartResult { Started, BadRequest, Busy, Unavailable };
 
 struct Request {
     Kind kind;
     char path[256];
-    char selection[2048]; // Newline-separated child names; empty selects path.
+    char selection[2048]; // Child names separated by newlines, or new name for Rename.
     uint32_t offset;
 };
 
@@ -29,8 +29,17 @@ public:
 using Ready = std::function<void(int code, const char *error,
     std::shared_ptr<Transfer> transfer, uint64_t size)>;
 
+struct MutationStatus {
+    bool active;
+    bool succeeded;
+    uint32_t changed;
+    char error[48];
+};
+
 // One browser operation, including its response lifetime. Ready runs outside
 // the SD executor. Size zero for archives denotes HTTP chunked transfer.
+// Mutations return no Transfer; completion is also retained for the CLI.
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active);
+void mutation_status(MutationStatus &out);
 
 }  // namespace StorageBrowser

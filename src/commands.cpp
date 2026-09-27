@@ -17,6 +17,8 @@
 #include "live_stream.h"
 #include "live_pmd.h"
 #include "export_sync.h"
+#include "board.h"
+#include "storage_browser.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -74,6 +76,58 @@ void dispatch_command(const char *line, String &response) {
                     String(LiveStream::is_stream_active(LivePmd::TAG) ? "subscribed" : "idle") +
                     "\n";
         response += "heap: " + String(ESP.getFreeHeap()) + "\n";
+        return;
+    }
+
+    if (upper == "STORAGE" || upper.startsWith("STORAGE ")) {
+#if AB_STORAGE_HAS_SDCARD
+        bool quoted = false;
+        for (unsigned i = 0; i < cmd.length(); i++) if (cmd[i] == '"') quoted = !quoted;
+        if (quoted) { response = "ERR: unmatched quote\n"; return; }
+        int position = 7;
+        String action = parse_quoted_token(cmd, &position);
+        action.toUpperCase();
+        const String path = parse_quoted_token(cmd, &position);
+        if ((action.isEmpty() || action == "STATUS") && path.isEmpty()) {
+            StorageBrowser::MutationStatus status;
+            StorageBrowser::mutation_status(status);
+            response = "state: ";
+            response += status.active ? "working" : status.succeeded ? "done" :
+                status.error[0] ? "failed" : "idle";
+            response += "\nchanged: " + String(status.changed) + "\n";
+            if (status.error[0]) response += "error: " + String(status.error) + "\n";
+            return;
+        }
+        const String name = parse_quoted_token(cmd, &position);
+        const String extra = parse_quoted_token(cmd, &position);
+        StorageBrowser::Request request = {};
+        const bool rename = action == "RENAME";
+        if ((!rename && action != "RM") || path.isEmpty() ||
+            path.length() >= sizeof(request.path) ||
+            (rename ? name.isEmpty() || name.length() >= 256 : !name.isEmpty()) ||
+            !extra.isEmpty()) {
+            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS\n";
+            return;
+        }
+        request.kind = rename ? StorageBrowser::Kind::Rename : StorageBrowser::Kind::Delete;
+        strcpy(request.path, path.c_str());
+        strcpy(request.selection, name.c_str());
+        std::weak_ptr<StorageBrowser::Transfer> active;
+        const auto result = StorageBrowser::start(request,
+            [](int, const char *, std::shared_ptr<StorageBrowser::Transfer>, uint64_t) {}, active);
+        switch (result) {
+        case StorageBrowser::StartResult::Started:
+            response = "OK: storage operation started; $STORAGE STATUS for result\n"; break;
+        case StorageBrowser::StartResult::BadRequest:
+            response = "ERR: invalid path or name\n"; break;
+        case StorageBrowser::StartResult::Busy:
+            response = "ERR: storage busy\n"; break;
+        default:
+            response = "ERR: storage unavailable\n"; break;
+        }
+#else
+        response = "ERR: storage unsupported\n";
+#endif
         return;
     }
 
@@ -529,6 +583,11 @@ void dispatch_command(const char *line, String &response) {
                    "  CONFIG SAVE|RESET   Save/reset config\n"
                    "  CONFIG DUMP         Show all config\n"
                    "  EXPORT STATUS|SMB|SLEEPHQ  Export status/manual sync\n"
+#if AB_STORAGE_HAS_SDCARD
+                   "  STORAGE RENAME path name  Rename a file or folder\n"
+                   "  STORAGE RM path     Delete a file or folder recursively\n"
+                   "  STORAGE STATUS      Last rename/delete result\n"
+#endif
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
                    "  LOG                 Show all category log levels\n"

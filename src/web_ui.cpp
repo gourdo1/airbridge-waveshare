@@ -1667,8 +1667,11 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
     if (!checkAuth(request)) return;
     StorageBrowser::Request operation = {};
     operation.kind = kind;
-    const String path = request->hasParam("path") ? request->getParam("path")->value() : "/";
-    if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path)) {
+    const bool mutation = kind == StorageBrowser::Kind::Rename || kind == StorageBrowser::Kind::Delete;
+    const String path = request->hasParam("path", mutation)
+        ? request->getParam("path", mutation)->value() : "/";
+    if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path) ||
+        path.length() != strlen(path.c_str())) {
         request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
         return;
     }
@@ -1687,9 +1690,9 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
     size_t length = 0;
     for (size_t i = 0; i < request->params(); i++) {
         const auto *param = request->getParam(i);
-        if (param->name() != "item") continue;
+        if (param->name() != "item" || param->isPost() != mutation) continue;
         const String &name = param->value();
-        if (name.isEmpty() || name.indexOf('\n') >= 0 ||
+        if (name.isEmpty() || name.indexOf('\n') >= 0 || name.length() != strlen(name.c_str()) ||
             length + name.length() + 2 > sizeof(operation.selection)) {
             request->send(400, "application/json", "{\"error\":\"invalid_selection\"}");
             return;
@@ -1698,8 +1701,16 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
         memcpy(operation.selection + length, name.c_str(), name.length() + 1);
         length += name.length();
     }
+    if (kind == StorageBrowser::Kind::Rename) {
+        const String name = request->hasParam("name", true) ? request->getParam("name", true)->value() : "";
+        if (length || name.isEmpty() || name.length() >= 256 || name.length() != strlen(name.c_str())) {
+            request->send(400, "application/json", "{\"error\":\"invalid_name\"}");
+            return;
+        }
+        strcpy(operation.selection, name.c_str());
+    }
     String disposition;
-    if (kind != StorageBrowser::Kind::List) {
+    if (kind == StorageBrowser::Kind::File || kind == StorageBrowser::Kind::Archive) {
         disposition = "attachment; filename*=UTF-8''";
         const char *name = kind == StorageBrowser::Kind::Archive ? "airbridge.zip" : strrchr(path.c_str(), '/') + 1;
         for (; *name; name++) {
@@ -1711,10 +1722,19 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
     auto paused = request->pause();
     std::weak_ptr<StorageBrowser::Transfer> active;
     const auto result = StorageBrowser::start(operation,
-        [paused, kind, disposition](int code, const char *error,
+        [paused, kind, disposition, mutation](int code, const char *error,
                                   std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
             auto request = paused.lock();
             if (!request) { if (transfer) transfer->cancel(); return; }
+            if (mutation) {
+                String body = "{\"ok\":";
+                body += error ? "false" : "true";
+                jsonAddUInt32(body, "changed", size);
+                if (error) jsonAddString(body, "error", error);
+                body += '}';
+                request->send(code, "application/json", body);
+                return;
+            }
             if (error) {
                 String body = "{\"error\":";
                 jsonQuote(body, error);
@@ -1784,6 +1804,12 @@ void WebUI::init(uint16_t port) {
     });
     http->on("/api/storage/archive", HTTP_GET, [](AsyncWebServerRequest *r) {
         handleStorage(r, StorageBrowser::Kind::Archive);
+    });
+    http->on("/api/storage/rename", HTTP_POST, [](AsyncWebServerRequest *r) {
+        handleStorage(r, StorageBrowser::Kind::Rename);
+    });
+    http->on("/api/storage/delete", HTTP_POST, [](AsyncWebServerRequest *r) {
+        handleStorage(r, StorageBrowser::Kind::Delete);
     });
 #endif
     http->on("/api/live", HTTP_GET, handleLive);

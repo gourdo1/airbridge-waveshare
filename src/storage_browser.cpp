@@ -3,6 +3,7 @@
 
 #if AB_STORAGE_HAS_SDCARD
 #include <Arduino.h>
+#include <FS.h>
 #include <algorithm>
 #include <atomic>
 #include <new>
@@ -13,6 +14,7 @@
 #include "large_text_buffer.h"
 #include "memory_manager.h"
 #include "sd_storage.h"
+#include "debug_log.h"
 
 namespace StorageBrowser {
 namespace {
@@ -21,6 +23,10 @@ constexpr size_t RING_BYTES = 16 * 1024;
 constexpr size_t INTERNAL_RING_BYTES = 4096;
 constexpr uint32_t CONSUMER_TIMEOUT_MS = 30000;
 std::atomic<bool> busy{false};
+MutationStatus mutation = {};
+portMUX_TYPE mutation_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool mutating(Kind kind) { return kind == Kind::Rename || kind == Kind::Delete; }
 
 bool valid_path(const char *path) {
     if (!path || path[0] != '/') return false;
@@ -38,6 +44,40 @@ bool valid_path(const char *path) {
     }
 }
 
+bool child_path(const char *parent, const char *name, size_t length, char (&out)[256]) {
+    if (!length || memchr(name, '/', length) || memchr(name, '\n', length)) return false;
+    const int written = snprintf(out, sizeof(out), "%s%s%.*s", parent,
+        strcmp(parent, "/") ? "/" : "", int(length), name);
+    return written > 0 && size_t(written) < sizeof(out) && valid_path(out);
+}
+
+bool rename_target(const Request &request, char (&out)[256]) {
+    char parent[256];
+    strcpy(parent, request.path);
+    char *slash = strrchr(parent, '/');
+    if (!slash || !slash[1]) return false;
+    if (slash == parent) slash[1] = 0;
+    else *slash = 0;
+    return child_path(parent, request.selection, strlen(request.selection), out);
+}
+
+bool valid_request(const Request &request) {
+    if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
+        !memchr(request.selection, 0, sizeof(request.selection))) return false;
+    char path[256];
+    if (request.kind == Kind::Rename) return rename_target(request, path);
+    if (request.kind == Kind::Delete && !strcmp(request.path, "/") && !*request.selection)
+        return false;
+    const char *name = request.selection;
+    while (*name) {
+        const char *end = strchr(name, '\n');
+        const size_t length = end ? size_t(end - name) : strlen(name);
+        if (!child_path(request.path, name, length, path) || (end && !end[1])) return false;
+        name = end ? end + 1 : name + length;
+    }
+    return true;
+}
+
 struct ZipEntry {
     char path[256];
     uint32_t size;
@@ -49,7 +89,7 @@ struct ZipEntry {
 
 class Job final : public Transfer {
 public:
-    Request request;
+    Request request = {};
     Ready ready;
     SdStorage::Session session;
     uint8_t *ring = nullptr;
@@ -101,7 +141,8 @@ public:
     }
 
     bool add(const char *path, uint64_t size, bool directory, int64_t modified = 0) {
-        if (size > UINT32_MAX || entry_count == UINT16_MAX || strlen(path) >= 256)
+        if ((request.kind != Kind::Delete && size > UINT32_MAX) ||
+            entry_count == UINT16_MAX || strlen(path) >= 256)
             return false;
         if (entry_count == entry_capacity) {
             const size_t next = std::min<size_t>(UINT16_MAX, entry_capacity ? entry_capacity * 2 : 16);
@@ -166,11 +207,8 @@ bool collect(Job &job) {
         while (*selection) {
             const char *end = strchr(selection, '\n');
             const size_t length = end ? size_t(end - selection) : strlen(selection);
-            if (!length || memchr(selection, '/', length)) return false;
             char path[256];
-            const int written = snprintf(path, sizeof(path), "%s%s%.*s", job.request.path,
-                strcmp(job.request.path, "/") ? "/" : "", int(length), selection);
-            if (written < 0 || size_t(written) >= sizeof(path) || !valid_path(path)) return false;
+            if (!child_path(job.request.path, selection, length, path)) return false;
             SdStorage::Reader file;
             const bool regular = file.open(job.session, path);
             if (!job.add(path, regular ? file.size() : 0, !regular,
@@ -191,13 +229,46 @@ bool collect(Job &job) {
             if (job.cancelled.load() || !dir.next(entry, end)) return false;
             if (end) break;
             char path[256];
-            const int written = snprintf(path, sizeof(path), "%s%s%s", parent,
-                strcmp(parent, "/") ? "/" : "", entry.name);
-            if (written < 0 || size_t(written) >= sizeof(path) ||
-                !valid_path(path) || !job.add(path, entry.size, entry.directory, entry.modified)) return false;
+            if (!child_path(parent, entry.name, strlen(entry.name), path) ||
+                !job.add(path, entry.size, entry.directory, entry.modified)) return false;
         }
     }
     return true;
+}
+
+const char *mutate(Job &job, uint32_t &changed) {
+    if (job.cancelled.load() || !job.session.valid()) return "cancelled";
+    if (job.request.kind == Kind::Rename) {
+        char destination[256];
+        if (!rename_target(job.request, destination)) return "invalid_name";
+        const char *error = "storage_busy";
+        const bool renamed = job.session.run([&](fs::FS &fs) {
+            if (job.cancelled.load()) { error = "cancelled"; return false; }
+            if (!fs.exists(job.request.path)) { error = "not_found"; return false; }
+            if (fs.exists(destination)) { error = "destination_exists"; return false; }
+            error = "rename_failed";
+            return fs.rename(job.request.path, destination);
+        });
+        if (!renamed) return error;
+        changed = 1;
+        return nullptr;
+    }
+    // Collect before deleting: malformed selections and allocation failures
+    // must not leave a half-deleted tree. Children follow parents in this list.
+    if (!collect(job)) return "selection_unavailable";
+    const char *error = nullptr;
+    for (size_t i = job.entry_count; i > 0; i--) {
+        if (job.cancelled.load() || !job.session.valid()) { error = "cancelled"; break; }
+        const ZipEntry &entry = job.entries[i - 1];
+        const bool removed = job.session.run([&](fs::FS &fs) {
+            if (job.cancelled.load()) return false;
+            return entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path);
+        });
+        if (!removed) { error = job.session.valid() ? "delete_failed" : "cancelled"; break; }
+        changed++;
+    }
+    if (changed) job.session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; });
+    return error;
 }
 
 constexpr size_t COPY_BYTES = 1024;
@@ -298,7 +369,22 @@ void produce(void *context) {
     auto job = std::move(*static_cast<std::shared_ptr<Job> *>(context));
     delete static_cast<std::shared_ptr<Job> *>(context);
     bool success = false;
-    if (!job->session.begin()) {
+    if (mutating(job->request.kind)) {
+        uint32_t changed = 0;
+        const char *error = job->session.begin() ? mutate(*job, changed) : "storage_busy";
+        success = !error;
+        portENTER_CRITICAL(&mutation_mux);
+        mutation.active = false;
+        mutation.succeeded = success;
+        mutation.changed = changed;
+        snprintf(mutation.error, sizeof(mutation.error), "%s", error ? error : "");
+        portEXIT_CRITICAL(&mutation_mux);
+        Log::logf(CAT_GENERAL, success ? LOG_INFO : LOG_WARN,
+            "[SD] %s %s: %s (%u changed)\n",
+            job->request.kind == Kind::Rename ? "rename" : "delete",
+            job->request.path, error ? error : "done", changed);
+        job->ready(success ? 200 : 409, error, nullptr, changed);
+    } else if (!job->session.begin()) {
         job->ready(409, "storage_busy", nullptr, 0);
     } else if (job->request.kind == Kind::List) {
         aircannect::LargeTextBuffer json;
@@ -326,9 +412,7 @@ void produce(void *context) {
 }  // namespace
 
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active) {
-    if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
-        !memchr(request.selection, 0, sizeof(request.selection)))
-        return StartResult::BadRequest;
+    if (!valid_request(request)) return StartResult::BadRequest;
     bool expected = false;
     if (!busy.compare_exchange_strong(expected, true)) return StartResult::Busy;
     void *memory = aircannect::Memory::alloc_large(sizeof(Job));
@@ -340,15 +424,23 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
     job->request = request;
     active = job;
     job->ready = std::move(ready);
-    job->capacity = RING_BYTES;
-    job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RING_BYTES, false));
-    if (!job->ring) {
-        job->capacity = INTERNAL_RING_BYTES;
-        job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
+    if (!mutating(request.kind)) {
+        job->capacity = RING_BYTES;
+        job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RING_BYTES, false));
+        if (!job->ring) {
+            job->capacity = INTERNAL_RING_BYTES;
+            job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
+        }
+        if (!job->ring) return StartResult::Unavailable;
     }
-    if (!job->ring) return StartResult::Unavailable;
     auto *context = new(std::nothrow) std::shared_ptr<Job>(job);
     if (!context) return StartResult::Unavailable;
+    if (mutating(request.kind)) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation = {};
+        mutation.active = true;
+        portEXIT_CRITICAL(&mutation_mux);
+    }
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
@@ -356,8 +448,23 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
     if (created != pdPASS)
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
             context, 1, nullptr, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (created != pdPASS) { delete context; return StartResult::Unavailable; }
+    if (created != pdPASS) {
+        delete context;
+        if (mutating(request.kind)) {
+            portENTER_CRITICAL(&mutation_mux);
+            mutation.active = false;
+            strcpy(mutation.error, "worker_unavailable");
+            portEXIT_CRITICAL(&mutation_mux);
+        }
+        return StartResult::Unavailable;
+    }
     return StartResult::Started;
+}
+
+void mutation_status(MutationStatus &out) {
+    portENTER_CRITICAL(&mutation_mux);
+    out = mutation;
+    portEXIT_CRITICAL(&mutation_mux);
 }
 }  // namespace StorageBrowser
 #endif
