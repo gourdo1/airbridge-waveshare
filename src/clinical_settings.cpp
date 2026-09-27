@@ -1,7 +1,6 @@
 #include "clinical_settings.h"
 #include "hex_util.h"
 #include <limits.h>
-#include "json_util.h"
 #include "clinical_jobs.h"
 #include "settings_defs.h"
 #include "uart_arbiter.h"
@@ -9,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <new>
 
 namespace ClinicalSettings {
 namespace {
@@ -21,7 +19,7 @@ enum Stage : uint8_t {
     VALUE, EDITABLE, SOURCE, TYPE,
     OPTIONS_START, OPTION_START, OPTION_VALUE, OPTION_LABEL, OPTION_END,
     SCALE, RAW_STEP, DECIMALS, RAW_MIN, RAW_MAX, UNITS, DISPLAY_VALUE, MINIMUM,
-    MAXIMUM, STEP, ENTRY_END, DONE, REPORT_INTERVALS
+    MAXIMUM, STEP, ENTRY_END, DONE
 };
 
 }
@@ -34,9 +32,6 @@ void Snapshot::reset() {
     count_ = 0;
     length_ = 0;
     error_ = nullptr;
-    if (report_) report_->~Snapshot();
-    aircannect::Memory::free(report_);
-    report_ = nullptr;
     metadata_.reset();
 }
 
@@ -131,166 +126,15 @@ int collect(Snapshot &snapshot) {
     return 200;
 }
 
-int collect_report(Snapshot &snapshot, SleepReport::Request request) {
-    snapshot.reset();
-    void *memory = aircannect::Memory::alloc_large(sizeof(SleepReport::Snapshot));
-    if (!memory) {
-        snapshot.error_ = "report_allocation_failed";
-        return 503;
-    }
-    snapshot.report_ = new (memory) SleepReport::Snapshot;
-    int code = SleepReport::collect(*snapshot.report_, request, ClinicalJobs::timeout_ms);
-    if (code != 200) {
-        snapshot.error_ = snapshot.report_->error;
-        return code;
-    }
-    size_t count;
-    SleepReport::fields(request.view, count);
-    snapshot.count_ = count;
-    Cursor counter;
-    while ((count = counter.read(snapshot, nullptr, 512))) snapshot.length_ += count;
-    return 200;
-}
-
-void Cursor::token(const char *text, bool quoted, size_t length) {
-    text_ = text;
-    length_ = length == SIZE_MAX ? strlen(text) : length;
-    offset_ = 0;
-    quoted_ = quoted;
-    quote_phase_ = 0;
-}
-
-void Cursor::field(const char *key, const char *text, bool quoted) {
-    token(key);
-    pending_ = text;
-    pending_quoted_ = quoted;
-}
-
-void Cursor::integer(const char *key, int64_t value) {
-    snprintf(number_, sizeof(number_), "%lld", (long long)value);
-    field(key, number_, false);
-}
-
-void Cursor::decimal(const char *key, int64_t raw, int16_t scale, uint8_t places) {
-    uint64_t magnitude = raw < 0 ? -raw : raw;
-    uint32_t divisor = scale > 0 ? scale : 1;
-    if (scale < 0) magnitude *= -(int32_t)scale;
-    size_t length = snprintf(number_, sizeof(number_), "%s%llu",
-                              raw < 0 ? "-" : "",
-                              (unsigned long long)(magnitude / divisor));
-    uint32_t remainder = magnitude % divisor;
-    if (places) number_[length++] = '.';
-    uint8_t written = 0;
-    while (written < places && length < sizeof(number_) - 2) {
-        remainder *= 10;
-        number_[length++] = '0' + remainder / divisor;
-        remainder %= divisor;
-        written++;
-    }
-    // Round exact rational values to nearest, ties to even, without newlib's
-    // heap-backed floating-point formatting. Keep the bounded text buffer.
-    if (written == places && (remainder * 2 > divisor ||
-        (remainder * 2 == divisor && ((number_[length - 1] - '0') & 1)))) {
-        size_t first = raw < 0 ? 1 : 0;
-        size_t digit = length;
-        bool carry = true;
-        while (digit > first && carry) {
-            char &c = number_[--digit];
-            if (c == '.') continue;
-            if (c == '9') c = '0';
-            else { c++; carry = false; }
-        }
-        if (carry) {
-            memmove(number_ + first + 1, number_ + first, length - first);
-            number_[first] = '1';
-            length++;
-        }
-    }
-    number_[length] = '\0';
-    field(key, number_);
-}
-
 bool Cursor::next(const Snapshot &snapshot) {
-    if (pending_) {
-        token(pending_, pending_quoted_);
-        pending_ = nullptr;
-        return true;
-    }
     if (stage_ == ARRAY_START) {
-        if (snapshot.report_) {
-            const auto &report = *snapshot.report_;
-            switch (option_++) {
-                case 0: field("{\"view\":", report.request.view == SleepReport::View::Day ? "day" : "period"); return true;
-                case 1: integer(",\"day\":", report.day); return true;
-                case 2: integer(",\"current_day\":", report.current_day); return true;
-                case 3: integer(",\"period\":", report.request.view == SleepReport::View::Period ? SleepReport::period_days(report.request.selection) : 0); return true;
-                case 4: integer(",\"days\":", report.days); return true;
-                case 5: field(",\"present\":", report.present ? "true" : "false", false); return true;
-                default: stage_ = ENTRY_START; option_ = 0; token(",\"fields\":["); return true;
-            }
-        }
         stage_ = ENTRY_START; token("["); return true;
     }
     if (row_ == snapshot.count_) {
         if (stage_ == DONE) return false;
-        if (snapshot.report_) {
-            if (stage_ != REPORT_INTERVALS) {
-                stage_ = REPORT_INTERVALS;
-                option_ = 0;
-                option_offset_ = 0;
-                token("],\"intervals\":["); return true;
-            }
-            const auto &report = *snapshot.report_;
-            while (report.request.view == SleepReport::View::Day && option_ < 10) {
-                uint16_t on = report.on[option_], off = report.off[option_];
-                option_++;
-                if (on == 0xFFFF && off == 0xFFFF) continue;
-                snprintf(number_, sizeof(number_), "%s{\"on\":%d,\"off\":%d}",
-                    option_offset_++ ? "," : "", on == 0xFFFF ? -1 : on, off == 0xFFFF ? -1 : off);
-                token(number_); return true;
-            }
-            stage_ = DONE; token("]}"); return true;
-        }
-        stage_ = DONE;
-        token("]");
-        return true;
+        stage_ = DONE; token("]"); return true;
     }
 
-    if (snapshot.report_) {
-        const auto &report = *snapshot.report_;
-        size_t count;
-        const SleepReport::Field &v = SleepReport::fields(report.request.view, count)[row_];
-        int64_t raw = report.values[row_] == SleepReport::MISSING ? -1 : int64_t(report.values[row_]);
-        switch (stage_) {
-            case ENTRY_START:
-                stage_ = LABEL;
-                field(row_ ? ",{\"cmd\":" : "{\"cmd\":", v.tag); return true;
-            case LABEL:
-                stage_ = VALUE; field(",\"label\":", v.label); return true;
-            case VALUE:
-                stage_ = DISPLAY_VALUE; integer(",\"raw\":", raw); return true;
-            case DISPLAY_VALUE:
-                stage_ = UNITS;
-                if (raw < 0) {
-                    field(",\"value\":", "--");
-                } else if (v.format == SleepReport::Format::Duration || v.format == SleepReport::Format::DaysPeriod) {
-                    if (v.format == SleepReport::Format::Duration)
-                        snprintf(number_, sizeof(number_), "%lld:%02lld", (long long)(raw / 60), (long long)(raw % 60));
-                    else
-                        snprintf(number_, sizeof(number_), "%lld/%u", (long long)raw, report.days);
-                    field(",\"value\":", number_);
-                } else {
-                    decimal(",\"value\":", raw, v.scale, v.decimals);
-                }
-                return true;
-            case UNITS:
-                stage_ = ENTRY_END;
-                field(",\"unit\":", v.unit); return true;
-            case ENTRY_END:
-                row_++; stage_ = ENTRY_START; token("}"); return true;
-            default: return false;
-        }
-    }
     const Value &value = snapshot.values_[row_];
     bool custom = value.flags & CUSTOM, valid = value.flags & VALID;
     CustomSettings::entry_view_t entry = {};
@@ -393,32 +237,7 @@ bool Cursor::next(const Snapshot &snapshot) {
 }
 
 size_t Cursor::read(const Snapshot &snapshot, char *out, size_t capacity) {
-    size_t written = 0;
-    while (written < capacity) {
-        char c;
-        if (escape_) { c = escape_; escape_ = 0; }
-        else if (!text_) {
-            if (!next(snapshot)) break;
-            continue;
-        } else if (quoted_ && !quote_phase_) { c = '"'; quote_phase_ = 1; }
-        else if (offset_ < length_) {
-            c = text_[offset_++];
-            if (quoted_) {
-                char encoded[6];
-                size_t count = aircannect::json_escape_char(c, encoded, true);
-                if (!count) continue;
-                c = encoded[0];
-                if (count == 2) escape_ = encoded[1];
-            }
-        } else {
-            text_ = nullptr;
-            if (!quoted_) continue;
-            c = '"';
-        }
-        if (out) out[written] = c;
-        written++;
-    }
-    return written;
+    return read_tokens(out, capacity, [&] { return next(snapshot); });
 }
 
 }  // namespace ClinicalSettings

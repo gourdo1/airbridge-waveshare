@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include "clinical_settings.h"
+#include "sleep_report.h"
+#include <variant>
 
 namespace ClinicalJobs {
 
@@ -15,6 +17,8 @@ void tick();  // Nonblocking result/cache cleanup from the main loop.
 bool submit(Kind kind, String &&body, uint32_t &id,
             SleepReport::Request report = {});
 
+using Cursor = std::variant<ClinicalSettings::Cursor, SleepReport::Cursor>;
+
 // Pins the immutable values and metadata until the HTTP response is destroyed.
 class Result {
 public:
@@ -25,7 +29,7 @@ public:
     Result(Result &&other) noexcept;
     bool available() const { return id_ != 0; }
     size_t length() const { return length_; }
-    size_t read(ClinicalSettings::Cursor &cursor, size_t offset, char *out, size_t capacity) const;
+    size_t read(Cursor &cursor, size_t offset, char *out, size_t capacity) const;
     void reset();
 
 private:
@@ -33,6 +37,7 @@ private:
     uint32_t id_ = 0;
     const char *data_ = nullptr;
     const ClinicalSettings::Snapshot *snapshot_ = nullptr;
+    const SleepReport::Snapshot *report_ = nullptr;
     size_t length_ = 0;
 };
 

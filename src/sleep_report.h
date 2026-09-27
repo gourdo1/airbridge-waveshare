@@ -1,5 +1,6 @@
 #pragma once
 
+#include "json_cursor.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -34,6 +35,19 @@ struct Snapshot {
     uint16_t on[10], off[10];  // Native minutes from noon; 0xFFFF = missing.
     const char *error = nullptr;
 };
+
+// Resumable JSON over the immutable report pinned by its job.
+class Cursor : private JsonCursor {
+public:
+    size_t read(const Snapshot &snapshot, char *out, size_t capacity);
+
+private:
+    bool next(const Snapshot &snapshot);
+    uint8_t row_ = 0, stage_ = 0, option_ = 0;
+    bool has_interval_ = false;
+};
+
+size_t json_length(const Snapshot &snapshot);
 
 using Budget = uint16_t (*)(uint32_t reserve_ms);
 bool valid(const Request &request);

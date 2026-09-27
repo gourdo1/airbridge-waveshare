@@ -653,7 +653,7 @@ protected:
     }
 
 private:
-    ClinicalSettings::Cursor cursor_;
+    ClinicalJobs::Cursor cursor_;
 };
 
 static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind kind) {

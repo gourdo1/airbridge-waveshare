@@ -1,6 +1,7 @@
 #include "clinical_jobs.h"
 #include "app_config.h"
 #include "debug_log.h"
+#include "memory_manager.h"
 #include <esp_heap_caps.h>
 #include <freertos/semphr.h>
 #include <utility>
@@ -23,6 +24,10 @@ struct Job {
     String body, result;
     ClinicalSettings::Snapshot snapshot;
     SleepReport::Request report;
+    SleepReport::Snapshot *report_snapshot = nullptr;
+    size_t report_length = 0;
+
+    ~Job() { aircannect::Memory::free(report_snapshot); }
 };
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr;
@@ -66,20 +71,30 @@ void worker(void *) {
         int code = 504;
         if (timeout_ms()) {
             if (job->kind == Kind::Write) code = handler(body, result);
-            else {
-                code = job->kind == Kind::Report
-                    ? ClinicalSettings::collect_report(job->snapshot, job->report)
-                    : ClinicalSettings::collect(job->snapshot);
-                if (code != 200) {
-                    if (job->kind == Kind::Report)
-                        result = String("{\"error\":\"") + job->snapshot.error() + "\"}";
-                    else result = job->snapshot.error();
+            else if (job->kind == Kind::Report) {
+                void *memory = aircannect::Memory::alloc_large(sizeof(SleepReport::Snapshot));
+                if (!memory) {
+                    code = 503;
+                    result = "{\"error\":\"report_allocation_failed\"}";
+                } else {
+                    job->report_snapshot = new (memory) SleepReport::Snapshot;
+                    code = SleepReport::collect(*job->report_snapshot, job->report, timeout_ms);
+                    if (code == 200)
+                        job->report_length = SleepReport::json_length(*job->report_snapshot);
+                    else
+                        result = String("{\"error\":\"") + job->report_snapshot->error + "\"}";
                 }
+            } else {
+                code = ClinicalSettings::collect(job->snapshot);
+                if (code != 200) result = job->snapshot.error();
             }
         }
         if (!timeout_ms() && code == 200) code = 504;
         if (code == 504) {
             job->snapshot.reset();
+            aircannect::Memory::free(job->report_snapshot);
+            job->report_snapshot = nullptr;
+            job->report_length = 0;
             result = job->kind == Kind::Report ? "{\"error\":\"report_deadline\"}" :
                 "{\"error\":\"settings_deadline\",\"partial_write_possible\":true}";
         }
@@ -141,7 +156,8 @@ Result::~Result() { reset(); }
 
 Result::Result(Result &&other) noexcept
     : id_(std::exchange(other.id_, 0)), data_(std::exchange(other.data_, nullptr)),
-      snapshot_(std::exchange(other.snapshot_, nullptr)), length_(std::exchange(other.length_, 0)) {}
+      snapshot_(std::exchange(other.snapshot_, nullptr)),
+      report_(std::exchange(other.report_, nullptr)), length_(std::exchange(other.length_, 0)) {}
 
 void Result::reset() {
     if (!id_) return;
@@ -156,12 +172,22 @@ void Result::reset() {
     id_ = 0;
     data_ = nullptr;
     snapshot_ = nullptr;
+    report_ = nullptr;
     length_ = 0;
 }
 
-size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
+size_t Result::read(Cursor &cursor, size_t offset,
                     char *out, size_t capacity) const {
-    if (snapshot_) return cursor.read(*snapshot_, out, capacity);
+    if (report_) {
+        auto *report_cursor = std::get_if<SleepReport::Cursor>(&cursor);
+        if (!report_cursor) report_cursor = &cursor.emplace<SleepReport::Cursor>();
+        return report_cursor->read(*report_, out, capacity);
+    }
+    if (snapshot_) {
+        auto *settings_cursor = std::get_if<ClinicalSettings::Cursor>(&cursor);
+        if (!settings_cursor) settings_cursor = &cursor.emplace<ClinicalSettings::Cursor>();
+        return settings_cursor->read(*snapshot_, out, capacity);
+    }
     if (!data_ || offset >= length_) return 0;
     size_t count = min(capacity, length_ - offset);
     memcpy(out, data_ + offset, count);
@@ -218,7 +244,8 @@ int poll(uint32_t id, Result &result) {
         if (job.state == Free || job.id != id) continue;
         if (job.state == Complete) {
             if (uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
-                size_t length = job.snapshot.length() ? job.snapshot.length() : job.result.length();
+                size_t length = job.report_length ? job.report_length :
+                    job.snapshot.length() ? job.snapshot.length() : job.result.length();
                 if (!length || job.readers == UINT16_MAX) {
                     code = 503;
                     break;
@@ -226,7 +253,8 @@ int poll(uint32_t id, Result &result) {
                 job.readers++;
                 result.id_ = job.id;
                 result.snapshot_ = job.snapshot.length() ? &job.snapshot : nullptr;
-                result.data_ = result.snapshot_ ? nullptr : job.result.c_str();
+                result.report_ = job.report_length ? job.report_snapshot : nullptr;
+                result.data_ = result.snapshot_ || result.report_ ? nullptr : job.result.c_str();
                 result.length_ = length;
                 code = job.code;
                 job.delivered = true;
