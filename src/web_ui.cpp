@@ -953,8 +953,8 @@ static bool uploadComplete = false;
 static bool uploadOwnsUart = false;
 static esp_ota_handle_t esp_ota_handle = 0;
 static const esp_partition_t *esp_ota_part = nullptr;
-static constexpr size_t ESP_OTA_ERASE_BLOCK = 64 * 1024;
-static size_t esp_ota_erased = 0;
+static constexpr size_t UPLOAD_ERASE_BLOCK = 64 * 1024;
+static size_t uploadErased = 0;
 
 static void finishUpload(AsyncWebServerRequest *request, bool success,
                          const char *error) {
@@ -987,6 +987,7 @@ static bool claimUpload(AsyncWebServerRequest *request) {
     if (!OtaManager::begin_manual_upload()) return false;
     uploadOwner = request;
     uploadNextIndex = 0;
+    uploadErased = 0;
     uploadComplete = false;
     uploadOwnsUart = false;
     request->onDisconnect([request]() {
@@ -1019,6 +1020,21 @@ static bool hasValidResmedUpload() {
            uploadOk && uploadSize > 0 && resmed_part;
 }
 
+static bool eraseUploadThrough(const esp_partition_t *part, size_t end) {
+    // Both upload paths check capacity before erasing ahead of their next write.
+    while (uploadErased < end) {
+        const size_t size = min(UPLOAD_ERASE_BLOCK, size_t(part->size - uploadErased));
+        esp_err_t err = esp_partition_erase_range(part, uploadErased, size);
+        if (err != ESP_OK) {
+            Log::logf(CAT_WEB, LOG_ERROR, "Upload erase failed in '%s' at %u: %s\n",
+                      part->label, uploadErased, esp_err_to_name(err));
+            return false;
+        }
+        uploadErased += size;
+    }
+    return true;
+}
+
 static void handleUploadChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
@@ -1039,14 +1055,6 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
         Log::logf(CAT_WEB, LOG_INFO, "Staging to '%s' (0x%X, %u bytes)\n",
                      resmed_part->label, resmed_part->address, resmed_part->size);
 
-        esp_err_t err = esp_partition_erase_range(resmed_part, 0, resmed_part->size);
-        if (err != ESP_OK) {
-            Log::logf(CAT_WEB, LOG_ERROR, "Erase failed: %s\n", esp_err_to_name(err));
-            resmed_part = nullptr;
-            uploadKind = UPLOAD_NONE;
-            finishUpload(request, false, "staging_erase_failed");
-            return;
-        }
         uploadOk = true;
     }
 
@@ -1058,8 +1066,12 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
             uploadOk = false;
             return;
         }
-        if (uploadSize + len > resmed_part->size) {
+        if (len > resmed_part->size - uploadSize) {
             Log::logf(CAT_WEB, LOG_ERROR, "File too large for partition!\n");
+            uploadOk = false;
+            return;
+        }
+        if (!eraseUploadThrough(resmed_part, uploadSize + len)) {
             uploadOk = false;
             return;
         }
@@ -1530,8 +1542,8 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
                   esp_ota_part->label, esp_ota_part->address, esp_ota_part->size);
 
         // Keep block erase speed without blocking async_tcp on the whole slot.
-        esp_ota_erased = min(ESP_OTA_ERASE_BLOCK, size_t(esp_ota_part->size));
-        esp_err_t err = esp_ota_begin(esp_ota_part, esp_ota_erased,
+        uploadErased = min(UPLOAD_ERASE_BLOCK, size_t(esp_ota_part->size));
+        esp_err_t err = esp_ota_begin(esp_ota_part, uploadErased,
                                       &esp_ota_handle);
         if (err != ESP_OK) {
             Log::logf(CAT_WEB, LOG_ERROR, "esp_ota_begin failed: %s\n", esp_err_to_name(err));
@@ -1562,19 +1574,10 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             abortEspOtaUpload(request);
             return;
         }
-        while (esp_ota_erased < uploadSize + len) {
-            const size_t erase_size = min(ESP_OTA_ERASE_BLOCK,
-                                         size_t(esp_ota_part->size - esp_ota_erased));
-            esp_err_t err = esp_partition_erase_range(esp_ota_part,
-                                                  esp_ota_erased, erase_size);
-            if (err != ESP_OK) {
-                Log::logf(CAT_WEB, LOG_ERROR, "ESP OTA erase failed at %u: %s\n",
-                          esp_ota_erased, esp_err_to_name(err));
-                uploadOk = false;
-                abortEspOtaUpload(request);
-                return;
-            }
-            esp_ota_erased += erase_size;
+        if (!eraseUploadThrough(esp_ota_part, uploadSize + len)) {
+            uploadOk = false;
+            abortEspOtaUpload(request);
+            return;
         }
         esp_err_t err = esp_ota_write(esp_ota_handle, data, len);
         if (err != ESP_OK) {
