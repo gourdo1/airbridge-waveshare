@@ -2,6 +2,7 @@
 #include "device_status.h"
 #include "web_ui_generated.h"
 #include "uart_arbiter.h"
+#include "airsense_state.h"
 #include "oxi_ble.h"
 #include "oxi_arbiter.h"
 #include "resmed_ota.h"
@@ -860,7 +861,7 @@ static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL
         ? "{\"supported\":true" : "{";
     if (full) {
         jsonAddBool(json, "sd_mounted", SdStorage::mounted());
-        jsonAddBool(json, "idle", Arbiter::device_standby());
+        jsonAddBool(json, "idle", AirSenseState::device_standby());
         jsonAddBool(json, "online", WiFi.status() == WL_CONNECTED);
         jsonAddUInt32(json, "config_revision", Config::revision());
     }
@@ -1382,7 +1383,7 @@ extern void dispatch_command(const char *line, String &response);
 struct WebCommand {
     AsyncWebServerRequestPtr request;
     uart_transaction_t *transaction = nullptr;
-    int rop = -1;
+    bool refresh_therapy = false;
 };
 static WebCommand web_commands[4];
 static SemaphoreHandle_t command_mutex = nullptr;
@@ -1399,7 +1400,7 @@ static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
     if (transaction) {
         slot->request = request->pause();
         slot->transaction = transaction;
-        slot->rop = cmd.startsWith("P S #ROP ") ? strtoul(cmd.c_str() + 9, nullptr, 16) : -1;
+        slot->refresh_therapy = cmd.startsWith("P S #ROP ");
     }
     xSemaphoreGive(command_mutex);
     if (!transaction)
@@ -1429,10 +1430,7 @@ static void serviceWebCommands() {
         else Arbiter::cancel_transaction(pending.transaction);
         if (!request) continue;
 
-        if (ok && pending.rop >= 0) {
-            Arbiter::set_cached_rop(pending.rop);
-            WebUI::push_status_event();
-        }
+        if (ok && pending.refresh_therapy) AirSenseState::request_refresh();
         String json = "{";
         jsonAddString(json, "ok", ok ? "true" : "false", false);
         if (ok && length) jsonAddString(json, "response", response);

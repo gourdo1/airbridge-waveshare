@@ -1366,17 +1366,6 @@ void Arbiter::remove_frame_listener(uart_frame_listener_t listener) {
 system_state_t Arbiter::get_state()         { return sys_state; }
 void Arbiter::set_state(system_state_t s)   { sys_state = s; }
 
-bool Arbiter::system_idle() { return get_state() == SYS_IDLE; }
-
-bool Arbiter::device_standby() {
-    return system_idle() && get_cached_rop() == 0;
-}
-
-bool Arbiter::local_background_allowed() {
-    const auto state = get_state();
-    return (state == SYS_IDLE || state == SYS_ERROR) && get_cached_rop() != 1;
-}
-
 bool Arbiter::wait_idle(uint16_t timeout_ms) {
     uint32_t start = millis();
     while (current_ticket != nullptr) {
@@ -1387,16 +1376,6 @@ bool Arbiter::wait_idle(uint16_t timeout_ms) {
     }
     return true;
 }
-
-static volatile int cached_rop = -1;
-static volatile int cached_mhr = -1;
-static volatile int cached_mop = -1;
-int  Arbiter::get_cached_rop()              { return cached_rop; }
-int  Arbiter::get_cached_mhr()              { return cached_mhr; }
-int  Arbiter::get_cached_mop()              { return cached_mop; }
-void Arbiter::set_cached_rop(int v)         { cached_rop = v; }
-void Arbiter::set_cached_mhr(int v)         { cached_mhr = v; }
-void Arbiter::set_cached_mop(int v)         { cached_mop = v; }
 
 void Arbiter::enter_transparent(Stream *bridge) {
     transparent_tx_reset();

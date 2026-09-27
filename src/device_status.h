@@ -1,6 +1,7 @@
 #pragma once
 
 #include "uart_arbiter.h"
+#include "airsense_state.h"
 #include "oxi_arbiter.h"
 #include "oxi_ble.h"
 
@@ -22,10 +23,10 @@ inline Snapshot snapshot() {
     out.sys = Arbiter::get_state();
     out.oxi = OxiBle::get_state();
     OxiArbiter::snapshot(out.reading);
-    out.rop = Arbiter::get_cached_rop();
-    out.mhr = Arbiter::get_cached_mhr();
+    out.rop = AirSenseState::rop();
+    out.mhr = AirSenseState::mhr();
     out.mop = out.sys == SYS_IDLE || out.sys == SYS_THERAPY
-        ? Arbiter::get_cached_mop() : -1;
+        ? AirSenseState::mop() : -1;
     out.feeding = OxiArbiter::is_feeding();
     return out;
 }

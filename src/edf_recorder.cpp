@@ -33,6 +33,7 @@
 #include "qframe.h"
 #include "sd_storage.h"
 #include "uart_arbiter.h"
+#include "airsense_state.h"
 
 namespace EdfRecorder {
 namespace {
@@ -205,7 +206,7 @@ static void post_error(const char *message) {
 }
 
 static bool post_processing_cancelled() {
-    return !Arbiter::device_standby() ||
+    return !AirSenseState::device_standby() ||
            __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
 }
@@ -2300,7 +2301,7 @@ static void start_session(const ControlEvent &event) {
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
     next_start_ms = millis() + 5000;
     if (status.active || !storage_ready || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
-        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) return;
+        Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1) return;
     portENTER_CRITICAL(&status_mux);
     const uint32_t mask_on_ms = therapy_on_capture_ms;
     portEXIT_CRITICAL(&status_mux);
@@ -2340,7 +2341,7 @@ static void start_session(const ControlEvent &event) {
     const bool same_therapy = mask_on_ms == therapy_on_capture_ms;
     portEXIT_CRITICAL(&status_mux);
     if (!same_therapy || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
-        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) {
+        Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1) {
         clear_session_memory(true);
         discard_pending();
         recording_storage_owned = false;
@@ -2727,7 +2728,7 @@ static bool prepare_storage() {
 static void retry_recording() {
     if (status.active || !storage_ready ||
         !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
-        Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1 ||
+        Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1 ||
         (next_start_ms && int32_t(millis() - next_start_ms) < 0)) return;
     const ControlEvent event = {ControlKind::Start, millis()};
     start_session(event);
@@ -2735,7 +2736,7 @@ static void retry_recording() {
 
 static void poll_recording_state() {
     const bool wanted = __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
-    if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) {
+    if (Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1) {
         next_recording_state_ms = 0;
         if (wanted) request_stop();
         return;
@@ -2746,7 +2747,7 @@ static void poll_recording_state() {
     uint32_t zle = 0;
     if (!read_u32_variable("ZLE", zle) || zle > 1) return;
     // ROP may have changed while the queued read was in flight.
-    if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1)
+    if (Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1)
         return;
     if (zle && !wanted) therapy_started();
     else if (!zle && wanted) request_stop();

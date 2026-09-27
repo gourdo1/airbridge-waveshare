@@ -7,6 +7,8 @@ namespace Air10Clock {
 
 // Published by the main health loop; never queries UART.
 void status_time(char (&out)[20]);
+void poll_status();  // Health pass after confirming device presence.
+void invalidate();
 
 struct Calendar {
     int year, month, day, hour, minute, second;

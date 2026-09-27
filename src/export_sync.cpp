@@ -25,6 +25,7 @@
 #include "storage_smb_client.h"
 #include "tls_memory.h"
 #include "uart_arbiter.h"
+#include "airsense_state.h"
 #include "wifi_setup.h"
 
 namespace ExportSync {
@@ -125,7 +126,7 @@ static void set_check(bool smb, uint32_t generation, CheckState state, uint32_t 
 static bool generation_aborted(uint32_t generation) {
     return generation !=
                __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE) ||
-           Arbiter::get_cached_rop() == 1;
+           AirSenseState::rop() == 1;
 }
 
 static bool export_ready(const EdfCatalog::Entry &entry) {
@@ -187,7 +188,7 @@ static void publish_sleephq_progress(
 static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
     return !run || generation_aborted(run->generation) ||
-           (run->network_only ? !Arbiter::device_standby() ||
+           (run->network_only ? !AirSenseState::device_standby() ||
                Config::revision(run->section) != run->config_revision : !storage.valid());
 }
 
@@ -774,7 +775,7 @@ static void run_check(const Request &request) {
         copy_text(error, sizeof(error), "configuration_changed");
     } else if (WiFi.status() != WL_CONNECTED) {
         copy_text(error, sizeof(error), "wifi_disconnected");
-    } else if (!Arbiter::device_standby()) {
+    } else if (!AirSenseState::device_standby()) {
         copy_text(error, sizeof(error), "standby_required");
     } else if (smb) {
         SmbConfig config = {};
@@ -823,7 +824,7 @@ static void refresh_backlog() {
         catalog.generation == backlog_catalog_generation &&
         smb_revision == backlog_smb_revision && shq_revision == backlog_shq_revision) return;
     if (uxQueueMessagesWaiting(request_queue) || !catalog.ready ||
-        !Arbiter::device_standby() || !storage.begin()) return;
+        !AirSenseState::device_standby() || !storage.begin()) return;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
     const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
     if (files_changed) roots_confirmed = false;
@@ -991,7 +992,7 @@ static void export_task(void *) {
             continue;
         }
         while ((WiFi.status() != WL_CONNECTED ||
-                Arbiter::get_cached_rop() < 0) &&
+                AirSenseState::rop() < 0) &&
                !generation_aborted(request.generation)) {
             refresh_backlog();
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1000,7 +1001,7 @@ static void export_task(void *) {
 
         bool admitted = false;
         while (!generation_aborted(request.generation)) {
-            if (Arbiter::device_standby() && storage.begin()) {
+            if (AirSenseState::device_standby() && storage.begin()) {
                 admitted = true;
                 break;
             }
@@ -1100,7 +1101,7 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     const bool smb = config.smb_enabled && config.smb_auto_after_therapy;
     const bool sleephq = config.sleephq_enabled &&
                          config.sleephq_auto_after_therapy;
-    if (!request_queue || Arbiter::get_cached_rop() == 1 ||
+    if (!request_queue || AirSenseState::rop() == 1 ||
         (!smb && !sleephq)) {
         return false;
     }
@@ -1114,7 +1115,7 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
 
 static const char *enqueue_request(bool smb, bool check) {
     if (!request_queue) return "unavailable";
-    if (Arbiter::get_cached_rop() == 1) return "not_idle";
+    if (AirSenseState::rop() == 1) return "not_idle";
     if (__atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
     if (check && __atomic_exchange_n(&check_pending, true, __ATOMIC_ACQ_REL))
         return "busy";
@@ -1175,7 +1176,7 @@ uint32_t revision() {
 PublicationStamp publication_stamp() {
     return {revision(), Config::revision(Config::Section::Smb),
         Config::revision(Config::Section::SleepHq), EdfCatalog::revision(),
-        WiFiSetup::revision(), Arbiter::get_state(), Arbiter::get_cached_rop(),
+        WiFiSetup::revision(), Arbiter::get_state(), AirSenseState::rop(),
         SdStorage::mounted(), __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE),
         __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)};
 }
@@ -1222,7 +1223,7 @@ const char *action_blocked(bool smb, bool check) {
     bool configured = smb ? !cfg.smb_endpoint.isEmpty() :
         !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty();
     if (!configured) return "not_configured";
-    if (!Arbiter::device_standby()) return "not_idle";
+    if (!AirSenseState::device_standby()) return "not_idle";
     if (WiFi.status() != WL_CONNECTED) return "offline";
     if (!request_queue) return "unavailable";
     if (busy() || __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";

@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <atomic>
-#include <limits.h>
 #include "app_config.h"
 #include "build_info.h"
 #include "debug_log.h"
@@ -22,9 +21,8 @@
 #include "export_sync.h"
 #include "custom_settings.h"
 #include "clinical_jobs.h"
-#include "device_uptime.h"
+#include "airsense_state.h"
 #include "air10_clock.h"
-#include "hex_util.h"
 #include "board.h"
 #if defined(AB_BOARD_WROOM_S3)
 #include "hal/usb_serial_jtag_ll.h"
@@ -85,17 +83,10 @@ static void serial_poll() {
 #define HEALTH_TIMEOUT_MS           500
 #define DEVICE_TIME_POLL_INTERVAL_MS 60000
 #define DEVICE_TIME_MAX_AGE_MS       (DEVICE_TIME_POLL_INTERVAL_MS + 3 * HEALTH_POLL_INTERVAL_MS)
-#define MHR_POLL_INTERVAL_MS        (30UL * 60 * 1000)
 
-static uint32_t last_health_poll = 0;
-static uint32_t last_mhr_poll = 0;
-static uint32_t consecutive_timeouts = 0;
-static bool airsense_present = false;
-static uint32_t airsense_seen_ms = 0;
 static std::atomic<bool> clock_sync_pending{true};
 static uint32_t clock_sync_attempt_ms = 0;
 static std::atomic<bool> clock_sync_attempted{false};
-static DeviceUptime::Tracker device_uptime;
 static portMUX_TYPE device_time_mux = portMUX_INITIALIZER_UNLOCKED;
 static char device_time[20] = "--";
 static uint32_t device_time_ms = 0;
@@ -117,6 +108,8 @@ static void publish_device_time(const char *text) {
     portEXIT_CRITICAL(&device_time_mux);
 }
 
+void Air10Clock::invalidate() { publish_device_time("--"); }
+
 bool Air10Clock::read(Calendar &out, uint16_t timeout_ms, uint32_t *captured_ms) {
     for (uint8_t attempt = 0; attempt < 2; attempt++) {
         char before[9], tic[7], after[9];
@@ -135,7 +128,7 @@ bool Air10Clock::read(Calendar &out, uint16_t timeout_ms, uint32_t *captured_ms)
     return false;
 }
 
-static void poll_device_time() {
+void Air10Clock::poll_status() {
     portENTER_CRITICAL(&device_time_mux);
     bool due = device_time[0] == '-' ||
         uint32_t(millis() - device_time_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
@@ -148,138 +141,6 @@ static void poll_device_time() {
         snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
                  t.year, t.month, t.day, t.hour, t.minute);
     publish_device_time(text);
-}
-
-static void poll_device_uptime() {
-    char response[48] = {};
-    if (!Arbiter::get_var("STK", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                          response, sizeof(response), HEALTH_TIMEOUT_MS)) return;
-    uint32_t ticks = 0;
-    if (!DeviceUptime::parse(response, ticks) ||
-        !device_uptime.observe(ticks, millis())) return;
-
-    Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
-    Config::invalidate_device_info();
-    publish_device_time("--");
-    CustomSettings::invalidate("STK reset");
-    LiveStream::reattach();
-    clock_sync_pending = true;
-    clock_sync_attempted = false;
-    Arbiter::set_cached_mhr(-1);
-    Arbiter::set_cached_mop(-1);
-    EdfRecorder::device_restarted();
-    if (Arbiter::get_state() == SYS_THERAPY) {
-        Arbiter::set_state(SYS_IDLE);
-    }
-}
-
-static void poll_mhr() {
-    uint32_t raw;
-    if (Arbiter::read_var_hex("MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, raw) !=
-        Arbiter::VarResult::Ok || raw > INT_MAX) {
-        // UART unhappy; leave cache alone and retry next opportunity.
-        return;
-    }
-    int new_mhr = static_cast<int>(raw);
-    int prev_mhr = Arbiter::get_cached_mhr();
-    Arbiter::set_cached_mhr(new_mhr);
-    last_mhr_poll = millis();
-    if (new_mhr != prev_mhr) {
-        WebUI::push_status_event();
-    }
-}
-
-static bool mhr_poll_due() {
-    if (Arbiter::get_cached_mhr() < 0) return true;
-    return millis() - last_mhr_poll >= MHR_POLL_INTERVAL_MS;
-}
-
-static void poll_therapy_mode() {
-    uint32_t raw;
-    const bool valid = Arbiter::read_var_hex("MOP", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                            raw, HEALTH_TIMEOUT_MS) == Arbiter::VarResult::Ok &&
-        raw <= INT_MAX;
-    Arbiter::set_cached_mop(valid ? static_cast<int>(raw) : -1);
-}
-
-static void poll_therapy_state() {
-    char resp[64] = {};
-
-    uint32_t t0 = millis();
-    Log::logf(CAT_HEALTH, LOG_DEBUG, "ROP poll start t=%lu\n", t0);
-    bool ok = Arbiter::get_var("ROP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, sizeof(resp), HEALTH_TIMEOUT_MS);
-    if (ok) {
-        consecutive_timeouts = 0;
-
-        const char *rv = resp;
-        airsense_present = rv && (strcmp(rv, "0000") == 0 || strcmp(rv, "0001") == 0);
-        if (airsense_present) {
-            airsense_seen_ms = millis();
-            poll_device_uptime();
-            Config::refresh_device_info();
-            poll_therapy_mode();
-            poll_device_time();
-            int new_rop = (int)strtoul(rv, nullptr, 16);
-            int prev_rop = Arbiter::get_cached_rop();
-            Arbiter::set_cached_rop(new_rop);
-
-            system_state_t current = Arbiter::get_state();
-            if (new_rop == 1 && current == SYS_IDLE) {
-                Arbiter::set_state(SYS_THERAPY);
-                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy started\n");
-                ExportSync::therapy_started();
-            } else if (new_rop == 0 && current == SYS_THERAPY) {
-                Arbiter::set_state(SYS_IDLE);
-                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
-                EdfRecorder::request_stop();
-                Air10Clock::request_sync();
-                poll_mhr();
-            }
-
-            if (new_rop != prev_rop) {
-                WebUI::push_status_event();
-            }
-        }
-    } else {
-        airsense_present = false;
-        consecutive_timeouts++;
-        Log::logf(CAT_HEALTH, consecutive_timeouts >= 2 ? LOG_WARN : LOG_DEBUG,
-                  "ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
-                  consecutive_timeouts, millis(), millis() - t0);
-
-        if (consecutive_timeouts >= 3) {
-            system_state_t current = Arbiter::get_state();
-            if (current != SYS_ERROR && current != SYS_TRANSPARENT &&
-                current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
-                if (current == SYS_THERAPY) EdfRecorder::request_stop();
-                Arbiter::set_state(SYS_ERROR);
-                Log::logf(CAT_HEALTH, LOG_ERROR, "UART unresponsive, entering ERROR state\n");
-            }
-        }
-    }
-    if (!airsense_present) {
-        publish_device_time("--");
-        Arbiter::set_cached_mop(-1);
-    }
-}
-
-static void attempt_recovery() {
-    if (Arbiter::get_state() != SYS_ERROR) return;
-
-    char resp[32] = {};
-    bool ok = Arbiter::get_var("BLS", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, sizeof(resp));
-    if (ok) {
-        Log::logf(CAT_HEALTH, LOG_INFO, "Device responded, clearing error\n");
-        consecutive_timeouts = 0;
-        Arbiter::set_state(SYS_IDLE);
-        Config::invalidate_device_info();
-        CustomSettings::invalidate("UART recovery");
-        // AirSense may have rebooted; force re-subscribe regardless of
-        // the broker's stale subscribed flags.
-        LiveStream::reattach();
-    }
 }
 
 bool pull_time_from_resmed(bool force = false);
@@ -405,9 +266,8 @@ bool pull_time_from_resmed(bool force) {
 }
 
 static void sync_resmed_clock() {
-    if (!clock_sync_pending || !airsense_present || !WiFiSetup::time_synced()) return;
-    if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
-    if (!Arbiter::device_standby()) return;
+    if (!clock_sync_pending || !AirSenseState::present_recently() || !WiFiSetup::time_synced()) return;
+    if (!AirSenseState::device_standby()) return;
     static const char *last_blocked = nullptr;
     const char *blocked = nullptr;
     if (!EdfRecorder::clock_write_allowed(&blocked)) {
@@ -469,22 +329,7 @@ void loop() {
 
     OxiArbiter::poll();
 
-    // health monitoring
-    if (millis() - last_health_poll >= HEALTH_POLL_INTERVAL_MS) {
-        last_health_poll = millis();
-
-        system_state_t st = Arbiter::get_state();
-        if (st == SYS_IDLE || st == SYS_THERAPY) {
-            poll_therapy_state();
-            // Catch-up resync if AirSense rebooted out from under us, or
-            // any consumer's initial subscribe attempt failed.
-            LiveStream::resync();
-            // MHR refreshed 30 min cadence and at therapy-stop transition
-            if (mhr_poll_due()) poll_mhr();
-        } else if (st == SYS_ERROR) {
-            attempt_recovery();
-        }
-    }
+    AirSenseState::poll();
 
     delay(10);
 }

@@ -14,6 +14,7 @@
 #include <freertos/semphr.h>
 #include "memory_manager.h"
 #include "uart_arbiter.h"
+#include "airsense_state.h"
 #endif
 
 namespace SdStorage {
@@ -69,7 +70,7 @@ OpenFile *find_reader(uint32_t id) {
 
 bool background_allowed() {
     return !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
-        Arbiter::local_background_allowed();
+        AirSenseState::local_background_allowed();
 }
 
 bool background_allowed(uint32_t expected) {
