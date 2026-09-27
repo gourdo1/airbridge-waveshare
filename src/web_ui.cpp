@@ -231,17 +231,17 @@ static size_t buildStatusJson(char *out, size_t cap) {
     Config::refresh_device_info();
     auto &cfg = Config::get();
 
-    char esp_time[20] = "--";
+    char esp_time[24] = "--";
     time_t now = time(nullptr);
     if (now > 1700000000) {
         struct tm t;
         localtime_r(&now, &t);
-        snprintf(esp_time, sizeof(esp_time), "%04d-%02d-%02d %02d:%02d",
+        snprintf(esp_time, sizeof(esp_time), "%04d-%02d-%02d %02d:%02d:%02d",
                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                 t.tm_hour, t.tm_min);
+                 t.tm_hour, t.tm_min, t.tm_sec);
     }
 
-    char resmed_time[20] = "--";
+    char resmed_time[24] = "--";
     if (got_dac && got_tic) {
         const char *dv = qframe_response_value(dac_resp);
         const char *tv = qframe_response_value(tic_resp);
@@ -249,8 +249,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
             int dd, mm, yyyy, hh, mn, ss;
             if (sscanf(dv, "%2d%2d%4d", &dd, &mm, &yyyy) == 3 &&
                 sscanf(tv, "%2d%2d%2d", &hh, &mn, &ss) == 3) {
-                snprintf(resmed_time, sizeof(resmed_time), "%04d-%02d-%02d %02d:%02d",
-                         yyyy, mm, dd, hh, mn);
+                snprintf(resmed_time, sizeof(resmed_time), "%04d-%02d-%02d %02d:%02d:%02d",
+                         yyyy, mm, dd, hh, mn, ss);
             }
         }
     }
