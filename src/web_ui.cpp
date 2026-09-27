@@ -35,10 +35,56 @@
 #include <new>
 #include <errno.h>
 #include <utility>
+#include <mutex>
 
 static AsyncWebServer *http = nullptr;
 static AsyncEventSource *events = nullptr;
 static AsyncEventSource *live_events = nullptr;
+
+enum class EventTopic : uint8_t { Status, Ota, Wifi, Exports, Count };
+struct EventClient {
+    AsyncEventSourceClient *client = nullptr;
+    uint32_t revision[static_cast<size_t>(EventTopic::Count)] = {};
+};
+// Four browser sessions; queues remain bounded by SSE_MAX_QUEUED_MESSAGES.
+static EventClient event_clients[4];
+static std::recursive_mutex event_clients_mutex;
+
+static void registerEventClient(AsyncEventSourceClient *client) {
+    std::lock_guard<std::recursive_mutex> lock(event_clients_mutex);
+    for (auto &entry : event_clients) {
+        if (entry.client) continue;
+        entry = {};
+        entry.client = client;
+        return;
+    }
+    client->close();
+}
+
+static void unregisterEventClient(AsyncEventSourceClient *client) {
+    // The library calls this before destroying its client. Never dereference
+    // the pointer here; the lock protects main-loop sends from destruction.
+    std::lock_guard<std::recursive_mutex> lock(event_clients_mutex);
+    for (auto &entry : event_clients)
+        if (entry.client == client) entry = {};
+}
+
+template <typename Build>
+static void publishState(EventTopic topic, uint32_t revision,
+                         const char *name, Build build) {
+    const size_t index = static_cast<size_t>(topic);
+    String payload[2];
+    for (auto &entry : event_clients) {
+        std::lock_guard<std::recursive_mutex> lock(event_clients_mutex);
+        if (!entry.client || entry.revision[index] == revision ||
+            entry.client->packetsWaiting() >= SSE_MAX_QUEUED_MESSAGES) continue;
+        const bool full = !entry.revision[index] || entry.revision[index] + 1 != revision;
+        String &json = payload[full];
+        if (json.isEmpty()) json = build(full);
+        if (!json.isEmpty() && entry.client->send(json.c_str(), name, millis()))
+            entry.revision[index] = revision;
+    }
+}
 
 static bool checkAuth(AsyncWebServerRequest *request) {
     if (request->getResponse()) return false;
@@ -745,19 +791,19 @@ static void handleExportStatus(AsyncWebServerRequest *request) {
 }
 
 #if AB_STORAGE_HAS_SDCARD
-static bool export_client_connected = false;
-
 static void publishExports() {
     static ExportPublication last = {};
+    static uint32_t revision = 1;
     const auto current = exportPublication();
-    const bool connected = __atomic_exchange_n(&export_client_connected, false, __ATOMIC_ACQ_REL);
-    if (!connected && current.config == last.config && current.sync == last.sync &&
-        current.system == last.system && current.rop == last.rop &&
-        current.mounted == last.mounted && current.online == last.online) return;
-    const String json = buildExportsJson(false);
-    if (events->send(json.c_str(), "exports", millis()) == AsyncEventSource::ENQUEUED)
+    if (current.config != last.config || current.sync != last.sync ||
+        current.system != last.system || current.rop != last.rop ||
+        current.mounted != last.mounted || current.online != last.online) {
         last = current;
-    else __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
+        if (!++revision) ++revision;
+    }
+    publishState(EventTopic::Exports, revision, "exports", [](bool) {
+        return buildExportsJson(false);
+    });
 }
 #endif
 
@@ -1528,28 +1574,21 @@ static void sendOtaStatus(AsyncWebServerRequest *request, int status_code) {
     request->send(status_code, "application/json", buildOtaStatus(status, true));
 }
 
-static bool ota_client_connected = false;
 static void publishOta() {
-    static uint32_t last_revision = UINT32_MAX;
-    const bool connected = __atomic_exchange_n(&ota_client_connected, false, __ATOMIC_ACQ_REL);
-    if (!connected && OtaManager::revision() == last_revision) return;
-    OtaManager::Status status;
-    if (!OtaManager::get_status(status)) {
-        if (connected) __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
-        return;
-    }
-    String json = buildOtaStatus(status, false);
-    if (events->send(json.c_str(), "ota", millis()) == AsyncEventSource::ENQUEUED)
-        last_revision = status.revision;
-    else __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
+    publishState(EventTopic::Ota, OtaManager::revision() + 1, "ota", [](bool) {
+        OtaManager::Status status;
+        return OtaManager::get_status(status) ? buildOtaStatus(status, false) : String();
+    });
 }
 
 static void publishWifi() {
-    static uint32_t last_revision = 0;
     const uint32_t revision = WiFiSetup::revision();
-    if (revision == last_revision) return;
-    if (events->send("{}", "wifi", millis()) == AsyncEventSource::ENQUEUED)
-        last_revision = revision;
+    publishState(EventTopic::Wifi, revision + 1, "wifi", [revision](bool) {
+        String json = "{";
+        jsonAddUInt32(json, "revision", revision, false);
+        json += '}';
+        return json;
+    });
 }
 
 static void handleOtaStatus(AsyncWebServerRequest *request) {
@@ -1875,12 +1914,8 @@ void WebUI::init(uint16_t port) {
         if (checkAuth(request)) next();
     };
     events->addMiddleware(authenticate_events);
-    events->onConnect([](AsyncEventSourceClient *) {
-        __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
-#if AB_STORAGE_HAS_SDCARD
-        __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
-#endif
-    });
+    events->onConnect(registerEventClient);
+    events->onDisconnect(unregisterEventClient);
     live_events->addMiddleware(authenticate_events);
     live_events->onConnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::acquire();
