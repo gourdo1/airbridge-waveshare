@@ -74,6 +74,15 @@ static uint32_t airsense_seen_ms = 0;
 static std::atomic<bool> clock_sync_pending{true};
 static uint32_t clock_sync_attempt_ms = 0;
 static std::atomic<bool> clock_sync_attempted{false};
+// Automatic re-syncs (NTP refresh, UTC offset change) wait until the AirSense
+// is idle so its clock never jumps in the middle of a therapy session.
+static std::atomic<bool> clock_sync_wait_idle{false};
+
+#define TIME_OFFSET_CHECK_MS        60000
+static uint32_t seen_ntp_syncs = 0;
+static bool     utc_offset_known = false;
+static long     last_utc_offset = 0;
+static uint32_t last_offset_check_ms = 0;
 
 // True if the last health poll got a valid answer from the AirSense.
 bool airsense_is_present() { return airsense_present; }
@@ -238,9 +247,57 @@ void setup() {
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
 }
 
+// Manual re-sync ($TIMESYNC): push as soon as possible, therapy or not.
 void reset_resmed_time_sync() {
     clock_sync_pending = true;
     clock_sync_attempted = false;
+    clock_sync_wait_idle = false;
+}
+
+// Automatic re-sync: push once the AirSense is idle.
+static void rearm_resmed_time_sync(const char *reason) {
+    clock_sync_pending = true;
+    clock_sync_attempted = false;
+    clock_sync_wait_idle = true;
+    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] ResMed clock resync queued: %s\n", reason);
+}
+
+// Local time minus UTC, in seconds (includes DST).
+static long utc_offset_seconds(time_t now) {
+    struct tm lt, gt;
+    localtime_r(&now, &lt);
+    gmtime_r(&now, &gt);
+    int day = lt.tm_yday - gt.tm_yday;
+    if (day > 1) day = -1;          // year boundary: local is Dec 31, UTC is Jan 1
+    else if (day < -1) day = 1;     // year boundary: local is Jan 1, UTC is Dec 31
+    return day * 86400L + (lt.tm_hour - gt.tm_hour) * 3600L +
+           (lt.tm_min - gt.tm_min) * 60L;
+}
+
+// Re-arm the ResMed clock push after each NTP refresh (the first sync after
+// boot is covered by the boot-time push) and when the UTC offset changes
+// (daylight saving transition or a new tz setting).
+static void check_time_triggers() {
+    uint32_t syncs = WiFiSetup::ntp_sync_count();
+    if (syncs != seen_ntp_syncs) {
+        bool first = (seen_ntp_syncs == 0);
+        seen_ntp_syncs = syncs;
+        if (!first) rearm_resmed_time_sync("NTP resync");
+    }
+
+    if (utc_offset_known && millis() - last_offset_check_ms < TIME_OFFSET_CHECK_MS) return;
+    last_offset_check_ms = millis();
+    time_t now = time(nullptr);
+    if (now < 1700000000) return;   // no valid time yet
+    long offset = utc_offset_seconds(now);
+    if (utc_offset_known && offset != last_utc_offset) {
+        char reason[48];
+        snprintf(reason, sizeof(reason), "UTC offset %+ld -> %+ld min",
+                 last_utc_offset / 60, offset / 60);
+        rearm_resmed_time_sync(reason);
+    }
+    last_utc_offset = offset;
+    utc_offset_known = true;
 }
 
 bool push_time_to_resmed() {
@@ -311,10 +368,14 @@ static void sync_resmed_clock() {
     if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
     system_state_t st = Arbiter::get_state();
     if (st != SYS_IDLE && st != SYS_THERAPY) return;
+    if (clock_sync_wait_idle && st != SYS_IDLE) return;
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;
-    if (push_time_to_resmed()) clock_sync_pending = false;
+    if (push_time_to_resmed()) {
+        clock_sync_pending = false;
+        clock_sync_wait_idle = false;
+    }
 }
 
 void loop() {
@@ -345,6 +406,7 @@ void loop() {
     }
     prev_ota_active = ota_active;
 
+    check_time_triggers();
     sync_resmed_clock();
 
     LiveWebConsumer::tick();

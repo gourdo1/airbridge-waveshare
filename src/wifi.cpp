@@ -71,8 +71,11 @@ static bool pending_ap_teardown = false;
 #define AP_TEARDOWN_QUIET_MS    120000
 
 
+static volatile uint32_t ntp_sync_counter = 0;
+
 static void ntp_sync_cb(struct timeval *tv) {
     ntp_synced = true;
+    ntp_sync_counter = ntp_sync_counter + 1;
     struct tm t;
     time_t now = time(nullptr);
     localtime_r(&now, &t);
@@ -734,6 +737,10 @@ bool WiFiSetup::set_fallback_time(int year, int month, int day, int hour, int mi
     Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Fallback time from ResMed: %04d-%02d-%02d %02d:%02d\n",
               year, month, day, hour, min);
     return true;
+}
+
+uint32_t WiFiSetup::ntp_sync_count() {
+    return ntp_sync_counter;
 }
 
 void WiFiSetup::force_ntp_sync() {

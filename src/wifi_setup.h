@@ -8,6 +8,7 @@ namespace WiFiSetup {
     bool time_synced();
     bool set_fallback_time(int year, int month, int day, int hour, int min, int sec, bool force = false);
     void force_ntp_sync();
+    uint32_t ntp_sync_count();      // successful NTP syncs since boot
 
     void suspend_roaming();
     void resume_roaming();
