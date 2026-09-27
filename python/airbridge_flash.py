@@ -313,9 +313,7 @@ def flash_target(target, data, args, auth):
         if args.no_reboot:
             emit(target, 'firmware staged; reboot manually to activate it')
             return 0
-        status_started = time.monotonic()
         status = request_json(target, 'GET', '/api/status', auth, args.timeout)
-        emit(target, f'pre-reboot status read: {time.monotonic() - status_started:.1f}s')
         uptime = status.get('uptime')
         if not isinstance(uptime, (int, float)):
             raise FlashError('upload succeeded, but device uptime is unavailable; reboot manually')
@@ -325,7 +323,6 @@ def flash_target(target, data, args, auth):
             body = request_json(target, 'POST', '/api/reboot', auth, min(args.timeout, 2.0))
             if not is_ok(body):
                 raise FlashError(f'reboot rejected: {body}')
-            emit(target, f'reboot request accepted in {time.monotonic() - started:.1f}s')
         except (OSError, http.client.HTTPException) as error:
             emit(target, f'reboot request ended after {time.monotonic() - started:.1f}s: '
                  f'{type(error).__name__}: {error}; restart not yet confirmed')
