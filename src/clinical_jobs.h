@@ -12,7 +12,8 @@ void init(Handler handler);
 void tick();  // Nonblocking result/cache cleanup from the main loop.
 // Results outlive HTTP requests: 30 s unread, at least 2 s after completion
 // once delivered. Callers must not resubmit writes after a polling failure.
-bool submit(Kind kind, String &&body, uint32_t &id);
+bool submit(Kind kind, String &&body, uint32_t &id,
+            SleepReport::Request report = {});
 
 // Pins the immutable values and metadata until the HTTP response is destroyed.
 class Result {
@@ -36,6 +37,6 @@ private:
 };
 
 int poll(uint32_t id, Result &result);  // 202 pending, 410 expired, 503 busy
-uint16_t timeout_ms();               // Remaining worker budget, capped per UART request
+uint16_t timeout_ms(uint32_t reserve_ms = 0);  // Remaining budget, capped per UART request
 
 }

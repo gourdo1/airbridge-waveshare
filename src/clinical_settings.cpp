@@ -9,68 +9,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
 
 namespace ClinicalSettings {
 namespace {
 constexpr uint8_t VALID = 1, CUSTOM = 2;
 const char *const GROUPS[] = {"therapy", "comfort", "accessories", "options", "configuration"};
 
-enum class ReportFormat : uint8_t { Number, Duration, DaysPeriod, Ratio };
-
-struct ReportField {
-    const char *cmd;
-    const char *label;
-    int16_t divisor;
-    uint8_t decimals;
-    const char *unit;
-    bool summary;
-    ReportFormat format = ReportFormat::Number;
-};
-
-const ReportField REPORT_FIELDS[] = {
-    {"UQD", "Usage", 60, 0, "", false, ReportFormat::Duration},
-    {"OND", "Mask On Duration", 60, 0, "", false, ReportFormat::Duration},
-    {"AQD", "Events/hr", 10, 1, "/hr", false},
-    {"MSP", "Median Pressure", 50, 1, "cmH2O", false},
-    {"AIS", "AI (All)", 10, 1, "/hr", false},
-    {"PM9", "Pressure P95", 50, 1, "cmH2O", false},
-    {"OPI", "Central AI", 10, 1, "/hr", false},
-    {"PMA", "Max Pressure", 50, 1, "cmH2O", false},
-    {"CLI", "Obstructive AI", 10, 1, "/hr", false},
-    {"AEP", "Avg EPR Pressure", 50, 1, "cmH2O", false},
-    {"HIS", "Hypopnea Index", 10, 1, "/hr", false},
-    {"LKM", "Leak Median", 50, 2, "L/s", false},
-    {"UAI", "Unknown AI", 10, 1, "/hr", false},
-    {"LK9", "Leak P95", 50, 2, "L/s", false},
-    {"RIN", "RERA Index", 10, 1, "/hr", false},
-    {"PHM", "Total Used Hrs", 1, 0, "hrs", true},
-    {"LRD", "Leak", 10, 0, "L/min", true},
-    {"DRD", "Days Used", 1, 0, "", true, ReportFormat::DaysPeriod},
-    {"ZAV", "Vt", 1, 0, "ml", true},
-    {"VRD", "Days 4hrs+", 1, 0, "", true, ReportFormat::DaysPeriod},
-    {"ZAR", "RR", 5, 0, "bpm", true},
-    {"WRD", "Avg. Usage", 60, 1, "hrs", true},
-    {"ZAM", "MV", 8, 1, "L/min", true},
-    {"XRD", "Used Hrs", 60, 1, "hrs", true},
-    {"ZA2", "TgMV", 8, 1, "L/min", true},
-    {"ZAI", "Pressure", 50, 1, "cmH2O", true},
-    {"ZA3", "Va", 8, 1, "L/min", true},
-    {"ZAE", "Exp. Pressure", 50, 1, "cmH2O", true},
-    {"ZAZ", "Ti", 50, 2, "s", true},
-    {"ARD", "AHI", 10, 1, "/hr", true},
-    {"ZA1", "I:E", 100, 0, "", true, ReportFormat::Ratio},
-    {"TRD", "Total AI", 10, 1, "/hr", true},
-    {"ZAS", "Spont Trig", 2, 1, "%", true},
-    {"CRD", "Central AI", 10, 1, "/hr", true},
-    {"ZAY", "Spont Cyc", 2, 1, "%", true},
-};
-
 enum Stage : uint8_t {
     ARRAY_START, ENTRY_START, LABEL, GROUP, GROUP_PATH_START, GROUP_PATH_ITEM,
     VALUE, EDITABLE, SOURCE, TYPE,
     OPTIONS_START, OPTION_START, OPTION_VALUE, OPTION_LABEL, OPTION_END,
     SCALE, RAW_STEP, DECIMALS, RAW_MIN, RAW_MAX, UNITS, DISPLAY_VALUE, MINIMUM,
-    MAXIMUM, STEP, ENTRY_END, DONE
+    MAXIMUM, STEP, ENTRY_END, DONE, REPORT_INTERVALS
 };
 
 }
@@ -83,8 +34,9 @@ void Snapshot::reset() {
     count_ = 0;
     length_ = 0;
     error_ = nullptr;
-    report_ = false;
-    period_ = 0;
+    if (report_) report_->~Snapshot();
+    aircannect::Memory::free(report_);
+    report_ = nullptr;
     metadata_.reset();
 }
 
@@ -112,18 +64,17 @@ void mode_label(int mode, char *out, size_t capacity) {
     snprintf(out, capacity, "%.*s", static_cast<int>(strcspn(label, ",")), label);
 }
 
-int collect(Snapshot &snapshot, bool report) {
+int collect(Snapshot &snapshot) {
     snapshot.reset();
-    snapshot.report_ = report;
     auto fail = [&](const char *error) {
         snapshot.reset();
         snapshot.error_ = error;
         return 503;
     };
-    if (!report && !snapshot.metadata_.acquire())
+    if (!snapshot.metadata_.acquire())
         return fail("{\"error\":\"settings_metadata_unavailable\"}");
     int mop = 0;
-    if (!report && !read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
+    if (!read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
     // Count the selected layout first, then allocate exactly its compact values.
@@ -166,25 +117,39 @@ int collect(Snapshot &snapshot, bool report) {
         }
         return count;
     };
-    snapshot.count_ = report ? sizeof(REPORT_FIELDS) / sizeof(REPORT_FIELDS[0]) : layout(false);
+    snapshot.count_ = layout(false);
     size_t bytes = snapshot.storage_bytes();
     if (bytes) {
         snapshot.values_ = static_cast<Value *>(aircannect::Memory::alloc_large(bytes));
         if (!snapshot.values_) return fail("{\"error\":\"settings_allocation_failed\"}");
     }
-    if (report) {
-        read_raw("URD", snapshot.period_);
-        for (uint16_t i = 0; i < snapshot.count_; i++) {
-            int raw = 0;
-            bool ok = read_raw(REPORT_FIELDS[i].cmd, raw);
-            snapshot.values_[i] = {(uint32_t)raw, i, 0, (uint8_t)(ok ? VALID : 0)};
-        }
-    } else layout(true);
-    if (!report && snapshot.metadata_.generation() != CustomSettings::generation())
+    layout(true);
+    if (snapshot.metadata_.generation() != CustomSettings::generation())
         return fail("{\"error\":\"settings_invalidated\"}");
 
     Cursor counter;
     size_t count;
+    while ((count = counter.read(snapshot, nullptr, 512))) snapshot.length_ += count;
+    return 200;
+}
+
+int collect_report(Snapshot &snapshot, SleepReport::Request request) {
+    snapshot.reset();
+    void *memory = aircannect::Memory::alloc_large(sizeof(SleepReport::Snapshot));
+    if (!memory) {
+        snapshot.error_ = "report_allocation_failed";
+        return 503;
+    }
+    snapshot.report_ = new (memory) SleepReport::Snapshot;
+    int code = SleepReport::collect(*snapshot.report_, request, ClinicalJobs::timeout_ms);
+    if (code != 200) {
+        snapshot.error_ = snapshot.report_->error;
+        return code;
+    }
+    size_t count;
+    SleepReport::fields(request.view, count);
+    snapshot.count_ = count;
+    Cursor counter;
     while ((count = counter.read(snapshot, nullptr, 512))) snapshot.length_ += count;
     return 200;
 }
@@ -253,57 +218,82 @@ bool Cursor::next(const Snapshot &snapshot) {
         pending_ = nullptr;
         return true;
     }
-    if (stage_ == ARRAY_START) { stage_ = ENTRY_START; token("["); return true; }
+    if (stage_ == ARRAY_START) {
+        if (snapshot.report_) {
+            const auto &report = *snapshot.report_;
+            switch (option_++) {
+                case 0: field("{\"view\":", report.request.view == SleepReport::View::Day ? "day" : "period"); return true;
+                case 1: integer(",\"day\":", report.day); return true;
+                case 2: integer(",\"current_day\":", report.current_day); return true;
+                case 3: integer(",\"period\":", report.request.view == SleepReport::View::Period ? SleepReport::period_days(report.request.selection) : 0); return true;
+                case 4: integer(",\"days\":", report.days); return true;
+                case 5: field(",\"present\":", report.present ? "true" : "false", false); return true;
+                default: stage_ = ENTRY_START; option_ = 0; token(",\"fields\":["); return true;
+            }
+        }
+        stage_ = ENTRY_START; token("["); return true;
+    }
     if (row_ == snapshot.count_) {
         if (stage_ == DONE) return false;
+        if (snapshot.report_) {
+            if (stage_ != REPORT_INTERVALS) {
+                stage_ = REPORT_INTERVALS;
+                option_ = 0;
+                option_offset_ = 0;
+                token("],\"intervals\":["); return true;
+            }
+            const auto &report = *snapshot.report_;
+            while (report.request.view == SleepReport::View::Day && option_ < 10) {
+                uint16_t on = report.on[option_], off = report.off[option_];
+                option_++;
+                if (on == 0xFFFF && off == 0xFFFF) continue;
+                snprintf(number_, sizeof(number_), "%s{\"on\":%d,\"off\":%d}",
+                    option_offset_++ ? "," : "", on == 0xFFFF ? -1 : on, off == 0xFFFF ? -1 : off);
+                token(number_); return true;
+            }
+            stage_ = DONE; token("]}"); return true;
+        }
         stage_ = DONE;
         token("]");
         return true;
     }
 
-    const Value &value = snapshot.values_[row_];
     if (snapshot.report_) {
-        const ReportField &v = REPORT_FIELDS[row_];
-        int raw = value.flags & VALID ? (int)value.raw : -1;
+        const auto &report = *snapshot.report_;
+        size_t count;
+        const SleepReport::Field &v = SleepReport::fields(report.request.view, count)[row_];
+        int64_t raw = report.values[row_] == SleepReport::MISSING ? -1 : int64_t(report.values[row_]);
         switch (stage_) {
             case ENTRY_START:
                 stage_ = LABEL;
-                field(row_ ? ",{\"cmd\":" : "{\"cmd\":", v.cmd); return true;
+                field(row_ ? ",{\"cmd\":" : "{\"cmd\":", v.tag); return true;
             case LABEL:
                 stage_ = VALUE; field(",\"label\":", v.label); return true;
             case VALUE:
                 stage_ = DISPLAY_VALUE; integer(",\"raw\":", raw); return true;
             case DISPLAY_VALUE:
                 stage_ = UNITS;
-                if (raw < 0 || (v.format == ReportFormat::Ratio && raw == 0)) {
+                if (raw < 0) {
                     field(",\"value\":", "--");
-                } else if (v.format == ReportFormat::Duration || v.format == ReportFormat::DaysPeriod) {
-                    if (v.format == ReportFormat::Duration)
-                        snprintf(number_, sizeof(number_), "%d:%02d", raw / 60, raw % 60);
+                } else if (v.format == SleepReport::Format::Duration || v.format == SleepReport::Format::DaysPeriod) {
+                    if (v.format == SleepReport::Format::Duration)
+                        snprintf(number_, sizeof(number_), "%lld:%02lld", (long long)(raw / 60), (long long)(raw % 60));
                     else
-                        snprintf(number_, sizeof(number_), "%d/%d", raw, snapshot.period_);
+                        snprintf(number_, sizeof(number_), "%lld/%u", (long long)raw, report.days);
                     field(",\"value\":", number_);
-                } else if (v.format == ReportFormat::Ratio) {
-                    decimal(",\"value\":", raw >= 100 ? raw : 100, raw >= 100 ? 100 : raw, 1);
-                    if (raw >= 100) strcat(number_, ":1");
-                    else {
-                        memmove(number_ + 2, number_, strlen(number_) + 1);
-                        memcpy(number_, "1:", 2);
-                    }
                 } else {
-                    decimal(",\"value\":", raw, v.divisor, v.decimals);
+                    decimal(",\"value\":", raw, v.scale, v.decimals);
                 }
                 return true;
             case UNITS:
-                stage_ = GROUP; field(",\"unit\":", v.unit); return true;
-            case GROUP:
                 stage_ = ENTRY_END;
-                field(",\"section\":", v.summary ? "summary" : "session"); return true;
+                field(",\"unit\":", v.unit); return true;
             case ENTRY_END:
                 row_++; stage_ = ENTRY_START; token("}"); return true;
             default: return false;
         }
     }
+    const Value &value = snapshot.values_[row_];
     bool custom = value.flags & CUSTOM, valid = value.flags & VALID;
     CustomSettings::entry_view_t entry = {};
     const var_def_t *stock = nullptr;

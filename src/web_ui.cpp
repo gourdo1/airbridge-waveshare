@@ -638,8 +638,29 @@ static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind
     }
     uint32_t id = 0;
     String body;
+    SleepReport::Request report;
+    if (kind == ClinicalJobs::Kind::Report) {
+        String view = request->arg("view");
+        if (view == "period") report.view = SleepReport::View::Period;
+        String selected = request->arg(report.view == SleepReport::View::Period ? "period" : "day");
+        bool valid = view.isEmpty() || view == "day" || view == "period";
+        if (selected.length() > 5) valid = false;
+        for (size_t i = 0; i < selected.length(); i++)
+            if (selected[i] < '0' || selected[i] > '9') valid = false;
+        unsigned long selection = strtoul(selected.c_str(), nullptr, 10);
+        if (selection > UINT16_MAX) valid = false;
+        report.selection = selection;
+        if (!valid || !SleepReport::valid(report)) {
+            request->send(400, "application/json", "{\"error\":\"report_invalid_selection\"}");
+            return;
+        }
+        if (report.view == SleepReport::View::Period && request->method() != HTTP_POST) {
+            request->send(405, "application/json", "{\"error\":\"report_period_requires_POST\"}");
+            return;
+        }
+    }
     if (write && !getBody(request, body)) return;
-    if (!ClinicalJobs::submit(kind, std::move(body), id)) {
+    if (!ClinicalJobs::submit(kind, std::move(body), id, report)) {
         request->send(503, "application/json", "{\"error\":\"settings_busy\"}");
         return;
     }
@@ -2051,6 +2072,7 @@ void WebUI::init(uint16_t port) {
     http->on("/api/flash/cancel", HTTP_POST, handleFlashCancel);
     http->on("/api/time", HTTP_POST, handleTimeAction, NULL, handleJsonBody);
     http->on("/api/report", HTTP_GET, handleReport);
+    http->on("/api/report", HTTP_POST, handleReport);
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);

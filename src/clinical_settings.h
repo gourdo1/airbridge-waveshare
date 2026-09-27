@@ -1,6 +1,7 @@
 #pragma once
 
 #include "custom_settings.h"
+#include "sleep_report.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -23,19 +24,19 @@ public:
     Snapshot &operator=(const Snapshot &) = delete;
     void reset();
     size_t length() const { return length_; }
-    size_t storage_bytes() const { return count_ * sizeof(Value); }
+    size_t storage_bytes() const { return report_ ? sizeof(SleepReport::Snapshot) : count_ * sizeof(Value); }
     const char *error() const { return error_; }
 
 private:
     friend class Cursor;
-    friend int collect(Snapshot &snapshot, bool report);
+    friend int collect(Snapshot &snapshot);
+    friend int collect_report(Snapshot &snapshot, SleepReport::Request request);
     CustomSettings::MetadataLease metadata_;
     Value *values_ = nullptr;
     uint16_t count_ = 0;
     size_t length_ = 0;
     const char *error_ = nullptr;
-    bool report_ = false;
-    int period_ = 0;
+    SleepReport::Snapshot *report_ = nullptr;
 };
 
 // A resumable token stream. Its strings refer only to the pinned snapshot.
@@ -61,7 +62,8 @@ private:
     char escape_ = 0;
 };
 
-int collect(Snapshot &snapshot, bool report = false);  // Worker only.
+int collect(Snapshot &snapshot);  // Worker only.
+int collect_report(Snapshot &snapshot, SleepReport::Request request);
 bool read_raw(const char *cmd, int &value);
 bool known_stock(const char *cmd);
 void mode_label(int mode, char *out, size_t capacity);

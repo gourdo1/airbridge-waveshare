@@ -22,6 +22,7 @@ struct Job {
     int code = 0;
     String body, result;
     ClinicalSettings::Snapshot snapshot;
+    SleepReport::Request report;
 };
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr;
@@ -66,14 +67,21 @@ void worker(void *) {
         if (timeout_ms()) {
             if (job->kind == Kind::Write) code = handler(body, result);
             else {
-                code = ClinicalSettings::collect(job->snapshot, job->kind == Kind::Report);
-                if (code != 200) result = job->snapshot.error();
+                code = job->kind == Kind::Report
+                    ? ClinicalSettings::collect_report(job->snapshot, job->report)
+                    : ClinicalSettings::collect(job->snapshot);
+                if (code != 200) {
+                    if (job->kind == Kind::Report)
+                        result = String("{\"error\":\"") + job->snapshot.error() + "\"}";
+                    else result = job->snapshot.error();
+                }
             }
         }
-        if (!timeout_ms()) code = 504;
+        if (!timeout_ms() && code == 200) code = 504;
         if (code == 504) {
             job->snapshot.reset();
-            result = "{\"error\":\"settings_deadline\",\"partial_write_possible\":true}";
+            result = job->kind == Kind::Report ? "{\"error\":\"report_deadline\"}" :
+                "{\"error\":\"settings_deadline\",\"partial_write_possible\":true}";
         }
         const char *operation = job->kind == Kind::Write ? "write" :
                                 job->kind == Kind::Report ? "report" : "read";
@@ -160,7 +168,8 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
     return count;
 }
 
-bool submit(Kind kind, String &&body, uint32_t &id) {
+bool submit(Kind kind, String &&body, uint32_t &id, SleepReport::Request report) {
+    if (kind == Kind::Report && !SleepReport::valid(report)) return false;
     if (!mutex || body.length() > MAX_BODY_SIZE || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
@@ -172,7 +181,8 @@ bool submit(Kind kind, String &&body, uint32_t &id) {
     }
     if (kind != Kind::Write && !mutation_pending) {
         for (Job &job : jobs) {
-            if (job.kind == kind && (job.state == Queued || job.state == Running)) {
+            if (job.kind == kind && (kind != Kind::Report || job.report == report) &&
+                (job.state == Queued || job.state == Running)) {
                 id = job.id;
                 xSemaphoreGive(mutex);
                 return true;
@@ -185,6 +195,7 @@ bool submit(Kind kind, String &&body, uint32_t &id) {
     }
     reset_job(*available);
     available->kind = kind;
+    available->report = report;
     available->body = std::move(body);
     available->id = next_id++;
     if (!next_id) next_id = 1;
@@ -228,10 +239,11 @@ int poll(uint32_t id, Result &result) {
     return code;
 }
 
-uint16_t timeout_ms() {
+uint16_t timeout_ms(uint32_t reserve_ms) {
     uint16_t limit = Config::get().uart_cmd_timeout_ms;
     if (xTaskGetCurrentTaskHandle() != task.load()) return limit;
     uint32_t elapsed = millis() - active_since;
-    return elapsed >= DEADLINE_MS ? 0 : min(uint32_t(limit), DEADLINE_MS - elapsed);
+    if (elapsed >= DEADLINE_MS || reserve_ms >= DEADLINE_MS - elapsed) return 0;
+    return min(uint32_t(limit), DEADLINE_MS - elapsed - reserve_ms);
 }
 }
