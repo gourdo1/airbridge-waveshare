@@ -1757,7 +1757,8 @@ function renderExports() {
   document.getElementById('syncUnavailable').hidden = supported;
   if (!supported) return;
   createSyncCards();
-  const busy = Object.keys(SYNC_ENDPOINTS).some(id => ['pending', 'working'].includes(data[id].state) || ['pending', 'working'].includes(data[id].check_state));
+  const blockedText = {sd_unavailable:'SD card unavailable', not_configured:'Configure this endpoint first',
+    not_idle:'Waiting for AirSense standby', offline:'Waiting for WiFi', unavailable:'Sync unavailable'};
   for (const id of Object.keys(SYNC_ENDPOINTS)) {
     const state = data[id];
     const card = document.getElementById(id + 'SyncCard');
@@ -1781,13 +1782,10 @@ function renderExports() {
       state.check_state === 'failed' ? state.check_error || 'Failed' :
       ['pending','working'].includes(state.check_state) ? 'Checking...' : '\u2014');
     const unavailable = !exportsFresh ? 'Status unavailable; reconnecting' :
-      !state.enabled ? '' : !data.sd_mounted ? 'SD card unavailable' :
-      !state.configured ? 'Configure this endpoint first' : !data.idle ? 'Waiting for AirSense standby' :
-      !data.online ? 'Waiting for WiFi' : '';
+      blockedText[state.sync_blocked] || '';
     text('availability', unavailable);
-    card.querySelector('[data-sync="start"]').disabled = !state.enabled || !!unavailable || busy || syncRequests.size > 0;
-    card.querySelector('[data-sync="check"]').disabled = !exportsFresh || !state.configured ||
-      !data.idle || !data.online || !data.sd_mounted || busy || syncRequests.size > 0;
+    card.querySelector('[data-sync="start"]').disabled = !exportsFresh || !!state.sync_blocked || syncRequests.size > 0;
+    card.querySelector('[data-sync="check"]').disabled = !exportsFresh || !!state.check_blocked || syncRequests.size > 0;
   }
 }
 

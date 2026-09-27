@@ -655,24 +655,27 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
 #if AB_STORAGE_HAS_SDCARD
 template <typename T>
 static void appendExportStatus(String &json, const T &status, bool enabled,
-                               bool configured, bool automatic, const char *endpoint) {
-    const bool active = status.state == ExportSync::State::Pending ||
-                        status.state == ExportSync::State::Working;
-    const auto state = active ? status.state : !enabled ? ExportSync::State::Disabled :
-        status.state == ExportSync::State::Disabled ? ExportSync::State::Idle : status.state;
+                               bool configured, bool automatic, const char *endpoint,
+                               bool smb, bool full) {
     json += '{';
-    jsonAddString(json, "state", ExportSync::state_name(state), false);
-    jsonAddBool(json, "enabled", enabled);
+    jsonAddString(json, "state", ExportSync::state_name(status.state), false);
     jsonAddBool(json, "configured", configured);
-    jsonAddBool(json, "automatic", automatic);
-    jsonAddString(json, "endpoint", endpoint);
+    if (full) {
+        jsonAddBool(json, "enabled", enabled);
+        jsonAddBool(json, "automatic", automatic);
+    }
+    if (smb || full) jsonAddString(json, "endpoint", endpoint);
+    jsonAddString(json, "sync_blocked", ExportSync::action_blocked(smb, false));
+    jsonAddString(json, "check_blocked", ExportSync::action_blocked(smb, true));
     jsonAddUInt32(json, "files_seen", status.files_seen);
     jsonAddUInt32(json, "files_uploaded", status.files_uploaded);
     jsonAddUInt32(json, "files_skipped", status.files_skipped);
-    char bytes[48];
-    snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
-             static_cast<unsigned long long>(status.bytes_uploaded));
-    json += bytes;
+    if (full) {
+        char bytes[48];
+        snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
+                 static_cast<unsigned long long>(status.bytes_uploaded));
+        json += bytes;
+    }
     jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
     jsonAddString(json, "current_day", status.current_day);
     jsonAddString(json, "error", status.last_error);
@@ -701,7 +704,7 @@ static ExportPublication exportPublication() {
 }
 #endif
 
-static String buildExportsJson() {
+static String buildExportsJson(bool full = true) {
 #if AB_STORAGE_HAS_SDCARD
     const auto published = exportPublication();
     ExportSync::Status smb;
@@ -710,17 +713,19 @@ static String buildExportsJson() {
     ExportSync::get_sleephq_status(sleephq);
     const auto &cfg = Config::get();
     String json = "{\"supported\":true";
-    jsonAddBool(json, "sd_mounted", published.mounted);
-    jsonAddBool(json, "idle", published.system == SYS_IDLE && published.rop == 0);
-    jsonAddBool(json, "online", published.online);
+    if (full) {
+        jsonAddBool(json, "sd_mounted", published.mounted);
+        jsonAddBool(json, "idle", published.system == SYS_IDLE && published.rop == 0);
+        jsonAddBool(json, "online", published.online);
+    }
     jsonAddUInt32(json, "config_revision", published.config);
     json += ",\"smb\":";
     appendExportStatus(json, smb, cfg.smb_enabled, !cfg.smb_endpoint.isEmpty(),
-                       cfg.smb_auto_after_therapy, cfg.smb_endpoint.c_str());
+                       cfg.smb_auto_after_therapy, cfg.smb_endpoint.c_str(), true, full);
     json += "},\"sleephq\":";
     appendExportStatus(json, sleephq, cfg.sleephq_enabled,
                        !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty(),
-                       cfg.sleephq_auto_after_therapy, "SleepHQ");
+                       cfg.sleephq_auto_after_therapy, "SleepHQ", false, full);
     jsonAddString(json, "team_id", cfg.sleephq_team_id.c_str());
     jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
     jsonAddUInt32(json, "import_id", sleephq.import_id);
@@ -749,9 +754,10 @@ static void publishExports() {
     if (!connected && current.config == last.config && current.sync == last.sync &&
         current.system == last.system && current.rop == last.rop &&
         current.mounted == last.mounted && current.online == last.online) return;
-    last = current;
-    const String json = buildExportsJson();
-    events->send(json.c_str(), "exports", millis());
+    const String json = buildExportsJson(false);
+    if (events->send(json.c_str(), "exports", millis()) == AsyncEventSource::ENQUEUED)
+        last = current;
+    else __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
 }
 #endif
 

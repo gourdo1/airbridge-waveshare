@@ -1082,10 +1082,17 @@ uint32_t revision() {
     return __atomic_load_n(&status_revision, __ATOMIC_ACQUIRE);
 }
 
+static State configured_state(State state, bool enabled) {
+    if (state == State::Pending || state == State::Working) return state;
+    if (!enabled) return State::Disabled;
+    return state == State::Disabled ? State::Idle : state;
+}
+
 void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
     portEXIT_CRITICAL(&status_mux);
+    out.state = configured_state(out.state, Config::get().smb_enabled);
     if (out.check.config_revision != Config::revision()) out.check = {};
     validate_backlog(out.backlog);
 }
@@ -1094,8 +1101,29 @@ void get_sleephq_status(SleepHqStatus &out) {
     portENTER_CRITICAL(&sleephq_status_mux);
     out = sleephq_status;
     portEXIT_CRITICAL(&sleephq_status_mux);
+    out.state = configured_state(out.state, Config::get().sleephq_enabled);
     if (out.check.config_revision != Config::revision()) out.check = {};
     validate_backlog(out.backlog);
+}
+
+const char *action_blocked(bool smb, bool check) {
+    const auto &cfg = Config::get();
+    if (!check && !(smb ? cfg.smb_enabled : cfg.sleephq_enabled)) return "disabled";
+    if (!SdStorage::mounted()) return "sd_unavailable";
+    bool configured = smb ? !cfg.smb_endpoint.isEmpty() :
+        !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty();
+    if (!configured) return "not_configured";
+    if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return "not_idle";
+    if (WiFi.status() != WL_CONNECTED) return "offline";
+    if (!request_queue) return "unavailable";
+    portENTER_CRITICAL(&status_mux);
+    bool busy = status.state == State::Pending || status.state == State::Working;
+    portEXIT_CRITICAL(&status_mux);
+    portENTER_CRITICAL(&sleephq_status_mux);
+    busy |= sleephq_status.state == State::Pending || sleephq_status.state == State::Working;
+    portEXIT_CRITICAL(&sleephq_status_mux);
+    if (busy || __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
+    return nullptr;
 }
 
 }  // namespace ExportSync
@@ -1103,6 +1131,8 @@ void get_sleephq_status(SleepHqStatus &out) {
 #else
 
 namespace ExportSync {
+
+const char *action_blocked(bool, bool) { return "unsupported"; }
 
 const char *state_name(State) { return "unsupported"; }
 void init() {}

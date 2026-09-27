@@ -72,6 +72,7 @@ void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
+const char *action_blocked(bool smb, bool check);
 const char *state_name(State state);
 const char *check_state_name(CheckState state);
 
