@@ -927,11 +927,11 @@ static void arbiter_task(void *param) {
 }
 
 
-void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud) {
+void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin) {
     uart = &serial;
     uart->setRxBufferSize(RX_BUF_SIZE);
-    uart->begin(baud, SERIAL_8N1, rx_pin, tx_pin);
-    current_baud = baud;
+    uart->begin(RESMED_DEFAULT_BAUD, SERIAL_8N1, rx_pin, tx_pin);
+    current_baud = RESMED_DEFAULT_BAUD;
 
     rx_ready = xSemaphoreCreateBinary();
     pq_init();

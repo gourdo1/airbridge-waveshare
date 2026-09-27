@@ -60,7 +60,7 @@ struct uart_transaction_t;
 typedef int8_t uart_frame_listener_t;
 
 namespace Arbiter {
-    void init(HardwareSerial &serial, int rx_pin, int tx_pin, uint32_t baud);
+    void init(HardwareSerial &serial, int rx_pin, int tx_pin);
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                   char *resp_buf, uint16_t *resp_len,

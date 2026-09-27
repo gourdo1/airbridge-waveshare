@@ -10,7 +10,6 @@
 #include <lwip/inet.h>
 
 #define CFG_DEFAULT_TCP_PORT    23
-#define CFG_DEFAULT_BAUD        57600
 
 static Preferences prefs;
 static AirBridgeConfig cfg;
@@ -29,7 +28,7 @@ static const struct {
     {Config::Section::Access, "access", "Web access"},
     {Config::Section::Time, "time", "Time"},
     {Config::Section::Oximetry, "oximetry", "Oximetry"},
-    {Config::Section::Uart, "uart", "AirSense UART"},
+    {Config::Section::Uart, "uart", "UART"},
     {Config::Section::Smb, "smb", "SMB"},
     {Config::Section::SleepHq, "sleephq", "SleepHQ"},
     {Config::Section::Updates, "updates", "Firmware updates"},
@@ -39,7 +38,7 @@ static const struct {
 struct KVEntry {
     const char *key;
     const char *nvs_key;
-    enum { STR, U8, U16, U32, BOOL } type;
+    enum { STR, U8, U16, BOOL } type;
     void *ptr;
     union Default {
         const char *text;
@@ -55,7 +54,6 @@ struct KVEntry {
 #define KV_SECRET(k, n, f, d, s) {k, n, KVEntry::STR, &cfg.f, {d}, true, Config::Section::s}
 #define KV_U8(k, n, f, d, s) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 #define KV_U16(k, n, f, d, s) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
-#define KV_U32(k, n, f, d, s) {k, n, KVEntry::U32, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 // Choice labels are used at build time, not retained in firmware RAM.
 #define KV_ENUM(k, n, f, d, s, ...) KV_U8(k, n, f, d, s)
 #define KV_BOOL(k, n, f, d, s, ...) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
@@ -69,12 +67,10 @@ static const KVEntry kv_table[] = {
     KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true, Oximetry),
     KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true, Oximetry),
     KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false, Oximetry),
-    KV_ENUM("oxi_device_type", "oxi_devtype", oxi_device_type, 0, Oximetry, "0=Auto", "1=Nonin", "2=O2Ring", "3=PLX", "4=WS20A"),
     KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, "", Oximetry),
     KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
     KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
     KV_BOOL("oxi_require_known", "oxi_req_known", oxi_require_known, false, Oximetry),
-    KV_U32("uart_baud", "uart_baud", uart_baud, CFG_DEFAULT_BAUD, Uart),
     KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500, Uart),
     KV_U8("uart_max_retries", "uart_retries", uart_max_retries, 3, Uart),
     KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false, Uart),
@@ -90,7 +86,6 @@ static const KVEntry kv_table[] = {
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
     KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025, Oximetry),
-    KV_ENUM("mitm_mode", "mitm_mode", mitm_mode, 0, Uart, "0=Off", "1=Forward", "2=Log", "3=Filter"),
     KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false, Smb),
     KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb, "0=Manual", "1=Automatic"),
     KV_STR("smb_endpoint", "smb_ep", smb_endpoint, "", Smb),
@@ -110,7 +105,6 @@ static void reset_value(const KVEntry &entry) {
         case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
         case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
         case KVEntry::U16:  *(uint16_t *)entry.ptr = entry.initial.number; break;
-        case KVEntry::U32:  *(uint32_t *)entry.ptr = entry.initial.number; break;
         case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
     }
 }
@@ -245,11 +239,6 @@ static bool load_values() {
                 value = prefs.getUShort(entry.nvs_key, value);
                 break;
             }
-            case KVEntry::U32: {
-                auto &value = *(uint32_t *)entry.ptr;
-                value = prefs.getULong(entry.nvs_key, value);
-                break;
-            }
             case KVEntry::BOOL: {
                 auto &value = *(bool *)entry.ptr;
                 value = prefs.getBool(entry.nvs_key, value);
@@ -283,7 +272,6 @@ static esp_err_t store_value(nvs_handle_t handle, const KVEntry &entry) {
         case KVEntry::STR: return nvs_set_str(handle, entry.nvs_key, ((String *)entry.ptr)->c_str());
         case KVEntry::U8: return nvs_set_u8(handle, entry.nvs_key, *(uint8_t *)entry.ptr);
         case KVEntry::U16: return nvs_set_u16(handle, entry.nvs_key, *(uint16_t *)entry.ptr);
-        case KVEntry::U32: return nvs_set_u32(handle, entry.nvs_key, *(uint32_t *)entry.ptr);
         case KVEntry::BOOL: return nvs_set_u8(handle, entry.nvs_key, *(bool *)entry.ptr);
     }
     return ESP_ERR_INVALID_ARG;
@@ -378,7 +366,6 @@ static void format_value(const KVEntry &entry, String &out) {
         case KVEntry::STR:  out = *(String *)entry.ptr; break;
         case KVEntry::U8:   out = String(*(uint8_t *)entry.ptr); break;
         case KVEntry::U16:  out = String(*(uint16_t *)entry.ptr); break;
-        case KVEntry::U32:  out = String(*(uint32_t *)entry.ptr); break;
         case KVEntry::BOOL: out = *(bool *)entry.ptr ? "1" : "0"; break;
     }
 }
@@ -418,7 +405,6 @@ bool Config::set_value(const char *key, const char *value) {
             case KVEntry::STR:  *(String*)entry.ptr = value; break;
             case KVEntry::U8:   *(uint8_t*)entry.ptr = atoi(value); break;
             case KVEntry::U16:  *(uint16_t*)entry.ptr = atoi(value); break;
-            case KVEntry::U32:  *(uint32_t*)entry.ptr = atol(value); break;
             case KVEntry::BOOL: *(bool*)entry.ptr = (atoi(value) != 0); break;
             }
             return true;

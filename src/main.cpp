@@ -314,7 +314,7 @@ void setup() {
     SdStorage::init();
     CustomSettings::init();
 
-    Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX, Config::get().uart_baud);
+    Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX);
     Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] UART arbiter started\n");
 
     bool wifi_ok = WiFiSetup::init();

@@ -119,7 +119,6 @@ only while therapy is inactive.
 | `oxi_enabled` | true | Enable BLE oximeter support |
 | `oxi_auto_start` | true | Start feeding data automatically on connect |
 | `oxi_feed_therapy_only` | false | Only inject readings during active therapy |
-| `oxi_device_type` | 0 | Compatibility setting; leave at 0 for auto-detect |
 | `oxi_device_addr` | *(empty)* | Preferred oximeter MAC (AA:BB:CC:DD:EE:FF) |
 | `oxi_interval_ms` | 500 | Injection interval in milliseconds |
 | `oxi_lframe_continuous` | true | Send L-frames even when no valid reading (keeps link alive) |
@@ -133,7 +132,6 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `uart_baud` | 57600 | AirSense UART baud rate (don't change unless you know what you're doing) |
 | `uart_cmd_timeout_ms` | 500 | Command response timeout |
 | `uart_max_retries` | 3 | Retry count for failed commands |
 
@@ -150,7 +148,6 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 | Key | Default | Description |
 |-----|---------|-------------|
 | `allow_transparent_during_therapy` | false | Allow raw UART passthrough during therapy |
-| `mitm_mode` | 0 | 0 = off, 1 = forward, 2 = log, 3 = filter |
 
 ## CLI commands
 

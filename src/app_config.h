@@ -30,13 +30,11 @@ struct AirBridgeConfig {
     bool        oxi_enabled;
     bool        oxi_auto_start;
     bool        oxi_feed_therapy_only;
-    uint8_t     oxi_device_type;    // 0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A
     String      oxi_device_addr;
     uint16_t    oxi_interval_ms;
     bool        oxi_lframe_continuous; // send L-frames even when no valid reading
     bool        oxi_require_known;     // only auto-connect to bonded/known devices
 
-    uint32_t    uart_baud;
     uint16_t    uart_cmd_timeout_ms;
     uint8_t     uart_max_retries;
 
@@ -58,8 +56,6 @@ struct AirBridgeConfig {
     String      tz;                 // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
 
     uint16_t    udp_oxi_port;       // UDP oximetry port, 0=disabled
-
-    uint8_t     mitm_mode;          // 0=off, 1=forward, 2=log, 3=filter
 
     bool        smb_enabled;
     bool        smb_auto_after_therapy;
