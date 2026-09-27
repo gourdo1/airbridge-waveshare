@@ -431,7 +431,8 @@ void handle() {
         blocked = start_blocked();
         if (blocked != last_blocked) {
             last_blocked = blocked;
-            status_revision.fetch_add(1);
+            if (runtime.enabled && runtime.operation == OP_NONE && !runtime.reboot_pending)
+                status_revision.fetch_add(1);
         }
         unlock();
     }

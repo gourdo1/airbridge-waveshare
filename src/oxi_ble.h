@@ -51,7 +51,7 @@ namespace OxiBle {
     bool restore_memory(uint32_t timeout_ms);
 
     oxi_state_t get_state();
-    uint32_t revision();  // State, completed scans and known-device changes.
+    uint32_t revision();  // Completed scans and known-device changes, not link state.
 
     void task(void *param);
 

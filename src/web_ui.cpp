@@ -1612,7 +1612,7 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
 
 static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     String json = "{";
-    json.reserve(512);
+    json.reserve(full ? 512 : 96);
     jsonAddString(json, "state", OtaManager::state_name(status.state), false);
     jsonAddUInt32(json, "revision", status.revision);
     if (status.state == OtaManager::State::Installing ||

@@ -52,7 +52,6 @@ static std::atomic<uint32_t> status_revision{0};
 static inline void set_state(oxi_state_t s) {
     if (state == s) return;
     state = s;
-    status_revision.fetch_add(1);
 }
 static volatile bool scan_requested = false;
 static volatile bool active_scan_requested = false;

@@ -675,7 +675,6 @@ function initSSE() {
   evtSrc.addEventListener('exports', e => {
     try {
       const data = JSON.parse(e.data);
-      exportsSerial++;
       applyExports(data);
     } catch(ex) { console.error(ex); }
   });
@@ -705,7 +704,6 @@ function initSSE() {
     otaSerial++;
     otaStatus = null;
     exportsSnapshot = null;
-    exportsSerial++;
     bleLoadedRevision = null;
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
@@ -718,8 +716,10 @@ const statusPush = {};
 let uiStarted = false;
 function applyConfigRevision(d) {
   if (d.config_revision !== undefined && lastStatus.config_revision !== undefined &&
-      d.config_revision !== lastStatus.config_revision)
+      d.config_revision !== lastStatus.config_revision) {
     document.querySelectorAll('[data-config-form]').forEach(root => { root.dataset.stale = '1'; });
+    bleLoadedRevision = null;
+  }
 }
 function updateStatusFromPush(d) {
   statusSerial++;
@@ -738,32 +738,33 @@ function updateBleFromPush(d) {
   if (d.ble_revision !== undefined) bleRevision = d.ble_revision;
   // Update dashboard oxi card from any push
   var st = d.oxi || d.state;
-  if (st) {
+  const dashboard = document.getElementById('p-status').classList.contains('active');
+  if (st && dashboard) {
     var b = document.getElementById('dashOxiBadge');
     if (b) {
       b.textContent = st;
       b.className = 'badge ' + (st === 'STREAMING' ? 'badge-streaming' : st === 'DISCONNECTED' ? 'badge-idle' : 'badge-idle');
     }
   }
-  if (d.oxi_addr !== undefined) {
+  if (d.oxi_addr !== undefined && dashboard) {
     var oa = document.getElementById('dashOxiAddr');
     if (oa) {
       if (d.oxi_addr) { oa.textContent = d.oxi_addr; oa.style.display = ''; }
       else { oa.style.display = 'none'; }
     }
   }
-  if (d.feeding !== undefined) {
+  if (d.feeding !== undefined && dashboard) {
     var fb = document.getElementById('dashFeedBadge');
     if (fb) {
       fb.textContent = 'Feed: ' + d.feeding;
       fb.className = 'badge ' + (d.feeding === 'yes' ? 'badge-feed' : 'badge-idle');
     }
   }
-  if (d.spo2 !== undefined) {
+  if (d.spo2 !== undefined && dashboard) {
     var s = document.getElementById('dashSpo2');
     if (s) s.textContent = d.spo2 >= 0 ? d.spo2 : '--';
   }
-  if (d.pulse !== undefined) {
+  if (d.pulse !== undefined && dashboard) {
     var p = document.getElementById('dashPulse');
     if (p) p.textContent = d.pulse >= 0 ? d.pulse : '--';
   }
@@ -786,6 +787,21 @@ function updateBleFromPush(d) {
   }
   var sp = document.getElementById('bleScanSpinner');
   if (sp && st) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
+  if (d.feeding !== undefined) {
+    const feed = document.getElementById('btnFeed');
+    feed.textContent = d.feeding === 'yes' ? 'Stop Feed' : 'Start Feed';
+    feed.onclick = () => bleAction(lastStatus.feeding === 'yes' ? 'stop_feed' : 'start_feed');
+  }
+  if (st) document.getElementById('btnOxiToggle').textContent = st === 'DISABLED' ? 'Enable' : 'Disable';
+  if (st || d.oxi_addr !== undefined) {
+    const connected = ['STREAMING', 'BONDING'].includes(lastStatus.oxi);
+    const address = (lastStatus.oxi_addr || '').toLowerCase();
+    document.querySelectorAll('#bleDevices [data-addr]').forEach(row => {
+      const active = connected && row.dataset.addr === address;
+      row.querySelector('button').hidden = active;
+      row.querySelector('.badge').hidden = !active;
+    });
+  }
 }
 
 function appendLiveSamples(d, reset = false) {
@@ -1713,8 +1729,6 @@ async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
 
 const SYNC_ENDPOINTS = {smb: 'SMB', sleephq: 'SleepHQ'};
 let exportsSnapshot = null;
-let exportsRead = null;
-let exportsSerial = 0;
 let exportsFresh = false;
 const syncRequests = new Set();
 
@@ -1975,31 +1989,6 @@ function applyExports(data) {
   renderExports(data);
 }
 
-async function loadExports() {
-  if (exportsRead) return exportsRead;
-  const serial = exportsSerial;
-  exportsRead = (async () => {
-    try {
-      const response = await api('/api/export');
-      if (!response) return false;
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Sync status read failed');
-      if (serial === exportsSerial) applyExports(data);
-      return true;
-    } catch(e) {
-      if (serial === exportsSerial) {
-        exportsFresh = false;
-        renderExports();
-        showMsg(document.getElementById('syncMsg'), e.message, 'err');
-      }
-      return false;
-    } finally {
-      exportsRead = null;
-    }
-  })();
-  return exportsRead;
-}
-
 async function startSync(id, check = false) {
   if (syncRequests.size) return;
   syncRequests.add(id);
@@ -2066,12 +2055,15 @@ function toggleOxi() {
 function loadBle() {
   if (bleRead) return bleRead;
   const revision = bleRevision;
+  const configRevision = lastStatus.config_revision;
   bleRead = (async () => {
   try {
     const r = await api('/api/ble', undefined, 5000); if (!r) return null;
     if (!r.ok) throw new Error('Oximetry status read failed');
     const d = await r.json();
-    if (revision !== bleRevision) return;
+    if (revision !== bleRevision || configRevision !== lastStatus.config_revision) return;
+    Object.assign(d, {state:lastStatus.oxi, feeding:lastStatus.feeding,
+      spo2:lastStatus.spo2, pulse:lastStatus.pulse});
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
     const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
     for (const [k,v] of Object.entries(fields)) {
@@ -2096,13 +2088,16 @@ function loadBle() {
       var isConn = connAddr && (d.state === 'STREAMING' || d.state === 'BONDING');
       d.devices.forEach(dev => {
         const row = document.createElement('div'); row.className = 'row';
+        row.dataset.addr = dev.addr.toLowerCase();
         var active = isConn && dev.addr.toLowerCase() === connAddr;
         row.innerHTML = '<label><strong></strong><br><small style="color:var(--text-dim)"></small></label>' +
-          (active ? '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>'
-                  : '<button class="btn btn-accent">Connect</button>');
+          '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>' +
+          '<button class="btn btn-accent">Connect</button>';
         row.querySelector('strong').textContent = dev.name || 'Unknown';
         row.querySelector('small').textContent = dev.addr + ' (' + dev.rssi + ' dBm)';
-        if (!active) row.querySelector('button').onclick = () => bleConnect(dev.addr);
+        row.querySelector('button').hidden = active;
+        row.querySelector('.badge').hidden = !active;
+        row.querySelector('button').onclick = () => bleConnect(dev.addr);
         dl.appendChild(row);
       });
     } else {
@@ -2110,8 +2105,8 @@ function loadBle() {
     }
     // Update dashboard oxi address
     var oa = document.getElementById('dashOxiAddr');
-    if (oa && d.configured_addr) {
-      oa.textContent = d.configured_addr;
+    if (oa && lastStatus.oxi_addr) {
+      oa.textContent = lastStatus.oxi_addr;
       oa.style.display = '';
     }
     const bl = document.getElementById('bleBonds'); bl.innerHTML = '';
@@ -2131,7 +2126,8 @@ function loadBle() {
   } catch(e) { console.error(e); }
   })().finally(() => {
     bleRead = null;
-    if (revision !== bleRevision && document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
+    if ((revision !== bleRevision || configRevision !== lastStatus.config_revision) &&
+        document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
   });
   return bleRead;
 }
@@ -2187,7 +2183,7 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
 });
 
 let otaStatusTimer = null;
-let otaRead = null, otaStatus = null, otaWatch = null, otaSerial = 0;
+let otaStatus = null, otaWatch = null, otaSerial = 0;
 
 function renderOtaStatus(d) {
   var version = document.getElementById('espFwVer');
@@ -2225,9 +2221,9 @@ function renderOtaStatus(d) {
 }
 
 function applyOtaStatus(d) {
-  if (otaStatus && d.revision < otaStatus.revision) return;
+  if (otaStatus && d.revision <= otaStatus.revision) { finishOtaObservation(); return; }
   otaStatus = d;
-  renderOtaStatus(d);
+  if (document.getElementById('p-ota').classList.contains('active')) renderOtaStatus(d);
   finishOtaObservation();
 }
 
@@ -2246,26 +2242,6 @@ function finishOtaObservation() {
   } else return;
   clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
   showMsg(document.getElementById('otaReleaseMsg'), message, type, 0);
-}
-
-function loadOtaStatus() {
-  if (otaRead) return otaRead;
-  const serial = otaSerial;
-  otaRead = (async () => {
-  try {
-    var r = await api('/api/ota', undefined, 5000);
-    if (!r) {
-      clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
-      return null;
-    }
-    if (!r.ok) throw new Error('Update status read failed');
-    var d = await r.json();
-    if (serial !== otaSerial) return otaStatus;
-    applyOtaStatus(d);
-    return d;
-  } catch(e) { return null; }
-  })().finally(() => { otaRead = null; });
-  return otaRead;
 }
 
 function watchOta(restarting, baseline) {
