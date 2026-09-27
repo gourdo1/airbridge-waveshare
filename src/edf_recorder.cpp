@@ -211,7 +211,7 @@ static void status_error(const char *message, const char *file = nullptr) {
             sizeof(status.last_error) - 1);
     status.last_error[sizeof(status.last_error) - 1] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_EDF, LOG_ERROR, "[EDF] %s%s%s\n",
+    Log::logf(CAT_EDF, LOG_ERROR, "%s%s%s\n",
               file ? file : "", file ? ": " : "", message ? message : "error");
 }
 
@@ -222,7 +222,7 @@ static void post_error(const char *message) {
             sizeof(status.last_error) - 1);
     status.last_error[sizeof(status.last_error) - 1] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_EDF, LOG_ERROR, "[EDF] %s\n",
+    Log::logf(CAT_EDF, LOG_ERROR, "%s\n",
               message ? message : "post-processing error");
 }
 
@@ -336,7 +336,7 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
         }
         if (attempt + 1 < attempts) {
             Log::logf(CAT_EDF, LOG_DEBUG,
-                      "[EDF] STR retry %s day=%04X attempt=%u/%u\n",
+                      "STR retry %s day=%04X attempt=%u/%u\n",
                       tag, epoch_day, attempt + 2, attempts);
         }
     }
@@ -476,7 +476,7 @@ static void fallback_schemas(uint16_t mid, uint16_t vid) {
 
     if (!profile) {
         Log::logf(CAT_EDF, LOG_WARN,
-                  "[EDF] unknown MID=%04X VID=%04X, using common AirSense schema\n",
+                  "unknown MID=%04X VID=%04X, using common AirSense schema\n",
                   mid, vid);
     }
 }
@@ -505,7 +505,7 @@ static void resolve_schemas(uint16_t mid, uint16_t vid) {
         if (query_schema(queried, tags[i])) {
             stream_schemas[i] = queried;
             Log::logf(CAT_EDF, LOG_INFO,
-                      "[EDF] %s schema from firmware (%u fields)\n",
+                      "%s schema from firmware (%u fields)\n",
                       tags[i], queried.field_count);
         }
     }
@@ -602,7 +602,7 @@ static bool publish_single_file(const char *partial_path,
     }
     if (had_final && !storage->remove(backup_path)) {
         Log::logf(CAT_EDF, LOG_WARN,
-                  "[EDF] could not remove metadata backup %s\n", backup_path);
+                  "could not remove metadata backup %s\n", backup_path);
     }
     return true;
 }
@@ -801,7 +801,7 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
         if (!read_variable(tag, value, sizeof(value), 1000) ||
             strchr(value, '\r') || strchr(value, '\n')) {
             Log::logf(CAT_EDF, LOG_WARN,
-                      "[EDF] Identification read failed for %s\n", tag);
+                      "Identification read failed for %s\n", tag);
             built = false;
             break;
         }
@@ -906,7 +906,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
             value = therapy_duration;
         } else if (!read_stored_value(tag, session_native_day, value)) {
             Log::logf(CAT_EDF, LOG_WARN,
-                      "[EDF] STR read failed for %s day=%04X\n",
+                      "STR read failed for %s day=%04X\n",
                       tag, session_native_day);
             complete = false;
             break;
@@ -919,7 +919,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         if (!value.present) {
             if (strcmp(tag, "LSD") == 0 || strcmp(tag, "THD") == 0) {
                 Log::logf(CAT_EDF, LOG_WARN,
-                          "[EDF] required STR value missing for %s day=%04X\n",
+                          "required STR value missing for %s day=%04X\n",
                           tag, session_native_day);
                 complete = false;
                 break;
@@ -929,7 +929,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         }
         if (value.sample_count != expected) {
             Log::logf(CAT_EDF, LOG_WARN,
-                      "[EDF] STR value invalid for %s day=%04X count=%u\n",
+                      "STR value invalid for %s day=%04X count=%u\n",
                       tag, session_native_day, value.sample_count);
             complete = false;
             break;
@@ -937,7 +937,7 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         if (strcmp(tag, "LSD") == 0 &&
             static_cast<uint16_t>(value.samples[0]) != session_native_day) {
             Log::logf(CAT_EDF, LOG_WARN,
-                      "[EDF] STR date mismatch wanted=%04X got=%04X\n",
+                      "STR date mismatch wanted=%04X got=%04X\n",
                       session_native_day,
                       static_cast<uint16_t>(value.samples[0]));
             complete = false;
@@ -1297,7 +1297,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
         return false;
     }
     Log::logf(CAT_EDF, LOG_INFO,
-              "[EDF] STR timeline %04X-%04X records=%u fillers=%u "
+              "STR timeline %04X-%04X records=%u fillers=%u "
               "replaced=%u discarded=%u\n",
               plan.start_day, plan.end_day, plan.record_count,
               build_stats.filler_records, build_stats.replaced_records,
@@ -1408,7 +1408,7 @@ static bool recover_partial_output(const char *partial_path) {
     }
     if (storage->exists(final_path)) {
         Log::logf(CAT_EDF, LOG_WARN,
-                  "[EDF] keeping partial with final-file collision: %s\n",
+                  "keeping partial with final-file collision: %s\n",
                   partial_path);
         return false;
     }
@@ -1516,7 +1516,7 @@ static bool recover_partial_output(const char *partial_path) {
         }
         if (!storage->remove(partial_path)) {
             Log::logf(CAT_EDF, LOG_WARN,
-                      "[EDF] recovered but could not remove %s\n", partial_path);
+                      "recovered but could not remove %s\n", partial_path);
         }
         recovered = true;
     } while (false);
@@ -1536,7 +1536,7 @@ static bool recover_partial_output(const char *partial_path) {
     portENTER_CRITICAL(&status_mux);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_EDF, LOG_INFO,
-              "[EDF] recovered %s (%u records)\n", final_path, records);
+              "recovered %s (%u records)\n", final_path, records);
     return true;
 }
 
@@ -1726,7 +1726,7 @@ static bool reconcile_catalog() {
                 known_count++;
             }
             Log::logf(CAT_EDF, LOG_INFO,
-                      "[EDF] catalog recovered %s/%s\n",
+                      "catalog recovered %s/%s\n",
                       entry.therapy_day, entry.file_prefix);
         }
         day.close();
@@ -2133,7 +2133,7 @@ static void acquire_stream(uint8_t slot, const char *tag) {
     if (!schema || !schema->field_count) return;
     stream_leases[slot] = LiveStream::acquire_internal(tag);
     if (stream_leases[slot] < 0)
-        Log::logf(CAT_EDF, LOG_WARN, "[EDF] %s subscribe failed\n", tag);
+        Log::logf(CAT_EDF, LOG_WARN, "%s subscribe failed\n", tag);
 }
 
 static void acquire_streams() {
@@ -2386,7 +2386,7 @@ static void start_session(const ControlEvent &event) {
     publish_progress(true, true);
     acquire_streams();
     Log::logf(CAT_EDF, LOG_INFO,
-              "[EDF] recording %s/%s MID=%u VID=%u\n",
+              "recording %s/%s MID=%u VID=%u\n",
               status.therapy_day, status.file_prefix, mid, vid);
 }
 
@@ -2422,10 +2422,10 @@ static void close_segment() {
     EdfCatalog::Entry catalog_entry;
     complete = commit_session_catalog(false, false, catalog_entry) && complete;
     Log::logf(CAT_EDF, !complete ? LOG_ERROR : finished.raw_dropped ? LOG_WARN : LOG_INFO,
-              "[EDF] %s %s drops=%u\n",
+              "%s %s drops=%u\n",
               !complete ? "incomplete" : finished.raw_dropped ? "complete with gaps" : "complete",
               finished.file_prefix, finished.raw_dropped);
-    Log::logf(CAT_EDF, LOG_DEBUG, "[EDF] records BRP=%u PLD=%u SAD=%u EVE=%u CSL=%u\n",
+    Log::logf(CAT_EDF, LOG_DEBUG, "records BRP=%u PLD=%u SAD=%u EVE=%u CSL=%u\n",
               finished.brp_records, finished.pld_records,
               finished.sad_records, finished.eve_records, finished.csl_records);
 }
@@ -2461,7 +2461,7 @@ static bool advance_segment(uint32_t captured_ms) {
     reset_session_state(event, true);
     progress_live = true;
     publish_progress(true, true);
-    Log::logf(CAT_EDF, LOG_INFO, "[EDF] noon rollover %s/%s\n",
+    Log::logf(CAT_EDF, LOG_INFO, "noon rollover %s/%s\n",
               status.therapy_day, status.file_prefix);
     return true;
 }
@@ -2557,7 +2557,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
             summary_export_pending = true;
         }
         if (success && summary_ready && !record)
-            Log::logf(CAT_EDF, LOG_INFO, "[EDF] no stored STR for day=%04X ZEN=%lu\n",
+            Log::logf(CAT_EDF, LOG_INFO, "no stored STR for day=%04X ZEN=%lu\n",
                       day, static_cast<unsigned long>(generation));
     } else {
         success = false;
@@ -2836,7 +2836,7 @@ void init() {
     status.ready = true;
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_EDF, LOG_INFO,
-              "[EDF] recorder ready queue=%u (%s)\n",
+              "recorder ready queue=%u (%s)\n",
               raw_queue_capacity,
               raw_queue_capacity == RAW_QUEUE_CAPACITY_PSRAM ? "PSRAM" : "internal");
 }

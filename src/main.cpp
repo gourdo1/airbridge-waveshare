@@ -158,7 +158,7 @@ static void poll_device_uptime() {
     if (!DeviceUptime::parse(response, ticks) ||
         !device_uptime.observe(ticks, millis())) return;
 
-    Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] AirSense restart detected by STK\n");
+    Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
     Config::invalidate_device_info();
     publish_device_time("--");
     CustomSettings::invalidate("STK reset");
@@ -209,7 +209,7 @@ static void poll_therapy_state() {
     char resp[64] = {};
 
     uint32_t t0 = millis();
-    Log::logf(CAT_HEALTH, LOG_DEBUG, "[HEALTH] ROP poll start t=%lu\n", t0);
+    Log::logf(CAT_HEALTH, LOG_DEBUG, "ROP poll start t=%lu\n", t0);
     bool ok = Arbiter::get_var("ROP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
                                resp, sizeof(resp), HEALTH_TIMEOUT_MS);
     if (ok) {
@@ -230,11 +230,11 @@ static void poll_therapy_state() {
             system_state_t current = Arbiter::get_state();
             if (new_rop == 1 && current == SYS_IDLE) {
                 Arbiter::set_state(SYS_THERAPY);
-                Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy started\n");
+                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy started\n");
                 ExportSync::therapy_started();
             } else if (new_rop == 0 && current == SYS_THERAPY) {
                 Arbiter::set_state(SYS_IDLE);
-                Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Therapy ended\n");
+                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
                 EdfRecorder::therapy_ended();
                 Air10Clock::request_sync();
                 poll_mhr();
@@ -248,7 +248,7 @@ static void poll_therapy_state() {
         airsense_present = false;
         consecutive_timeouts++;
         Log::logf(CAT_HEALTH, consecutive_timeouts >= 2 ? LOG_WARN : LOG_DEBUG,
-                  "[HEALTH] ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
+                  "ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
                   consecutive_timeouts, millis(), millis() - t0);
 
         if (consecutive_timeouts >= 3) {
@@ -257,7 +257,7 @@ static void poll_therapy_state() {
                 current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
                 if (current == SYS_THERAPY) EdfRecorder::therapy_ended();
                 Arbiter::set_state(SYS_ERROR);
-                Log::logf(CAT_HEALTH, LOG_ERROR, "[HEALTH] UART unresponsive, entering ERROR state\n");
+                Log::logf(CAT_HEALTH, LOG_ERROR, "UART unresponsive, entering ERROR state\n");
             }
         }
     }
@@ -274,7 +274,7 @@ static void attempt_recovery() {
     bool ok = Arbiter::get_var("BLS", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
                                resp, sizeof(resp));
     if (ok) {
-        Log::logf(CAT_HEALTH, LOG_INFO, "[HEALTH] Device responded, clearing error\n");
+        Log::logf(CAT_HEALTH, LOG_INFO, "Device responded, clearing error\n");
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
         Config::invalidate_device_info();

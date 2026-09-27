@@ -72,10 +72,10 @@ static void inject_lframe() {
 
     if (current.valid != last_valid) {
         if (current.valid)
-            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Finger detected: SpO2=%d%% HR=%d bpm (%s)\n",
+            Log::logf(CAT_OXI, LOG_INFO, "Finger detected: SpO2=%d%% HR=%d bpm (%s)\n",
                       current.spo2, current.pulse_bpm, src_name(current_source));
         else
-            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Finger lost\n");
+            Log::logf(CAT_OXI, LOG_INFO, "Finger lost\n");
         last_valid = current.valid;
     }
 
@@ -103,7 +103,7 @@ static void inject_lframe() {
              oxh_seq, oxs, hrr, sas, sar);
     oxh_seq = (oxh_seq + 1) & 0xFF;
 
-    Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] L-frame seq=%02X %s SpO2=%d HR=%d t=%lu\n",
+    Log::logf(CAT_OXI, LOG_DEBUG, "L-frame seq=%02X %s SpO2=%d HR=%d t=%lu\n",
               (oxh_seq - 1) & 0xFF, current.valid ? "valid" : "no-finger",
               current.spo2, current.pulse_bpm, millis());
 
@@ -163,9 +163,9 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
     portEXIT_CRITICAL(&reading_mux);
 
     if (source_claimed) {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source active: %s\n", src_name(src));
+        Log::logf(CAT_OXI, LOG_INFO, "Source active: %s\n", src_name(src));
         if (feed_started)
-            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding started\n");
+            Log::logf(CAT_OXI, LOG_INFO, "Feeding started\n");
         Arbiter::lcd_message("Oximeter Connected", 15000);
     }
 }
@@ -174,7 +174,7 @@ void OxiArbiter::start_feed() {
     portENTER_CRITICAL(&reading_mux);
     feeding = true;
     portEXIT_CRITICAL(&reading_mux);
-    Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding started\n");
+    Log::logf(CAT_OXI, LOG_INFO, "Feeding started\n");
 }
 
 void OxiArbiter::stop_feed(oxi_source_t source) {
@@ -185,7 +185,7 @@ void OxiArbiter::stop_feed(oxi_source_t source) {
     }
     feeding = false;
     portEXIT_CRITICAL(&reading_mux);
-    Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding stopped\n");
+    Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped\n");
 }
 
 bool OxiArbiter::is_feeding() {
@@ -240,10 +240,10 @@ void OxiArbiter::poll() {
     }
     portEXIT_CRITICAL(&reading_mux);
     if (timed_out_source != OXI_SRC_NONE) {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] Source %s timed out\n",
+        Log::logf(CAT_OXI, LOG_INFO, "Source %s timed out\n",
                   src_name(timed_out_source));
         if (feed_stopped)
-            Log::logf(CAT_OXI, LOG_INFO, "[OXI] Feeding stopped after source timeout\n");
+            Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped after source timeout\n");
     }
 
     // inject at configured interval

@@ -377,7 +377,7 @@ static void handle_transparent() {
     Arbiter::exit_transparent();
     if (!output_ok) {
         client.stop();
-        Log::logf(CAT_TCP, LOG_WARN, "[TCP] Transparent output failed\n");
+        Log::logf(CAT_TCP, LOG_WARN, "Transparent output failed\n");
     } else if (client.connected()) {
         client.println("OK: transparent mode exited");
     }
@@ -399,7 +399,7 @@ static void handle_framed() {
 
     framed_stream_count = 0;
     client.println("OK: entering framed arbiter mode");
-    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Framed arbiter mode entered\n");
+    Log::logf(CAT_TCP, LOG_INFO, "Framed arbiter mode entered\n");
 
     qframe_parser_t parser;
     qframe_parser_init(&parser);
@@ -521,7 +521,7 @@ static void handle_framed() {
     Arbiter::remove_frame_listener(listener);
     framed_release_streams();
     framed_queue_shutdown();
-    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Framed arbiter mode exited\n");
+    Log::logf(CAT_TCP, LOG_INFO, "Framed arbiter mode exited\n");
 }
 
 
@@ -650,7 +650,7 @@ void TcpBridge::task(void *param) {
     auto &cfg = Config::get();
 
     if (cfg.wifi_mode == WIFI_MODE_OFF) {
-        Log::logf(CAT_TCP, LOG_INFO, "[TCP] WiFi disabled, TCP bridge not starting\n");
+        Log::logf(CAT_TCP, LOG_INFO, "WiFi disabled, TCP bridge not starting\n");
         vTaskDelete(nullptr);
         return;
     }
@@ -658,7 +658,7 @@ void TcpBridge::task(void *param) {
     server = new WiFiServer(cfg.tcp_port);
     server->begin();
     server->setNoDelay(true);
-    Log::logf(CAT_TCP, LOG_INFO, "[TCP] Listening on port %d\n", cfg.tcp_port);
+    Log::logf(CAT_TCP, LOG_INFO, "Listening on port %d\n", cfg.tcp_port);
 
     while (true) {
         if (!client.connected() && !client.available()) {
@@ -668,7 +668,7 @@ void TcpBridge::task(void *param) {
                 client = newClient;
                 client.setNoDelay(true);
                 line_pos = 0;
-                Log::logf(CAT_TCP, LOG_INFO, "[TCP] Client connected from %s\n",
+                Log::logf(CAT_TCP, LOG_INFO, "Client connected from %s\n",
                             client.remoteIP().toString().c_str());
                 client.printf("AirBridge %s\n", airbridge_version());
             }

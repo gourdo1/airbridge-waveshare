@@ -859,7 +859,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
         if (!claimUpload(request)) return;
-        Log::logf(CAT_WEB, LOG_INFO, "[WEB] Upload start: %s\n", filename.c_str());
+        Log::logf(CAT_WEB, LOG_INFO, "Upload start: %s\n", filename.c_str());
         uploadKind = UPLOAD_RESMED;
         uploadSize = 0;
         uploadOk = false;
@@ -867,17 +867,17 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
 
         resmed_part = ResmedOta::get_staging_partition();
         if (!resmed_part) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No staging partition found\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "No staging partition found\n");
             uploadKind = UPLOAD_NONE;
             finishUpload(request, false, "staging_partition_missing");
             return;
         }
-        Log::logf(CAT_WEB, LOG_INFO, "[WEB] Staging to '%s' (0x%X, %u bytes)\n",
+        Log::logf(CAT_WEB, LOG_INFO, "Staging to '%s' (0x%X, %u bytes)\n",
                      resmed_part->label, resmed_part->address, resmed_part->size);
 
         esp_err_t err = esp_partition_erase_range(resmed_part, 0, resmed_part->size);
         if (err != ESP_OK) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Erase failed: %s\n", esp_err_to_name(err));
+            Log::logf(CAT_WEB, LOG_ERROR, "Erase failed: %s\n", esp_err_to_name(err));
             resmed_part = nullptr;
             uploadKind = UPLOAD_NONE;
             finishUpload(request, false, "staging_erase_failed");
@@ -890,18 +890,18 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
     if (uploadKind == UPLOAD_RESMED && resmed_part && uploadOk && len > 0) {
         // reject ESP32 binaries uploaded to resmed slot
         if (uploadSize == 0 && len > 0 && data[0] == 0xE9) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Rejected: ESP32 binary uploaded to ResMed slot\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "Rejected: ESP32 binary uploaded to ResMed slot\n");
             uploadOk = false;
             return;
         }
         if (uploadSize + len > resmed_part->size) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] File too large for partition!\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "File too large for partition!\n");
             uploadOk = false;
             return;
         }
         esp_err_t err = esp_partition_write(resmed_part, uploadSize, data, len);
         if (err != ESP_OK) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Write failed at offset %u: %s\n",
+            Log::logf(CAT_WEB, LOG_ERROR, "Write failed at offset %u: %s\n",
                          uploadSize, esp_err_to_name(err));
             uploadOk = false;
             return;
@@ -912,7 +912,7 @@ static void handleUploadChunk(AsyncWebServerRequest *request, const String& file
 
     if (final) {
         if (uploadOk) {
-            Log::logf(CAT_WEB, LOG_INFO, "[WEB] Upload complete: %u bytes\n", uploadSize);
+            Log::logf(CAT_WEB, LOG_INFO, "Upload complete: %u bytes\n", uploadSize);
         }
     }
 }
@@ -1356,10 +1356,10 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
         if (!claimUpload(request)) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA rejected: OTA busy\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "ESP OTA rejected: OTA busy\n");
             return;
         }
-        Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA start: %s\n", filename.c_str());
+        Log::logf(CAT_WEB, LOG_INFO, "ESP OTA start: %s\n", filename.c_str());
         uploadKind = UPLOAD_ESP;
         resmed_part = nullptr;
         uploadSize = 0;
@@ -1367,12 +1367,12 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
 
         esp_ota_part = esp_ota_get_next_update_partition(NULL);
         if (!esp_ota_part) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] No OTA partition found\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "No OTA partition found\n");
             uploadKind = UPLOAD_NONE;
             finishUpload(request, false, "ota_partition_missing");
             return;
         }
-        Log::logf(CAT_WEB, LOG_INFO, "[WEB] OTA target: '%s' (0x%X, %u bytes)\n",
+        Log::logf(CAT_WEB, LOG_INFO, "OTA target: '%s' (0x%X, %u bytes)\n",
                   esp_ota_part->label, esp_ota_part->address, esp_ota_part->size);
 
         // Keep block erase speed without blocking async_tcp on the whole slot.
@@ -1380,7 +1380,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         esp_err_t err = esp_ota_begin(esp_ota_part, esp_ota_erased,
                                       &esp_ota_handle);
         if (err != ESP_OK) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_begin failed: %s\n", esp_err_to_name(err));
+            Log::logf(CAT_WEB, LOG_ERROR, "esp_ota_begin failed: %s\n", esp_err_to_name(err));
             esp_ota_part = nullptr;
             uploadKind = UPLOAD_NONE;
             finishUpload(request, false, "esp_ota_begin_failed");
@@ -1393,7 +1393,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
     if (uploadKind == UPLOAD_ESP && esp_ota_part && uploadOk && len > 0) {
         // validate esp binary magic on first data
         if (uploadSize == 0 && len > 0 && data[0] != 0xE9) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] Not an ESP32 binary (magic=0x%02X)\n", data[0]);
+            Log::logf(CAT_WEB, LOG_ERROR, "Not an ESP32 binary (magic=0x%02X)\n", data[0]);
             uploadOk = false;
             abortEspOtaUpload(request);
             return;
@@ -1403,7 +1403,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             Arbiter::set_state(SYS_OTA_ESP);
         }
         if (len > esp_ota_part->size - uploadSize) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA image exceeds partition\n");
+            Log::logf(CAT_WEB, LOG_ERROR, "ESP OTA image exceeds partition\n");
             uploadOk = false;
             abortEspOtaUpload(request);
             return;
@@ -1414,7 +1414,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
             esp_err_t err = esp_partition_erase_range(esp_ota_part,
                                                   esp_ota_erased, erase_size);
             if (err != ESP_OK) {
-                Log::logf(CAT_WEB, LOG_ERROR, "[WEB] ESP OTA erase failed at %u: %s\n",
+                Log::logf(CAT_WEB, LOG_ERROR, "ESP OTA erase failed at %u: %s\n",
                           esp_ota_erased, esp_err_to_name(err));
                 uploadOk = false;
                 abortEspOtaUpload(request);
@@ -1424,7 +1424,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         }
         esp_err_t err = esp_ota_write(esp_ota_handle, data, len);
         if (err != ESP_OK) {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_write failed at %u: %s\n",
+            Log::logf(CAT_WEB, LOG_ERROR, "esp_ota_write failed at %u: %s\n",
                       uploadSize, esp_err_to_name(err));
             uploadOk = false;
             abortEspOtaUpload(request);
@@ -1434,7 +1434,7 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
     }
 
     if (final && uploadOk) {
-        Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA upload complete: %u bytes\n", uploadSize);
+        Log::logf(CAT_WEB, LOG_INFO, "ESP OTA upload complete: %u bytes\n", uploadSize);
     }
 }
 
@@ -1456,15 +1456,15 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
             err = esp_ota_set_boot_partition(esp_ota_part);
             if (err == ESP_OK) {
                 ok = true;
-                Log::logf(CAT_WEB, LOG_INFO, "[WEB] ESP OTA OK, boot set to '%s'\n",
+                Log::logf(CAT_WEB, LOG_INFO, "ESP OTA OK, boot set to '%s'\n",
                           esp_ota_part->label);
             } else {
                 error = esp_err_to_name(err);
-                Log::logf(CAT_WEB, LOG_ERROR, "[WEB] set_boot_partition failed: %s\n",
+                Log::logf(CAT_WEB, LOG_ERROR, "set_boot_partition failed: %s\n",
                           esp_err_to_name(err));
             }
         } else {
-            Log::logf(CAT_WEB, LOG_ERROR, "[WEB] esp_ota_end failed: %s\n", esp_err_to_name(err));
+            Log::logf(CAT_WEB, LOG_ERROR, "esp_ota_end failed: %s\n", esp_err_to_name(err));
             error = esp_err_to_name(err);
         }
     }
@@ -1883,7 +1883,7 @@ void WebUI::init(uint16_t port) {
     DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");
 
     http->begin();
-    Log::logf(CAT_WEB, LOG_INFO, "[WEB] HTTP server on port %d\n", port);
+    Log::logf(CAT_WEB, LOG_INFO, "HTTP server on port %d\n", port);
 }
 
 static String build_status_payload(const DeviceStatus::Snapshot &status) {

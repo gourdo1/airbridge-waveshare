@@ -164,7 +164,7 @@ static void load_wifi_nets(bool migrate = true) {
             wp.getBytes("profiles", &stored, sizeof(stored)) != sizeof(stored) ||
             !decode_wifi_nets(stored)) {
             cfg.wifi_net_count = 0;
-            Log::logf(CAT_WIFI, LOG_ERROR, "[WIFI] invalid saved profiles\n");
+            Log::logf(CAT_WIFI, LOG_ERROR, "invalid saved profiles\n");
         }
         wp.end();
         return;

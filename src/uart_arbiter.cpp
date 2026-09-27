@@ -377,7 +377,7 @@ static void transparent_apply_baud(uint32_t new_baud, const char *reason) {
         vTaskDelay(pdMS_TO_TICKS(10));
         uart->updateBaudRate(new_baud);
         Log::logf(CAT_ARB, LOG_INFO,
-                  "[ARB] transparent baud (%s): %u -> %u\n",
+                  "transparent baud (%s): %u -> %u\n",
                   reason ? reason : "unknown", current_baud, new_baud);
         current_baud = new_baud;
     }
@@ -407,7 +407,7 @@ static const char *transparent_reboot_command(const uint8_t *payload,
 static void transparent_schedule_reboot_baud(const char *cmd) {
     transparent_reboot_baud_at = millis() + TRANSPARENT_REBOOT_BAUD_DELAY_MS;
     Log::logf(CAT_ARB, LOG_DEBUG,
-              "[ARB] transparent %s pending default baud in %ums\n",
+              "transparent %s pending default baud in %ums\n",
               cmd ? cmd : "reset", TRANSPARENT_REBOOT_BAUD_DELAY_MS);
 }
 
@@ -447,7 +447,7 @@ static void transparent_tx_handle_frame() {
         transparent_pending_baud = new_baud;
         transparent_pending_baud_at = millis();
         Log::logf(CAT_ARB, LOG_DEBUG,
-                  "[ARB] BDD transparent pending baud %u\n", new_baud);
+                  "BDD transparent pending baud %u\n", new_baud);
     }
 
     const char *reboot_cmd = transparent_reboot_command(transparent_tx_payload,
@@ -583,7 +583,7 @@ static void rx_task(void *param) {
             if (transparent_pending_baud &&
                 (uint32_t)(millis() - transparent_pending_baud_at) > 1000) {
                 Log::logf(CAT_ARB, LOG_WARN,
-                          "[ARB] BDD transparent pending baud %u expired\n",
+                          "BDD transparent pending baud %u expired\n",
                           transparent_pending_baud);
                 transparent_pending_baud = 0;
                 transparent_pending_baud_at = 0;
@@ -595,7 +595,7 @@ static void rx_task(void *param) {
             if (avail > 0) {
                 int n = uart->readBytes(buf, min(avail, (int)sizeof(buf)));
                 transparent_last_activity = millis();
-                Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] TRANSP RX %d bytes t=%lu\n", n, millis());
+                Log::logf(CAT_ARB, LOG_DEBUG, "TRANSP RX %d bytes t=%lu\n", n, millis());
                 if (n > 0) {
                     bridge->write(buf, n);
                 }
@@ -607,10 +607,10 @@ static void rx_task(void *param) {
                             char pl[48] = {};
                             int plen = f->payload_len < sizeof(pl)-1 ? f->payload_len : sizeof(pl)-1;
                             memcpy(pl, f->payload, plen);
-                            Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] Shadow type=%c len=%u: %s\n",
+                            Log::logf(CAT_ARB, LOG_DEBUG, "Shadow type=%c len=%u: %s\n",
                                       (char)f->type, f->payload_len, pl);
                         } else {
-                            Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] Shadow type=%c len=%u crc=BAD\n",
+                            Log::logf(CAT_ARB, LOG_DEBUG, "Shadow type=%c len=%u crc=BAD\n",
                                       f ? (char)f->type : '?', f ? f->payload_len : 0);
                         }
                         if (f && f->crc_valid && f->type == QFRAME_TYPE_R) {
@@ -656,7 +656,7 @@ static void rx_task(void *param) {
                         stat_rx++;
                         stat_l_rx++;
                         Log::logf(CAT_ARB, LOG_DEBUG,
-                                  "[ARB] RX-L tag=%c%c%c len=%u t=%lu\n",
+                                  "RX-L tag=%c%c%c len=%u t=%lu\n",
                                   f->payload_len > 0 ? (char)f->payload[0] : '?',
                                   f->payload_len > 1 ? (char)f->payload[1] : '?',
                                   f->payload_len > 2 ? (char)f->payload[2] : '?',
@@ -674,18 +674,18 @@ static void rx_task(void *param) {
                         if (push_result == RX_PUSH_STORED_DROPPED_OLD) {
                             stat_error++;
                             Log::logf(CAT_ARB, LOG_WARN,
-                                      "[ARB] RX queue full, dropped queued frame t=%lu\n",
+                                      "RX queue full, dropped queued frame t=%lu\n",
                                       millis());
                         } else if (push_result == RX_PUSH_DROPPED_FULL) {
                             stat_error++;
                             Log::logf(CAT_ARB, LOG_WARN,
-                                      "[ARB] RX queue full, dropped incoming frame t=%lu\n",
+                                      "RX queue full, dropped incoming frame t=%lu\n",
                                       millis());
                         }
                     }
                 } else {
                     stat_error++;
-                    Log::logf(CAT_ARB, LOG_WARN, "[ARB] RX frame CRC error t=%lu\n", millis());
+                    Log::logf(CAT_ARB, LOG_WARN, "RX frame CRC error t=%lu\n", millis());
                 }
                 qframe_parser_reset(&rx_parser);
             }
@@ -773,7 +773,7 @@ static void arbiter_task(void *param) {
             t->result.success = false;
             stat_error++;
             Log::logf(CAT_ARB, LOG_WARN,
-                      "[ARB] TX blocked by state=%s src=%d t=%lu\n",
+                      "TX blocked by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
             t = nullptr;
@@ -787,7 +787,7 @@ static void arbiter_task(void *param) {
             t->result.success = false;
             stat_error++;
             Log::logf(CAT_ARB, LOG_WARN,
-                      "[ARB] TX blocked before write by state=%s src=%d t=%lu\n",
+                      "TX blocked before write by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
             t = nullptr;
@@ -811,7 +811,7 @@ static void arbiter_task(void *param) {
             char snip[33] = {};
             int plen = t->frame_len > 5 ? t->frame_len - 9 : 0;  // minus header(5)+crc(4)
             if (plen > 0) memcpy(snip, t->frame + 5, min(plen, 32));
-            Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] TX %s src=%d prio=%d t=%lu\n",
+            Log::logf(CAT_ARB, LOG_DEBUG, "TX %s src=%d prio=%d t=%lu\n",
                       snip, t->source, t->priority, millis());
         }
 
@@ -860,7 +860,7 @@ static void arbiter_task(void *param) {
                 if (!mask || !(accepted & mask) ||
                     !qframe_response_matches(t->frame, t->frame_len, rx)) {
                     Log::logf(CAT_ARB, LOG_WARN,
-                              "[ARB] Ignored unexpected RX type=%c (%s) ticket=%lu\n",
+                              "Ignored unexpected RX type=%c (%s) ticket=%lu\n",
                               (char)rx.type, qframe_type_name(rx.type),
                               (unsigned long)t->ticket_id);
                     continue;
@@ -890,7 +890,7 @@ static void arbiter_task(void *param) {
                                min((int)rx.payload_len, (int)sizeof(snip) - 1));
                     }
                     Log::logf(CAT_ARB, LOG_DEBUG,
-                              "[ARB] RX-%c %s ticket=%lu t=%lu\n",
+                              "RX-%c %s ticket=%lu t=%lu\n",
                               (char)rx.type, snip,
                               (unsigned long)t->ticket_id, millis());
                 }
@@ -1220,7 +1220,7 @@ bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_l
         uint32_t new_baud = parse_bdd_baud(payload, min(capture->length, capture->capacity));
         if (new_baud && new_baud != current_baud) {
             uart->updateBaudRate(new_baud);
-            Log::logf(CAT_ARB, LOG_INFO, "[ARB] BDD arbiter: baud %u -> %u\n",
+            Log::logf(CAT_ARB, LOG_INFO, "BDD arbiter: baud %u -> %u\n",
                       current_baud, new_baud);
             current_baud = new_baud;
         }
@@ -1414,7 +1414,7 @@ void Arbiter::clear_rx_frames() {
         xSemaphoreTake(rx_ready, 0);
     }
     if (cleared > 0) {
-        Log::logf(CAT_ARB, LOG_DEBUG, "[ARB] RX queue cleared (%u frame%s) t=%lu\n",
+        Log::logf(CAT_ARB, LOG_DEBUG, "RX queue cleared (%u frame%s) t=%lu\n",
                   cleared, cleared == 1 ? "" : "s", millis());
     }
 }
@@ -1455,7 +1455,7 @@ void Arbiter::set_baud(uint32_t baud) {
         while (uart->available()) uart->read();
         rx_reset_requested.store(true);
         Arbiter::clear_rx_frames();
-        Log::logf(CAT_ARB, LOG_INFO, "[ARB] set_baud: %u -> %u\n", current_baud, baud);
+        Log::logf(CAT_ARB, LOG_INFO, "set_baud: %u -> %u\n", current_baud, baud);
         current_baud = baud;
     }
 }
@@ -1527,7 +1527,7 @@ bool Arbiter::lcd_clear() {
 static bool lcd_advance(uart_transaction_t *t) {
     if (t->lcd_step == LcdStep::None) return false;
     if (!t->result.success) {
-        Log::logf(CAT_ARB, LOG_WARN, "[ARB] LCD command failed at step %u\n",
+        Log::logf(CAT_ARB, LOG_WARN, "LCD command failed at step %u\n",
                   static_cast<unsigned>(t->lcd_step));
         return false;
     }

@@ -18,7 +18,7 @@ static void udp_task(void *param) {
     auto &cfg = Config::get();
     uint16_t port = cfg.udp_oxi_port;
     if (port == 0) {
-        Log::logf(CAT_OXI, LOG_INFO, "[OXI] UDP disabled (port=0)\n");
+        Log::logf(CAT_OXI, LOG_INFO, "UDP disabled (port=0)\n");
         vTaskDelete(NULL);
         return;
     }
@@ -30,11 +30,11 @@ static void udp_task(void *param) {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     if (fd < 0 || bind(fd, (sockaddr *)&local, sizeof(local)) < 0) {
         if (fd >= 0) close(fd);
-        Log::logf(CAT_OXI, LOG_ERROR, "[OXI] UDP bind failed on port %u\n", port);
+        Log::logf(CAT_OXI, LOG_ERROR, "UDP bind failed on port %u\n", port);
         vTaskDelete(NULL);
         return;
     }
-    Log::logf(CAT_OXI, LOG_INFO, "[OXI] UDP listening on port %u\n", port);
+    Log::logf(CAT_OXI, LOG_INFO, "UDP listening on port %u\n", port);
 
     while (true) {
         // One extra byte distinguishes oversized datagrams without retaining them.
@@ -50,19 +50,19 @@ static void udp_task(void *param) {
         vTaskDelay(1);  // yield after each packet
 
         if (len != UDP_PACKET_SIZE) {
-            Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP bad length %d (expected %d)\n",
+            Log::logf(CAT_OXI, LOG_WARN, "UDP bad length %d (expected %d)\n",
                       len, UDP_PACKET_SIZE);
             continue;
         }
 
         if (buf[0] != UDP_MAGIC_0 || buf[1] != UDP_MAGIC_1) {
-            Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP bad magic %02X %02X\n",
+            Log::logf(CAT_OXI, LOG_WARN, "UDP bad magic %02X %02X\n",
                       buf[0], buf[1]);
             continue;
         }
 
         if (buf[2] & 0xE0) {
-            Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP bad flags %02X\n", buf[2]);
+            Log::logf(CAT_OXI, LOG_WARN, "UDP bad flags %02X\n", buf[2]);
             continue;
         }
 
@@ -77,13 +77,13 @@ static void udp_task(void *param) {
                 if (inet_ntop(AF_INET, &remote.sin_addr, address, sizeof(address)))
                     OxiArbiter::set_source_id(address);
             }
-            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] UDP SpO2=%d HR=%d\n", spo2, hr);
+            Log::logf(CAT_OXI, LOG_DEBUG, "UDP SpO2=%d HR=%d\n", spo2, hr);
             OxiArbiter::feed(OXI_SRC_UDP, spo2, hr, true);
         } else if (spo2 < 0 || hr < 0) {
-            Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] UDP invalid (raw=%04X,%04X)\n", spo2_raw, hr_raw);
+            Log::logf(CAT_OXI, LOG_DEBUG, "UDP invalid (raw=%04X,%04X)\n", spo2_raw, hr_raw);
             OxiArbiter::feed(OXI_SRC_UDP, -1, -1, false);
         } else {
-            Log::logf(CAT_OXI, LOG_WARN, "[OXI] UDP out of range (spo2=%d hr=%d)\n", spo2, hr);
+            Log::logf(CAT_OXI, LOG_WARN, "UDP out of range (spo2=%d hr=%d)\n", spo2, hr);
         }
     }
 }

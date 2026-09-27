@@ -115,9 +115,9 @@ void finish_check(const OtaRelease::Manifest *manifest,
     if (error) set_error_locked(error);
     unlock();
     if (error) {
-        Log::logf(CAT_OTA, LOG_WARN, "[OTA] Release check failed: %s\n", error);
+        Log::logf(CAT_OTA, LOG_WARN, "Release check failed: %s\n", error);
     } else {
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Release check: latest=%s available=%d\n",
+        Log::logf(CAT_OTA, LOG_INFO, "Release check: latest=%s available=%d\n",
                   manifest ? manifest->version : "?", update_available);
     }
 }
@@ -204,7 +204,7 @@ void abort_install(const char *error) {
         unlock();
     }
     Arbiter::set_state(SYS_IDLE);
-    Log::logf(CAT_OTA, LOG_ERROR, "[OTA] Release install failed: %s\n",
+    Log::logf(CAT_OTA, LOG_ERROR, "Release install failed: %s\n",
               error ? error : "install_failed");
 }
 
@@ -295,7 +295,7 @@ void install_task(void *) {
         unlock();
     }
     Log::logf(CAT_OTA, LOG_INFO,
-              "[OTA] Release %s installed to '%s', rebooting\n",
+              "Release %s installed to '%s', rebooting\n",
               runtime.update_version, partition_name);
     vTaskDelete(nullptr);
 }
@@ -350,15 +350,15 @@ void init() {
             unlock();
         }
         if (!claimed) {
-            Log::logf(CAT_OTA, LOG_ERROR, "[OTA] ArduinoOTA collision\n");
+            Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA collision\n");
             return;
         }
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] ArduinoOTA start\n");
+        Log::logf(CAT_OTA, LOG_INFO, "ArduinoOTA start\n");
         Arbiter::set_state(SYS_OTA_ESP);
     });
 
     ArduinoOTA.onEnd([]() {
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] ArduinoOTA complete\n");
+        Log::logf(CAT_OTA, LOG_INFO, "ArduinoOTA complete\n");
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
@@ -376,12 +376,12 @@ void init() {
             unlock();
         }
         Arbiter::set_state(SYS_IDLE);
-        Log::logf(CAT_OTA, LOG_ERROR, "[OTA] ArduinoOTA error %u\n", error);
+        Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA error %u\n", error);
     });
 
     ArduinoOTA.begin();
     Log::logf(CAT_OTA, LOG_INFO,
-              "[OTA] Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
+              "Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
 }
 
 void handle() {

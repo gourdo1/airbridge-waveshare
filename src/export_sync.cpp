@@ -975,7 +975,7 @@ void init() {
     if (!request_queue || created != pdPASS) {
         set_state(State::Error, "task_initialization_failed");
         set_sleephq_state(State::Error, "task_initialization_failed");
-        Log::logf(CAT_EXPORT, LOG_ERROR, "[EXPORT] Task initialization failed\n");
+        Log::logf(CAT_EXPORT, LOG_ERROR, "Task initialization failed\n");
         return;
     }
     set_state(Config::get().smb_enabled ? State::Idle : State::Disabled);

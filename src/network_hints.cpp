@@ -36,7 +36,7 @@ void NetworkHints::init() {
     uint8_t ver = prefs.getUChar("version", 0);
     if (ver != HINT_NVS_VERSION) {
         prefs.end();
-        Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Hints: empty (no/old NVS)\n");
+        Log::logf(CAT_WIFI, LOG_DEBUG, "Hints: empty (no/old NVS)\n");
         return;
     }
     int n = prefs.getUChar("count", 0);
@@ -46,7 +46,7 @@ void NetworkHints::init() {
     }
     prefs.end();
     hint_count = n;
-    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Hints: loaded %d entries\n", hint_count);
+    Log::logf(CAT_WIFI, LOG_INFO, "Hints: loaded %d entries\n", hint_count);
 }
 
 void NetworkHints::save() {
@@ -96,7 +96,7 @@ void NetworkHints::upsert(const char *ssid, const uint8_t *bssid,
     save();
 
     Log::logf(CAT_WIFI, LOG_DEBUG,
-              "[WIFI] Hint upsert: %s ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X flags=0x%02X\n",
+              "Hint upsert: %s ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X flags=0x%02X\n",
               hints[idx].ssid, hints[idx].channel,
               bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
               hints[idx].flags);
@@ -117,7 +117,7 @@ void NetworkHints::clear_for(const char *ssid) {
     }
     if (changed) {
         save();
-        Log::logf(CAT_WIFI, LOG_DEBUG, "[WIFI] Hints cleared for '%s'\n", ssid);
+        Log::logf(CAT_WIFI, LOG_DEBUG, "Hints cleared for '%s'\n", ssid);
     }
 }
 
@@ -125,7 +125,7 @@ void NetworkHints::clear_all() {
     memset(hints, 0, sizeof(hints));
     hint_count = 0;
     save();
-    Log::logf(CAT_WIFI, LOG_INFO, "[WIFI] Hints cleared\n");
+    Log::logf(CAT_WIFI, LOG_INFO, "Hints cleared\n");
 }
 
 int NetworkHints::count() { return hint_count; }
