@@ -2737,7 +2737,7 @@ static void poll_recording_state() {
     const bool wanted = __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
     if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1) {
         next_recording_state_ms = 0;
-        if (wanted) therapy_ended();
+        if (wanted) request_stop();
         return;
     }
     if (next_recording_state_ms && int32_t(millis() - next_recording_state_ms) < 0)
@@ -2749,7 +2749,7 @@ static void poll_recording_state() {
     if (Arbiter::get_state() != SYS_THERAPY || Arbiter::get_cached_rop() != 1)
         return;
     if (zle && !wanted) therapy_started();
-    else if (!zle && wanted) therapy_ended();
+    else if (!zle && wanted) request_stop();
 }
 
 static void recorder_task(void *) {
@@ -2869,9 +2869,9 @@ void therapy_started() {
     const uint32_t captured_ms = millis();
     portENTER_CRITICAL(&status_mux);
     therapy_on_capture_ms = captured_ms;
-    portEXIT_CRITICAL(&status_mux);
     __atomic_store_n(&therapy_wanted, true, __ATOMIC_RELEASE);
     __atomic_store_n(&therapy_start_pending, true, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
     if (!status.ready || !control_queue) return;
     ControlEvent event = {ControlKind::Start, captured_ms};
     if (xQueueSend(control_queue, &event, 0) != pdTRUE) {
@@ -2879,13 +2879,17 @@ void therapy_started() {
     }
 }
 
-void therapy_ended() {
+void request_stop() {
     ControlEvent event = {ControlKind::Stop, millis()};
     portENTER_CRITICAL(&status_mux);
+    if (!__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE)) {
+        portEXIT_CRITICAL(&status_mux);
+        return;
+    }
     latest_stop = event;
-    portEXIT_CRITICAL(&status_mux);
-    __atomic_store_n(&therapy_wanted, false, __ATOMIC_RELEASE);
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&therapy_wanted, false, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
     if (!status.ready || !control_queue) return;
     if (xQueueSend(control_queue, &event, 0) != pdTRUE)
         status_error("control queue full at therapy stop");
@@ -2893,7 +2897,7 @@ void therapy_ended() {
 
 void device_restarted() {
     __atomic_add_fetch(&device_generation, 1, __ATOMIC_RELEASE);
-    therapy_ended();
+    request_stop();
 }
 
 bool clock_write_allowed(const char **reason) {
@@ -2923,7 +2927,7 @@ namespace EdfRecorder {
 
 void init() {}
 void therapy_started() {}
-void therapy_ended() {}
+void request_stop() {}
 void device_restarted() {}
 bool clock_write_allowed(const char **reason) {
     if (reason) *reason = nullptr;

@@ -232,7 +232,7 @@ static void poll_therapy_state() {
             } else if (new_rop == 0 && current == SYS_THERAPY) {
                 Arbiter::set_state(SYS_IDLE);
                 Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
-                EdfRecorder::therapy_ended();
+                EdfRecorder::request_stop();
                 Air10Clock::request_sync();
                 poll_mhr();
             }
@@ -252,7 +252,7 @@ static void poll_therapy_state() {
             system_state_t current = Arbiter::get_state();
             if (current != SYS_ERROR && current != SYS_TRANSPARENT &&
                 current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
-                if (current == SYS_THERAPY) EdfRecorder::therapy_ended();
+                if (current == SYS_THERAPY) EdfRecorder::request_stop();
                 Arbiter::set_state(SYS_ERROR);
                 Log::logf(CAT_HEALTH, LOG_ERROR, "UART unresponsive, entering ERROR state\n");
             }

@@ -28,7 +28,7 @@ struct Status {
 void init();
 // Detailed capture follows ZLE; system standby/connection loss can also stop it.
 void therapy_started();
-void therapy_ended();
+void request_stop();
 void device_restarted();
 bool clock_write_allowed(const char **reason = nullptr);
 void get_status(Status &out);
