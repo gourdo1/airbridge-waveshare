@@ -565,12 +565,16 @@ static void pending_path(const char *prefix, char *path, size_t size) {
     snprintf(path, size, "/airbridge/pending/%s.str", prefix);
 }
 
-static bool read_pending(const char *path, EdfPending::Record &record) {
+enum class PendingRead { Ready, Invalid, Unavailable };
+
+static PendingRead read_pending(const char *path, EdfPending::Record &record) {
     fs::File file = storage->open(path, FILE_READ);
+    if (!file || file.isDirectory()) return PendingRead::Unavailable;
     uint8_t bytes[EdfPending::WIRE_SIZE];
-    return file && file.size() == sizeof(bytes) &&
-           file.read(bytes, sizeof(bytes)) == sizeof(bytes) &&
-           EdfPending::decode(bytes, sizeof(bytes), record);
+    if (file.size() != sizeof(bytes)) return PendingRead::Invalid;
+    if (file.read(bytes, sizeof(bytes)) != sizeof(bytes)) return PendingRead::Unavailable;
+    return EdfPending::decode(bytes, sizeof(bytes), record)
+        ? PendingRead::Ready : PendingRead::Invalid;
 }
 
 static bool write_pending(const EdfPending::Record &record) {
@@ -618,8 +622,8 @@ static void recover_pending() {
         if (!path.endsWith(".part") && !path.endsWith(".bak")) continue;
         String target = path.substring(0, path.lastIndexOf('.'));
         EdfPending::Record record;
-        if (read_pending(target.c_str(), record)) storage->remove(path);
-        else if (read_pending(path.c_str(), record)) {
+        if (read_pending(target.c_str(), record) == PendingRead::Ready) storage->remove(path);
+        else if (read_pending(path.c_str(), record) == PendingRead::Ready) {
             storage->remove(target);
             if (!storage->rename(path, target)) post_error("STR journal recovery failed");
         } else post_error("invalid STR pending journal");
@@ -2554,10 +2558,23 @@ static void process_pending() {
             String path = item.path();
             item.close();
             if (!path.endsWith(".str")) continue;
-            count++;
             EdfPending::Record candidate;
-            if (!read_pending(path.c_str(), candidate)) {
-                post_error("invalid STR pending journal");
+            const PendingRead result = read_pending(path.c_str(), candidate);
+            if (result == PendingRead::Invalid) {
+                String rejected = path;
+                rejected += ".rejected";
+                if (!storage->exists(rejected) && storage->rename(path, rejected)) {
+                    Log::logf(CAT_EDF, LOG_WARN, "STR journal rejected: %s -> %s\n",
+                              path.c_str(), rejected.c_str());
+                    continue;
+                }
+                count++;
+                post_error("STR journal quarantine failed");
+                continue;
+            }
+            count++;
+            if (result == PendingRead::Unavailable) {
+                post_error("STR pending journal read failed");
                 continue;
             }
             if (strcmp(candidate.prefix, pending_cursor) <= 0) continue;
