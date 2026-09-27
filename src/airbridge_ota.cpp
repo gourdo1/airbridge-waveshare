@@ -322,7 +322,7 @@ const char *start_blocked() {
     if (!runtime.initialized) return "ota_unavailable";
     if (runtime.operation != OP_NONE || runtime.reboot_pending) return "ota_busy";
     if (WiFi.status() != WL_CONNECTED) return "network_unavailable";
-    if (Arbiter::get_state() != SYS_IDLE) return "device_not_idle";
+    if (!Arbiter::system_idle()) return "device_not_idle";
     if (ResmedOta::is_active()) return "resmed_ota_active";
     if (!background_work_idle()) return "background_work_active";
     return nullptr;
@@ -345,7 +345,7 @@ const char *cached_start_blocked() {
     static bool observed = false;
     const BlockedInputs inputs = {WiFiSetup::revision(), runtime.initialized,
         runtime.operation != OP_NONE || runtime.reboot_pending,
-        Arbiter::get_state() == SYS_IDLE, ResmedOta::is_active(), background_work_idle()};
+        Arbiter::system_idle(), ResmedOta::is_active(), background_work_idle()};
     if (!observed || !(inputs == previous)) {
         const char *blocked = start_blocked();
         if (blocked != last_blocked && runtime.enabled &&
@@ -597,7 +597,7 @@ bool begin_manual_upload() {
     if (!lock()) return false;
     bool allowed = runtime.initialized && runtime.operation == OP_NONE &&
                    !runtime.reboot_pending &&
-                   Arbiter::get_state() == SYS_IDLE &&
+                   Arbiter::system_idle() &&
                    !ResmedOta::is_active() && background_work_idle();
     if (allowed) {
         runtime.operation = OP_MANUAL;
@@ -621,7 +621,7 @@ bool begin_resmed_flash() {
     if (!lock()) return false;
     bool allowed = runtime.initialized && runtime.operation == OP_NONE &&
                    !runtime.reboot_pending &&
-                   Arbiter::get_state() == SYS_IDLE &&
+                   Arbiter::system_idle() &&
                    !ResmedOta::is_active() && background_work_idle();
     if (allowed) {
         runtime.operation = OP_RESMED;

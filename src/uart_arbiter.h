@@ -127,6 +127,9 @@ namespace Arbiter {
 
     system_state_t get_state();
     void set_state(system_state_t state);
+    bool system_idle();
+    bool device_standby();
+    bool local_background_allowed();
     bool wait_idle(uint16_t timeout_ms);
 
     // Each session starts at 57600; BDD may change baud within the session.

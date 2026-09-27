@@ -410,7 +410,7 @@ bool pull_time_from_resmed(bool force) {
 static void sync_resmed_clock() {
     if (!clock_sync_pending || !airsense_present || !WiFiSetup::time_synced()) return;
     if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
-    if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return;
+    if (!Arbiter::device_standby()) return;
     static const char *last_blocked = nullptr;
     const char *blocked = nullptr;
     if (!EdfRecorder::clock_write_allowed(&blocked)) {

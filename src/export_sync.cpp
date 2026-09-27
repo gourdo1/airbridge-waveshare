@@ -187,7 +187,7 @@ static void publish_sleephq_progress(
 static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
     return !run || generation_aborted(run->generation) ||
-           (run->network_only ? Arbiter::get_state() != SYS_IDLE ||
+           (run->network_only ? !Arbiter::device_standby() ||
                Config::revision(run->section) != run->config_revision : !storage.valid());
 }
 
@@ -774,7 +774,7 @@ static void run_check(const Request &request) {
         copy_text(error, sizeof(error), "configuration_changed");
     } else if (WiFi.status() != WL_CONNECTED) {
         copy_text(error, sizeof(error), "wifi_disconnected");
-    } else if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) {
+    } else if (!Arbiter::device_standby()) {
         copy_text(error, sizeof(error), "standby_required");
     } else if (smb) {
         SmbConfig config = {};
@@ -822,8 +822,8 @@ static void refresh_backlog() {
     if (!__atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE) &&
         catalog.generation == backlog_catalog_generation &&
         smb_revision == backlog_smb_revision && shq_revision == backlog_shq_revision) return;
-    if (uxQueueMessagesWaiting(request_queue) || !catalog.ready || Arbiter::get_state() != SYS_IDLE ||
-        Arbiter::get_cached_rop() != 0 || !storage.begin()) return;
+    if (uxQueueMessagesWaiting(request_queue) || !catalog.ready ||
+        !Arbiter::device_standby() || !storage.begin()) return;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
     const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
     if (files_changed) roots_confirmed = false;
@@ -1000,8 +1000,7 @@ static void export_task(void *) {
 
         bool admitted = false;
         while (!generation_aborted(request.generation)) {
-            if (Arbiter::get_state() == SYS_IDLE &&
-                Arbiter::get_cached_rop() == 0 && storage.begin()) {
+            if (Arbiter::device_standby() && storage.begin()) {
                 admitted = true;
                 break;
             }
@@ -1216,7 +1215,7 @@ const char *action_blocked(bool smb, bool check) {
     bool configured = smb ? !cfg.smb_endpoint.isEmpty() :
         !cfg.sleephq_client_id.isEmpty() && !cfg.sleephq_client_secret.isEmpty();
     if (!configured) return "not_configured";
-    if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return "not_idle";
+    if (!Arbiter::device_standby()) return "not_idle";
     if (WiFi.status() != WL_CONNECTED) return "offline";
     if (!request_queue) return "unavailable";
     if (busy() || __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";

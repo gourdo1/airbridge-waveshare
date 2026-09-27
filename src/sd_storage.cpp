@@ -68,9 +68,8 @@ OpenFile *find_reader(uint32_t id) {
 }
 
 bool background_allowed() {
-    const auto state = Arbiter::get_state();
     return !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
-        (state == SYS_IDLE || state == SYS_ERROR) && Arbiter::get_cached_rop() != 1;
+        Arbiter::local_background_allowed();
 }
 
 bool background_allowed(uint32_t expected) {

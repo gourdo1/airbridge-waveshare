@@ -205,7 +205,7 @@ static void post_error(const char *message) {
 }
 
 static bool post_processing_cancelled() {
-    return Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0 ||
+    return !Arbiter::device_standby() ||
            __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
 }

@@ -821,7 +821,7 @@ static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL
         ? "{\"supported\":true" : "{";
     if (full) {
         jsonAddBool(json, "sd_mounted", SdStorage::mounted());
-        jsonAddBool(json, "idle", Arbiter::get_state() == SYS_IDLE && Arbiter::get_cached_rop() == 0);
+        jsonAddBool(json, "idle", Arbiter::device_standby());
         jsonAddBool(json, "online", WiFi.status() == WL_CONNECTED);
         jsonAddUInt32(json, "config_revision", Config::revision());
     }
