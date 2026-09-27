@@ -241,6 +241,7 @@ def load_firmware(path):
 
 
 def upload(target, data, auth, timeout, chunk_size):
+    started = time.monotonic()
     boundary = '----airbridge-' + uuid.uuid4().hex
     prefix = (f'--{boundary}\r\n'
               'Content-Disposition: form-data; name="firmware"; filename="firmware.bin"\r\n'
@@ -262,6 +263,7 @@ def upload(target, data, auth, timeout, chunk_size):
             conn.send(chunk)
             print_progress(target, offset + len(chunk), len(data))
         conn.send(suffix)
+        sent = time.monotonic()
         print_progress(target, len(data), len(data), force=True)
         finish_status()
         body = decode_response(conn.getresponse())
@@ -269,7 +271,8 @@ def upload(target, data, auth, timeout, chunk_size):
             raise FlashError(f'upload rejected: {body.get("error") or body}')
         if body.get('size') != len(data):
             raise FlashError(f'upload size mismatch: expected {len(data)}, got {body.get("size")}')
-        emit(target, f'upload confirmed, partition={body.get("partition", "unknown")}')
+        emit(target, f'upload confirmed, partition={body.get("partition", "unknown")} '
+             f'(send {sent - started:.1f}s, confirmation {time.monotonic() - sent:.1f}s)')
     except (OSError, http.client.HTTPException) as error:
         raise FlashError(f'upload connection failed ({error}); outcome unknown, not retrying or rebooting') from error
     finally:
@@ -279,21 +282,24 @@ def upload(target, data, auth, timeout, chunk_size):
 
 def wait_for_reboot(target, previous_uptime, started, auth, timeout, reboot_timeout):
     emit(target, 'waiting for reboot/API...')
-    deadline = time.monotonic() + reboot_timeout
+    wait_started = time.monotonic()
+    deadline = wait_started + reboot_timeout
     while time.monotonic() < deadline:
         time.sleep(min(1, max(0, deadline - time.monotonic())))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         try:
-            status = request_json(target, 'GET', '/api/status', auth, min(timeout, remaining))
+            status = request_json(target, 'GET', '/api/status', auth,
+                                  min(timeout, 2.0, remaining))
         except (OSError, http.client.HTTPException):
             continue
         uptime = status.get('uptime')
         # Reachability alone does not prove reboot: the old app can still reply.
         expected = previous_uptime + time.monotonic() - started
         if isinstance(uptime, (int, float)) and uptime < expected - 2:
-            emit(target, f'reboot confirmed, version={status.get("version", "unknown")}')
+            emit(target, f'reboot confirmed, version={status.get("version", "unknown")} '
+                 f'(API wait {time.monotonic() - wait_started:.1f}s)')
             return
     raise FlashError('upload succeeded, but reboot could not be confirmed before timeout')
 
@@ -307,7 +313,9 @@ def flash_target(target, data, args, auth):
         if args.no_reboot:
             emit(target, 'firmware staged; reboot manually to activate it')
             return 0
+        status_started = time.monotonic()
         status = request_json(target, 'GET', '/api/status', auth, args.timeout)
+        emit(target, f'pre-reboot status read: {time.monotonic() - status_started:.1f}s')
         uptime = status.get('uptime')
         if not isinstance(uptime, (int, float)):
             raise FlashError('upload succeeded, but device uptime is unavailable; reboot manually')
@@ -316,8 +324,10 @@ def flash_target(target, data, args, auth):
             body = request_json(target, 'POST', '/api/reboot', auth, args.timeout)
             if not is_ok(body):
                 raise FlashError(f'reboot rejected: {body}')
-        except (OSError, http.client.HTTPException):
-            emit(target, 'connection closed during reboot request; checking restart')
+            emit(target, f'reboot request accepted in {time.monotonic() - started:.1f}s')
+        except (OSError, http.client.HTTPException) as error:
+            emit(target, f'reboot request ended after {time.monotonic() - started:.1f}s: '
+                 f'{type(error).__name__}: {error}; restart not yet confirmed')
         if not args.no_wait:
             wait_for_reboot(target, uptime, started, auth, args.timeout, args.reboot_timeout)
         else:
