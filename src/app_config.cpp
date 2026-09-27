@@ -55,18 +55,20 @@ struct KVEntry {
 #define KV_U8(k, n, f, d, s) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 #define KV_U16(k, n, f, d, s) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 #define KV_U32(k, n, f, d, s) {k, n, KVEntry::U32, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
-#define KV_BOOL(k, n, f, d, s) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+// Choice labels are used at build time, not retained in firmware RAM.
+#define KV_ENUM(k, n, f, d, s, ...) KV_U8(k, n, f, d, s)
+#define KV_BOOL(k, n, f, d, s, ...) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 
 static const KVEntry kv_table[] = {
     KV_STR("hostname", "hostname", hostname, DEFAULT_HOSTNAME, Network),
-    KV_U8("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY, Network),
+    KV_ENUM("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY, Network, "0=Auto (STA + AP fallback)", "1=AP only", "2=Off", "3=STA only", "4=STA+AP always"),
     KV_BOOL("wifi_roam", "wifi_roam", wifi_roam, true, Network),
     KV_STR("wifi_country", "wifi_country", wifi_country, "01", Network),
     KV_U16("tcp_port", "tcp_port", tcp_port, CFG_DEFAULT_TCP_PORT, Uart),
     KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true, Oximetry),
     KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true, Oximetry),
     KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false, Oximetry),
-    KV_U8("oxi_device_type", "oxi_devtype", oxi_device_type, 0, Oximetry),
+    KV_ENUM("oxi_device_type", "oxi_devtype", oxi_device_type, 0, Oximetry, "0=Auto", "1=Nonin", "2=O2Ring", "3=PLX", "4=WS20A"),
     KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, "", Oximetry),
     KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
     KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
@@ -87,14 +89,14 @@ static const KVEntry kv_table[] = {
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
     KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025, Oximetry),
-    KV_U8("mitm_mode", "mitm_mode", mitm_mode, 0, Uart),
+    KV_ENUM("mitm_mode", "mitm_mode", mitm_mode, 0, Uart, "0=Off", "1=Forward", "2=Log", "3=Filter"),
     KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false, Smb),
-    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb),
+    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb, "0=Manual", "1=Automatic"),
     KV_STR("smb_endpoint", "smb_ep", smb_endpoint, "", Smb),
     KV_STR("smb_user", "smb_user", smb_user, "", Smb),
     KV_SECRET("smb_password", "smb_pass", smb_password, "", Smb),
     KV_BOOL("sleephq_enabled", "shq_enable", sleephq_enabled, false, SleepHq),
-    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true, SleepHq),
+    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true, SleepHq, "0=Manual", "1=Automatic"),
     KV_STR("sleephq_client_id", "shq_id", sleephq_client_id, "", SleepHq),
     KV_SECRET("sleephq_client_secret", "shq_secret", sleephq_client_secret, "", SleepHq),
     KV_STR("sleephq_team_id", "shq_team", sleephq_team_id, "", SleepHq),

@@ -45,17 +45,25 @@ def fill_config_sections(html, source):
         if not match:
             raise ValueError(f'unsupported config section: {row}')
         symbol, name, label = match.groups()
-        sections[symbol] = {'id': name, 'label': label, 'keys': []}
+        sections[symbol] = {'id': name, 'label': label, 'keys': [], 'options': {}}
 
     rows = source.split('static const KVEntry kv_table[] = {', 1)[1].split('};', 1)[0]
     for row in rows.splitlines():
         if not row.strip():
             continue
-        match = re.fullmatch(r'\s*KV_\w+\("([^"]+)".*?, (\w+)\),\s*', row)
+        match = re.fullmatch(
+            r'\s*KV_(\w+)\("([^"]+)", "[^"]+", \w+, '
+            r'(?:"(?:\\.|[^"\\])*"|[^,]+), (\w+)(.*?)\),\s*', row)
         if not match:
             raise ValueError(f'unsupported config field: {row}')
-        key, section = match.groups()
+        kind, key, section, choices = match.groups()
         sections[section]['keys'].append(key)
+        if kind in ('BOOL', 'ENUM'):
+            labels = (json.loads('[' + choices.removeprefix(', ') + ']') if choices
+                      else ['0=Disabled', '1=Enabled'] if kind == 'BOOL' else [])
+            if not labels:
+                raise ValueError(f'missing enum choices: {key}')
+            sections[section]['options'][key] = [label.split('=', 1) for label in labels]
 
     marker = '/* CONFIG_SECTIONS */ []'
     if html.count(marker) != 1:
