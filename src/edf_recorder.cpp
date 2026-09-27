@@ -144,6 +144,7 @@ static const char *pending_scan_error = nullptr;
 static uint32_t device_generation = 0;
 static uint32_t synced_device_generation = 0;
 static uint32_t synced_str_generation = 0;
+static uint16_t synced_saved_day = 0;
 static bool have_synced_generation = false;
 static bool summary_export_pending = false;
 static EdfCatalog::Entry summary_export_entry = {};
@@ -171,6 +172,11 @@ static char session_directory[40] = {};
 static uint16_t session_mid = 0;
 static uint16_t session_vid = 0;
 static char session_srn[24] = {};
+static bool identification_verified = false;
+static uint32_t identification_device = 0;
+static uint32_t identification_crc = 0;
+static uint16_t identification_mid = 0, identification_vid = 0;
+static char identification_srn[24] = {};
 
 static WaveClock wave_clock = {};
 static uint32_t last_pld_slot = UINT32_MAX;
@@ -566,13 +572,13 @@ static bool write_pending(const EdfPending::Record &record) {
     return publish_single_file(part, path, backup);
 }
 
-static bool save_pending() {
+static bool save_pending(const char *prefix = nullptr, const char *day = nullptr) {
     EdfPending::Record pending;
     pending.native_day = session_native_day;
     pending.mid = session_mid; pending.vid = session_vid;
     memcpy(pending.srn, session_srn, sizeof(pending.srn));
-    memcpy(pending.prefix, status.file_prefix, sizeof(pending.prefix));
-    memcpy(pending.day, status.therapy_day, sizeof(pending.day));
+    memcpy(pending.prefix, prefix ? prefix : status.file_prefix, sizeof(pending.prefix));
+    memcpy(pending.day, day ? day : status.therapy_day, sizeof(pending.day));
     if (!write_pending(pending)) {
         post_error("STR pending journal write failed");
         return false;
@@ -803,6 +809,38 @@ static bool write_identification(const uint8_t *content, size_t content_len) {
     return true;
 }
 
+static bool ensure_identification(uint32_t device) {
+    if (!SdStorage::try_acquire()) return false;
+    const bool current = identification_verified && identification_device == device &&
+        identification_mid == session_mid && identification_vid == session_vid &&
+        !strcmp(identification_srn, session_srn) &&
+        storage->exists("/Identification.tgt") && storage->exists("/Identification.crc");
+    SdStorage::release();
+    if (current) return true;
+
+    uint8_t *content = nullptr;
+    size_t size = 0;
+    bool success = collect_identification(content, size) &&
+        !post_processing_cancelled() &&
+        device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
+    if (success && SdStorage::try_acquire()) {
+        success = write_identification(content, size);
+        SdStorage::release();
+        if (success) {
+            identification_device = device;
+            identification_crc = crc32_ieee(content, size);
+            identification_mid = session_mid;
+            identification_vid = session_vid;
+            memcpy(identification_srn, session_srn, sizeof(identification_srn));
+            identification_verified = true;
+        }
+    } else {
+        success = false;
+    }
+    aircannect::Memory::free(content);
+    return success;
+}
+
 static bool fetch_str_record(uint8_t *record, size_t capacity) {
     const Air10Edf::Schema &schema = Air10Edf::str_schema();
     const size_t sample_count = Air10Edf::numeric_sample_count(schema);
@@ -1028,7 +1066,8 @@ static bool render_empty_str_record(uint16_t epoch_day, uint8_t *record,
     return set_str_record_day(epoch_day, record, size);
 }
 
-static bool update_str_file(const uint8_t *incoming_record) {
+static bool update_str_file(const uint8_t *incoming_record,
+                            const EdfCatalog::Entry &latest) {
     constexpr const char *FINAL = "/STR.edf";
     constexpr const char *PART = "/STR.edf.part";
     constexpr const char *BACKUP = "/STR.edf.bak";
@@ -1055,6 +1094,7 @@ static bool update_str_file(const uint8_t *incoming_record) {
     uint32_t existing_records = 0;
     bool valid = true;
     bool cancelled = false;
+    bool same_header = false, same_record = false;
     Air10StrTimeline::Scan scan;
     if (storage->exists(FINAL)) {
         input = storage->open(FINAL, FILE_READ);
@@ -1073,9 +1113,10 @@ static bool update_str_file(const uint8_t *incoming_record) {
             input.size() != header_size + existing_records * record_size ||
             !Air10StrTimeline::begin(header_start_day, existing_records,
                                      scan) ||
-            !render_str_header(session_native_day, 0, header, header_size)) {
+            !render_str_header(header_start_day, existing_records, header, header_size)) {
             valid = false;
         }
+        if (valid) same_header = memcmp(fixed, header, sizeof(fixed)) == 0;
 
         size_t compared = 256;
         while (valid && compared < header_size) {
@@ -1106,6 +1147,8 @@ static bool update_str_file(const uint8_t *incoming_record) {
                 !Air10StrTimeline::scan_record(scan, i, SdStorage::get_le16(work))) {
                 valid = false;
             }
+            if (valid && SdStorage::get_le16(work) == session_native_day)
+                same_record = memcmp(work, incoming_record, record_size) == 0;
         }
         if (!valid) {
             input.close();
@@ -1130,6 +1173,14 @@ static bool update_str_file(const uint8_t *incoming_record) {
         aircannect::Memory::free(work);
         post_error("STR timeline range invalid");
         return false;
+    }
+
+    if (same_header && same_record && scan.continuous &&
+        plan.start_day == scan.header_start_day && plan.record_count == existing_records) {
+        input.close();
+        aircannect::Memory::free(header);
+        aircannect::Memory::free(work);
+        return true;
     }
 
     const size_t timeline_size =
@@ -1216,6 +1267,11 @@ static bool update_str_file(const uint8_t *incoming_record) {
         return false;
     }
 
+    // Preserve the day across a reset between STR publication and catalog commit.
+    char pending[80];
+    pending_path(latest.file_prefix, pending, sizeof(pending));
+    if (valid && !storage->exists(pending))
+        valid = save_pending(latest.file_prefix, latest.therapy_day);
     if (!valid || !publish_single_file(PART, FINAL, BACKUP)) {
         storage->remove(PART);
         aircannect::Memory::free(timeline);
@@ -2423,47 +2479,59 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
              date.tm_year + 1900, date.tm_mon + 1, date.tm_mday);
 
     if (!SdStorage::try_acquire()) return false;
-    EdfCatalog::Status catalog;
-    EdfCatalog::get_status(catalog);
-    EdfCatalog::Entry latest = {};
-    bool valid = catalog.ready;
-    for (uint32_t i = 0; valid && i < catalog.entries; i++) {
-        EdfCatalog::Entry entry;
-        valid = EdfCatalog::read(i, entry);
-        if (valid && !strcmp(entry.therapy_day, day_text) &&
-            strcmp(entry.file_prefix, latest.file_prefix) > 0) latest = entry;
-    }
+    EdfCatalog::Entry *entries = nullptr;
+    uint32_t count = 0;
+    const bool valid = EdfCatalog::snapshot_day(day_text, entries, count);
     SdStorage::release();
-    if (!valid || !latest.file_prefix[0]) return valid && !required;
+    if (!valid || !count) {
+        aircannect::Memory::free(entries);
+        return valid && !required;
+    }
+    uint32_t latest_index = 0;
+    for (uint32_t i = 1; i < count; i++)
+        if (strcmp(entries[i].file_prefix, entries[latest_index].file_prefix) > 0)
+            latest_index = i;
+    EdfCatalog::Entry &latest = entries[latest_index];
 
     session_native_day = day;
-    uint8_t *identification = nullptr, *record = nullptr;
-    size_t identification_size = 0;
-    bool success = collect_identification(identification, identification_size);
+    uint8_t *record = nullptr;
+    bool success = ensure_identification(device);
     bool summary_ready = success && collect_str_summary(record, generation);
     success = success && !post_processing_cancelled() &&
         device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
     if (success && SdStorage::try_acquire()) {
-        success = write_identification(identification, identification_size);
-        if (success && summary_ready && record)
-            summary_ready = update_str_file(record);
-        for (uint32_t i = 0; success && i < catalog.entries; i++) {
-            EdfCatalog::Entry entry;
-            success = !post_processing_cancelled() && EdfCatalog::read(i, entry);
-            if (!success || strcmp(entry.therapy_day, day_text)) continue;
+        uint32_t revision = 0;
+        bool catalog_changed = false;
+        if (summary_ready && record) {
+            summary_ready = update_str_file(record, latest);
+            // A content token survives retries after STR was published but the
+            // catalog was not. Consumers compare revisions, never order them.
+            uint8_t identity[4];
+            SdStorage::put_le32(identity, identification_crc);
+            uint32_t crc = crc32_ieee_update(crc32_ieee_initial(), record,
+                Air10Edf::record_size(Air10Edf::str_schema()));
+            revision = crc32_ieee_finish(crc32_ieee_update(crc, identity, sizeof(identity)));
+        }
+        for (uint32_t i = 0; success && i < count; i++) {
+            success = !post_processing_cancelled();
+            if (!success) break;
+            EdfCatalog::Entry &entry = entries[i];
             const uint8_t old_flags = entry.flags;
-            const bool latest_entry = !strcmp(entry.file_prefix, latest.file_prefix);
+            const uint32_t old_revision = entry.str_revision;
             entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY;
             if (summary_ready && record) {
                 entry.flags |= EdfCatalog::ENTRY_STR_READY;
-                if (latest_entry) entry.str_revision++;
+                if (i == latest_index) entry.str_revision = revision;
             }
-            if (old_flags != entry.flags || (summary_ready && record && latest_entry))
+            if (old_flags != entry.flags || old_revision != entry.str_revision) {
                 success = EdfCatalog::commit(entry);
-            if (latest_entry) latest = entry;
+                if (success) catalog_changed = true;
+            }
+        }
+        for (uint32_t i = 0; success && summary_ready && i < count; i++) {
             char path[80];
-            pending_path(entry.file_prefix, path, sizeof(path));
-            if (success && summary_ready && storage->exists(path)) {
+            pending_path(entries[i].file_prefix, path, sizeof(path));
+            if (storage->exists(path)) {
                 success = storage->remove(path);
                 if (success) {
                     portENTER_CRITICAL(&status_mux);
@@ -2473,7 +2541,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
             }
         }
         SdStorage::release();
-        if (success && summary_ready && record) {
+        if (catalog_changed && summary_ready && record) {
             summary_export_entry = latest;
             summary_export_pending = true;
         }
@@ -2483,7 +2551,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
     } else {
         success = false;
     }
-    aircannect::Memory::free(identification);
+    aircannect::Memory::free(entries);
     aircannect::Memory::free(record);
     return success && summary_ready;
 }
@@ -2547,6 +2615,12 @@ static bool scan_pending(EdfPending::Record *selected = nullptr) {
     return complete;
 }
 
+static void request_summary_export() {
+    if (!status.pending_str && summary_export_pending &&
+        ExportSync::request_post_therapy(summary_export_entry))
+        summary_export_pending = false;
+}
+
 static void sync_pending() {
     EdfPending::Record selected;
     if (!pending_scanned || status.pending_str) {
@@ -2560,7 +2634,10 @@ static void sync_pending() {
     if (!read_u32_variable("ZEN", generation)) return;
     const bool changed = !have_synced_generation || device != synced_device_generation ||
                          generation != synced_str_generation;
-    if (!changed && !status.pending_str) return;
+    if (!changed && !status.pending_str) {
+        request_summary_export();
+        return;
+    }
     if (!read_u32_variable("SSD", saved_day) ||
         !read_u32_variable("ZEN", after) || after != generation) return;
 
@@ -2582,9 +2659,13 @@ static void sync_pending() {
         pending_cursor[0] = 0;
     }
     if (success && changed && saved_day >= 0x1000 && saved_day < 0xffff) {
-        // A noon rollover can leave two recorded days to update. Do not
-        // require a new save after stop: it may already have completed.
-        for (uint16_t day : {uint16_t(saved_day), uint16_t(saved_day - 1)}) {
+        // SSD names the completed write. Revisit the preceding day only after
+        // startup/restart, a day change or saves missed while UART was busy.
+        const bool catch_up = !have_synced_generation || device != synced_device_generation ||
+            saved_day != synced_saved_day || uint32_t(generation - synced_str_generation) != 1;
+        const uint16_t days[] = {uint16_t(saved_day), uint16_t(saved_day - 1)};
+        for (unsigned i = 0; i < (catch_up ? 2u : 1u); i++) {
+            const uint16_t day = days[i];
             if (selected.prefix[0] && day == selected.native_day) continue;
             if (!refresh_str_day(day, generation, device, false)) {
                 success = false;
@@ -2598,12 +2679,10 @@ static void sync_pending() {
     if (success) {
         synced_str_generation = generation;
         synced_device_generation = device;
+        synced_saved_day = saved_day;
         have_synced_generation = true;
     }
-    if (success && !status.pending_str && summary_export_pending) {
-        (void)ExportSync::request_post_therapy(summary_export_entry);
-        summary_export_pending = false;
-    }
+    if (success) request_summary_export();
 }
 
 static void process_pending() {
