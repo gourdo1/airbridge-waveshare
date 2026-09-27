@@ -1546,7 +1546,7 @@ function renderConfigFields(root, d) {
         const section = document.createElement('details');
         section.className = 'config-section';
         section.dataset.group = lastGroup;
-        section.open = expanded.has(lastGroup) ? expanded.get(lastGroup) : categoryInfo?.id !== 'logging';
+        section.open = expanded.has(lastGroup) ? expanded.get(lastGroup) : true;
         const heading = document.createElement('summary');
         heading.textContent = lastGroup;
         section.appendChild(heading);
