@@ -786,6 +786,8 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
 }
 
 struct ExportPublication {
+    ExportSync::PublicationStamp stamp = {};
+    bool observed = false;
     ExportSync::Status smb = {};
     ExportSync::SleepHqStatus shq = {};
     String endpoint, team, device;
@@ -872,41 +874,46 @@ static void publishExports() {
         if (!memory) return;
         last = new (memory) ExportPublication;
     }
-    ExportSync::Status smb;
-    ExportSync::SleepHqStatus shq;
-    ExportSync::get_status(smb);
-    ExportSync::get_sleephq_status(shq);
-    uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
-    if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status))
-        fields[1] |= EXPORT_RUN;
-    const auto &cfg = Config::get();
-    if (last->endpoint != cfg.smb_endpoint) {
-        last->endpoint = cfg.smb_endpoint;
-        fields[0] |= EXPORT_META;
-    }
-    if (last->team != cfg.sleephq_team_id || last->device != cfg.sleephq_device_id) {
-        last->team = cfg.sleephq_team_id;
-        last->device = cfg.sleephq_device_id;
-        fields[1] |= EXPORT_META;
-    }
-    for (uint8_t i = 0; i < 4; ++i) {
-        const char *reason = ExportSync::action_blocked(i < 2, i % 2);
-        if (reason == last->blocked[i]) continue;
-        last->blocked[i] = reason;
-        fields[i / 2] |= EXPORT_ACTIONS;
-    }
-    const char *backlog[] = {ExportSync::backlog_state(smb.backlog, true),
-                             ExportSync::backlog_state(shq.backlog, false)};
-    for (uint8_t i = 0; i < 2; ++i) {
-        if (backlog[i] == last->backlog[i]) continue;
-        last->backlog[i] = backlog[i];
-        fields[i] |= EXPORT_BACKLOG;
-    }
-    if (fields[0] || fields[1]) {
-        last->smb = smb;
-        last->shq = shq;
-        memcpy(last->fields, fields, sizeof(fields));
-        if (!++last->revision) ++last->revision;
+    const auto stamp = ExportSync::publication_stamp();
+    if (!last->observed || !(stamp == last->stamp)) {
+        ExportSync::Status smb;
+        ExportSync::SleepHqStatus shq;
+        ExportSync::get_status(smb);
+        ExportSync::get_sleephq_status(shq);
+        uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
+        if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status))
+            fields[1] |= EXPORT_RUN;
+        const auto &cfg = Config::get();
+        if (last->endpoint != cfg.smb_endpoint) {
+            last->endpoint = cfg.smb_endpoint;
+            fields[0] |= EXPORT_META;
+        }
+        if (last->team != cfg.sleephq_team_id || last->device != cfg.sleephq_device_id) {
+            last->team = cfg.sleephq_team_id;
+            last->device = cfg.sleephq_device_id;
+            fields[1] |= EXPORT_META;
+        }
+        for (uint8_t i = 0; i < 4; ++i) {
+            const char *reason = ExportSync::action_blocked(i < 2, i % 2);
+            if (reason == last->blocked[i]) continue;
+            last->blocked[i] = reason;
+            fields[i / 2] |= EXPORT_ACTIONS;
+        }
+        const char *backlog[] = {ExportSync::backlog_state(smb.backlog, true),
+                                 ExportSync::backlog_state(shq.backlog, false)};
+        for (uint8_t i = 0; i < 2; ++i) {
+            if (backlog[i] == last->backlog[i]) continue;
+            last->backlog[i] = backlog[i];
+            fields[i] |= EXPORT_BACKLOG;
+        }
+        if (fields[0] || fields[1]) {
+            last->smb = smb;
+            last->shq = shq;
+            memcpy(last->fields, fields, sizeof(fields));
+            if (!++last->revision) ++last->revision;
+        }
+        last->stamp = stamp;
+        last->observed = true;
     }
     publishState(EventTopic::Exports, last->revision, "exports", [&](bool full) {
         return buildExportsJson(false, full ? EXPORT_ALL : last->fields[0],

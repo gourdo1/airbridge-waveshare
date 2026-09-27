@@ -36,6 +36,7 @@ struct Header {
 };
 
 static Status status = {true};
+static uint32_t status_revision = 0;
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t changed_indexes[32] = {};
 static uint32_t change_count = 0;
@@ -48,6 +49,7 @@ static void set_error(const char *message) {
     strncpy(status.error, message ? message : "catalog error",
             sizeof(status.error) - 1);
     status.error[sizeof(status.error) - 1] = 0;
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_EDF, LOG_ERROR, "catalog: %s\n",
               message ? message : "catalog error");
@@ -196,6 +198,7 @@ void init() {
     if (status.ready) return;
     portENTER_CRITICAL(&status_mux);
     status.error[0] = 0;
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     storage = SdStorage::filesystem();
     if (!storage) return;
@@ -318,6 +321,7 @@ bool commit(const Entry &entry) {
         status.generation = new_header.generation;
         changed_indexes[status.generation % 32] = changed_index;
         if (change_count < 32) ++change_count;
+        __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
         portEXIT_CRITICAL(&status_mux);
         Log::logf(CAT_EDF, LOG_INFO,
                   "catalog commit %s entries=%u generation=%u\n",
@@ -453,6 +457,10 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
+uint32_t revision() {
+    return __atomic_load_n(&status_revision, __ATOMIC_ACQUIRE);
+}
+
 bool changes_since(uint32_t generation, Changes &out) {
     portENTER_CRITICAL(&status_mux);
     out.catalog = status;
@@ -472,6 +480,7 @@ bool changes_since(uint32_t generation, Changes &out) {
 namespace EdfCatalog {
 
 void init() {}
+uint32_t revision() { return 0; }
 bool commit(const Entry &) { return false; }
 bool changes_since(uint32_t, Changes &out) { out = {}; return false; }
 bool read(uint32_t, Entry &) { return false; }

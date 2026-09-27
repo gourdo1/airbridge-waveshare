@@ -127,10 +127,16 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         got_ip = true;
         hint_refresh_pending = true;
+        status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         sta_disconnected = true;
         last_disconnect_reason = info.wifi_sta_disconnected.reason;
+        status_revision.fetch_add(1);
+        break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+    case ARDUINO_EVENT_WIFI_STA_STOP:
+        status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
         ap_client_count = ap_client_count + 1;

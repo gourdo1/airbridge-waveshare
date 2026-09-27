@@ -65,6 +65,20 @@ struct SleepHqStatus {
     Backlog backlog;
 };
 
+struct PublicationStamp {
+    uint32_t exports, smb_config, shq_config, catalog, network;
+    int system, rop;
+    bool mounted, backlog_pending, check_pending;
+
+    bool operator==(const PublicationStamp &other) const {
+        return exports == other.exports && smb_config == other.smb_config &&
+            shq_config == other.shq_config && catalog == other.catalog &&
+            network == other.network && system == other.system && rop == other.rop &&
+            mounted == other.mounted && backlog_pending == other.backlog_pending &&
+            check_pending == other.check_pending;
+    }
+};
+
 void init();
 void therapy_started();
 bool request_post_therapy(const EdfCatalog::Entry &entry);
@@ -72,6 +86,8 @@ bool request_manual_smb(bool check = false);
 bool request_manual_sleephq(bool check = false);
 void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
+PublicationStamp publication_stamp();
+bool busy();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
 const char *action_blocked(bool smb, bool check);

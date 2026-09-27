@@ -25,6 +25,7 @@
 #include "storage_smb_client.h"
 #include "tls_memory.h"
 #include "uart_arbiter.h"
+#include "wifi_setup.h"
 
 namespace ExportSync {
 namespace {
@@ -147,7 +148,7 @@ static void copy_text(char *dst, size_t capacity, const char *src) {
 
 static void set_state(State state, const char *error = nullptr) {
     portENTER_CRITICAL(&status_mux);
-    status.state = state;
+    __atomic_store_n(&status.state, state, __ATOMIC_RELEASE);
     if (error) copy_text(status.last_error, sizeof(status.last_error), error);
     else if (state != State::Error) status.last_error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
@@ -156,7 +157,7 @@ static void set_state(State state, const char *error = nullptr) {
 
 static void set_sleephq_state(State state, const char *error = nullptr) {
     portENTER_CRITICAL(&sleephq_status_mux);
-    sleephq_status.state = state;
+    __atomic_store_n(&sleephq_status.state, state, __ATOMIC_RELEASE);
     if (error) {
         copy_text(sleephq_status.last_error,
                   sizeof(sleephq_status.last_error), error);
@@ -1165,6 +1166,21 @@ uint32_t revision() {
     return __atomic_load_n(&status_revision, __ATOMIC_ACQUIRE);
 }
 
+PublicationStamp publication_stamp() {
+    return {revision(), Config::revision(Config::Section::Smb),
+        Config::revision(Config::Section::SleepHq), EdfCatalog::revision(),
+        WiFiSetup::revision(), Arbiter::get_state(), Arbiter::get_cached_rop(),
+        SdStorage::mounted(), __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE),
+        __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)};
+}
+
+bool busy() {
+    const State smb = __atomic_load_n(&status.state, __ATOMIC_ACQUIRE);
+    const State shq = __atomic_load_n(&sleephq_status.state, __ATOMIC_ACQUIRE);
+    return smb == State::Pending || smb == State::Working ||
+           shq == State::Pending || shq == State::Working;
+}
+
 static State configured_state(State state, bool enabled) {
     if (state == State::Pending || state == State::Working) return state;
     if (!enabled) return State::Disabled;
@@ -1203,13 +1219,7 @@ const char *action_blocked(bool smb, bool check) {
     if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return "not_idle";
     if (WiFi.status() != WL_CONNECTED) return "offline";
     if (!request_queue) return "unavailable";
-    portENTER_CRITICAL(&status_mux);
-    bool busy = status.state == State::Pending || status.state == State::Working;
-    portEXIT_CRITICAL(&status_mux);
-    portENTER_CRITICAL(&sleephq_status_mux);
-    busy |= sleephq_status.state == State::Pending || sleephq_status.state == State::Working;
-    portEXIT_CRITICAL(&sleephq_status_mux);
-    if (busy || __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
+    if (busy() || __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
     return nullptr;
 }
 
@@ -1234,6 +1244,8 @@ const char *backlog_state(const Backlog &, bool) { return "unsupported"; }
 const char *state_name(State) { return "unsupported"; }
 void init() {}
 uint32_t revision() { return 0; }
+PublicationStamp publication_stamp() { return {}; }
+bool busy() { return false; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
 bool request_manual_smb(bool) { return false; }

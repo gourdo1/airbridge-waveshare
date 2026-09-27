@@ -41,6 +41,7 @@ bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count);
 // Caller releases the matching entries with Memory::free, including on errors.
 bool snapshot_day(const char *day, Entry *&out, uint32_t &count);
 void get_status(Status &out);
+uint32_t revision();
 // False requires a full snapshot (startup or the change history was exceeded).
 bool changes_since(uint32_t generation, Changes &out);
 

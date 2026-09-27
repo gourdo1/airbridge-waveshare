@@ -218,10 +218,10 @@ void init() {
     const uint64_t card_bytes = SD_MMC.cardSize();
     const uint64_t used_bytes = SD_MMC.usedBytes();
     portENTER_CRITICAL(&status_mux);
-    status.mounted = true;
     status.card_bytes = card_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
+    __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_GENERAL, LOG_INFO,
               "[SD] mounted width=%u freq=%ukHz size=%lluMB\n",
@@ -231,10 +231,7 @@ void init() {
 }
 
 bool mounted() {
-    portENTER_CRITICAL(&status_mux);
-    const bool value = status.mounted;
-    portEXIT_CRITICAL(&status_mux);
-    return value;
+    return __atomic_load_n(&status.mounted, __ATOMIC_ACQUIRE);
 }
 
 fs::FS *filesystem() {
