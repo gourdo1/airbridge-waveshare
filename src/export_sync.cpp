@@ -65,6 +65,7 @@ struct RunContext {
     BackgroundOperationControl operation;
     bool network_only;
     uint32_t config_revision;
+    Config::Section section;
 };
 
 struct SmbConfig {
@@ -85,8 +86,17 @@ static uint32_t status_revision = 0;
 static bool check_pending = false;
 static bool backlog_refresh = true;
 static bool backlog_files_changed = false;
-static uint32_t backlog_config_revision = UINT32_MAX;
+static uint32_t backlog_smb_revision = UINT32_MAX;
+static uint32_t backlog_shq_revision = UINT32_MAX;
 static uint32_t backlog_catalog_generation = UINT32_MAX;
+enum : uint8_t { SMB_VALID = 1, SHQ_VALID = 2, WAITING = 4, SHQ_PENDING = 8 };
+struct BacklogEntry {
+    uint8_t smb_files;
+    uint8_t shq_files;
+    uint8_t flags;
+};
+static BacklogEntry *backlog_entries = nullptr;
+static uint32_t backlog_entry_count = 0;
 static bool roots_confirmed = false;
 static uint32_t roots_endpoint = 0;
 static uint32_t roots_catalog_generation = 0;
@@ -121,6 +131,11 @@ static bool export_ready(const EdfCatalog::Entry &entry) {
     constexpr uint8_t required = EdfCatalog::ENTRY_LIVE_COMPLETE |
         EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
     return (entry.flags & required) == required;
+}
+
+static void invalidate_backlog_entry(uint32_t index, uint8_t mask) {
+    if (index < backlog_entry_count) backlog_entries[index].flags &= ~mask;
+    request_backlog_refresh();
 }
 
 static void copy_text(char *dst, size_t capacity, const char *src) {
@@ -172,7 +187,7 @@ static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
     return !run || generation_aborted(run->generation) ||
            (run->network_only ? Arbiter::get_state() != SYS_IDLE ||
-               Config::revision() != run->config_revision : !storage.valid());
+               Config::revision(run->section) != run->config_revision : !storage.valid());
 }
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
@@ -588,6 +603,7 @@ static bool run_smb(const Request &request) {
                 break;
             }
             if (!export_ready(entry) || state_marker_exists(config, entry)) continue;
+            invalidate_backlog_entry(i - 1, SMB_VALID);
             portENTER_CRITICAL(&status_mux);
             copy_text(status.current_day, sizeof(status.current_day),
                       entry.therapy_day);
@@ -708,9 +724,16 @@ static bool run_sleephq(const Request &request) {
             break;
         }
         if (!export_ready(entry)) continue;
+        SleepHqSync::BacklogChanges changes = {};
         success = SleepHqSync::sync_session(
             storage, config, entry, run.operation, progress,
-            publish_sleephq_progress, nullptr, error, sizeof(error));
+            publish_sleephq_progress, nullptr, error, sizeof(error), &changes);
+        if (changes.entry) invalidate_backlog_entry(i - 1, SHQ_VALID);
+        if (changes.other_entries) {
+            for (uint32_t n = 0; n < backlog_entry_count; ++n)
+                backlog_entries[n].flags &= ~SHQ_VALID;
+            request_backlog_refresh();
+        }
     }
 
     if (!success) {
@@ -738,6 +761,7 @@ static void run_check(const Request &request) {
     run.generation = request.generation;
     run.network_only = true;
     run.config_revision = request.config_revision;
+    run.section = smb ? Config::Section::Smb : Config::Section::SleepHq;
     run.operation.started_ms = request.queued_ms;
     run.operation.timeout_ms = OPERATION_IDLE_TIMEOUT_MS;
     run.operation.should_abort = run_aborted;
@@ -745,7 +769,7 @@ static void run_check(const Request &request) {
 
     if (run.operation.stop_reason(millis()) != aircannect::BackgroundOperationStop::None) {
         copy_text(error, sizeof(error), "preempted_or_timed_out");
-    } else if (Config::revision() != request.config_revision) {
+    } else if (Config::revision(run.section) != request.config_revision) {
         copy_text(error, sizeof(error), "configuration_changed");
     } else if (WiFi.status() != WL_CONNECTED) {
         copy_text(error, sizeof(error), "wifi_disconnected");
@@ -789,25 +813,61 @@ static void run_check(const Request &request) {
 }
 
 static void refresh_backlog() {
-    EdfCatalog::Status catalog;
-    EdfCatalog::get_status(catalog);
-    const uint32_t config_revision = Config::revision();
+    EdfCatalog::Changes changes;
+    const bool incremental = EdfCatalog::changes_since(backlog_catalog_generation, changes);
+    const auto &catalog = changes.catalog;
+    const uint32_t smb_revision = Config::revision(Config::Section::Smb);
+    const uint32_t shq_revision = Config::revision(Config::Section::SleepHq);
     if (!__atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE) &&
         catalog.generation == backlog_catalog_generation &&
-        config_revision == backlog_config_revision) return;
+        smb_revision == backlog_smb_revision && shq_revision == backlog_shq_revision) return;
     if (uxQueueMessagesWaiting(request_queue) || !catalog.ready || Arbiter::get_state() != SYS_IDLE ||
         Arbiter::get_cached_rop() != 0 || !storage.begin()) return;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
-    if (__atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL))
-        roots_confirmed = false;
+    const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
+    if (files_changed) roots_confirmed = false;
 
     Backlog smb = {}, shq = {};
-    smb.config_revision = shq.config_revision = config_revision;
+    smb.config_revision = smb_revision;
+    shq.config_revision = shq_revision;
     smb.catalog_generation = shq.catalog_generation = catalog.generation;
     SmbConfig smb_config = {};
     SleepHqSync::Config shq_config = {};
     smb.known = snapshot_smb_config(smb_config, smb.error, sizeof(smb.error), false);
     shq.known = snapshot_sleephq_config(shq_config, shq.error, sizeof(shq.error), false);
+
+    bool cache_ready = true;
+    if (catalog.entries > backlog_entry_count) {
+        // Three bytes per session; large catalogs require PSRAM.
+        void *grown = aircannect::Memory::realloc_large(backlog_entries,
+            catalog.entries * sizeof(BacklogEntry), catalog.entries <= 128);
+        cache_ready = grown != nullptr;
+        if (cache_ready) {
+            backlog_entries = static_cast<BacklogEntry *>(grown);
+            memset(backlog_entries + backlog_entry_count, 0,
+                   (catalog.entries - backlog_entry_count) * sizeof(BacklogEntry));
+            backlog_entry_count = catalog.entries;
+        }
+    }
+    uint8_t invalidate = 0;
+    if (!incremental || files_changed) invalidate = SMB_VALID | SHQ_VALID;
+    if (smb_revision != backlog_smb_revision) invalidate |= SMB_VALID;
+    if (shq_revision != backlog_shq_revision) invalidate |= SHQ_VALID;
+    for (uint32_t i = 0; i < backlog_entry_count; ++i)
+        backlog_entries[i].flags &= ~invalidate;
+    for (uint32_t i = 0; i < changes.count; ++i) {
+        if (changes.indexes[i] < backlog_entry_count)
+            backlog_entries[changes.indexes[i]].flags = 0;
+    }
+    if (cache_ready) {
+        backlog_catalog_generation = catalog.generation;
+        backlog_smb_revision = smb_revision;
+        backlog_shq_revision = shq_revision;
+    } else {
+        smb.known = shq.known = false;
+        copy_text(smb.error, sizeof(smb.error), "backlog_alloc");
+        copy_text(shq.error, sizeof(shq.error), "backlog_alloc");
+    }
 
     for (uint32_t i = 0; i < catalog.entries && (smb.known || shq.known); ++i) {
         if (uxQueueMessagesWaiting(request_queue)) {
@@ -815,51 +875,74 @@ static void refresh_backlog() {
             __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
             return;
         }
-        EdfCatalog::Entry entry;
-        if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i, entry); })) {
+        auto &cached = backlog_entries[i];
+        const bool read_smb = smb.known && !(cached.flags & SMB_VALID);
+        const bool read_shq = shq.known && !(cached.flags & SHQ_VALID);
+        EdfCatalog::Entry entry = {};
+        if ((read_smb || read_shq) &&
+            !storage.run([&](fs::FS &) { return EdfCatalog::read(i, entry); })) {
             smb.known = shq.known = false;
             copy_text(smb.error, sizeof(smb.error), "catalog_read");
             copy_text(shq.error, sizeof(shq.error), "catalog_read");
             break;
         }
-        if (!export_ready(entry)) {
+        if (read_smb || read_shq) {
+            if (export_ready(entry)) cached.flags &= ~WAITING;
+            else cached.flags |= WAITING;
+        }
+        if (cached.flags & WAITING) {
+            cached.flags |= SMB_VALID | SHQ_VALID;
             ++smb.waiting_sessions;
             ++shq.waiting_sessions;
             continue;
         }
-        if (smb.known && !state_marker_exists(smb_config, entry)) {
-            ++smb.sessions;
-            smb.files += 2 * (sizeof(SESSION_SUFFIXES) / sizeof(SESSION_SUFFIXES[0]));
+        if (read_smb) {
+            cached.smb_files = state_marker_exists(smb_config, entry) ? 0 :
+                2 * (sizeof(SESSION_SUFFIXES) / sizeof(SESSION_SUFFIXES[0]));
+            cached.flags |= SMB_VALID;
         }
-        if (shq.known) {
+        smb.files += cached.smb_files;
+        smb.sessions += cached.smb_files ? 1 : 0;
+        if (read_shq) {
             uint32_t files = 0;
             bool incomplete = false;
             shq.known = SleepHqSync::pending_files(storage, shq_config, entry,
                 files, incomplete, shq.error, sizeof(shq.error));
-            shq.files += files;
-            shq.sessions += incomplete ? 1 : 0;
+            if (shq.known) {
+                cached.shq_files = files;
+                cached.flags = (cached.flags & ~SHQ_PENDING) | SHQ_VALID |
+                    (incomplete ? SHQ_PENDING : 0);
+            }
+        }
+        shq.files += cached.shq_files;
+        shq.sessions += (cached.flags & SHQ_PENDING) ? 1 : 0;
+        if (!storage.valid()) {
+            cached.flags = 0;
+            storage.end();
+            __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+            return;
         }
     }
     if (smb.known && (!roots_confirmed || roots_endpoint != endpoint_hash(smb_config) ||
                       roots_catalog_generation != catalog.generation)) {
-        for (const char *path : ROOT_FILES) {
-            bool exists = false;
-            if (!storage.run([&](fs::FS &fs) { exists = fs.exists(path); return true; })) {
-                smb.known = false;
-                copy_text(smb.error, sizeof(smb.error), "storage_unavailable");
-                break;
-            }
-            if (exists) ++smb.files;
+        if (!storage.run([&](fs::FS &fs) {
+            for (const char *path : ROOT_FILES) if (fs.exists(path)) ++smb.files;
+            return true;
+        })) {
+            smb.known = false;
+            copy_text(smb.error, sizeof(smb.error), "storage_unavailable");
         }
     }
-    if (!storage.valid() || Config::revision() != config_revision) {
+    if (!storage.valid() || Config::revision(Config::Section::Smb) != smb_revision ||
+        Config::revision(Config::Section::SleepHq) != shq_revision) {
+        // An interrupted marker read is not evidence that the marker is absent.
+        for (uint32_t i = 0; i < backlog_entry_count; ++i)
+            backlog_entries[i].flags = 0;
         storage.end();
         __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
         return;
     }
     storage.end();
-    backlog_config_revision = config_revision;
-    backlog_catalog_generation = catalog.generation;
     portENTER_CRITICAL(&status_mux);
     status.backlog = smb;
     portEXIT_CRITICAL(&status_mux);
@@ -1045,7 +1128,7 @@ static bool request_manual(bool smb, bool check) {
                          : (smb ? RequestKind::ManualSmb : RequestKind::ManualSleepHq);
     request.generation =
         __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
-    request.config_revision = Config::revision();
+    request.config_revision = Config::revision(smb ? Config::Section::Smb : Config::Section::SleepHq);
     request.queued_ms = millis();
     if (check) set_check(smb, request.generation, CheckState::Pending, request.config_revision);
     else if (smb) set_state(State::Pending);
@@ -1069,11 +1152,11 @@ void request_backlog_refresh(bool files_changed) {
     __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
 }
 
-static void validate_backlog(Backlog &out) {
+static void validate_backlog(Backlog &out, Config::Section section) {
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready || !SdStorage::mounted() ||
-        out.config_revision != Config::revision() ||
+        out.config_revision != Config::revision(section) ||
         out.catalog_generation != catalog.generation ||
         __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE)) out = {};
 }
@@ -1095,8 +1178,8 @@ void get_status(Status &out) {
     out.state = configured_state(out.state, Config::get().smb_enabled);
     out.has_files = out.state == State::Working || out.last_sync_epoch ||
         out.files_seen || out.files_uploaded || out.files_skipped;
-    if (out.check.config_revision != Config::revision()) out.check = {};
-    validate_backlog(out.backlog);
+    if (out.check.config_revision != Config::revision(Config::Section::Smb)) out.check = {};
+    validate_backlog(out.backlog, Config::Section::Smb);
 }
 
 void get_sleephq_status(SleepHqStatus &out) {
@@ -1106,8 +1189,8 @@ void get_sleephq_status(SleepHqStatus &out) {
     out.state = configured_state(out.state, Config::get().sleephq_enabled);
     out.has_files = out.state == State::Working || out.last_sync_epoch ||
         out.files_seen || out.files_uploaded || out.files_skipped;
-    if (out.check.config_revision != Config::revision()) out.check = {};
-    validate_backlog(out.backlog);
+    if (out.check.config_revision != Config::revision(Config::Section::SleepHq)) out.check = {};
+    validate_backlog(out.backlog, Config::Section::SleepHq);
 }
 
 const char *action_blocked(bool smb, bool check) {

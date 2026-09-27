@@ -727,7 +727,9 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
                   const EdfCatalog::Entry &entry,
                   BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback,
-                  void *callback_context, char *error, size_t error_size) {
+                  void *callback_context, char *error, size_t error_size,
+                  BacklogChanges *changes) {
+    if (changes) *changes = {};
     if (!configured(config)) {
         set_error(error, error_size, "not_configured");
         return false;
@@ -753,11 +755,16 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
         return false;
     }
     if (loaded == JournalLoad::Invalid) {
+        if (changes) changes->other_entries = true;
         Log::logf(CAT_EXPORT, LOG_WARN,
                   "[SLEEPHQ] discarded invalid inflight journal\n");
         remove_journal(storage, paths);
     } else if (loaded == JournalLoad::Valid) {
         const bool requested_entry = same_entry(journal, entry);
+        if (changes) {
+            changes->entry = requested_entry;
+            changes->other_entries = !requested_entry;
+        }
         if (!run_journal(storage, paths, client, journal, operation,
                          progress, callback, callback_context,
                          error, error_size)) {
@@ -811,6 +818,7 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
               entry.therapy_day);
     copy_cstr(journal.file_prefix, sizeof(journal.file_prefix),
               entry.file_prefix);
+    if (changes) changes->entry = true;
     if (!write_journal(storage, paths, journal)) {
         set_error(error, error_size, "inflight_write");
         client.disconnect();

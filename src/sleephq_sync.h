@@ -29,6 +29,11 @@ struct Progress {
 
 using ProgressCallback = void (*)(void *context, const Progress &progress);
 
+struct BacklogChanges {
+    bool entry;
+    bool other_entries;
+};
+
 bool configured(const Config &config);
 bool check_account(const Config &config,
                    aircannect::BackgroundOperationControl &operation,
@@ -42,6 +47,7 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
                   const EdfCatalog::Entry &entry,
                   aircannect::BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback,
-                  void *callback_context, char *error, size_t error_size);
+                  void *callback_context, char *error, size_t error_size,
+                  BacklogChanges *changes = nullptr);
 
 }  // namespace SleepHqSync

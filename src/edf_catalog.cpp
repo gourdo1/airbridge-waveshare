@@ -37,6 +37,8 @@ struct Header {
 
 static Status status = {true};
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t changed_indexes[32] = {};
+static uint32_t change_count = 0;
 static SemaphoreHandle_t mutex = nullptr;
 static fs::FS *storage = nullptr;
 
@@ -223,6 +225,7 @@ void init() {
     file.close();
     portENTER_CRITICAL(&status_mux);
     status.ready = true;
+    change_count = 0;
     status.entries = header.count;
     status.generation = header.generation;
     status.error[0] = 0;
@@ -242,6 +245,7 @@ bool commit(const Entry &entry) {
     Header old_header = {};
     bool success = read_valid_header(input, old_header) && input.seek(HEADER_SIZE);
     bool found = false;
+    uint32_t changed_index = old_header.count;
     uint8_t bytes[ENTRY_SIZE];
     if (success) {
         for (uint32_t i = 0; i < old_header.count; i++) {
@@ -253,6 +257,7 @@ bool commit(const Entry &entry) {
             }
             if (strcmp(decoded.file_prefix, entry.file_prefix) == 0) {
                 found = true;
+                changed_index = i;
                 break;
             }
         }
@@ -311,6 +316,8 @@ bool commit(const Entry &entry) {
         portENTER_CRITICAL(&status_mux);
         status.entries = new_header.count;
         status.generation = new_header.generation;
+        changed_indexes[status.generation % 32] = changed_index;
+        if (change_count < 32) ++change_count;
         portEXIT_CRITICAL(&status_mux);
         Log::logf(CAT_EDF, LOG_INFO,
                   "catalog commit %s entries=%u generation=%u\n",
@@ -446,6 +453,18 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
+bool changes_since(uint32_t generation, Changes &out) {
+    portENTER_CRITICAL(&status_mux);
+    out.catalog = status;
+    const uint32_t distance = status.generation - generation;
+    const bool complete = status.ready && distance <= change_count;
+    out.count = complete ? distance : 0;
+    for (uint32_t i = 0; i < out.count; ++i)
+        out.indexes[i] = changed_indexes[(generation + i + 1) % 32];
+    portEXIT_CRITICAL(&status_mux);
+    return complete;
+}
+
 }  // namespace EdfCatalog
 
 #else
@@ -454,6 +473,7 @@ namespace EdfCatalog {
 
 void init() {}
 bool commit(const Entry &) { return false; }
+bool changes_since(uint32_t, Changes &out) { out = {}; return false; }
 bool read(uint32_t, Entry &) { return false; }
 bool find(const char *, Entry &) { return false; }
 bool snapshot_prefixes(char *, size_t, uint32_t &count) {
