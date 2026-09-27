@@ -169,7 +169,6 @@ size_t Result::read(ClinicalSettings::Cursor &cursor, size_t offset,
 }
 
 bool submit(Kind kind, String &&body, uint32_t &id, SleepReport::Request report) {
-    if (kind == Kind::Report && !SleepReport::valid(report)) return false;
     if (!mutex || body.length() > MAX_BODY_SIZE || xSemaphoreTake(mutex, 0) != pdTRUE)
         return false;
     Job *available = nullptr;
