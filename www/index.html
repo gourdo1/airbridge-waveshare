@@ -80,8 +80,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 #p-report .row{gap:12px;flex-wrap:wrap}
 #p-report .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
 .report-note{font-size:12px;color:var(--text-dim);margin:12px 0;line-height:1.5}
+.report-note:empty{display:none}
 #reportGrid .stat{gap:12px;align-items:baseline}
-#reportIntervals .stat{gap:12px;flex-wrap:wrap}
+.report-interval{display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
+.report-interval:last-child{border-bottom:none}
+.interval-date{font-size:12px;color:var(--text-dim)}
+.interval-range{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
 .row input[type=number]{width:100px}
 input[type=text],input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:200px;font-size:14px}
 
@@ -1239,9 +1243,8 @@ function renderReport(data) {
   document.getElementById('reportTitle').textContent = day
     ? (data.day ? 'Therapy day ' + reportDate(data.day) : 'Therapy day')
     : 'Last ' + data.period + (data.period === 1 ? ' day' : ' days');
-  document.getElementById('reportNote').textContent = day
-    ? (data.present ? 'Saved device data. Therapy days run from noon to noon in AirSense time.' : 'No saved data for this therapy day.')
-    : 'Through therapy day ' + reportDate(data.day) + '. Device-calculated averages of valid daily values.' + (data.present ? '' : ' No therapy recorded in this period.');
+  document.getElementById('reportNote').textContent = data.present ? ''
+    : day ? 'No saved data for this therapy day.' : 'No therapy recorded in this period.';
   const rows = document.createDocumentFragment();
   for (const value of data.fields) {
     const row = document.createElement('div'); row.className = 'stat';
@@ -1255,10 +1258,14 @@ function renderReport(data) {
   intervals.replaceChildren();
   document.getElementById('reportMaskCard').hidden = !day || !data.present;
   for (const interval of data.intervals) {
-    const row = document.createElement('div'); row.className = 'stat';
-    const on = document.createElement('span'); on.className = 'k'; on.textContent = reportMaskTime(data.day, interval.on);
-    const off = document.createElement('span'); off.className = 'v'; off.textContent = reportMaskTime(data.day, interval.off);
-    row.append(on, off); intervals.append(row);
+    const on = reportMaskTime(data.day, interval.on), off = reportMaskTime(data.day, interval.off);
+    const onDate = interval.on < 0 ? '' : on.slice(0, 10), offDate = interval.off < 0 ? '' : off.slice(0, 10);
+    const row = document.createElement('div'); row.className = 'report-interval';
+    const date = document.createElement('span'); date.className = 'interval-date';
+    date.textContent = onDate && offDate && onDate !== offDate ? onDate + ' / ' + offDate : onDate || offDate;
+    const range = document.createElement('span'); range.className = 'interval-range';
+    range.textContent = (interval.on < 0 ? '--' : on.slice(11)) + ' \u2013 ' + (interval.off < 0 ? '--' : off.slice(11));
+    row.append(date, range); intervals.append(row);
   }
   if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
 }
