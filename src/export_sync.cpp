@@ -41,22 +41,30 @@ constexpr uint32_t OPERATION_IDLE_TIMEOUT_MS = 60000;
 constexpr uint32_t SLEEPHQ_IDLE_TIMEOUT_MS = 5 * 60 * 1000UL;
 constexpr uint32_t DNS_TIMEOUT_MS = 15000;
 constexpr uint16_t EXPORT_TASK_STACK = 8192;
+static const char *const SESSION_SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
+static const char *const ROOT_FILES[] = {"/Identification.tgt", "/Identification.crc", "/STR.edf"};
 
 enum class RequestKind : uint8_t {
     PostTherapy,
     ManualSmb,
     ManualSleepHq,
+    CheckSmb,
+    CheckSleepHq,
 };
 
 struct Request {
     RequestKind kind;
     EdfCatalog::Entry entry;
     uint32_t generation;
+    uint32_t config_revision;
+    uint32_t queued_ms;
 };
 
 struct RunContext {
     uint32_t generation;
     BackgroundOperationControl operation;
+    bool network_only;
+    uint32_t config_revision;
 };
 
 struct SmbConfig {
@@ -74,9 +82,32 @@ static TaskHandle_t export_task_handle = nullptr;
 static SdStorage::Session storage;
 static volatile uint32_t abort_generation = 1;
 static uint32_t status_revision = 0;
+static bool check_pending = false;
+static bool backlog_refresh = true;
+static uint32_t backlog_config_revision = UINT32_MAX;
+static uint32_t backlog_catalog_generation = UINT32_MAX;
+static bool roots_confirmed = false;
+static uint32_t roots_endpoint = 0;
+static uint32_t roots_catalog_generation = 0;
 
 static void publish_change() {
     __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
+}
+
+static void set_check(bool smb, uint32_t generation, CheckState state, uint32_t revision,
+                      const char *error = "") {
+    portMUX_TYPE *mux = smb ? &status_mux : &sleephq_status_mux;
+    CheckStatus &check = smb ? status.check : sleephq_status.check;
+    portENTER_CRITICAL(mux);
+    if (generation != __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE)) {
+        portEXIT_CRITICAL(mux);
+        return;
+    }
+    check.state = state;
+    check.config_revision = revision;
+    snprintf(check.error, sizeof(check.error), "%s", error);
+    portEXIT_CRITICAL(mux);
+    publish_change();
 }
 
 static bool generation_aborted(uint32_t generation) {
@@ -138,15 +169,18 @@ static void publish_sleephq_progress(
 
 static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
-    return !run || generation_aborted(run->generation) || !storage.valid();
+    return !run || generation_aborted(run->generation) ||
+           (run->network_only ? Arbiter::get_state() != SYS_IDLE ||
+               Config::revision() != run->config_revision : !storage.valid());
 }
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
                          char *error, size_t error_size) {
     const uint32_t started = millis();
     while (true) {
-        if (run_aborted(&run)) {
-            copy_text(error, error_size, "preempted");
+        const auto stop = run.operation.stop_reason(millis());
+        if (stop != aircannect::BackgroundOperationStop::None) {
+            copy_text(error, error_size, aircannect::background_operation_stop_error(stop));
             return false;
         }
         const StorageSmbOperationResult result =
@@ -441,11 +475,8 @@ static bool sync_session_files(StorageSmbClient &client,
                                uint8_t *buffer, size_t buffer_size,
                                RunContext &run,
                                char *error, size_t error_size) {
-    static const char *const suffixes[] = {
-        "BRP", "PLD", "SAD", "EVE", "CSL",
-    };
     char path[128];
-    for (const char *suffix : suffixes) {
+    for (const char *suffix : SESSION_SUFFIXES) {
         snprintf(path, sizeof(path), "/DATALOG/%s/%s_%s.edf",
                  entry.therapy_day, entry.file_prefix, suffix);
         if (!sync_smb_file(client, path, false, buffer, buffer_size,
@@ -462,10 +493,7 @@ static bool sync_root_files(StorageSmbClient &client,
                             uint8_t *buffer, size_t buffer_size,
                             RunContext &run,
                             char *error, size_t error_size) {
-    static const char *const paths[] = {
-        "/Identification.tgt", "/Identification.crc", "/STR.edf",
-    };
-    for (const char *path : paths) {
+    for (const char *path : ROOT_FILES) {
         bool exists = false;
         if (!storage.run([&](fs::FS &fs) { exists = fs.exists(path); return true; }))
             return false;
@@ -477,9 +505,9 @@ static bool sync_root_files(StorageSmbClient &client,
 }
 
 static bool snapshot_smb_config(SmbConfig &out,
-                                char *error, size_t error_size) {
+                                char *error, size_t error_size, bool require_enabled = true) {
     const AirBridgeConfig &config = Config::get();
-    if (!config.smb_enabled) return false;
+    if (require_enabled && !config.smb_enabled) return false;
     if (config.smb_endpoint.isEmpty()) {
         copy_text(error, error_size, "endpoint_missing");
         return false;
@@ -590,15 +618,18 @@ static bool run_smb(const Request &request) {
     status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
     status.current_day[0] = 0;
     portEXIT_CRITICAL(&status_mux);
+    roots_confirmed = true;
+    roots_endpoint = endpoint_hash(config);
+    roots_catalog_generation = catalog.generation;
     publish_change();
     set_state(State::Idle);
     return true;
 }
 
 static bool snapshot_sleephq_config(SleepHqSync::Config &out,
-                                    char *error, size_t error_size) {
+                                    char *error, size_t error_size, bool require_enabled = true) {
     const AirBridgeConfig &config = Config::get();
-    if (!config.sleephq_enabled) return false;
+    if (require_enabled && !config.sleephq_enabled) return false;
     if (config.sleephq_client_id.isEmpty() ||
         config.sleephq_client_secret.isEmpty()) {
         copy_text(error, error_size, "credentials_missing");
@@ -697,6 +728,144 @@ static bool run_sleephq(const Request &request) {
     return true;
 }
 
+static void run_check(const Request &request) {
+    const bool smb = request.kind == RequestKind::CheckSmb;
+    char error[96] = {};
+    bool success = false;
+    set_check(smb, request.generation, CheckState::Working, request.config_revision);
+    RunContext run = {};
+    run.generation = request.generation;
+    run.network_only = true;
+    run.config_revision = request.config_revision;
+    run.operation.started_ms = request.queued_ms;
+    run.operation.timeout_ms = OPERATION_IDLE_TIMEOUT_MS;
+    run.operation.should_abort = run_aborted;
+    run.operation.ctx = &run;
+
+    if (run.operation.stop_reason(millis()) != aircannect::BackgroundOperationStop::None) {
+        copy_text(error, sizeof(error), "preempted_or_timed_out");
+    } else if (Config::revision() != request.config_revision) {
+        copy_text(error, sizeof(error), "configuration_changed");
+    } else if (WiFi.status() != WL_CONNECTED) {
+        copy_text(error, sizeof(error), "wifi_disconnected");
+    } else if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) {
+        copy_text(error, sizeof(error), "standby_required");
+    } else if (smb) {
+        SmbConfig config = {};
+        StorageSmbClient client;
+        char remote[aircannect::AC_STORAGE_SMB_REMOTE_PATH_MAX];
+        StorageSmbRemoteStat stat;
+        success = snapshot_smb_config(config, error, sizeof(error), false) &&
+            client.configure(config.endpoint, config.user, config.password, error, sizeof(error)) &&
+            wait_resolve(client, run, error, sizeof(error)) &&
+            wait_connect(client, run, error, sizeof(error)) &&
+            client.make_remote_path("/", remote, sizeof(remote)) &&
+            wait_stat(client, remote, stat, run, error, sizeof(error));
+        if (success && (!stat.exists || !stat.directory)) {
+            success = false;
+            copy_text(error, sizeof(error), "directory_missing");
+        }
+        if (client.connected()) disconnect(client, run);
+        else client.abort_connection();
+    } else {
+        SleepHqSync::Config config = {};
+        if (!aircannect::TlsMemory::status().installed)
+            copy_text(error, sizeof(error), "tls_allocator_install");
+        else success = snapshot_sleephq_config(config, error, sizeof(error), false) &&
+                SleepHqSync::check_account(config, run.operation, error, sizeof(error));
+    }
+    if (request.generation != __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE)) return;
+    if (run_aborted(&run)) {
+        success = false;
+        copy_text(error, sizeof(error), "preempted");
+    }
+    set_check(smb, request.generation, success ? CheckState::Passed : CheckState::Failed,
+              request.config_revision, success ? "" : error[0] ? error : "check_failed");
+    __atomic_store_n(&check_pending, false, __ATOMIC_RELEASE);
+    Log::logf(CAT_EXPORT, success ? LOG_INFO : LOG_WARN, "[%s] Check %s%s%s\n",
+              smb ? "SMB" : "SLEEPHQ", success ? "passed" : "failed",
+              error[0] ? ": " : "", error);
+}
+
+static void refresh_backlog() {
+    EdfCatalog::Status catalog;
+    EdfCatalog::get_status(catalog);
+    const uint32_t config_revision = Config::revision();
+    if (!__atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE) &&
+        catalog.generation == backlog_catalog_generation &&
+        config_revision == backlog_config_revision) return;
+    if (uxQueueMessagesWaiting(request_queue) || !catalog.ready || Arbiter::get_state() != SYS_IDLE ||
+        Arbiter::get_cached_rop() != 0 || !storage.begin()) return;
+    __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
+
+    Backlog smb = {}, shq = {};
+    smb.config_revision = shq.config_revision = config_revision;
+    smb.catalog_generation = shq.catalog_generation = catalog.generation;
+    SmbConfig smb_config = {};
+    SleepHqSync::Config shq_config = {};
+    smb.known = snapshot_smb_config(smb_config, smb.error, sizeof(smb.error), false);
+    shq.known = snapshot_sleephq_config(shq_config, shq.error, sizeof(shq.error), false);
+
+    for (uint32_t i = 0; i < catalog.entries && (smb.known || shq.known); ++i) {
+        if (uxQueueMessagesWaiting(request_queue)) {
+            storage.end();
+            __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+            return;
+        }
+        EdfCatalog::Entry entry;
+        if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i, entry); })) {
+            smb.known = shq.known = false;
+            copy_text(smb.error, sizeof(smb.error), "catalog_read");
+            copy_text(shq.error, sizeof(shq.error), "catalog_read");
+            break;
+        }
+        if (!export_ready(entry)) {
+            ++smb.waiting_sessions;
+            ++shq.waiting_sessions;
+            continue;
+        }
+        if (smb.known && !state_marker_exists(smb_config, entry)) {
+            ++smb.sessions;
+            smb.files += 2 * (sizeof(SESSION_SUFFIXES) / sizeof(SESSION_SUFFIXES[0]));
+        }
+        if (shq.known) {
+            uint32_t files = 0;
+            bool incomplete = false;
+            shq.known = SleepHqSync::pending_files(storage, shq_config, entry,
+                files, incomplete, shq.error, sizeof(shq.error));
+            shq.files += files;
+            shq.sessions += incomplete ? 1 : 0;
+        }
+    }
+    if (smb.known && (!roots_confirmed || roots_endpoint != endpoint_hash(smb_config) ||
+                      roots_catalog_generation != catalog.generation)) {
+        for (const char *path : ROOT_FILES) {
+            bool exists = false;
+            if (!storage.run([&](fs::FS &fs) { exists = fs.exists(path); return true; })) {
+                smb.known = false;
+                copy_text(smb.error, sizeof(smb.error), "storage_unavailable");
+                break;
+            }
+            if (exists) ++smb.files;
+        }
+    }
+    if (!storage.valid() || Config::revision() != config_revision) {
+        storage.end();
+        __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+        return;
+    }
+    storage.end();
+    backlog_config_revision = config_revision;
+    backlog_catalog_generation = catalog.generation;
+    portENTER_CRITICAL(&status_mux);
+    status.backlog = smb;
+    portEXIT_CRITICAL(&status_mux);
+    portENTER_CRITICAL(&sleephq_status_mux);
+    sleephq_status.backlog = shq;
+    portEXIT_CRITICAL(&sleephq_status_mux);
+    publish_change();
+}
+
 template <typename T>
 static void run_logged(const Request &request, const char *name,
                         bool (*run)(const Request &), void (*snapshot)(T &)) {
@@ -722,16 +891,22 @@ static void run_logged(const Request &request, const char *name,
 
 static void export_task(void *) {
     while (true) {
+        refresh_backlog();
         Request request;
-        if (xQueueReceive(request_queue, &request, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(request_queue, &request, pdMS_TO_TICKS(1000)) != pdTRUE)
             continue;
         if (request.generation !=
             __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE)) {
             continue;
         }
+        if (request.kind == RequestKind::CheckSmb || request.kind == RequestKind::CheckSleepHq) {
+            run_check(request);
+            continue;
+        }
         while ((WiFi.status() != WL_CONNECTED ||
                 Arbiter::get_cached_rop() < 0) &&
                !generation_aborted(request.generation)) {
+            refresh_backlog();
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
         if (generation_aborted(request.generation)) continue;
@@ -747,6 +922,7 @@ static void export_task(void *) {
         }
         if (!admitted) continue;
         if (generation_aborted(request.generation)) { storage.end(); continue; }
+        request_backlog_refresh();
 
         if (request.kind == RequestKind::ManualSmb) {
             run_logged(request, "SMB", run_smb, get_status);
@@ -813,8 +989,19 @@ void init() {
 }
 
 void therapy_started() {
-    __atomic_add_fetch(&abort_generation, 1, __ATOMIC_ACQ_REL);
+    const uint32_t generation = __atomic_add_fetch(&abort_generation, 1, __ATOMIC_ACQ_REL);
     if (request_queue) xQueueReset(request_queue);
+    request_backlog_refresh();
+    if (__atomic_exchange_n(&check_pending, false, __ATOMIC_ACQ_REL)) {
+        Status smb;
+        SleepHqStatus shq;
+        get_status(smb);
+        get_sleephq_status(shq);
+        if (smb.check.state == CheckState::Pending || smb.check.state == CheckState::Working)
+            set_check(true, generation, CheckState::Failed, smb.check.config_revision, "preempted");
+        if (shq.check.state == CheckState::Pending || shq.check.state == CheckState::Working)
+            set_check(false, generation, CheckState::Failed, shq.check.config_revision, "preempted");
+    }
     set_state(Config::get().smb_enabled ? State::Idle : State::Disabled);
     set_sleephq_state(Config::get().sleephq_enabled
                           ? State::Idle : State::Disabled);
@@ -837,28 +1024,54 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     return true;
 }
 
-bool request_manual_smb() {
+static bool request_manual(bool smb, bool check) {
     if (!request_queue || Arbiter::get_cached_rop() == 1 ||
-        !Config::get().smb_enabled) return false;
+        __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE) ||
+        (!check && !(smb ? Config::get().smb_enabled : Config::get().sleephq_enabled))) return false;
+    if (check) {
+        Status a;
+        SleepHqStatus b;
+        get_status(a);
+        get_sleephq_status(b);
+        if (a.state == State::Pending || a.state == State::Working ||
+            b.state == State::Pending || b.state == State::Working ||
+            __atomic_exchange_n(&check_pending, true, __ATOMIC_ACQ_REL)) return false;
+    }
     Request request = {};
-    request.kind = RequestKind::ManualSmb;
+    request.kind = check ? (smb ? RequestKind::CheckSmb : RequestKind::CheckSleepHq)
+                         : (smb ? RequestKind::ManualSmb : RequestKind::ManualSleepHq);
     request.generation =
         __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
-    if (xQueueSend(request_queue, &request, 0) != pdTRUE) return false;
-    set_state(State::Pending);
+    request.config_revision = Config::revision();
+    request.queued_ms = millis();
+    if (check) set_check(smb, request.generation, CheckState::Pending, request.config_revision);
+    else if (smb) set_state(State::Pending);
+    else set_sleephq_state(State::Pending);
+    if (xQueueSend(request_queue, &request, 0) != pdTRUE) {
+        if (check) {
+            set_check(smb, request.generation, CheckState::NotRun, request.config_revision);
+            __atomic_store_n(&check_pending, false, __ATOMIC_RELEASE);
+        } else if (smb) set_state(State::Error, "queue_full");
+        else set_sleephq_state(State::Error, "queue_full");
+        return false;
+    }
     return true;
 }
 
-bool request_manual_sleephq() {
-    if (!request_queue || Arbiter::get_cached_rop() == 1 ||
-        !Config::get().sleephq_enabled) return false;
-    Request request = {};
-    request.kind = RequestKind::ManualSleepHq;
-    request.generation =
-        __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
-    if (xQueueSend(request_queue, &request, 0) != pdTRUE) return false;
-    set_sleephq_state(State::Pending);
-    return true;
+bool request_manual_smb(bool check) { return request_manual(true, check); }
+bool request_manual_sleephq(bool check) { return request_manual(false, check); }
+
+void request_backlog_refresh() {
+    __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+}
+
+static void validate_backlog(Backlog &out) {
+    EdfCatalog::Status catalog;
+    EdfCatalog::get_status(catalog);
+    if (!catalog.ready || !SdStorage::mounted() ||
+        out.config_revision != Config::revision() ||
+        out.catalog_generation != catalog.generation ||
+        __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE)) out = {};
 }
 
 uint32_t revision() {
@@ -869,12 +1082,16 @@ void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
     portEXIT_CRITICAL(&status_mux);
+    if (out.check.config_revision != Config::revision()) out.check = {};
+    validate_backlog(out.backlog);
 }
 
 void get_sleephq_status(SleepHqStatus &out) {
     portENTER_CRITICAL(&sleephq_status_mux);
     out = sleephq_status;
     portEXIT_CRITICAL(&sleephq_status_mux);
+    if (out.check.config_revision != Config::revision()) out.check = {};
+    validate_backlog(out.backlog);
 }
 
 }  // namespace ExportSync
@@ -888,8 +1105,9 @@ void init() {}
 uint32_t revision() { return 0; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
-bool request_manual_smb() { return false; }
-bool request_manual_sleephq() { return false; }
+bool request_manual_smb(bool) { return false; }
+bool request_manual_sleephq(bool) { return false; }
+void request_backlog_refresh() {}
 
 void get_status(Status &out) {
     out = {};
@@ -904,3 +1122,14 @@ void get_sleephq_status(SleepHqStatus &out) {
 }  // namespace ExportSync
 
 #endif
+
+const char *ExportSync::check_state_name(CheckState state) {
+    switch (state) {
+        case CheckState::NotRun: return "not_run";
+        case CheckState::Pending: return "pending";
+        case CheckState::Working: return "working";
+        case CheckState::Passed: return "passed";
+        case CheckState::Failed: return "failed";
+    }
+    return "not_run";
+}

@@ -1725,10 +1725,12 @@ function createSyncCards() {
       <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">&mdash;</span></div>
       <div class="time-row"><span class="label">Therapy day</span><span class="value" data-sync="day">&mdash;</span></div>
       <div class="time-row"><span class="label">Files</span><span class="value sync-value" data-sync="files">&mdash;</span></div>
+      <div class="time-row"><span class="label">Pending</span><span class="value sync-value" data-sync="backlog">&mdash;</span></div>
+      <div class="time-row"><span class="label">Connection check</span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
       <div class="sync-note" data-sync="import"></div>
       <div class="sync-note" data-sync="availability"></div>
       <div class="sync-error" data-sync="error"></div>
-      <div class="btn-row"><button class="btn btn-accent" data-sync="start">Sync now</button><button class="btn" data-sync="edit">Edit</button></div>
+      <div class="btn-row"><button class="btn btn-accent" data-sync="start">Sync now</button><button class="btn" data-sync="check">${id === 'smb' ? 'Check share' : 'Check account'}</button><button class="btn" data-sync="edit">Edit</button></div>
       <div class="msg" id="${id}SyncMsg"></div>
       <div id="${id}ConfigPanel" hidden>
         <div id="${id}ConfigFields" data-config-form="${id}"></div>
@@ -1737,6 +1739,7 @@ function createSyncCards() {
         <div class="msg" id="${id}ConfigMsg"></div>
       </div>`;
     card.querySelector('[data-sync="start"]').onclick = () => startSync(id);
+    card.querySelector('[data-sync="check"]').onclick = () => startSync(id, true);
     card.querySelector('[data-sync="edit"]').onclick = () => editSyncEndpoint(id);
     card.querySelector('[data-sync="save"]').onclick = () => saveConfig(id + 'ConfigFields', id + 'ConfigMsg');
     card.querySelector('[data-sync="cancel"]').onclick = () => cancelSyncEndpoint(id);
@@ -1753,7 +1756,7 @@ function renderExports() {
   document.getElementById('syncUnavailable').hidden = supported;
   if (!supported) return;
   createSyncCards();
-  const busy = Object.keys(SYNC_ENDPOINTS).some(id => ['pending', 'working'].includes(data[id].state));
+  const busy = Object.keys(SYNC_ENDPOINTS).some(id => ['pending', 'working'].includes(data[id].state) || ['pending', 'working'].includes(data[id].check_state));
   for (const id of Object.keys(SYNC_ENDPOINTS)) {
     const state = data[id];
     const card = document.getElementById(id + 'SyncCard');
@@ -1767,14 +1770,23 @@ function renderExports() {
     const hasFiles = state.state === 'working' || state.last_sync_epoch ||
       state.files_seen || state.files_uploaded || state.files_skipped;
     text('files', hasFiles ? state.files_uploaded + ' uploaded, ' + state.files_skipped + ' skipped' : '\u2014');
+    text('backlog', state.backlog_known ? state.backlog_files + ' files' +
+      (state.backlog_waiting ? ', ' + state.backlog_waiting + ' sessions not ready' : '') +
+      (!state.backlog_files && state.backlog_sessions ? ', awaiting confirmation' : '') :
+      state.configured && state.backlog_error ? state.backlog_error : '\u2014');
     text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
     text('error', state.error || '');
+    text('check-result', state.check_state === 'passed' ? 'Passed' :
+      state.check_state === 'failed' ? state.check_error || 'Failed' :
+      ['pending','working'].includes(state.check_state) ? 'Checking...' : '\u2014');
     const unavailable = !exportsFresh ? 'Status unavailable; reconnecting' :
       !state.enabled ? '' : !data.sd_mounted ? 'SD card unavailable' :
       !state.configured ? 'Configure this endpoint first' : !data.idle ? 'Waiting for AirSense standby' :
       !data.online ? 'Waiting for WiFi' : '';
     text('availability', unavailable);
     card.querySelector('[data-sync="start"]').disabled = !state.enabled || !!unavailable || busy || syncRequests.size > 0;
+    card.querySelector('[data-sync="check"]').disabled = !exportsFresh || !state.configured ||
+      !data.idle || !data.online || !data.sd_mounted || busy || syncRequests.size > 0;
   }
 }
 
@@ -1984,17 +1996,17 @@ async function loadExports() {
   return exportsRead;
 }
 
-async function startSync(id) {
+async function startSync(id, check = false) {
   if (syncRequests.size) return;
   syncRequests.add(id);
   renderExports();
   const message = document.getElementById(id + 'SyncMsg');
   try {
-    const response = await api('/api/export/' + id, {method: 'POST'});
+    const response = await api('/api/export/' + id + (check ? '?action=check' : ''), {method: 'POST'});
     if (!response) return;
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || 'Sync request failed');
-    showMsg(message, 'Sync queued', 'ok');
+    showMsg(message, check ? 'Check queued' : 'Sync queued', 'ok');
     await loadExports();
   } catch(e) {
     showMsg(message, e.message, 'err');

@@ -30,8 +30,14 @@ struct Progress {
 using ProgressCallback = void (*)(void *context, const Progress &progress);
 
 bool configured(const Config &config);
+bool check_account(const Config &config,
+                   aircannect::BackgroundOperationControl &operation,
+                   char *error, size_t error_size);
 bool complete(SdStorage::Session &storage, const Config &config,
               const EdfCatalog::Entry &entry);
+bool pending_files(SdStorage::Session &storage, const Config &config,
+                   const EdfCatalog::Entry &entry, uint32_t &files,
+                   bool &incomplete, char *error, size_t error_size);
 bool sync_session(SdStorage::Session &storage, const Config &config,
                   const EdfCatalog::Entry &entry,
                   aircannect::BackgroundOperationControl &operation,

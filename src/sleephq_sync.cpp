@@ -253,13 +253,15 @@ static bool decode_journal(const uint8_t *data, Journal &journal) {
 }
 
 static JournalLoad load_journal(SdStorage::Session &access, const StatePaths &paths,
-                                Journal &journal) {
+                                Journal &journal, bool recover = true) {
     JournalLoad result = JournalLoad::Missing;
     const bool loaded = access.run([&](fs::FS &storage) {
-        recover_journal(storage, paths);
-        if (!storage.exists(paths.journal)) return true;
+        if (recover) recover_journal(storage, paths);
+        const char *path = !recover && !storage.exists(paths.journal)
+            ? paths.journal_backup : paths.journal;
+        if (!storage.exists(path)) return true;
         uint8_t data[JOURNAL_SIZE];
-        fs::File file = storage.open(paths.journal, FILE_READ);
+        fs::File file = storage.open(path, FILE_READ);
         if (!file) return false;
         bool valid = false;
         if (file.size() == sizeof(data)) {
@@ -633,10 +635,51 @@ static bool same_entry(const Journal &journal,
            journal.flags == entry.flags;
 }
 
+static bool configure_client(SleepHqClient &client, const Config &config) {
+    SleepHqConfig client_config;
+    copy_cstr(client_config.client_id, sizeof(client_config.client_id), config.client_id);
+    copy_cstr(client_config.client_secret, sizeof(client_config.client_secret), config.client_secret);
+    copy_cstr(client_config.team_id, sizeof(client_config.team_id), config.team_id);
+    copy_cstr(client_config.device_id, sizeof(client_config.device_id), config.device_id);
+    return client.configure(client_config);
+}
+
 }  // namespace
 
 bool configured(const Config &config) {
     return config.client_id[0] && config.client_secret[0];
+}
+
+bool check_account(const Config &config, BackgroundOperationControl &operation,
+                   char *error, size_t error_size) {
+    uint32_t team_id = 0;
+    struct Selection { uint32_t id; bool found; } selection = {};
+    if ((config.team_id[0] && (!aircannect::parse_uint32_decimal(config.team_id, team_id) || !team_id)) ||
+        (config.device_id[0] && (!aircannect::parse_uint32_decimal(config.device_id, selection.id) || !selection.id))) {
+        set_error(error, error_size, "invalid_team_or_device_id");
+        return false;
+    }
+    SleepHqClient client;
+    bool success = configure_client(client, config) &&
+        client.resolve_team_id(team_id, &operation);
+    bool more = true;
+    for (uint32_t page = 1; success && more && !selection.found; ++page) {
+        size_t count = 0;
+        success = client.list_team_machines(team_id, page, selection.id ? 25 : 1,
+            [](void *ctx, const aircannect::SleepHqMachine &machine) {
+                auto &selected = *static_cast<Selection *>(ctx);
+                if (machine.id == selected.id) selected.found = true;
+                return true;
+            }, &selection, count, more, &operation);
+        if (!selection.id) break;
+    }
+    if (!success) set_error(error, error_size, client.last_error());
+    else if (selection.id && !selection.found) {
+        success = false;
+        set_error(error, error_size, "device_not_in_team");
+    }
+    client.disconnect();
+    return success;
 }
 
 bool complete(SdStorage::Session &storage, const Config &config,
@@ -644,6 +687,40 @@ bool complete(SdStorage::Session &storage, const Config &config,
     StatePaths paths = {};
     return configured(config) && build_state_paths(config, paths) &&
            marker_valid(storage, paths, entry);
+}
+
+bool pending_files(SdStorage::Session &storage, const Config &config,
+                   const EdfCatalog::Entry &entry, uint32_t &files,
+                   bool &incomplete, char *error, size_t error_size) {
+    files = 0;
+    incomplete = false;
+    StatePaths paths = {};
+    if (!configured(config) || !build_state_paths(config, paths)) {
+        set_error(error, error_size, "not_configured");
+        return false;
+    }
+    if (marker_valid(storage, paths, entry)) return true;
+    incomplete = true;
+    Journal journal = {};
+    const auto loaded = load_journal(storage, paths, journal, false);
+    if (loaded == JournalLoad::Unavailable || loaded == JournalLoad::Invalid) {
+        set_error(error, error_size, loaded == JournalLoad::Invalid
+            ? "inflight_invalid" : "storage_unavailable");
+        return false;
+    }
+    uint16_t uploaded = 0;
+    if (loaded == JournalLoad::Valid && strcmp(journal.file_prefix, entry.file_prefix) == 0) {
+        if (!same_entry(journal, entry)) {
+            set_error(error, error_size, "inflight_revision_changed");
+            return false;
+        }
+        uploaded = journal.uploaded_mask;
+    } else if (marker_valid(storage, paths, entry, false)) {
+        uploaded = ((1u << FILE_COUNT) - 1) & ~7u;
+    }
+    for (size_t i = 0; i < FILE_COUNT; ++i)
+        if (!(uploaded & (1u << i))) ++files;
+    return true;
 }
 
 bool sync_session(SdStorage::Session &storage, const Config &config,
@@ -663,17 +740,8 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
         return false;
     }
 
-    SleepHqConfig client_config;
-    copy_cstr(client_config.client_id, sizeof(client_config.client_id),
-              config.client_id);
-    copy_cstr(client_config.client_secret,
-              sizeof(client_config.client_secret), config.client_secret);
-    copy_cstr(client_config.team_id, sizeof(client_config.team_id),
-              config.team_id);
-    copy_cstr(client_config.device_id, sizeof(client_config.device_id),
-              config.device_id);
     SleepHqClient client;
-    if (!client.configure(client_config)) {
+    if (!configure_client(client, config)) {
         set_error(error, error_size, "not_configured");
         return false;
     }

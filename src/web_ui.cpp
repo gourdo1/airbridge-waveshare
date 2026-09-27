@@ -669,6 +669,13 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
     jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
     jsonAddString(json, "current_day", status.current_day);
     jsonAddString(json, "error", status.last_error);
+    jsonAddString(json, "check_state", ExportSync::check_state_name(status.check.state));
+    jsonAddString(json, "check_error", status.check.error);
+    jsonAddBool(json, "backlog_known", status.backlog.known);
+    jsonAddUInt32(json, "backlog_files", status.backlog.files);
+    jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
+    jsonAddUInt32(json, "backlog_waiting", status.backlog.waiting_sessions);
+    jsonAddString(json, "backlog_error", status.backlog.error);
 }
 
 struct ExportPublication {
@@ -720,6 +727,7 @@ static String buildExportsJson() {
 
 static void handleExportStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
+    ExportSync::request_backlog_refresh();
     auto *response = request->beginResponse(200, "application/json", buildExportsJson());
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
@@ -741,27 +749,20 @@ static void publishExports() {
 }
 #endif
 
-static void handleSmbSync(AsyncWebServerRequest *request) {
+static void handleExportRequest(AsyncWebServerRequest *request, bool smb) {
     if (!checkAuth(request)) return;
+    const String action = request->hasParam("action") ? request->getParam("action")->value() : "sync";
+    if (action != "sync" && action != "check") {
+        request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_action\"}");
+        return;
+    }
     if (Arbiter::get_cached_rop() == 1) {
         request->send(409, "application/json",
                       "{\"ok\":false,\"error\":\"therapy_active\"}");
         return;
     }
-    const bool queued = ExportSync::request_manual_smb();
-    request->send(queued ? 202 : 409, "application/json",
-                  queued ? "{\"ok\":true,\"state\":\"pending\"}" :
-                           "{\"ok\":false,\"error\":\"unavailable\"}");
-}
-
-static void handleSleepHqSync(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
-    if (Arbiter::get_cached_rop() == 1) {
-        request->send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"therapy_active\"}");
-        return;
-    }
-    const bool queued = ExportSync::request_manual_sleephq();
+    const bool queued = smb ? ExportSync::request_manual_smb(action == "check")
+                            : ExportSync::request_manual_sleephq(action == "check");
     request->send(queued ? 202 : 409, "application/json",
                   queued ? "{\"ok\":true,\"state\":\"pending\"}" :
                            "{\"ok\":false,\"error\":\"unavailable\"}");
@@ -1772,6 +1773,7 @@ void WebUI::init(uint16_t port) {
 #if AB_STORAGE_HAS_SDCARD
     events->onConnect([](AsyncEventSourceClient *) {
         __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
+        ExportSync::request_backlog_refresh();
     });
 #endif
     live_events->addMiddleware(authenticate_events);
@@ -1793,8 +1795,8 @@ void WebUI::init(uint16_t port) {
     http->on("/api/config", HTTP_GET, handleGetConfig);
     http->on("/api/config", HTTP_POST, handlePostConfig, NULL, handleJsonBody);
     http->on("/api/export", HTTP_GET, handleExportStatus);
-    http->on("/api/export/smb", HTTP_POST, handleSmbSync);
-    http->on("/api/export/sleephq", HTTP_POST, handleSleepHqSync);
+    http->on("/api/export/smb", HTTP_POST, [](AsyncWebServerRequest *r) { handleExportRequest(r, true); });
+    http->on("/api/export/sleephq", HTTP_POST, [](AsyncWebServerRequest *r) { handleExportRequest(r, false); });
 #if AB_STORAGE_HAS_SDCARD
     http->on("/api/storage/list", HTTP_GET, [](AsyncWebServerRequest *r) {
         handleStorage(r, StorageBrowser::Kind::List);
