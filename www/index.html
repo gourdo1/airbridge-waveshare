@@ -2216,9 +2216,13 @@ function renderOtaStatus(d) {
   bar.style.width = (d.reboot_pending ? 100 : (d.progress || 0)) + '%';
 
   var msgEl = document.getElementById('otaReleaseMsg');
-  if (d.reboot_pending) showMsg(msgEl, 'Update complete. Restarting...', 'ok', 0);
-  else if (d.installing) showMsg(msgEl, 'Installing update: ' + (d.progress || 0) + '%', 'ok', 0);
-  else if (d.error) showMsg(msgEl, d.error, 'err', 0);
+  var text = d.reboot_pending ? 'Update complete. Restarting...' :
+    d.installing ? 'Installing update: ' + (d.progress || 0) + '%' :
+    d.checking ? 'Checking for updates...' : d.error;
+  if (text) {
+    msgEl.textContent = text;
+    msgEl.className = 'msg ' + (d.error ? 'err' : 'ok');
+  }
 }
 
 function applyOtaStatus(d) {
