@@ -100,6 +100,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
 /* Configuration */
 #configCategories{margin:16px 0}
+#configFields .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
 [data-config-form][data-loading="1"]::before{content:'Loading...';display:block;color:var(--text-dim);margin:12px 0}
 .config-section-title{color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
 [data-config-form] .row{gap:16px}
@@ -487,7 +488,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
             <div class="msg" id="wifiMsg"></div>
           </div>
-          <div class="btn-row" id="configCategories" aria-label="Configuration categories"></div>
+          <div class="btn-group" id="configCategories" aria-label="Configuration categories"></div>
           <div id="configFields"></div>
         </div>
       </div>
