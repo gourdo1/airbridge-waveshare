@@ -67,7 +67,6 @@ static const KVEntry kv_table[] = {
     KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true, Oximetry),
     KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true, Oximetry),
     KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false, Oximetry),
-    KV_STR("oxi_device_addr", "oxi_devaddr", oxi_device_addr, "", Oximetry),
     KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
     KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
     KV_BOOL("oxi_require_known", "oxi_req_known", oxi_require_known, false, Oximetry),

@@ -727,7 +727,7 @@ class OxiScanCB : public NimBLEScanCallbacks {
         // Passive advertisements need not contain a name or service UUID.
         bool known = is_device_known(addr, address);
         bool is_oxi = has_oxyii_manufacturer(dev) ||
-                       known || strcasecmp(addr, Config::get().oxi_device_addr.c_str()) == 0 ||
+                       known ||
                        dev->isAdvertisingService(PLX_SERVICE_UUID) ||
                        dev->isAdvertisingService(NONIN_OXI_SERVICE_UUID) ||
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
@@ -1153,40 +1153,19 @@ void OxiBle::task(void *param) {
                 Log::logf(CAT_OXI, LOG_DEBUG, "Scan done, %d results\n", scan_result_count);
                 set_state(OXI_DISCONNECTED);
                 if (scan_result_count > 0 && !manual_scan && !active_scan_requested) {
-                    String target = cfg.oxi_device_addr;
-                    bool found = false;
-                    if (target.length() > 0) {
-                        for (int i = 0; i < scan_result_count; i++) {
-                            if (strcasecmp(scan_results[i].addr, target.c_str()) == 0) {
-                                found = true;
-                                Log::logf(CAT_OXI, LOG_DEBUG, "Target %s found in scan\n", target.c_str());
-                                break;
-                            }
-                        }
-                        if (!found) Log::logf(CAT_OXI, LOG_DEBUG, "Target %s not in scan results\n", target.c_str());
-                    } else {
-                        for (int i = 0; i < scan_result_count; i++) {
-                            NimBLEAddress address(std::string(scan_results[i].addr),
-                                                    scan_results[i].addr_type);
-                            bool known = is_device_known(scan_results[i].addr, address);
-                            Log::logf(CAT_OXI, LOG_DEBUG, "%s %s known=%d\n",
-                                      scan_results[i].name.c_str(), scan_results[i].addr, known);
-                            if (cfg.oxi_require_known) {
-                                if (known) { target = scan_results[i].addr; found = true; break; }
-                            } else {
-                                if (strncasecmp(scan_results[i].name.c_str(), "Nonin", 5) == 0) {
-                                    if (known) { target = scan_results[i].addr; found = true; break; }
-                                } else {
-                                    target = scan_results[i].addr;
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (found) {
-                        request_connect(CONN_AUTO, target.c_str());
+                    for (int i = 0; i < scan_result_count; i++) {
+                        NimBLEAddress address(std::string(scan_results[i].addr),
+                                              scan_results[i].addr_type);
+                        bool known = is_device_known(scan_results[i].addr, address);
+                        Log::logf(CAT_OXI, LOG_DEBUG, "%s %s known=%d\n",
+                                  scan_results[i].name.c_str(), scan_results[i].addr, known);
+                        bool requires_known = cfg.oxi_require_known ||
+                            strncasecmp(scan_results[i].name.c_str(), "Nonin", 5) == 0;
+                        if (requires_known && !known) continue;
+
+                        request_connect(CONN_AUTO, scan_results[i].addr);
                         Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect triggered\n");
+                        break;
                     }
                 }
             }
@@ -1240,8 +1219,6 @@ void OxiBle::task(void *param) {
             scan_complete = false;  // discard any pending scan-complete trigger
 
             String addr = connection.addr;
-            if (addr.length() == 0 && cfg.oxi_device_addr.length() > 0)
-                addr = cfg.oxi_device_addr;
             if (addr.length() == 0 && scan_result_count > 0)
                 addr = scan_results[0].addr;
 

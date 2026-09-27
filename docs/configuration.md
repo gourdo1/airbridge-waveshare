@@ -119,7 +119,6 @@ only while therapy is inactive.
 | `oxi_enabled` | true | Enable BLE oximeter support |
 | `oxi_auto_start` | true | Start feeding data automatically on connect |
 | `oxi_feed_therapy_only` | false | Only inject readings during active therapy |
-| `oxi_device_addr` | *(empty)* | Preferred oximeter MAC (AA:BB:CC:DD:EE:FF) |
 | `oxi_interval_ms` | 500 | Injection interval in milliseconds |
 | `oxi_lframe_continuous` | true | Send L-frames even when no valid reading (keeps link alive) |
 | `udp_oxi_port` | 8025 | UDP oximetry listener port, 0 = disabled |

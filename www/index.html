@@ -1622,7 +1622,7 @@ const CFG_META = {
     update_url:['Release manifest URL (empty disables automatic checks)'],ota_password:['ArduinoOTA password'],
     ntp_server:['NTP server (empty = DHCP or pool.ntp.org)'],tz:['POSIX timezone string'],
     udp_oxi_port:['UDP oximetry port (0=disabled)'],
-    oxi_enabled:['Enable BLE oximeter support'],oxi_auto_start:['Auto-start feeding on connect'],oxi_feed_therapy_only:['Only inject during active therapy'],oxi_device_addr:['Preferred oximeter MAC'],oxi_interval_ms:['Injection interval (ms)'],oxi_lframe_continuous:['Send L-frames even without valid reading'],oxi_require_known:['Only auto-connect to known devices'],
+    oxi_enabled:['Enable BLE oximeter support'],oxi_auto_start:['Auto-start feeding on connect'],oxi_feed_therapy_only:['Only inject during active therapy'],oxi_interval_ms:['Injection interval (ms)'],oxi_lframe_continuous:['Send L-frames even without valid reading'],oxi_require_known:['Only auto-connect to known devices'],
     smb_enabled:['Enable SMB synchronization'],smb_auto_after_therapy:['Sync backlog at startup and after therapy'],smb_endpoint:['//host/share/optional/path'],smb_user:['SMB username'],smb_password:['SMB password'],
     sleephq_enabled:['Enable SleepHQ synchronization'],sleephq_auto_after_therapy:['Sync backlog at startup and after therapy'],sleephq_client_id:['SleepHQ API client ID'],sleephq_client_secret:['SleepHQ API client secret'],sleephq_team_id:['Optional team ID (resolved automatically when empty)'],sleephq_device_id:['Optional SleepHQ device ID'],
     uart_cmd_timeout_ms:['Command response timeout (ms)'],uart_max_retries:['Retry count for failed commands'],tcp_port:['TCP command port'],
@@ -2185,7 +2185,7 @@ function loadBle() {
     Object.assign(d, {state:lastStatus.oxi, feeding:lastStatus.feeding,
       spo2:lastStatus.spo2, pulse:lastStatus.pulse});
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
-    const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
+    const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',auto_start:d.auto_start};
     for (const [k,v] of Object.entries(fields)) {
       const stat = document.createElement('div'); stat.className = 'stat';
       stat.innerHTML = '<span class="k"></span> <span class="v"></span>';

@@ -1216,7 +1216,6 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
     jsonAddString(json, "feeding", OxiArbiter::is_feeding() ? "yes" : "no");
     jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
     jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
-    jsonAddString(json, "configured_addr", cfg.oxi_device_addr.c_str());
     jsonAddString(json, "auto_start", cfg.oxi_auto_start ? "yes" : "no");
 
 
@@ -1302,11 +1301,6 @@ static void handleBleAction(AsyncWebServerRequest *request) {
         ok = true;
     } else if (action == "delete_bond") {
         if (addr.length() > 0) {
-            // Clear the configured device addr synchronously if it matches.
-            if (strcasecmp(addr.c_str(), Config::get().oxi_device_addr.c_str()) == 0) {
-                Config::set_value("oxi_device_addr", "");
-                Config::save();
-            }
             OxiBle::request_remove_known(addr.c_str());
             result = "queued";
             ok = true;
@@ -1315,10 +1309,6 @@ static void handleBleAction(AsyncWebServerRequest *request) {
             ok = true;
         }
     } else if (action == "delete_all_bonds") {
-        if (Config::get().oxi_device_addr.length() > 0) {
-            Config::set_value("oxi_device_addr", "");
-            Config::save();
-        }
         OxiBle::request_clear_all_known();
         result = "queued";
         ok = true;
