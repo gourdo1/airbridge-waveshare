@@ -321,7 +321,8 @@ def flash_target(target, data, args, auth):
             raise FlashError('upload succeeded, but device uptime is unavailable; reboot manually')
         started = time.monotonic()
         try:
-            body = request_json(target, 'POST', '/api/reboot', auth, args.timeout)
+            # Restart can strand this connection; confirm on a fresh status read.
+            body = request_json(target, 'POST', '/api/reboot', auth, min(args.timeout, 2.0))
             if not is_ok(body):
                 raise FlashError(f'reboot rejected: {body}')
             emit(target, f'reboot request accepted in {time.monotonic() - started:.1f}s')
