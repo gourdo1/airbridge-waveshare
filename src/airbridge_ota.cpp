@@ -423,6 +423,16 @@ void init() {
               "Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
 }
 
+void request_reboot() {
+    if (!lock()) return;
+    const bool changed = !runtime.reboot_pending;
+    if (changed) {
+        runtime.reboot_pending = true;
+        runtime.reboot_at_ms = millis() + REBOOT_DELAY_MS;
+    }
+    unlock(changed);
+}
+
 void handle() {
     bool initialized = false;
     bool poll_arduino = false;

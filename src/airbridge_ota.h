@@ -21,6 +21,7 @@ namespace OtaManager {
 
     void init();
     void handle();
+    void request_reboot();  // Deferred to handle(); repeated requests coalesce.
 
     bool request_check(const char **error = nullptr);
     bool request_install(const char **error = nullptr);

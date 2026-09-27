@@ -1875,9 +1875,9 @@ static void handleOnboardingComplete(AsyncWebServerRequest *request) {
 
 static void handleReboot(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
+    // send() stages the response; transmission starts after this handler returns.
+    request->onDisconnect([]() { OtaManager::request_reboot(); });
     request->send(200, "application/json", "{\"ok\":true}");
-    delay(100);
-    ESP.restart();
 }
 
 
