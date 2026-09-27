@@ -84,7 +84,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 #reportGrid .stat{gap:12px;align-items:baseline}
 .report-interval{display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
 .report-interval:last-child{border-bottom:none}
-.interval-date{font-size:12px;color:var(--text-dim)}
+.interval-duration{font-size:12px;color:var(--text-dim);white-space:nowrap}
 .interval-range{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
 .row input[type=number]{width:100px}
 input[type=text],input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:200px;font-size:14px}
@@ -1259,13 +1259,14 @@ function renderReport(data) {
   document.getElementById('reportMaskCard').hidden = !day || !data.present;
   for (const interval of data.intervals) {
     const on = reportMaskTime(data.day, interval.on), off = reportMaskTime(data.day, interval.off);
-    const onDate = interval.on < 0 ? '' : on.slice(0, 10), offDate = interval.off < 0 ? '' : off.slice(0, 10);
     const row = document.createElement('div'); row.className = 'report-interval';
-    const date = document.createElement('span'); date.className = 'interval-date';
-    date.textContent = onDate && offDate && onDate !== offDate ? onDate + ' / ' + offDate : onDate || offDate;
     const range = document.createElement('span'); range.className = 'interval-range';
     range.textContent = (interval.on < 0 ? '--' : on.slice(11)) + ' \u2013 ' + (interval.off < 0 ? '--' : off.slice(11));
-    row.append(date, range); intervals.append(row);
+    const minutes = interval.on >= 0 && interval.off >= interval.on ? interval.off - interval.on : -1;
+    const duration = document.createElement('span'); duration.className = 'interval-duration';
+    duration.textContent = '\u00b7 ' + (minutes < 0 ? '--' : minutes < 60 ? minutes + ' min'
+      : Math.floor(minutes / 60) + ' h' + (minutes % 60 ? ' ' + (minutes % 60) + ' min' : ''));
+    row.append(range, duration); intervals.append(row);
   }
   if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
 }
