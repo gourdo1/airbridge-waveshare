@@ -99,11 +99,8 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .stat .v{color:var(--text);font-weight:500;text-align:right;padding-right:8px}
 
 /* Configuration */
-.config-section{border:1px solid var(--border);border-radius:8px;margin:12px 0;overflow:hidden}
-.config-section summary{cursor:pointer;padding:14px 16px;font-size:14px;font-weight:600;color:var(--text)}
-.config-section[open] summary{border-bottom:1px solid var(--border)}
-.config-section summary:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
-.config-section-fields{padding:0 16px 12px}
+#configCategories{margin:16px 0}
+[data-config-form][data-loading="1"]::before{content:'Loading...';display:block;color:var(--text-dim);margin:12px 0}
 .config-section-title{color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
 [data-config-form] .row{gap:16px}
 [data-config-form] label{min-width:0;overflow-wrap:anywhere}
@@ -490,10 +487,8 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
             <div class="msg" id="wifiMsg"></div>
           </div>
-          <div class="spinner" id="configSpinner"></div>
-          <div id="configFields" data-config-form=""></div>
-          <div class="btn-row"><button class="btn btn-accent" onclick="saveConfig()">Save & Persist</button></div>
-          <div class="msg" id="configMsg"></div>
+          <div class="btn-row" id="configCategories" aria-label="Configuration categories"></div>
+          <div id="configFields"></div>
         </div>
       </div>
 
@@ -688,7 +683,7 @@ function initSSE() {
     wifiSerial++;
     // Refresh WiFi list if Config tab is active
     var pane = document.getElementById('p-device');
-    if (pane && pane.classList.contains('active')) loadWifiNets();
+    if (pane && pane.classList.contains('active') && configSection === 'network') loadWifiNets();
     if (setupActive() && setupStep === 'network') loadSetupWifi();
   });
   evtSrc.onerror = () => {
@@ -1071,11 +1066,7 @@ function showTab(id) {
   if (id === 'clinical') loadSettings();
   if (id === 'bluetooth') loadBle();
   if (id === 'console') document.getElementById('cmdInput').focus();
-  if (id === 'device') {
-    loadWifiNets();
-    if (!document.getElementById('configFields').children.length ||
-        document.getElementById('configFields').dataset.stale === '1') loadConfig();
-  }
+  if (id === 'device') loadConfig();
   if (id === 'sync') renderExports();
   if (id === 'ota') {
     checkFlashReady();
@@ -1497,7 +1488,7 @@ function loadWifiNets() {
   } catch(e) { console.error(e); }
   })().finally(() => {
     wifiRead = null;
-    if (serial !== wifiSerial && document.getElementById('p-device').classList.contains('active')) loadWifiNets();
+    if (serial !== wifiSerial && document.getElementById('p-device').classList.contains('active') && configSection === 'network') loadWifiNets();
   });
   return wifiRead;
 }
@@ -1545,14 +1536,11 @@ const CFG_META = {
   };
 
 let configStorageSupported = false;
+let configSection = 'network';
 
 function renderConfigFields(root, d) {
-  const grouped = root === document.getElementById('configFields');
-  const wifi = grouped ? document.getElementById('configWifi') : null;
-  const expanded = new Map([...root.querySelectorAll('details')].map(section => [section.dataset.group, section.open]));
   root.innerHTML = '';
   var lastGroup = '';
-  let fields = root;
   const category = key => {
     const index = CFG_SECTIONS.findIndex(section => section.keys.includes(key));
     return index < 0 ? CFG_SECTIONS.length : index;
@@ -1565,28 +1553,10 @@ function renderConfigFields(root, d) {
     var meta = CFG_META[k] || [''];
     if (group !== lastGroup) {
       lastGroup = group;
-      if (grouped) {
-        const section = document.createElement('details');
-        section.className = 'config-section';
-        section.dataset.group = lastGroup;
-        section.open = expanded.has(lastGroup) ? expanded.get(lastGroup) : true;
-        const heading = document.createElement('summary');
-        heading.textContent = lastGroup;
-        section.appendChild(heading);
-        fields = document.createElement('div');
-        fields.className = 'config-section-fields';
-        section.appendChild(fields);
-        root.appendChild(section);
-        if (categoryInfo?.id === 'network' && wifi) {
-          wifi.hidden = false;
-          fields.appendChild(wifi);
-        }
-      } else {
-        const heading = document.createElement('h4');
-        heading.className = 'config-section-title';
-        heading.textContent = lastGroup;
-        root.appendChild(heading);
-      }
+      const heading = document.createElement('h4');
+      heading.className = 'config-section-title';
+      heading.textContent = lastGroup;
+      root.appendChild(heading);
     }
     var row = document.createElement('div'); row.className = 'row';
     var isPass = k.includes('pass') || k.includes('secret');
@@ -1622,7 +1592,7 @@ function renderConfigFields(root, d) {
     }
     control.value = isPass ? '' : v;
     row.appendChild(control);
-    fields.appendChild(row);
+    root.appendChild(row);
     if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
     if (k === 'tz') attachTzHelper(row.querySelector('input'));
   }
@@ -1651,9 +1621,10 @@ function collectConfigChanges(root) {
 async function loadConfigFields(root, section, messageId) {
   if (root.dataset.loading === '1' || root.dataset.saving === '1') return;
   root.dataset.loading = '1';
+  delete root.dataset.stale;
   try {
     const r = await api('/api/config' + (section ? '?section=' + encodeURIComponent(section) : ''));
-    if (!r) return;
+    if (!r) { root.dataset.stale = '1'; return; }
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'Config read failed');
     const drafts = collectConfigChanges(root);
@@ -1666,28 +1637,75 @@ async function loadConfigFields(root, section, messageId) {
         input.placeholder = '(empty = remove)';
       }
     });
-    delete root.dataset.stale;
+    root.dataset.loaded = '1';
+    showMsg(document.getElementById(messageId), '', 'ok');
     return true;
   } catch(e) {
+    root.dataset.stale = '1';
     showMsg(document.getElementById(messageId), 'Error: ' + e.message, 'err');
   } finally {
     delete root.dataset.loading;
   }
 }
 
-async function loadConfig() {
-  const sp = document.getElementById('configSpinner');
-  sp.style.display = 'block';
-  try {
-    await loadConfigFields(document.getElementById('configFields'), '', 'configMsg');
-  } catch(e) {
-    showMsg(document.getElementById('configMsg'), 'Error: ' + e.message, 'err');
-  } finally {
-    sp.style.display = 'none';
+async function loadConfig(selected = configSection) {
+  const categories = document.getElementById('configCategories');
+  const container = document.getElementById('configFields');
+  if (!categories.children.length) {
+    for (const section of CFG_SECTIONS) {
+      if (!configStorageSupported && ['smb','sleephq'].includes(section.id)) continue;
+      const button = document.createElement('button');
+      button.textContent = section.label;
+      button.dataset.section = section.id;
+      button.onclick = () => loadConfig(section.id);
+      categories.appendChild(button);
+
+      const panel = document.createElement('div');
+      panel.id = 'config-panel-' + section.id;
+      panel.hidden = true;
+      if (section.id === 'network') {
+        const wifi = document.getElementById('configWifi');
+        wifi.hidden = false;
+        panel.appendChild(wifi);
+      }
+      const root = document.createElement('div');
+      root.id = 'config-' + section.id;
+      root.dataset.configForm = section.id;
+      panel.appendChild(root);
+      const actions = document.createElement('div');
+      actions.className = 'btn-row';
+      const message = document.createElement('div');
+      message.id = root.id + '-msg';
+      message.className = 'msg';
+      const save = document.createElement('button');
+      save.className = 'btn btn-accent';
+      save.textContent = 'Save & Persist';
+      save.onclick = () => saveConfig(root.id, message.id);
+      actions.appendChild(save);
+      const refresh = document.createElement('button');
+      refresh.className = 'btn';
+      refresh.textContent = 'Refresh';
+      refresh.onclick = () => loadConfigFields(root, section.id, message.id);
+      actions.appendChild(refresh);
+      panel.appendChild(actions);
+      panel.appendChild(message);
+      container.appendChild(panel);
+    }
   }
+  configSection = selected;
+  for (const button of categories.children) {
+    const active = button.dataset.section === selected;
+    button.className = active ? 'btn btn-accent' : 'btn';
+    button.setAttribute('aria-pressed', String(active));
+    document.getElementById('config-panel-' + button.dataset.section).hidden = !active;
+  }
+  if (selected === 'network') loadWifiNets();
+  const root = document.getElementById('config-' + selected);
+  if (root.dataset.loaded !== '1' || root.dataset.stale === '1')
+    return loadConfigFields(root, selected, root.id + '-msg');
 }
 
-async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
+async function saveConfig(rootId, messageId) {
   const root = document.getElementById(rootId);
   if (root.dataset.saving === '1' || root.dataset.loading === '1') return;
   const changes = collectConfigChanges(root);
@@ -1716,8 +1734,8 @@ async function saveConfig(rootId = 'configFields', messageId = 'configMsg') {
     });
     document.querySelectorAll('[data-config-form]').forEach(other => {
       if (other === root) return;
-      const section = other.dataset.configForm;
-      if (!section || Object.keys(changes).some(key => key.startsWith(section + '_')))
+      const section = CFG_SECTIONS.find(section => section.id === other.dataset.configForm);
+      if (!section || section.keys.some(key => Object.hasOwn(changes, key)))
         other.dataset.stale = '1';
     });
     showMsg(msgEl, 'Config saved', 'ok');
