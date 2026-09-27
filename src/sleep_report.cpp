@@ -40,24 +40,10 @@ const Field PERIOD_FIELDS[] = {
 static_assert(sizeof(DAY_FIELDS) / sizeof(Field) <= MAX_FIELDS);
 static_assert(sizeof(PERIOD_FIELDS) / sizeof(Field) <= MAX_FIELDS);
 
-enum class Scalar { Ok, Missing, Failed };
+using Scalar = Arbiter::VarResult;
 Scalar read_scalar(const char *tag, uint32_t &value, uint16_t timeout) {
     if (!timeout) return Scalar::Failed;
-    char command[9], response[40] = {};
-    snprintf(command, sizeof(command), "G S #%s", tag);
-    uint16_t length = sizeof(response);
-    bool ok = Arbiter::send_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                response, &length, timeout);
-    if (length >= sizeof(response)) return Scalar::Failed;
-    const bool echoed = length > 11 && memcmp(response, command, 8) == 0 &&
-        memcmp(response + 8, " = ", 3) == 0;
-    if (!ok) {
-        if (!strcmp(response, "6009") || (echoed && !strcmp(response + 11, "6009")))
-            return Scalar::Missing;
-        return Scalar::Failed;
-    }
-    return echoed && aircannect::parse_hex(response + 11, length - 11, value)
-        ? Scalar::Ok : Scalar::Failed;
+    return Arbiter::read_var_hex(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, timeout);
 }
 
 bool select_period(uint16_t selection, uint16_t timeout) {

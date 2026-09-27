@@ -276,10 +276,10 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
 }
 
 static bool read_numeric_variable(const char *name, int16_t &value) {
-    char text[24] = {};
     uint32_t parsed = 0;
-    if (!read_variable(name, text, sizeof(text)) ||
-        !parse_hex_value(text, strlen(text), parsed) || parsed > INT16_MAX) {
+    if (Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                             parsed, POLL_TIMEOUT_MS) != Arbiter::VarResult::Ok ||
+        parsed > INT16_MAX) {
         return false;
     }
     value = static_cast<int16_t>(parsed);
@@ -287,9 +287,8 @@ static bool read_numeric_variable(const char *name, int16_t &value) {
 }
 
 static bool read_u32_variable(const char *name, uint32_t &value) {
-    char text[24] = {};
-    return read_variable(name, text, sizeof(text)) &&
-           parse_hex_value(text, strlen(text), value);
+    return Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                                 value, POLL_TIMEOUT_MS) == Arbiter::VarResult::Ok;
 }
 
 static void reset_schema(StreamSchema &schema, const char *tag) {

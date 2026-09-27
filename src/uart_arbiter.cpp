@@ -3,6 +3,7 @@
 #include "debug_log.h"
 #include "live_stream.h"
 #include "custom_settings.h"
+#include "hex_util.h"
 #include <freertos/queue.h>
 #include <atomic>
 #include <cstddef>
@@ -1151,6 +1152,7 @@ typedef struct {
     uint16_t length;
     bool received;
     bool bdd;
+    bool missing;
     // The retained payload and its terminator follow this header.
 } single_response_capture_t;
 
@@ -1173,6 +1175,13 @@ static bool capture_single_response(const qframe_t *frame, void *context) {
 
 static bool capture_variable(const qframe_t *frame, void *context) {
     // A rejected value is not a sink failure: the matched R/E is terminal.
+    if (frame->type == QFRAME_TYPE_E) {
+        auto *capture = static_cast<single_response_capture_t *>(context);
+        capture->missing =
+            (frame->payload_len == 4 && memcmp(frame->payload, "6009", 4) == 0) ||
+            (frame->payload_len == 15 && memcmp(frame->payload + 8, " = 6009", 7) == 0);
+        return true;
+    }
     if (frame->type != QFRAME_TYPE_R || frame->payload_len <= 11 ||
         memcmp(frame->payload + 8, " = ", 3) != 0) return true;
     return capture_response(frame, context, 11);
@@ -1246,7 +1255,8 @@ uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
 
 static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                        char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
-                         uart_frame_sink_t sink) {
+                         uart_frame_sink_t sink, bool *missing = nullptr) {
+    if (missing) *missing = false;
     uint16_t capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
     if (resp_buf && resp_len) capacity = *resp_len ? min(capacity, uint16_t(*resp_len - 1)) : 0;
     auto *t = begin_read_command(cmd, src, prio, capacity, timeout_ms, sink);
@@ -1259,6 +1269,8 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
         if (resp_len) *resp_len = 0;
         return false;
     }
+    if (missing)
+        *missing = static_cast<single_response_capture_t *>(t->sink_context)->missing;
     return Arbiter::finish_cmd(t, resp_buf, resp_len);
 }
 
@@ -1268,17 +1280,35 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                          capture_single_response);
 }
 
-bool Arbiter::get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
-                      char *out, uint16_t capacity, uint16_t timeout_ms) {
-    if (!name || strlen(name) != 3 || !out || capacity < 2) return false;
+Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
+                                    cmd_priority_t prio, char *out,
+                                    uint16_t capacity, uint16_t timeout_ms) {
+    if (out && capacity) out[0] = 0;
+    if (!name || strlen(name) != 3 || !out || capacity < 2) return VarResult::Failed;
     char command[9];
     snprintf(command, sizeof(command), "G S #%s", name);
     uint16_t length = capacity;
-    out[0] = 0;
+    bool missing;
     bool ok = read_command(command, src, prio, out, &length, timeout_ms,
-                            capture_variable);
-    if (!ok || length >= capacity) { out[0] = 0; return false; }
-    return true;
+                            capture_variable, &missing);
+    if (missing) return VarResult::Missing;
+    if (!ok || length >= capacity) { out[0] = 0; return VarResult::Failed; }
+    return VarResult::Ok;
+}
+
+Arbiter::VarResult Arbiter::read_var_hex(const char *name, cmd_source_t src,
+                                        cmd_priority_t prio, uint32_t &out,
+                                        uint16_t timeout_ms) {
+    char text[9];
+    VarResult result = read_var(name, src, prio, text, sizeof(text), timeout_ms);
+    if (result != VarResult::Ok) return result;
+    return aircannect::parse_hex(text, strlen(text), out)
+        ? VarResult::Ok : VarResult::Failed;
+}
+
+bool Arbiter::get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
+                      char *out, uint16_t capacity, uint16_t timeout_ms) {
+    return read_var(name, src, prio, out, capacity, timeout_ms) == VarResult::Ok;
 }
 
 bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,

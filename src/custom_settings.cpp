@@ -175,10 +175,8 @@ bool error_is(const char *value, const char *code) {
 bool read_raw_locked(const char *name, uint32_t &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout || loaded_generation != generation()) return false;
-    char text[9];
-    return Arbiter::get_var(name, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                            text, sizeof(text), timeout) &&
-           aircannect::parse_hex(text, strlen(text), value);
+    return Arbiter::read_var_hex(name, CMD_SRC_TCP, CMD_PRIO_NORMAL, value, timeout) ==
+           Arbiter::VarResult::Ok;
 }
 
 bool add_enum_option_locked(cached_entry_t &entry, uint8_t value,

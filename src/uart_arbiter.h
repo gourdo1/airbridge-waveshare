@@ -60,6 +60,8 @@ struct uart_transaction_t;
 typedef int8_t uart_frame_listener_t;
 
 namespace Arbiter {
+    enum class VarResult { Ok, Missing, Failed };
+
     void init(HardwareSerial &serial, int rx_pin, int tx_pin);
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
@@ -74,6 +76,10 @@ namespace Arbiter {
     bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length);
 
     // Return only the scalar value; a truncated value is a failed read.
+    VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,
+                       char *out, uint16_t capacity, uint16_t timeout_ms = 0);
+    VarResult read_var_hex(const char *name, cmd_source_t src, cmd_priority_t prio,
+                           uint32_t &out, uint16_t timeout_ms = 0);
     bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                  char *out, uint16_t capacity, uint16_t timeout_ms = 0);
 

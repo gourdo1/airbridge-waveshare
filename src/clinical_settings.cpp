@@ -43,11 +43,9 @@ void Snapshot::reset() {
 bool read_raw(const char *cmd, int &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout) return false;
-    char text[9];
     uint32_t raw;
-    if (!Arbiter::get_var(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                          text, sizeof(text), timeout) ||
-        !aircannect::parse_hex(text, strlen(text), raw) || raw > INT_MAX) return false;
+    if (Arbiter::read_var_hex(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL, raw, timeout) !=
+        Arbiter::VarResult::Ok || raw > INT_MAX) return false;
     value = static_cast<int>(raw);
     return true;
 }

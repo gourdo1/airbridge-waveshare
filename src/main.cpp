@@ -174,14 +174,12 @@ static void poll_device_uptime() {
 }
 
 static void poll_mhr() {
-    char mhr_resp[32] = {};
-    if (!Arbiter::get_var("MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                          mhr_resp, sizeof(mhr_resp))) {
+    uint32_t raw;
+    if (Arbiter::read_var_hex("MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, raw) !=
+        Arbiter::VarResult::Ok || raw > INT_MAX) {
         // UART unhappy; leave cache alone and retry next opportunity.
         return;
     }
-    uint32_t raw;
-    if (!aircannect::parse_hex(mhr_resp, strlen(mhr_resp), raw) || raw > INT_MAX) return;
     int new_mhr = static_cast<int>(raw);
     int prev_mhr = Arbiter::get_cached_mhr();
     Arbiter::set_cached_mhr(new_mhr);
@@ -197,11 +195,10 @@ static bool mhr_poll_due() {
 }
 
 static void poll_therapy_mode() {
-    char response[9];
     uint32_t raw;
-    const bool valid = Arbiter::get_var("MOP", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                       response, sizeof(response), HEALTH_TIMEOUT_MS) &&
-        aircannect::parse_hex(response, strlen(response), raw) && raw <= INT_MAX;
+    const bool valid = Arbiter::read_var_hex("MOP", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                            raw, HEALTH_TIMEOUT_MS) == Arbiter::VarResult::Ok &&
+        raw <= INT_MAX;
     Arbiter::set_cached_mop(valid ? static_cast<int>(raw) : -1);
 }
 
