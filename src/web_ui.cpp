@@ -346,6 +346,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddString(json, "version", airbridge_version(), false);
     fixedJsonAddString(json, "built", airbridge_build_date());
     fixedJsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
+    fixedJsonPrintf(json, ",\"config_revision\":%u", Config::revision());
     fixedJsonAddString(json, "system", system_state_name(status.sys));
     fixedJsonAddInt(json, "rop", status.rop);
     char mode[24];
@@ -1978,40 +1979,62 @@ void WebUI::init(uint16_t port) {
     Log::logf(CAT_WEB, LOG_INFO, "HTTP server on port %d\n", port);
 }
 
-static String build_status_payload(const DeviceStatus::Snapshot &status) {
-    const auto &r = status.reading;
-    char esp_time[20], resmed_time[20];
-    statusClocks(esp_time, resmed_time);
+enum StatusFields : uint8_t {
+    STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
+    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_ALL = 31,
+};
 
-    String sj;
-    sj.reserve(256);
-    sj = "{";
-    jsonAddString(sj, "system", system_state_name(status.sys), false);
-    jsonAddString(sj, "esp_time", esp_time);
-    jsonAddString(sj, "resmed_time", resmed_time);
-    jsonAddInt(sj, "rop", status.rop);
-    jsonAddInt(sj, "mhr", status.mhr);
-    char mode[24];
-    ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
-    jsonAddString(sj, "mode", mode);
+static String build_status_payload(const DeviceStatus::Snapshot &status,
+                                   uint8_t fields = STATUS_ALL) {
+    const auto &r = status.reading;
+    String sj = "{";
+    jsonAddUInt32(sj, "sample_ms", millis(), false);
+    if (fields & STATUS_THERAPY) {
+        jsonAddString(sj, "system", system_state_name(status.sys));
+        jsonAddInt(sj, "rop", status.rop);
+        jsonAddInt(sj, "mhr", status.mhr);
+        char mode[24];
+        ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
+        jsonAddString(sj, "mode", mode);
+    }
+    if (fields & STATUS_HEALTH) {
+        char esp_time[20], resmed_time[20];
+        statusClocks(esp_time, resmed_time);
+        jsonAddString(sj, "esp_time", esp_time);
+        jsonAddString(sj, "resmed_time", resmed_time);
 #if AB_STORAGE_HAS_SDCARD
-    SdStorage::Status sd;
-    SdStorage::get_status(sd);
-    jsonAddString(sj, "sd", sd.mounted ? "mounted" : "unavailable");
-    jsonAddInt(sj, "sd_total_mb", sd.card_bytes / (1024 * 1024));
-    jsonAddInt(sj, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+        SdStorage::Status sd;
+        SdStorage::get_status(sd);
+        jsonAddString(sj, "sd", sd.mounted ? "mounted" : "unavailable");
+        jsonAddInt(sj, "sd_total_mb", sd.card_bytes / (1024 * 1024));
+        jsonAddInt(sj, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+#else
+        jsonAddString(sj, "sd", "unsupported");
 #endif
-    jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
-    jsonAddUInt32(sj, "ble_revision", OxiBle::revision());
-    char oxi_addr[32];
-    OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
-    jsonAddString(sj, "oxi_addr", oxi_addr);
-    jsonAddString(sj, "feeding", status.feeding ? "yes" : "no");
-    jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
-    jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
-    jsonAddInt(sj, "heap", ESP.getFreeHeap());
-    jsonAddInt(sj, "rssi", WiFi.RSSI());
-    jsonAddInt(sj, "uptime", millis() / 1000);
+        jsonAddInt(sj, "heap", ESP.getFreeHeap());
+        jsonAddInt(sj, "rssi", WiFi.RSSI());
+        jsonAddInt(sj, "uptime", millis() / 1000);
+    }
+    if (fields & STATUS_OXI) {
+        jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
+        jsonAddUInt32(sj, "ble_revision", OxiBle::revision());
+        char oxi_addr[32];
+        OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
+        jsonAddString(sj, "oxi_addr", oxi_addr);
+        jsonAddString(sj, "feeding", status.feeding ? "yes" : "no");
+        jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
+        jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
+    }
+    if (fields & STATUS_CONFIG) {
+        jsonAddUInt32(sj, "config_revision", Config::revision());
+        jsonAddInt(sj, "onboarding_complete", Config::onboarding_complete());
+    }
+    if (fields & STATUS_IDENTITY) {
+        jsonAddString(sj, "version", airbridge_version());
+        jsonAddString(sj, "built", airbridge_build_date());
+        jsonAddString(sj, "pna", Config::get().device_pna.c_str());
+        jsonAddString(sj, "srn", Config::get().device_srn.c_str());
+    }
     sj += '}';
     return sj;
 }
@@ -2020,31 +2043,54 @@ static DeviceStatus::Snapshot last_published = {
     SYS_IDLE, OXI_DISABLED, {}, INT_MIN, INT_MIN, INT_MIN, false
 };
 
-static bool snapshot_differs(const DeviceStatus::Snapshot &a,
-                             const DeviceStatus::Snapshot &b) {
-    return a.rop     != b.rop     ||
-           a.mhr     != b.mhr     ||
-           a.mop     != b.mop     ||
-           a.sys     != b.sys     ||
-           a.oxi     != b.oxi     ||
-           a.feeding != b.feeding ||
-           (a.reading.valid ? a.reading.spo2 : -1) !=
-               (b.reading.valid ? b.reading.spo2 : -1) ||
-           (a.reading.valid ? a.reading.pulse_bpm : -1) !=
-               (b.reading.valid ? b.reading.pulse_bpm : -1);
-}
-
-static uint32_t last_status_push = 0;
-static uint32_t last_ble_revision = 0;
+static bool status_requested = true;
 
 void WebUI::push_status_event() {
-    if (!events || events->count() == 0) return;
+    status_requested = true;
+}
+
+static void publishStatus() {
+    static uint32_t revision = 1, health_at = 0, oxi_at = 0;
+    static uint32_t ble_revision = 0, config_revision = 0, device_revision = 0;
+    static char source_id[32] = {};
+    static uint8_t pending_fields = STATUS_ALL;
     const auto status = DeviceStatus::snapshot();
-    last_published = status;
-    last_ble_revision = OxiBle::revision();
-    last_status_push = millis();
-    String sj = build_status_payload(status);
-    events->send(sj.c_str(), "status", millis());
+    const auto &a = status;
+    const auto &b = last_published;
+    const uint32_t now = millis();
+    char current_source[sizeof(source_id)];
+    OxiArbiter::get_source_id(current_source, sizeof(current_source));
+    uint8_t fields = 0;
+    if (status_requested || a.rop != b.rop || a.sys != b.sys ||
+        a.mhr != b.mhr || a.mop != b.mop) fields |= STATUS_THERAPY;
+    if (a.oxi != b.oxi || a.feeding != b.feeding || strcmp(source_id, current_source) ||
+        a.reading.valid != b.reading.valid ||
+        (a.reading.valid && (a.reading.spo2 != b.reading.spo2 ||
+                            a.reading.pulse_bpm != b.reading.pulse_bpm)) ||
+        OxiBle::revision() != ble_revision ||
+        (now - oxi_at >= 2000 && live_events && live_events->count())) {
+        fields |= STATUS_OXI;
+        oxi_at = now;
+    }
+    if (now - health_at >= 10000) {
+        fields |= STATUS_HEALTH;
+        health_at = now;
+    }
+    if (Config::revision() != config_revision) fields |= STATUS_CONFIG;
+    if (Config::device_info_revision() != device_revision) fields |= STATUS_IDENTITY;
+    status_requested = false;
+    if (fields) {
+        last_published = status;
+        ble_revision = OxiBle::revision();
+        config_revision = Config::revision();
+        device_revision = Config::device_info_revision();
+        memcpy(source_id, current_source, sizeof(source_id));
+        pending_fields = fields;
+        if (!++revision) ++revision;
+    }
+    publishState(EventTopic::Status, revision, "status", [&](bool full) {
+        return build_status_payload(status, full ? STATUS_ALL : pending_fields);
+    });
 }
 
 void WebUI::handle() {
@@ -2054,15 +2100,11 @@ void WebUI::handle() {
     uint32_t now = millis();
     if (uint32_t(now - last_check) < 100) return;
     last_check = now;
+    publishStatus();
     publishOta();
     publishWifi();
 #if AB_STORAGE_HAS_SDCARD
     publishExports();
 #endif
 
-    if (snapshot_differs(DeviceStatus::snapshot(), last_published) ||
-        OxiBle::revision() != last_ble_revision ||
-        millis() - last_status_push >= 10000) {
-        WebUI::push_status_event();
-    }
 }

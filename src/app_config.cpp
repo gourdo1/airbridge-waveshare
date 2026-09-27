@@ -15,6 +15,7 @@
 static Preferences prefs;
 static AirBridgeConfig cfg;
 static uint32_t config_revision = 0;
+static uint32_t device_revision = 0;
 static bool onboarding_done = false;
 static bool onboarding_stored = false;
 
@@ -351,18 +352,25 @@ AirBridgeConfig& Config::get() {
 void Config::refresh_device_info() {
     char value[64];
     if (cfg.device_pna.isEmpty() &&
-        Arbiter::get_var("PNA", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value)))
+        Arbiter::get_var("PNA", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value))) {
         cfg.device_pna = value;
+        ++device_revision;
+    }
 
     if (cfg.device_srn.isEmpty() &&
-        Arbiter::get_var("SRN", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value)))
+        Arbiter::get_var("SRN", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, sizeof(value))) {
         cfg.device_srn = value;
+        ++device_revision;
+    }
 }
 
 void Config::invalidate_device_info() {
     cfg.device_pna = "";
     cfg.device_srn = "";
+    ++device_revision;
 }
+
+uint32_t Config::device_info_revision() { return device_revision; }
 
 
 static void format_value(const KVEntry &entry, String &out) {

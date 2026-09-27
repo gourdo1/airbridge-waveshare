@@ -2,7 +2,6 @@
 #include "live_stream.h"
 #include "live_pmd.h"
 #include "web_ui.h"
-#include "oxi_arbiter.h"
 #include "debug_log.h"
 
 #define LWC_BATCH           5           // samples per SSE event (~5 Hz fire @ 25 Hz)
@@ -37,8 +36,6 @@ static void flush_batch() {
     uint16_t sequence = sent_seq;
     portEXIT_CRITICAL(&ring_mux);
 
-    oxi_reading_t r;
-    OxiArbiter::snapshot(r);
     char json[256];
     int n = snprintf(json, sizeof(json),
                      "{\"seq\":%u,\"samples\":[", sequence);
@@ -48,10 +45,7 @@ static void flush_batch() {
                       batch[i].mkp, batch[i].rfl, batch[i].lyk);
     }
     if (n < (int)sizeof(json)) {
-        n += snprintf(json + n, sizeof(json) - n,
-                      "],\"spo2\":%d,\"pulse\":%d}",
-                      r.valid ? r.spo2 : -1,
-                      r.valid ? r.pulse_bpm : -1);
+        snprintf(json + n, sizeof(json) - n, "]}");
     }
     WebUI::push_event("live", json);
 }

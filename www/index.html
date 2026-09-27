@@ -704,10 +704,7 @@ function initSSE() {
     wifiSerial++;
     otaSerial++;
     otaStatus = null;
-    loadStatus();
-    loadExports();
-    if (otaWatch || document.getElementById('p-ota').classList.contains('active')) loadOtaStatus();
-    if (document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
+    bleLoadedRevision = null;
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
   };
@@ -716,14 +713,23 @@ function initSSE() {
 let lastStatus = {};
 let statusRead = null, statusSerial = 0;
 const statusPush = {};
+let uiStarted = false;
+function applyConfigRevision(d) {
+  if (d.config_revision !== undefined && lastStatus.config_revision !== undefined &&
+      d.config_revision !== lastStatus.config_revision)
+    document.querySelectorAll('[data-config-form]').forEach(root => { root.dataset.stale = '1'; });
+}
 function updateStatusFromPush(d) {
   statusSerial++;
+  applyConfigRevision(d);
   Object.assign(statusPush, d);
   Object.assign(lastStatus, d);
-  renderStatus(lastStatus);
-  renderSetupDevice();
+  renderStatus(d);
+  if (setupActive()) renderSetupDevice();
   updateBleFromPush(d);
+  updateOxiChart(d);
   finishOtaObservation();
+  if (!uiStarted && d.version) { uiStarted = true; startUI(); }
 }
 
 function updateBleFromPush(d) {
@@ -768,15 +774,16 @@ function updateBleFromPush(d) {
   if (bleRevision !== bleLoadedRevision) loadBle();
   var fields = {
     state: st, feeding: d.feeding,
-    spo2: d.spo2 >= 0 ? d.spo2 + '%' : '--',
-    pulse: d.pulse >= 0 ? d.pulse + ' bpm' : '--'
+    spo2: d.spo2 === undefined ? undefined : d.spo2 >= 0 ? d.spo2 + '%' : '--',
+    pulse: d.pulse === undefined ? undefined : d.pulse >= 0 ? d.pulse + ' bpm' : '--'
   };
   for (var k in fields) {
+    if (fields[k] === undefined) continue;
     var el = g.querySelector('[data-field="' + k + '"]');
     if (el) el.textContent = fields[k];
   }
   var sp = document.getElementById('bleScanSpinner');
-  if (sp) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
+  if (sp && st) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
 }
 
 function appendLiveSamples(d, reset = false) {
@@ -801,16 +808,25 @@ function appendLiveSamples(d, reset = false) {
 function updateChartsFromPush(d) {
   // SSE and HTTP backfill can overlap. Append only samples newer than liveSeq.
   if (!appendLiveSamples(d)) return;
-  // Slow charts: ~0.5 Hz (every 10 SSE events at 5 Hz fire rate).
-  const slowChanged = ++slowTick >= 10;
-  if (slowChanged) {
-    slowData.spo2.push(d.spo2 >= 0 ? d.spo2 : -32768);
-    slowData.pulse.push(d.pulse >= 0 ? d.pulse : -32768);
-    while (slowData.spo2.length > SLOW_PTS) slowData.spo2.shift();
-    while (slowData.pulse.length > SLOW_PTS) slowData.pulse.shift();
-    slowTick = 0;
+  updateCharts(false);
+}
+
+function updateOxiChart(d) {
+  if (d.spo2 === undefined || !Number.isFinite(d.sample_ms)) return;
+  const bucket = Math.floor(d.sample_ms / 2000);
+  if (bucket === slowBucket) return;
+  if (slowBucket !== null && bucket < slowBucket) {
+    slowData.spo2.length = slowData.pulse.length = 0;
+    slowBucket = null;
   }
-  updateCharts(slowChanged);
+  const gaps = slowBucket === null ? 0 : Math.min(SLOW_PTS - 1, bucket - slowBucket - 1);
+  for (const [key, value] of Object.entries({spo2:d.spo2, pulse:d.pulse})) {
+    for (let i = 0; i < gaps; i++) slowData[key].push(-32768);
+    slowData[key].push(value >= 0 ? value : -32768);
+    if (slowData[key].length > SLOW_PTS) slowData[key].splice(0, slowData[key].length - SLOW_PTS);
+  }
+  slowBucket = bucket;
+  if (!document.hidden && document.getElementById('p-status').classList.contains('active')) updateCharts(true);
 }
 
 // Initial setup shares Config forms and the existing status/WiFi events.
@@ -1032,7 +1048,7 @@ function showTab(id) {
   document.querySelectorAll('.bnav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   window.location.hash = id;
   updateLiveSubscription();
-  if (id === 'status') loadStatus();
+  if (id === 'status') { renderStatus(lastStatus); updateBleFromPush(lastStatus); }
   if (id === 'report') loadReport();
   if (id === 'clinical') loadSettings();
   if (id === 'bluetooth') loadBle();
@@ -1042,10 +1058,10 @@ function showTab(id) {
     if (!document.getElementById('configFields').children.length ||
         document.getElementById('configFields').dataset.stale === '1') loadConfig();
   }
-  if (id === 'sync') loadExports();
+  if (id === 'sync') renderExports();
   if (id === 'ota') {
     checkFlashReady();
-    loadOtaStatus();
+    if (otaStatus) renderOtaStatus(otaStatus);
     var ev = document.getElementById('espFwVer');
     if (ev && lastStatus.version) ev.textContent = lastStatus.version + (lastStatus.built ? ' (' + lastStatus.built + ')' : '');
   }
@@ -1087,9 +1103,11 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
-  renderStorageStatus(d);
-  renderDashboardStorage(d);
-  if (d.mode !== undefined) document.getElementById('dashMode').textContent = d.mode || '--';
+  if (d.sd !== undefined) {
+    configStorageSupported = d.sd !== 'unsupported';
+    renderStorageStatus(d);
+    if (!configStorageSupported) applyExports({supported:false});
+  }
   // Topbar - update from any push, even without full status
   var el;
   el = document.getElementById('topHeap'); if (el && d.heap) el.textContent = (d.heap/1024).toFixed(1) + ' KB free';
@@ -1107,55 +1125,52 @@ function renderStatus(d) {
     if (vb && d.built) vb.textContent = d.built;
   }
 
-  if (!d.version && !d.pna) return;  // SSE-only push, no full status data
+  if (!document.getElementById('p-status').classList.contains('active')) return;
+  if (d.sd !== undefined) renderDashboardStorage(d);
+  if (d.mode !== undefined) document.getElementById('dashMode').textContent = d.mode || '--';
 
   // Dashboard cards
-  var pna = d.pna || '--';
-  pna = pna.replace(/_/g, ' ');
-  var el;
-  el = document.getElementById('dashPna'); if (el) el.textContent = pna;
-  el = document.getElementById('dashSrn'); if (el) el.textContent = d.srn || '--';
+  el = document.getElementById('dashPna');
+  if (el && d.pna !== undefined) el.textContent = (d.pna || '--').replace(/_/g, ' ');
+  el = document.getElementById('dashSrn');
+  if (el && d.srn !== undefined) el.textContent = d.srn || '--';
   el = document.getElementById('dashMhr');
   if (el && d.mhr !== undefined && d.mhr >= 0) {
     var h = Math.round(d.mhr / 3600);
     el.textContent = h.toLocaleString() + ' hrs';
   }
-  // Infer rop from system state if not in payload (SSE push)
-  if (d.rop === undefined && d.system) {
-    d.rop = d.system === 'THERAPY' ? 1 : d.system === 'ERROR' ? -1 : 0;
+  if (d.rop !== undefined) {
+    var ropBadge = document.getElementById('dashRopBadge');
+    if (ropBadge) {
+      ropBadge.textContent = ROP_NAMES[d.rop] || (d.system || '--');
+      ropBadge.className = 'badge ' + (d.rop === 1 ? 'badge-therapy' : d.system === 'ERROR' ? 'badge-error' : 'badge-idle');
+    }
+    var ropBtns = {1:'btnTherapy', 0:'btnStandby', 3:'btnPwrSave'};
+    ['btnTherapy','btnStandby','btnPwrSave'].forEach(function(id) {
+      var b = document.getElementById(id);
+      if (b) b.className = (ropBtns[d.rop] === id) ? 'btn btn-accent' : 'btn';
+    });
   }
-  var rop = ROP_NAMES[d.rop] || (d.system || '--');
-  var ropBadge = document.getElementById('dashRopBadge');
-  if (ropBadge) {
-    ropBadge.textContent = rop;
-    ropBadge.className = 'badge ' + (d.rop === 1 ? 'badge-therapy' : d.system === 'ERROR' ? 'badge-error' : 'badge-idle');
-  }
-  el = document.getElementById('dashEspTime'); if (el) el.textContent = d.esp_time || '--';
-  el = document.getElementById('dashResmedTime'); if (el) el.textContent = d.resmed_time || '--';
-
-  // Oxi summary
-  el = document.getElementById('dashSpo2'); if (el) el.textContent = d.spo2 >= 0 ? d.spo2 : '--';
-  el = document.getElementById('dashPulse'); if (el) el.textContent = d.pulse >= 0 ? d.pulse : '--';
-
-  // Highlight active ROP button
-  var ropBtns = {1:'btnTherapy', 0:'btnStandby', 3:'btnPwrSave'};
-  ['btnTherapy','btnStandby','btnPwrSave'].forEach(function(id) {
-    var b = document.getElementById(id);
-    if (b) b.className = (ropBtns[d.rop] === id) ? 'btn btn-accent' : 'btn';
-  });
+  el = document.getElementById('dashEspTime');
+  if (el && d.esp_time !== undefined) el.textContent = d.esp_time || '--';
+  el = document.getElementById('dashResmedTime');
+  if (el && d.resmed_time !== undefined) el.textContent = d.resmed_time || '--';
 
 }
 
 function loadStatus() {
   if (statusRead) return statusRead;
   const serial = statusSerial;
+  for (const key of Object.keys(statusPush)) delete statusPush[key];
   statusRead = (async () => {
   try {
     const r = await api('/api/status', undefined, 5000);
     if (!r) return;
     if (!r.ok) throw new Error("Status read failed");
     const data = await r.json();
-    Object.assign(lastStatus, data, serial === statusSerial ? {} : statusPush);
+    const current = {...data, ...(serial === statusSerial ? {} : statusPush)};
+    applyConfigRevision(current);
+    Object.assign(lastStatus, current);
     renderStatus(lastStatus);
     renderSetupDevice();
     finishOtaObservation();
@@ -1950,9 +1965,6 @@ async function storageDelete() {
 }
 
 function applyExports(data) {
-  if (exportsSnapshot && data.config_revision !== exportsSnapshot.config_revision) {
-    document.querySelectorAll('[data-config-form]').forEach(root => { root.dataset.stale = '1'; });
-  }
   exportsSnapshot = data;
   exportsFresh = true;
   configStorageSupported = data.supported === true;
@@ -2462,7 +2474,7 @@ const WAVE_PTS = 500;     // ~20 s @ 25 Hz; covers 4-5 breath cycles
 const waveData = {press:[],flow:[],leak:[]};
 const slowData = {spo2:[],pulse:[]};
 const SLOW_PTS = 150;
-let liveSeq = null, slowTick = 0;
+let liveSeq = null, slowBucket = null;
 
 // Auto-rescaling. Values stored are raw; min/max grow on overshoot
 const chartScales = {
@@ -2603,16 +2615,15 @@ async function backfillLive() {
 // Init
 async function startUI() {
   const ht = window.location.hash.slice(1);
-  const status = await loadStatus();
+  const status = lastStatus;
   let deferred = false;
   try { deferred = sessionStorage.getItem('airbridge.setup') === 'later'; } catch(e) {}
   if (window.location.pathname === '/wizard' || ht === 'setup' ||
       (status && !status.onboarding_complete && !deferred)) await startSetup();
   else showTab(tabNames.includes(ht) ? ht : 'status');
   if (ht === 'storage' && !setupActive()) loadStorage();
-  initSSE();
 }
-startUI();
+initSSE();
 </script>
 </body>
 </html>
