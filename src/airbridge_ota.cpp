@@ -10,6 +10,7 @@
 #include "oxi_arbiter.h"
 #include "oxi_ble.h"
 #include "uart_arbiter.h"
+#include "wifi_setup.h"
 
 #include <ArduinoOTA.h>
 #include <atomic>
@@ -60,6 +61,7 @@ struct RuntimeStatus {
 static RuntimeStatus runtime;
 static std::atomic<uint32_t> status_revision{0};
 static const char *last_blocked = nullptr;
+static bool last_arduino_allowed = false;
 static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
@@ -313,15 +315,7 @@ bool start_worker(TaskFunction_t function, const char *name) {
 }
 
 bool background_work_idle() {
-    if (OxiArbiter::is_feeding()) return false;
-    ExportSync::Status smb;
-    ExportSync::SleepHqStatus sleephq;
-    ExportSync::get_status(smb);
-    ExportSync::get_sleephq_status(sleephq);
-    return smb.state != ExportSync::State::Pending &&
-           smb.state != ExportSync::State::Working &&
-           sleephq.state != ExportSync::State::Pending &&
-           sleephq.state != ExportSync::State::Working;
+    return !OxiArbiter::is_feeding() && !ExportSync::busy();
 }
 
 const char *start_blocked() {
@@ -332,6 +326,37 @@ const char *start_blocked() {
     if (ResmedOta::is_active()) return "resmed_ota_active";
     if (!background_work_idle()) return "background_work_active";
     return nullptr;
+}
+
+struct BlockedInputs {
+    uint32_t network;
+    bool initialized, ota_busy, device_idle, resmed_active, background_idle;
+
+    bool operator==(const BlockedInputs &other) const {
+        return network == other.network && initialized == other.initialized &&
+            ota_busy == other.ota_busy && device_idle == other.device_idle &&
+            resmed_active == other.resmed_active && background_idle == other.background_idle;
+    }
+};
+
+// Called under the OTA mutex. Admission requests still use start_blocked directly.
+const char *cached_start_blocked() {
+    static BlockedInputs previous = {};
+    static bool observed = false;
+    const BlockedInputs inputs = {WiFiSetup::revision(), runtime.initialized,
+        runtime.operation != OP_NONE || runtime.reboot_pending,
+        Arbiter::get_state() == SYS_IDLE, ResmedOta::is_active(), background_work_idle()};
+    if (!observed || !(inputs == previous)) {
+        const char *blocked = start_blocked();
+        if (blocked != last_blocked && runtime.enabled &&
+            runtime.operation == OP_NONE && !runtime.reboot_pending)
+            status_revision.fetch_add(1);
+        last_blocked = blocked;
+        last_arduino_allowed = inputs.device_idle && !inputs.resmed_active && inputs.background_idle;
+        previous = inputs;
+        observed = true;
+    }
+    return last_blocked;
 }
 
 }  // namespace
@@ -401,6 +426,7 @@ void handle() {
     bool initialized = false;
     bool poll_arduino = false;
     bool arduino_active = false;
+    bool arduino_allowed = false;
     bool reboot = false;
     bool auto_check = false;
     const char *blocked = "ota_unavailable";
@@ -428,12 +454,8 @@ void handle() {
                 status_revision.fetch_add(1);
             }
         }
-        blocked = start_blocked();
-        if (blocked != last_blocked) {
-            last_blocked = blocked;
-            if (runtime.enabled && runtime.operation == OP_NONE && !runtime.reboot_pending)
-                status_revision.fetch_add(1);
-        }
+        blocked = cached_start_blocked();
+        arduino_allowed = arduino_active || last_arduino_allowed;
         unlock();
     }
     if (!initialized) return;
@@ -442,9 +464,6 @@ void handle() {
         ESP.restart();
         return;
     }
-    bool arduino_allowed = arduino_active ||
-        (Arbiter::get_state() == SYS_IDLE && !ResmedOta::is_active() &&
-         background_work_idle());
     if (poll_arduino && arduino_allowed && lock(pdMS_TO_TICKS(10))) {
         if (runtime.operation == OP_NONE || runtime.operation == OP_ARDUINO)
             ArduinoOTA.handle();
@@ -554,13 +573,13 @@ const char *state_name(State state) {
 bool get_status(Status &status) {
     memset(&status, 0, sizeof(status));
     if (!lock(pdMS_TO_TICKS(50))) return false;
+    status.blocked = cached_start_blocked();
     status.revision = status_revision.load();
     status.state = runtime.reboot_pending ? State::Rebooting :
         runtime.operation == OP_CHECK ? State::Checking :
         runtime.operation == OP_INSTALL ? State::Installing :
         runtime.operation != OP_NONE ? State::Busy :
         !runtime.enabled ? State::Disabled : runtime.result;
-    status.blocked = start_blocked();
     status.bytes = runtime.bytes;
     status.total_size = runtime.total_size;
     status.progress = progress_percent(runtime.bytes, runtime.total_size);
