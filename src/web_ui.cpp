@@ -307,6 +307,9 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddString(json, "esp_time", esp_time);
     fixedJsonAddString(json, "resmed_time", resmed_time);
     fixedJsonAddString(json, "oxi", oxi_state_name(status.oxi));
+    char oxi_addr[32];
+    OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
+    fixedJsonAddString(json, "oxi_addr", oxi_addr);
     fixedJsonAddString(json, "feeding", status.feeding ? "yes" : "no");
     fixedJsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
     fixedJsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);

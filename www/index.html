@@ -695,6 +695,7 @@ function initSSE() {
     if (li) li.style.background = '#555';
   };
   evtSrc.onopen = () => {
+    loadStatus();
     loadExports();
     if (setupActive() && setupStep === 'network') loadSetupWifi();
     var li = document.getElementById('liveIndicator');
@@ -703,7 +704,11 @@ function initSSE() {
 }
 
 let lastStatus = {};
+let statusRead = null, statusSerial = 0;
+const statusPush = {};
 function updateStatusFromPush(d) {
+  statusSerial++;
+  Object.assign(statusPush, d);
   Object.assign(lastStatus, d);
   renderStatus(lastStatus);
   renderSetupDevice();
@@ -1171,16 +1176,22 @@ function renderStatus(d) {
 
 }
 
-async function loadStatus() {
+function loadStatus() {
+  if (statusRead) return statusRead;
+  const serial = statusSerial;
+  statusRead = (async () => {
   try {
-    const r = await api('/api/status');
+    const r = await api('/api/status', undefined, 5000);
     if (!r) return;
     if (!r.ok) throw new Error("Status read failed");
-    lastStatus = await r.json();
+    const data = await r.json();
+    Object.assign(lastStatus, data, serial === statusSerial ? {} : statusPush);
     renderStatus(lastStatus);
     renderSetupDevice();
     return lastStatus;
   } catch(e) { console.error(e); }
+  })().finally(() => { statusRead = null; });
+  return statusRead;
 }
 
 async function ropCmd(action) {
