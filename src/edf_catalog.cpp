@@ -232,6 +232,7 @@ void init() {
     status.entries = header.count;
     status.generation = header.generation;
     status.error[0] = 0;
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_EDF, LOG_INFO,
               "catalog ready entries=%u generation=%u\n",
