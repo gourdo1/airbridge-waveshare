@@ -1490,25 +1490,25 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
 static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     String json = "{";
     json.reserve(512);
-    jsonAddString(json, "version", airbridge_version(), false);
+    jsonAddString(json, "state", OtaManager::state_name(status.state), false);
     jsonAddUInt32(json, "revision", status.revision);
-    jsonAddUInt32(json, "uptime", millis() / 1000);
-    jsonAddString(json, "release_target", status.release_target);
-    jsonAddBool(json, "enabled", status.enabled);
-    jsonAddBool(json, "checking", status.checking);
-    jsonAddBool(json, "checked", status.checked);
-    jsonAddBool(json, "update_available", status.update_available);
-    jsonAddBool(json, "installable", status.installable);
-    jsonAddBool(json, "installing", status.installing);
-    jsonAddBool(json, "reboot_pending", status.reboot_pending);
-    jsonAddInt(json, "progress", status.progress);
+    if (status.state == OtaManager::State::Installing ||
+        status.state == OtaManager::State::Rebooting)
+        jsonAddInt(json, "progress", status.progress);
+    else if (status.blocked && status.state != OtaManager::State::Busy &&
+             status.state != OtaManager::State::Checking &&
+             status.state != OtaManager::State::Disabled)
+        jsonAddString(json, "blocked", status.blocked);
     if (full) {
+        jsonAddString(json, "version", airbridge_version());
+        jsonAddUInt32(json, "uptime", millis() / 1000);
+        jsonAddString(json, "release_target", AB_OTA_RELEASE_TARGET);
         jsonAddInt(json, "bytes", status.bytes);
         jsonAddInt(json, "total_size", status.total_size);
         jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
     }
-    jsonAddString(json, "update_version", status.update_version);
-    jsonAddString(json, "error", status.error);
+    if (status.update_version[0]) jsonAddString(json, "update_version", status.update_version);
+    if (status.state == OtaManager::State::Error) jsonAddString(json, "error", status.error);
     json += '}';
     return json;
 }
@@ -1543,14 +1543,25 @@ static void handleOtaStatus(AsyncWebServerRequest *request) {
     sendOtaStatus(request, 200);
 }
 
-static void handleOtaCheck(AsyncWebServerRequest *request) {
+static void handleOtaRequest(AsyncWebServerRequest *request, bool install) {
     if (!checkAuth(request)) return;
-    sendOtaStatus(request, OtaManager::request_check() ? 202 : 409);
+    const char *error = nullptr;
+    bool accepted = install ? OtaManager::request_install(&error) : OtaManager::request_check(&error);
+    if (accepted) sendOtaStatus(request, 202);
+    else {
+        String json = "{";
+        jsonAddString(json, "error", error, false);
+        json += '}';
+        request->send(409, "application/json", json);
+    }
+}
+
+static void handleOtaCheck(AsyncWebServerRequest *request) {
+    handleOtaRequest(request, false);
 }
 
 static void handleOtaInstall(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) return;
-    sendOtaStatus(request, OtaManager::request_install() ? 202 : 409);
+    handleOtaRequest(request, true);
 }
 
 // WiFi management

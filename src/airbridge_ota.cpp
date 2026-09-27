@@ -43,9 +43,7 @@ enum Operation : uint8_t {
 struct RuntimeStatus {
     bool initialized = false;
     bool enabled = false;
-    bool checked = false;
-    bool update_available = false;
-    bool installable = false;
+    State result = State::Idle;
     bool reboot_pending = false;
     size_t bytes = 0;
     size_t total_size = 0;
@@ -61,6 +59,7 @@ struct RuntimeStatus {
 
 static RuntimeStatus runtime;
 static std::atomic<uint32_t> status_revision{0};
+static const char *last_blocked = nullptr;
 static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
@@ -81,6 +80,7 @@ uint8_t progress_percent(size_t bytes, size_t total) {
 }
 
 void set_error_locked(const char *error) {
+    runtime.result = State::Error;
     snprintf(runtime.error, sizeof(runtime.error), "%s", error ? error : "error");
 }
 
@@ -97,16 +97,14 @@ bool operation_allowed() {
 
 void finish_check(const OtaRelease::Manifest *manifest,
                   const OtaRelease::Artifact *artifact,
-                  bool update_available, bool installable,
+                  bool update_available,
                   const char *error) {
     if (!lock()) return;
     if (runtime.operation != OP_CHECK) {
         unlock();
         return;
     }
-    runtime.checked = error == nullptr;
-    runtime.update_available = update_available;
-    runtime.installable = installable;
+    runtime.result = update_available ? State::Available : State::Current;
     runtime.last_check_ms = millis();
     runtime.next_check_ms = runtime.last_check_ms +
         (error ? RETRY_INTERVAL_MS : CHECK_INTERVAL_MS);
@@ -118,7 +116,7 @@ void finish_check(const OtaRelease::Manifest *manifest,
         snprintf(runtime.update_version, sizeof(runtime.update_version), "%s",
                  manifest->version);
     }
-    if (artifact && update_available) available_artifact = *artifact;
+    if (artifact && update_available && !error) available_artifact = *artifact;
     if (error) set_error_locked(error);
     unlock(true);
     if (error) {
@@ -140,7 +138,7 @@ void check_task(void *) {
     size_t length = 0;
     OtaUrl::Error transport_error;
     if (!OxiBle::release_memory(BLE_PAUSE_TIMEOUT_MS)) {
-        finish_check(nullptr, nullptr, false, false, "ble_memory_busy");
+        finish_check(nullptr, nullptr, false, "ble_memory_busy");
         vTaskDelete(nullptr);
         return;
     }
@@ -158,7 +156,7 @@ void check_task(void *) {
     // TLS and the manifest buffer are gone before BLE allocates again.
     bool restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
     if (!fetched || !restored) {
-        finish_check(nullptr, nullptr, false, false,
+        finish_check(nullptr, nullptr, false,
                      !restored ? "ble_restore_failed" :
                      transport_error.code[0] ? transport_error.code
                                              : "manifest_fetch_failed");
@@ -167,14 +165,14 @@ void check_task(void *) {
     }
 
     if (!parsed) {
-        finish_check(nullptr, nullptr, false, false, manifest_error);
+        finish_check(nullptr, nullptr, false, manifest_error);
         vTaskDelete(nullptr);
         return;
     }
 
     bool newer = false;
     if (!OtaRelease::is_newer(airbridge_version(), manifest.version, newer)) {
-        finish_check(&manifest, nullptr, false, false,
+        finish_check(&manifest, nullptr, false,
                      "current_version_invalid");
         vTaskDelete(nullptr);
         return;
@@ -183,7 +181,7 @@ void check_task(void *) {
     OtaRelease::Artifact resolved = manifest.artifact;
     if (!OtaRelease::resolve_artifact_url(
             url, manifest.artifact.url, resolved.url, sizeof(resolved.url))) {
-        finish_check(&manifest, nullptr, false, false,
+        finish_check(&manifest, nullptr, false,
                      "artifact_url_invalid");
         vTaskDelete(nullptr);
         return;
@@ -191,7 +189,7 @@ void check_task(void *) {
 
     const esp_partition_t *partition = esp_ota_get_next_update_partition(nullptr);
     bool installable = newer && partition && resolved.size <= partition->size;
-    finish_check(&manifest, &resolved, newer, installable,
+    finish_check(&manifest, &resolved, newer,
                  newer && !installable ? "artifact_too_large" : nullptr);
     vTaskDelete(nullptr);
 }
@@ -326,6 +324,16 @@ bool background_work_idle() {
            sleephq.state != ExportSync::State::Working;
 }
 
+const char *start_blocked() {
+    if (!runtime.initialized) return "ota_unavailable";
+    if (runtime.operation != OP_NONE || runtime.reboot_pending) return "ota_busy";
+    if (WiFi.status() != WL_CONNECTED) return "network_unavailable";
+    if (Arbiter::get_state() != SYS_IDLE) return "device_not_idle";
+    if (ResmedOta::is_active()) return "resmed_ota_active";
+    if (!background_work_idle()) return "background_work_active";
+    return nullptr;
+}
+
 }  // namespace
 
 void init() {
@@ -352,7 +360,6 @@ void init() {
                 runtime.operation = OP_ARDUINO;
                 runtime.bytes = 0;
                 runtime.total_size = 0;
-                runtime.error[0] = '\0';
                 claimed = true;
             }
             unlock(claimed);
@@ -371,17 +378,14 @@ void init() {
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         if (!lock(pdMS_TO_TICKS(10))) return;
-        uint8_t before = progress_percent(runtime.bytes, runtime.total_size);
         runtime.bytes = progress;
         runtime.total_size = total;
-        unlock(before != progress_percent(runtime.bytes, runtime.total_size));
+        unlock();
     });
 
     ArduinoOTA.onError([](ota_error_t error) {
         if (lock()) {
             runtime.operation = OP_NONE;
-            snprintf(runtime.error, sizeof(runtime.error),
-                     "arduino_ota_%u", (unsigned)error);
             unlock(true);
         }
         Arbiter::set_state(SYS_IDLE);
@@ -399,6 +403,7 @@ void handle() {
     bool arduino_active = false;
     bool reboot = false;
     bool auto_check = false;
+    const char *blocked = "ota_unavailable";
     if (lock(pdMS_TO_TICKS(10))) {
         initialized = runtime.initialized;
         poll_arduino = runtime.operation == OP_NONE ||
@@ -418,10 +423,15 @@ void handle() {
             if (release_claim) {
                 runtime.operation = OP_NONE;
                 if (!runtime.resmed_started)
-                    set_error_locked("resmed_ota_start_failed");
+                    Log::logf(CAT_OTA, LOG_WARN, "ResMed OTA claim expired before start\n");
                 runtime.resmed_started = false;
                 status_revision.fetch_add(1);
             }
+        }
+        blocked = start_blocked();
+        if (blocked != last_blocked) {
+            last_blocked = blocked;
+            status_revision.fetch_add(1);
         }
         unlock();
     }
@@ -439,9 +449,7 @@ void handle() {
             ArduinoOTA.handle();
         unlock();
     }
-    if (auto_check && WiFi.status() == WL_CONNECTED &&
-        Arbiter::get_state() == SYS_IDLE && !ResmedOta::is_active() &&
-        background_work_idle()) {
+    if (auto_check && !blocked) {
         if (!request_check() && lock(pdMS_TO_TICKS(10))) {
             if (deadline_due(millis(), runtime.next_check_ms))
                 runtime.next_check_ms = millis() + RETRY_INTERVAL_MS;
@@ -450,25 +458,19 @@ void handle() {
     }
 }
 
-bool request_check() {
+bool request_check(const char **error) {
     auto &cfg = Config::get();
-    if (!mutex || !lock()) return false;
-    runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
-    if (!runtime.enabled) set_error_locked("update_check_disabled");
+    if (error) *error = nullptr;
+    if (!mutex || !lock()) {
+        if (error) *error = "ota_unavailable";
+        return false;
+    }
+    const char *rejected = start_blocked();
+    if (!runtime.enabled) rejected = "update_check_disabled";
     else if (cfg.update_url.length() >= sizeof(work_url) ||
              !OtaUrl::supported(cfg.update_url.c_str()))
-        set_error_locked("update_url_invalid");
-    else if (runtime.operation != OP_NONE || runtime.reboot_pending)
-        set_error_locked("ota_busy");
-    else if (WiFi.status() != WL_CONNECTED)
-        set_error_locked("network_unavailable");
-    else if (Arbiter::get_state() != SYS_IDLE)
-        set_error_locked("device_not_idle");
-    else if (ResmedOta::is_active())
-        set_error_locked("resmed_ota_active");
-    else if (!background_work_idle())
-        set_error_locked("background_work_active");
-    else {
+        rejected = "update_url_invalid";
+    if (!rejected) {
         snprintf(work_url, sizeof(work_url), "%s", cfg.update_url.c_str());
         runtime.operation = OP_CHECK;
         runtime.error[0] = '\0';
@@ -479,28 +481,24 @@ bool request_check() {
             set_error_locked("update_task_alloc_failed");
             unlock(true);
         }
+        if (error) *error = "update_task_alloc_failed";
         return false;
     }
-    unlock(true);
+    unlock();
+    if (error) *error = rejected;
     return false;
 }
 
-bool request_install() {
-    if (!mutex || !lock()) return false;
-    if (runtime.operation != OP_NONE || runtime.reboot_pending)
-        set_error_locked("ota_busy");
-    else if (!runtime.update_available || !runtime.installable ||
-             !available_artifact.size)
-        set_error_locked("update_not_available");
-    else if (WiFi.status() != WL_CONNECTED)
-        set_error_locked("network_unavailable");
-    else if (Arbiter::get_state() != SYS_IDLE)
-        set_error_locked("device_not_idle");
-    else if (ResmedOta::is_active())
-        set_error_locked("resmed_ota_active");
-    else if (!background_work_idle())
-        set_error_locked("background_work_active");
-    else {
+bool request_install(const char **error) {
+    if (error) *error = nullptr;
+    if (!mutex || !lock()) {
+        if (error) *error = "ota_unavailable";
+        return false;
+    }
+    const char *rejected = start_blocked();
+    if (!rejected && (runtime.result != State::Available || !available_artifact.size))
+        rejected = "update_not_available";
+    if (!rejected) {
         runtime.operation = OP_INSTALL;
         runtime.bytes = 0;
         runtime.total_size = available_artifact.size;
@@ -514,9 +512,11 @@ bool request_install() {
             unlock(true);
         }
         Arbiter::set_state(SYS_IDLE);
+        if (error) *error = "install_task_alloc_failed";
         return false;
     }
-    unlock(true);
+    unlock();
+    if (error) *error = rejected;
     return false;
 }
 
@@ -525,9 +525,7 @@ void config_changed() {
     if (!lock()) return;
     if (runtime.operation == OP_CHECK) runtime.operation = OP_NONE;
     runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
-    runtime.checked = false;
-    runtime.update_available = false;
-    runtime.installable = false;
+    runtime.result = State::Idle;
     runtime.update_version[0] = '\0';
     runtime.error[0] = '\0';
     available_artifact = {};
@@ -537,29 +535,40 @@ void config_changed() {
 
 uint32_t revision() { return status_revision.load(); }
 
+const char *state_name(State state) {
+    switch (state) {
+    case State::Disabled: return "disabled";
+    case State::Idle: return "idle";
+    case State::Checking: return "checking";
+    case State::Current: return "current";
+    case State::Available: return "available";
+    case State::Installing: return "installing";
+    case State::Rebooting: return "rebooting";
+    case State::Busy: return "busy";
+    case State::Error: return "error";
+    }
+    return "error";
+}
+
 bool get_status(Status &status) {
     memset(&status, 0, sizeof(status));
     if (!lock(pdMS_TO_TICKS(50))) return false;
     status.revision = status_revision.load();
-    status.enabled = runtime.enabled;
-    status.checking = runtime.operation == OP_CHECK;
-    status.checked = runtime.checked;
-    status.update_available = runtime.update_available;
-    status.installable = runtime.installable;
-    status.installing = runtime.operation == OP_INSTALL ||
-                        runtime.operation == OP_MANUAL ||
-                        runtime.operation == OP_ARDUINO;
-    status.reboot_pending = runtime.reboot_pending;
+    status.state = runtime.reboot_pending ? State::Rebooting :
+        runtime.operation == OP_CHECK ? State::Checking :
+        runtime.operation == OP_INSTALL ? State::Installing :
+        runtime.operation != OP_NONE ? State::Busy :
+        !runtime.enabled ? State::Disabled : runtime.result;
+    status.blocked = start_blocked();
     status.bytes = runtime.bytes;
     status.total_size = runtime.total_size;
     status.progress = progress_percent(runtime.bytes, runtime.total_size);
     status.last_check_age_ms = runtime.last_check_ms
         ? millis() - runtime.last_check_ms : 0;
-    snprintf(status.release_target, sizeof(status.release_target), "%s",
-             AB_OTA_RELEASE_TARGET);
     snprintf(status.update_version, sizeof(status.update_version), "%s",
              runtime.update_version);
-    snprintf(status.error, sizeof(status.error), "%s", runtime.error);
+    if (status.state == State::Error)
+        snprintf(status.error, sizeof(status.error), "%s", runtime.error);
     unlock();
     return true;
 }
@@ -574,19 +583,18 @@ bool begin_manual_upload() {
         runtime.operation = OP_MANUAL;
         runtime.bytes = 0;
         runtime.total_size = 0;
-        runtime.error[0] = '\0';
-    } else {
-        set_error_locked("ota_busy");
     }
-    unlock(true);
+    unlock(allowed);
     return allowed;
 }
 
 void end_manual_upload(bool success, const char *error) {
     if (!lock()) return;
-    if (runtime.operation == OP_MANUAL) runtime.operation = OP_NONE;
-    if (!success) set_error_locked(error ? error : "upload_failed");
-    unlock(true);
+    bool ended = runtime.operation == OP_MANUAL;
+    if (ended) runtime.operation = OP_NONE;
+    unlock(ended);
+    if (ended && !success)
+        Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
 }
 
 bool begin_resmed_flash() {
@@ -599,11 +607,8 @@ bool begin_resmed_flash() {
         runtime.operation = OP_RESMED;
         runtime.resmed_claimed_at_ms = millis();
         runtime.resmed_started = false;
-        runtime.error[0] = '\0';
-    } else {
-        set_error_locked("ota_busy");
     }
-    unlock(true);
+    unlock(allowed);
     return allowed;
 }
 
