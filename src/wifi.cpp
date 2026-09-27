@@ -1,7 +1,6 @@
 #include "wifi_setup.h"
 #include "app_config.h"
 #include "debug_log.h"
-#include "web_ui.h"
 #include "network_hints.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -24,6 +23,7 @@ typedef enum {
 } wifi_state_t;
 
 static wifi_state_t wf_state = WF_OFF;
+static std::atomic<uint32_t> status_revision{0};
 static uint32_t state_entered_ms = 0;
 static bool ntp_done = false;
 
@@ -145,6 +145,7 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 
 static void set_state(wifi_state_t s) {
+    if (wf_state != s) status_revision.fetch_add(1);
     wf_state = s;
     state_entered_ms = millis();
 }
@@ -383,7 +384,7 @@ static void process_scan_results() {
         Log::logf(CAT_WIFI, LOG_INFO, "Scan: 0 known of %d visible\n", n);
     }
 
-    WebUI::push_event("wifi", "{\"scan_done\":true}");
+    status_revision.fetch_add(1);
 }
 
 static void on_connected() {
@@ -413,7 +414,6 @@ static void on_connected() {
     // hint_refresh_pending was set by the same STA_GOT_IP that drove us here;
     // we just upserted, so the WF_CONNECTED-branch drain has nothing left to do.
     hint_refresh_pending = false;
-    WebUI::push_event("wifi", "{\"connected\":true}");
 
     if (!ntp_done) {
         sync_ntp();
@@ -528,6 +528,7 @@ void WiFiSetup::profiles_changed() {
 }
 
 static void apply_network_config() {
+    status_revision.fetch_add(1);
     const auto &cfg = Config::get();
     if (wf_state == WF_SMARTCONFIG) WiFi.stopSmartConfig();
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
@@ -576,6 +577,7 @@ static void apply_network_config() {
 }
 
 static void apply_profile_changes() {
+    status_revision.fetch_add(1);
     wifi_config_t current = {};
     if (WiFi.status() == WL_CONNECTED &&
         esp_wifi_get_config(WIFI_IF_STA, &current) == ESP_OK) {
@@ -762,6 +764,7 @@ void WiFiSetup::check() {
                               AP_TEARDOWN_QUIET_MS / 1000);
                     WiFi.softAPdisconnect(true);
                     WiFi.mode(WIFI_STA);
+                    status_revision.fetch_add(1);
                     pending_ap_teardown = false;
                     ap_quiet_since_ms = 0;
                 }
@@ -916,6 +919,8 @@ void WiFiSetup::force_ntp_sync() {
 
 void WiFiSetup::suspend_roaming() { roaming_suspended = true; }
 void WiFiSetup::resume_roaming()  { roaming_suspended = false; }
+
+uint32_t WiFiSetup::revision() { return status_revision.load(); }
 
 const char *WiFiSetup::state_name() {
     switch (wf_state) {

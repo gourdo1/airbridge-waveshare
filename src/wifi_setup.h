@@ -15,6 +15,7 @@ namespace WiFiSetup {
     void resume_roaming();
 
     const char *state_name();
+    uint32_t revision();
     int8_t current_rssi();
     const char *connected_ssid();
     uint8_t connected_net_idx();

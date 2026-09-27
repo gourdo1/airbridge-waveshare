@@ -682,10 +682,8 @@ function initSSE() {
   evtSrc.addEventListener('ota', e => {
     try { otaSerial++; applyOtaStatus(JSON.parse(e.data)); } catch(ex) { console.error(ex); }
   });
-  evtSrc.addEventListener('flash', e => {
-    try { updateFlashFromPush(JSON.parse(e.data)); } catch(ex) {}
-  });
   evtSrc.addEventListener('wifi', e => {
+    wifiSerial++;
     // Refresh WiFi list if Config tab is active
     var pane = document.getElementById('p-device');
     if (pane && pane.classList.contains('active')) loadWifiNets();
@@ -699,10 +697,12 @@ function initSSE() {
     if (li) li.style.background = '#555';
   };
   evtSrc.onopen = () => {
+    wifiSerial++;
     loadStatus();
     loadExports();
     if (otaWatch || document.getElementById('p-ota').classList.contains('active')) loadOtaStatus();
     if (document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
+    if (document.getElementById('p-device').classList.contains('active')) loadWifiNets();
     if (setupActive() && setupStep === 'network') loadSetupWifi();
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
@@ -722,7 +722,6 @@ function updateStatusFromPush(d) {
   finishOtaObservation();
 }
 
-var lastBleState = '';
 function updateBleFromPush(d) {
   if (d.ble_revision !== undefined) bleRevision = d.ble_revision;
   // Update dashboard oxi card from any push
@@ -774,35 +773,6 @@ function updateBleFromPush(d) {
   }
   var sp = document.getElementById('bleScanSpinner');
   if (sp) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
-  if (pendingConnect) {
-    var msgEl = document.getElementById('bleMsg');
-    if (st === 'STREAMING') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connected', 'ok');
-    } else if (st === 'DISABLED') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connection failed', 'err');
-    } else if (st === 'DISCONNECTED' && lastBleState !== 'CONNECTING' && lastBleState !== 'BONDING') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connection failed', 'err');
-    }
-  }
-  lastBleState = st;
-}
-
-function updateFlashFromPush(d) {
-  if (d.active !== undefined) {
-    const phase = document.getElementById('flashPhase');
-    const bar = document.getElementById('flashBar');
-    const prog = document.getElementById('flashProgress');
-    if (phase) phase.textContent = d.phase || '';
-    if (d.total > 0 && bar) {
-      bar.style.width = (d.sent / d.total * 100) + '%';
-      prog.style.display = 'block';
-    }
-    if (!d.active && d.error) showMsg(document.getElementById('flashMsg'), d.error, 'err');
-    if (!d.active && !d.error) showMsg(document.getElementById('flashMsg'), 'Flash complete', 'ok');
-  }
 }
 
 function appendLiveSamples(d, reset = false) {
@@ -885,11 +855,13 @@ function setupNetworkSelected() {
 
 async function loadSetupWifi() {
   if (setupWifiRead) return setupWifiRead;
+  const serial = wifiSerial;
   setupWifiRead = (async () => {
     try {
-      const r = await api('/api/wifi');
+      const r = await api('/api/wifi', undefined, 5000);
       if (!r || !r.ok) throw new Error('Cannot read WiFi status');
       const d = await r.json();
+      if (serial !== wifiSerial) return null;
       document.getElementById('setupWifiStatus').textContent =
         'State: ' + d.state + (d.ssid ? ' | ' + d.ssid : '') +
         ' | Saved: ' + (d.networks.map(n => n.ssid).join(', ') || 'none');
@@ -900,7 +872,10 @@ async function loadSetupWifi() {
     } catch(e) {
       showMsg(document.getElementById('setupMsg'), e.message, 'err');
       return null;
-    } finally { setupWifiRead = null; }
+    } finally {
+      setupWifiRead = null;
+      if (serial !== wifiSerial && setupActive() && setupStep === 'network') loadSetupWifi();
+    }
   })();
   return setupWifiRead;
 }
@@ -1451,10 +1426,15 @@ var TZ_ZONES=['Pacific/Honolulu','America/Anchorage','America/Los_Angeles','Amer
 function attachTzHelper(inp){var wrap=document.createElement('div');wrap.style.cssText='display:flex;gap:6px;align-items:center;flex-wrap:wrap';inp.parentNode.insertBefore(wrap,inp);wrap.appendChild(inp);var btn=document.createElement('button');btn.className='btn';btn.style.cssText='padding:4px 10px;font-size:12px';btn.textContent='detect';wrap.appendChild(btn);var sel=document.createElement('select');sel.style.cssText='font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px';var o0=document.createElement('option');o0.value='';o0.textContent='preset...';sel.appendChild(o0);TZ_ZONES.forEach(function(tz){var o=document.createElement('option');o.value=tz;o.textContent=tz;sel.appendChild(o)});wrap.appendChild(sel);btn.onclick=function(){try{var detected=Intl.DateTimeFormat().resolvedOptions().timeZone;inp.value=getPosixTz(detected);inp.title=detected}catch(e){inp.value='detection failed'}};sel.onchange=function(){if(sel.value){try{inp.value=getPosixTz(sel.value);inp.title=sel.value}catch(e){inp.value='error'}}}}
 
 // WiFi network management
-async function loadWifiNets() {
+let wifiRead = null, wifiSerial = 0;
+function loadWifiNets() {
+  if (wifiRead) return wifiRead;
+  const serial = wifiSerial;
+  wifiRead = (async () => {
   try {
-    var r = await api('/api/wifi'); if (!r) return;
+    var r = await api('/api/wifi', undefined, 5000); if (!r || !r.ok) return;
     var d = await r.json();
+    if (serial !== wifiSerial) return;
     var el = document.getElementById('wifiNetList');
     el.innerHTML = '';
     if (d.networks && d.networks.length) {
@@ -1478,6 +1458,11 @@ async function loadWifiNets() {
     var ws = document.getElementById('wifiState');
     if (ws) ws.textContent = 'State: ' + d.state + (d.roam === '1' ? ' | Roaming enabled' : '');
   } catch(e) { console.error(e); }
+  })().finally(() => {
+    wifiRead = null;
+    if (serial !== wifiSerial && document.getElementById('p-device').classList.contains('active')) loadWifiNets();
+  });
+  return wifiRead;
 }
 
 function wifiAddPrompt() {
@@ -2136,11 +2121,7 @@ async function bleScan() {
   await bleAction('scan');
 }
 
-var pendingConnect = false;
 async function bleConnect(addr) {
-  var msgEl = document.getElementById('bleMsg');
-  showMsg(msgEl, 'Connecting to ' + addr + '...', 'ok', 0);
-  pendingConnect = true;
   await bleAction('connect', addr);
 }
 

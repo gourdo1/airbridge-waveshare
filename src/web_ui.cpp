@@ -1544,6 +1544,14 @@ static void publishOta() {
     else __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
 }
 
+static void publishWifi() {
+    static uint32_t last_revision = 0;
+    const uint32_t revision = WiFiSetup::revision();
+    if (revision == last_revision) return;
+    if (events->send("{}", "wifi", millis()) == AsyncEventSource::ENQUEUED)
+        last_revision = revision;
+}
+
 static void handleOtaStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
     sendOtaStatus(request, 200);
@@ -2012,6 +2020,7 @@ void WebUI::handle() {
     if (uint32_t(now - last_check) < 100) return;
     last_check = now;
     publishOta();
+    publishWifi();
 #if AB_STORAGE_HAS_SDCARD
     publishExports();
 #endif
