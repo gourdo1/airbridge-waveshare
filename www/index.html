@@ -1082,8 +1082,8 @@ document.querySelectorAll('.nav-item, .bnav-item').forEach(n => {
   if (n.dataset.tab === 'storage') n.addEventListener('click', () => loadStorage());
 });
 
-async function api(url, opts) {
-  const r = await fetch(url, opts);
+async function api(url, opts, timeoutMs = 0) {
+  const r = await fetch(url, timeoutMs ? {...opts, signal:AbortSignal.timeout(timeoutMs)} : opts);
   if (r.status === 401) { alert('Authentication failed'); return null; }
   return r;
 }
@@ -2053,6 +2053,7 @@ function showMsg(el, text, type, timeout) {
 
 // BLE
 let bleTimer = null;
+let bleRead = null, bleGeneration = 0;
 function toggleOxi() {
   var st = document.getElementById('bleStatusGrid');
   var isDisabled = st && st.querySelector('[data-field="state"]') &&
@@ -2060,9 +2061,12 @@ function toggleOxi() {
   bleAction(isDisabled ? 'enable' : 'disable');
 }
 
-async function loadBle() {
+function loadBle() {
+  if (bleRead) return bleRead;
+  bleRead = (async () => {
   try {
-    const r = await api('/api/ble'); if (!r) return;
+    const r = await api('/api/ble', undefined, 5000); if (!r) return null;
+    if (!r.ok) throw new Error('Oximetry status read failed');
     const d = await r.json();
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
     const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
@@ -2120,17 +2124,31 @@ async function loadBle() {
     }
     return d;
   } catch(e) { console.error(e); }
+  })().finally(() => { bleRead = null; });
+  return bleRead;
 }
 
 async function bleScan() {
+  const generation = ++bleGeneration;
+  if (bleTimer) clearTimeout(bleTimer);
   await bleAction('scan');
-  if (bleTimer) clearInterval(bleTimer);
+  if (generation !== bleGeneration) return;
   document.getElementById('bleScanSpinner').style.display = 'inline-block';
-  let polls = 0;
-  bleTimer = setInterval(async () => {
-    const d = await loadBle(); polls++;
-    if ((d && d.state !== 'SCANNING') || polls > 20) { clearInterval(bleTimer); bleTimer = null; document.getElementById('bleScanSpinner').style.display = 'none'; }
-  }, 1500);
+  const deadline = Date.now() + 35000;
+  const poll = async () => {
+    if (generation !== bleGeneration) return;
+    const d = await loadBle();
+    if (generation !== bleGeneration) return;
+    if (d === null || (d && d.state !== 'SCANNING') || Date.now() >= deadline) {
+      bleTimer = null;
+      document.getElementById('bleScanSpinner').style.display = 'none';
+      if (Date.now() >= deadline)
+        showMsg(document.getElementById('bleMsg'), 'Scan status timed out. Refresh to check the result.', 'err');
+      return;
+    }
+    bleTimer = setTimeout(poll, 1500);
+  };
+  bleTimer = setTimeout(poll, 1500);
 }
 
 var pendingConnect = false;
@@ -2401,6 +2419,7 @@ document.getElementById('flashBlock').addEventListener('change', updateBlxVisibi
 document.getElementById('flashBlx').addEventListener('change', updateBlxVisibility);
 
 let flashPollTimer = null;
+let flashPolling = false;
 async function startFlash() {
   const block = document.getElementById('flashBlock').value;
   const flashBlx = document.getElementById('flashBlx').checked;
@@ -2419,23 +2438,39 @@ async function startFlash() {
 }
 
 function pollFlash() {
-  if (flashPollTimer) clearInterval(flashPollTimer);
-  flashPollTimer = setInterval(async () => {
+  if (flashPolling) return;
+  flashPolling = true;
+  let failedAt = null;
+  const poll = async () => {
     try {
-      const r = await api('/api/flash'); if (!r) return; const d = await r.json();
+      const r = await api('/api/flash', undefined, 5000);
+      if (!r) { flashPolling = false; flashPollTimer = null; return; }
+      if (!r.ok) throw new Error('Flash status read failed');
+      const d = await r.json();
+      failedAt = null;
       const bar = document.getElementById('flashBar'), phase = document.getElementById('flashPhase'), msgEl = document.getElementById('flashMsg');
       if (d.total > 0) bar.style.width = (d.sent/d.total*100)+'%';
       phase.textContent = d.phase + (d.total > 0 ? ' - ' + Math.round(d.sent/1024) + '/' + Math.round(d.total/1024) + ' KB' : '');
       if (d.active !== 'true') {
-        clearInterval(flashPollTimer); flashPollTimer = null;
+        flashPolling = false; flashPollTimer = null;
         document.getElementById('btnFlash').disabled = false;
         document.getElementById('btnFlashCancel').style.display = 'none';
         if (d.error) showMsg(msgEl, d.error, 'err');
         else if (d.phase === 'Complete') showMsg(msgEl, 'Flash completed successfully!', 'ok');
         else showMsg(msgEl, 'Flash finished: ' + d.phase, 'ok');
+        return;
       }
-    } catch(e) { console.error(e); }
-  }, 500);
+    } catch(e) {
+      if (failedAt === null) failedAt = Date.now();
+      if (Date.now() - failedAt >= 30000) {
+        flashPolling = false; flashPollTimer = null;
+        showMsg(document.getElementById('flashMsg'), 'Flash status unavailable. The operation may still be running; refresh to check.', 'err', 0);
+        return;
+      }
+    }
+    flashPollTimer = setTimeout(poll, 500);
+  };
+  flashPollTimer = setTimeout(poll, 500);
 }
 
 async function cancelFlash() { try { await api('/api/flash/cancel', {method:'POST'}); } catch(e) { console.error(e); } }
