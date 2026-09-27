@@ -15,6 +15,7 @@
 #include "memory_manager.h"
 #include "sd_storage.h"
 #include "debug_log.h"
+#include "export_sync.h"
 
 namespace StorageBrowser {
 namespace {
@@ -372,6 +373,7 @@ void produce(void *context) {
     if (mutating(job->request.kind)) {
         uint32_t changed = 0;
         const char *error = job->session.begin() ? mutate(*job, changed) : "storage_busy";
+        if (changed) ExportSync::request_backlog_refresh(true);
         success = !error;
         portENTER_CRITICAL(&mutation_mux);
         mutation.active = false;

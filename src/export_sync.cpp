@@ -84,6 +84,7 @@ static volatile uint32_t abort_generation = 1;
 static uint32_t status_revision = 0;
 static bool check_pending = false;
 static bool backlog_refresh = true;
+static bool backlog_files_changed = false;
 static uint32_t backlog_config_revision = UINT32_MAX;
 static uint32_t backlog_catalog_generation = UINT32_MAX;
 static bool roots_confirmed = false;
@@ -797,6 +798,8 @@ static void refresh_backlog() {
     if (uxQueueMessagesWaiting(request_queue) || !catalog.ready || Arbiter::get_state() != SYS_IDLE ||
         Arbiter::get_cached_rop() != 0 || !storage.begin()) return;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
+    if (__atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL))
+        roots_confirmed = false;
 
     Backlog smb = {}, shq = {};
     smb.config_revision = shq.config_revision = config_revision;
@@ -1061,7 +1064,8 @@ static bool request_manual(bool smb, bool check) {
 bool request_manual_smb(bool check) { return request_manual(true, check); }
 bool request_manual_sleephq(bool check) { return request_manual(false, check); }
 
-void request_backlog_refresh() {
+void request_backlog_refresh(bool files_changed) {
+    if (files_changed) __atomic_store_n(&backlog_files_changed, true, __ATOMIC_RELEASE);
     __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
 }
 
@@ -1107,7 +1111,7 @@ void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
 bool request_manual_smb(bool) { return false; }
 bool request_manual_sleephq(bool) { return false; }
-void request_backlog_refresh() {}
+void request_backlog_refresh(bool) {}
 
 void get_status(Status &out) {
     out = {};

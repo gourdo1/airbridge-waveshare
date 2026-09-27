@@ -730,7 +730,6 @@ static String buildExportsJson() {
 
 static void handleExportStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
-    ExportSync::request_backlog_refresh();
     auto *response = request->beginResponse(200, "application/json", buildExportsJson());
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
@@ -1823,7 +1822,6 @@ void WebUI::init(uint16_t port) {
 #if AB_STORAGE_HAS_SDCARD
     events->onConnect([](AsyncEventSourceClient *) {
         __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
-        ExportSync::request_backlog_refresh();
     });
 #endif
     live_events->addMiddleware(authenticate_events);

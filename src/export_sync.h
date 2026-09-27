@@ -68,7 +68,7 @@ void therapy_started();
 bool request_post_therapy(const EdfCatalog::Entry &entry);
 bool request_manual_smb(bool check = false);
 bool request_manual_sleephq(bool check = false);
-void request_backlog_refresh();
+void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
