@@ -76,7 +76,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .setting-group .setting-group{margin-left:12px}
 .setting-group h4{font-size:13px;color:var(--text);margin-bottom:4px}
 .row label{flex:1;font-size:14px}
-.row select,.row input[type=number]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
+.row select,.row input[type=number],.row input[type=date]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
+#p-report .row{gap:12px;flex-wrap:wrap}
+#p-report .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.report-note{font-size:12px;color:var(--text-dim);margin:12px 0;line-height:1.5}
+#reportGrid .stat{gap:12px;align-items:baseline}
+#reportIntervals .stat{gap:12px;flex-wrap:wrap}
 .row input[type=number]{width:100px}
 input[type=text],input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:200px;font-size:14px}
 
@@ -382,15 +387,23 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
       <!-- SLEEP REPORT -->
       <div class="pane" id="p-report">
         <div class="card">
-          <h3>Last Session</h3>
+          <h3>Sleep Report</h3>
+          <div class="row"><label for="reportView">View</label><select id="reportView" onchange="loadReport()"><option value="day">Day</option><option value="period">Period</option></select></div>
+          <div class="row" id="reportDayRow"><label for="reportDay">Therapy date</label><input type="date" id="reportDay" onchange="loadReport()"></div>
+          <div class="row" id="reportPeriodRow" hidden><label for="reportPeriod">Period</label><select id="reportPeriod" onchange="loadReport()"><option value="0">1 day</option><option value="1">7 days</option><option value="2">30 days</option><option value="3">90 days</option><option value="4">180 days</option><option value="5">365 days</option></select></div>
+          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)">Last saved day</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
+          <div class="msg" id="reportMsg" role="status"></div>
+        </div>
+        <div class="card" aria-busy="false" id="reportResult">
+          <h3 id="reportTitle">Therapy day</h3>
           <div class="spinner" id="reportSpinner"></div>
-          <div id="sessionGrid" class="status-grid"></div>
+          <p class="report-note" id="reportNote"></p>
+          <div id="reportGrid" class="status-grid"></div>
         </div>
-        <div class="card">
-          <h3>Summary</h3>
-          <div id="summaryGrid" class="status-grid"></div>
+        <div class="card" id="reportMaskCard" hidden>
+          <h3>Mask intervals</h3>
+          <div id="reportIntervals"></div>
         </div>
-        <div class="btn-row"><button class="btn btn-accent" onclick="loadReport()">Refresh</button></div>
       </div>
 
       <!-- CLINICAL -->
@@ -1206,22 +1219,95 @@ async function timeAction(action) {
   } catch(e) { showMsg(null, 'Error: ' + e.message, 'err'); }
 }
 
-async function loadReport() {
-  const sp = document.getElementById('reportSpinner');
-  if (sp) sp.style.display = 'block';
+let reportGeneration = 0;
+
+function reportDate(day) {
+  return new Date(day * 86400000).toISOString().slice(0, 10);
+}
+
+function reportMaskTime(day, minute) {
+  if (minute < 0) return '--';
+  return new Date((day * 1440 + 720 + minute) * 60000).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function renderReport(data) {
+  const day = data.view === 'day';
+  const date = document.getElementById('reportDay');
+  date.min = reportDate(0x1000);
+  date.max = reportDate(data.current_day);
+  if (day && data.day) date.value = reportDate(data.day);
+  document.getElementById('reportTitle').textContent = day
+    ? (data.day ? 'Therapy day ' + reportDate(data.day) : 'Therapy day')
+    : 'Last ' + data.period + (data.period === 1 ? ' day' : ' days');
+  document.getElementById('reportNote').textContent = day
+    ? (data.present ? 'Saved device data. Therapy days run from noon to noon in AirSense time.' : 'No saved data for this therapy day.')
+    : 'Through therapy day ' + reportDate(data.day) + '. Device-calculated averages of valid daily values.' + (data.present ? '' : ' No therapy recorded in this period.');
+  const rows = document.createDocumentFragment();
+  for (const value of data.fields) {
+    const row = document.createElement('div'); row.className = 'stat';
+    const label = document.createElement('span'); label.className = 'k'; label.textContent = value.label;
+    const text = document.createElement('span'); text.className = 'v';
+    text.textContent = value.value + (value.raw >= 0 && value.unit ? ' ' + value.unit : '');
+    row.append(label, text); rows.append(row);
+  }
+  document.getElementById('reportGrid').replaceChildren(rows);
+  const intervals = document.getElementById('reportIntervals');
+  intervals.replaceChildren();
+  document.getElementById('reportMaskCard').hidden = !day || !data.present;
+  for (const interval of data.intervals) {
+    const row = document.createElement('div'); row.className = 'stat';
+    const on = document.createElement('span'); on.className = 'k'; on.textContent = reportMaskTime(data.day, interval.on);
+    const off = document.createElement('span'); off.className = 'v'; off.textContent = reportMaskTime(data.day, interval.off);
+    row.append(on, off); intervals.append(row);
+  }
+  if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
+}
+
+async function loadReport(latest = false) {
+  const generation = ++reportGeneration;
+  const view = document.getElementById('reportView').value;
+  const day = view === 'day';
+  const date = document.getElementById('reportDay');
+  if (latest) date.value = '';
+  document.getElementById('reportDayRow').hidden = !day;
+  document.getElementById('reportPeriodRow').hidden = day;
+  document.getElementById('reportLatest').hidden = !day;
+  document.getElementById('reportMaskCard').hidden = true;
+  document.getElementById('reportGrid').replaceChildren();
+  document.getElementById('reportNote').textContent = '';
+  document.getElementById('reportTitle').textContent = day ? 'Therapy day' : 'Period';
+  document.getElementById('reportMsg').style.display = 'none';
+  document.getElementById('reportRefresh').disabled = true;
+  document.getElementById('reportResult').setAttribute('aria-busy', 'true');
+  document.getElementById('reportSpinner').style.display = 'block';
   try {
-    const data = await settingsRequest(undefined, '/api/report');
-    const sg = document.getElementById('sessionGrid'); sg.innerHTML = '';
-    const ug = document.getElementById('summaryGrid'); ug.innerHTML = '';
-    data.forEach(v => {
-      if (v.raw < 0) return;
-      const target = v.section === 'summary' ? ug : sg;
-      target.innerHTML += '<div class="stat"><span class="k">'+v.label+':</span> <span class="v">'+v.value+' '+v.unit+'</span></div>';
-    });
-    if (!sg.children.length) sg.innerHTML = '<div class="stat"><span class="k">No session data</span></div>';
-    if (!ug.children.length) ug.innerHTML = '<div class="stat"><span class="k">No summary data</span></div>';
-  } catch(e) { showMsg(null, 'Report: ' + e.message, 'err'); }
-  finally { if (sp) sp.style.display = 'none'; }
+    const selection = day ? (date.value ? Date.parse(date.value + 'T00:00:00Z') / 86400000 : 0)
+      : Number(document.getElementById('reportPeriod').value);
+    if (!Number.isInteger(selection)) throw new Error('Choose a valid date');
+    const query = '?view=' + view + (day ? '&day=' : '&period=') + selection;
+    const data = await settingsRequest(day ? undefined : {method:'POST'}, '/api/report', query);
+    if (generation !== reportGeneration) return;
+    renderReport(data);
+  } catch(e) {
+    if (generation !== reportGeneration) return;
+    const errors = {
+      report_restore_failed: 'Could not restore the previous report period. Check Sleep Report on the AirSense.',
+      report_period_changed: 'The report period changed on the device during this request. Refresh to read again.',
+      report_period_not_selected: 'The device has not selected the requested period. Refresh to read again.',
+      report_history_changed: 'The device saved new data during this read. Refresh to read again.',
+      report_history_unsupported: 'This firmware does not provide stored daily reports.',
+      report_read_failed: 'Could not read the report from the AirSense.',
+      report_day_unavailable: 'This therapy date is not available.',
+      report_deadline: 'The report request timed out.'
+    };
+    showMsg(document.getElementById('reportMsg'), errors[e.message] || e.message, 'err');
+  } finally {
+    if (generation === reportGeneration) {
+      document.getElementById('reportSpinner').style.display = 'none';
+      document.getElementById('reportRefresh').disabled = false;
+      document.getElementById('reportResult').setAttribute('aria-busy', 'false');
+    }
+  }
 }
 
 function renderField(s) {
@@ -1259,12 +1345,12 @@ function renderField(s) {
   return div;
 }
 
-async function settingsRequest(options, endpoint = '/api/settings') {
+async function settingsRequest(options, endpoint = '/api/settings', query = '') {
   const deadline = Date.now() + 35000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 35000);
   try {
-  let r = await api(endpoint, {...options, signal:controller.signal});
+  let r = await api(endpoint + query, {...options, signal:controller.signal});
   if (!r) throw new Error('Request cancelled');
   let data = await r.json();
   const job = data.job;
