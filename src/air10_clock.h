@@ -5,11 +5,6 @@
 
 namespace Air10Clock {
 
-// Published by the main health loop; never queries UART.
-void status_time(char (&out)[20]);
-void poll_status();  // Health pass after confirming device presence.
-void invalidate();
-
 struct Calendar {
     int year, month, day, hour, minute, second;
 };
@@ -17,8 +12,15 @@ struct Calendar {
 // Queued UART read of DAC/TIC, bracketed by DAC across midnight.
 bool read(Calendar &out, uint16_t timeout_ms = 0, uint32_t *captured_ms = nullptr);
 
-// The main loop applies NTP time when therapy and pending STR work are finished.
+// Health pass after confirming presence; status_time only reads the cache.
+void poll_status();
+void status_time(char (&out)[20]);
+void invalidate();
+
+// Called from the main loop; applies NTP time after therapy and pending STR.
+void handle();
 void request_sync();
+bool pull_time(bool force = false);
 
 inline bool parse_calendar(const char *dac, const char *tic, Calendar &out) {
     if (!dac || !tic || strlen(dac) != 8 || strlen(tic) != 6) return false;

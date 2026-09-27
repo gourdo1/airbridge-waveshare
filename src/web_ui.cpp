@@ -1890,7 +1890,6 @@ void WebUI::push_event(const char *event, const String &json) {
     push_event(event, json.c_str());
 }
 
-extern bool pull_time_from_resmed(bool force);
 
 static void handleTimeAction(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
@@ -1916,7 +1915,7 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
         ok = true;
         result = "ResMed clock sync requested";
     } else if (action == "sync_from_resmed") {
-        ok = pull_time_from_resmed(true);
+        ok = Air10Clock::pull_time(true);
         result = ok ? "ESP32 clock set from ResMed" : "Failed to read ResMed clock";
     }
 
