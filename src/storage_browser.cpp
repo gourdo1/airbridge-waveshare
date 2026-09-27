@@ -22,6 +22,8 @@ namespace {
 using aircannect::Memory::free;
 constexpr size_t RING_BYTES = 16 * 1024;
 constexpr size_t INTERNAL_RING_BYTES = 4096;
+constexpr size_t INTERNAL_COPY_BYTES = 1024;
+static_assert(SdStorage::READ_CHUNK_BYTES <= UINT16_MAX, "ZIP stored block length");
 constexpr uint32_t CONSUMER_TIMEOUT_MS = 30000;
 std::atomic<bool> busy{false};
 MutationStatus mutation = {};
@@ -95,6 +97,8 @@ public:
     SdStorage::Session session;
     uint8_t *ring = nullptr;
     size_t capacity = 0;
+    uint8_t *copy_buffer = nullptr;
+    size_t copy_capacity = 0;
     std::atomic<uint32_t> produced{0}, consumed{0};
     std::atomic<bool> cancelled{false}, done{false}, error{false};
     ZipEntry *entries = nullptr;
@@ -103,6 +107,7 @@ public:
     ~Job() override {
         free(entries);
         free(ring);
+        free(copy_buffer);
         busy.store(false);
     }
 
@@ -272,18 +277,16 @@ const char *mutate(Job &job, uint32_t &changed) {
     return error;
 }
 
-constexpr size_t COPY_BYTES = 1024;
-
-uint64_t zip_data_size(uint32_t size) {
-    return uint64_t(size) + 5 * (size ? (uint64_t(size) + COPY_BYTES - 1) / COPY_BYTES : 1);
+uint64_t zip_data_size(uint32_t size, size_t block_bytes) {
+    return uint64_t(size) + 5 * (size ? (uint64_t(size) + block_bytes - 1) / block_bytes : 1);
 }
 
 bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr) {
-    uint8_t buffer[COPY_BYTES];
+    uint8_t *buffer = job.copy_buffer;
     uint64_t remaining = file.size();
     uint32_t crc = crc32_ieee_initial();
     do {
-        const size_t count = std::min<uint64_t>(sizeof(buffer), remaining);
+        const size_t count = std::min<uint64_t>(job.copy_capacity, remaining);
         if (checksum) {
             // Raw DEFLATE stored block: one pass, no compression workspace.
             uint8_t block[5];
@@ -310,7 +313,7 @@ bool archive(Job &job) {
         if (entry.directory) continue;
         const char *name = entry.path + 1;
         const size_t length = strlen(name);
-        const uint64_t compressed_size = zip_data_size(entry.size);
+        const uint64_t compressed_size = zip_data_size(entry.size, job.copy_capacity);
         if (position + 30 + length + compressed_size + 16 > UINT32_MAX) return false;
         entry.offset = position;
         uint8_t header[30] = {};
@@ -349,7 +352,7 @@ bool archive(Job &job) {
         put_le16(header + 10, 8);
         put_le32(header + 12, entry.modified);
         put_le32(header + 16, entry.crc);
-        put_le32(header + 20, zip_data_size(entry.size));
+        put_le32(header + 20, zip_data_size(entry.size, job.copy_capacity));
         put_le32(header + 24, entry.size);
         put_le16(header + 28, length);
         put_le32(header + 42, entry.offset);
@@ -406,6 +409,8 @@ void produce(void *context) {
     } else job->ready(409, "archive_unavailable", nullptr, 0);
     job->ready = nullptr;
     job->session.end();
+    free(job->copy_buffer);
+    job->copy_buffer = nullptr;
     job->error.store(!success);
     job->done.store(true);
     job.reset();
@@ -434,6 +439,15 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
             job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
         }
         if (!job->ring) return StartResult::Unavailable;
+    }
+    if (request.kind == Kind::File || request.kind == Kind::Archive) {
+        job->copy_capacity = SdStorage::READ_CHUNK_BYTES;
+        job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity, false));
+        if (!job->copy_buffer) {
+            job->copy_capacity = INTERNAL_COPY_BYTES;
+            job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity));
+        }
+        if (!job->copy_buffer) return StartResult::Unavailable;
     }
     auto *context = new(std::nothrow) std::shared_ptr<Job>(job);
     if (!context) return StartResult::Unavailable;

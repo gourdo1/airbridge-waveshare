@@ -387,7 +387,7 @@ size_t Reader::read(uint8_t *data, size_t length) {
 #if AB_STORAGE_HAS_SDCARD
     if (!*this || !data) return 0;
     while (total < length && offset_ < size_) {
-        const size_t count = std::min<size_t>(4096,
+        const size_t count = std::min<size_t>(READ_CHUNK_BYTES,
             std::min<uint64_t>(length - total, size_ - offset_));
         const bool read = session_.run([&](fs::FS &) {
             OpenFile *reader = find_reader(handle_);

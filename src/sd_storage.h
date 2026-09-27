@@ -11,6 +11,8 @@ class File;
 
 namespace SdStorage {
 
+constexpr size_t READ_CHUNK_BYTES = 4096;
+
 struct Status {
     bool supported;
     bool mounted;
