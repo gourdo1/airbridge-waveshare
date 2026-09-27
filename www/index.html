@@ -2137,13 +2137,20 @@ function cancelSyncEndpoint(id) {
 
 
 function showMsg(el, text, type, timeout) {
+  text = text == null ? '' : String(text);
+  const empty = !text.trim();
   // Inline msg element
   if (el) {
-    el.textContent = text;
-    el.className = 'msg ' + type;
     if (el._msgTimer) clearTimeout(el._msgTimer);
+    el._msgTimer = null;
+    el.style.removeProperty('display');
+    el.textContent = empty ? '' : text;
+    el.className = empty ? 'msg' : 'msg ' + type;
+    if (empty) return;
     if (timeout !== 0) el._msgTimer = setTimeout(() => { el.className = 'msg'; }, timeout || 5000);
+    return;
   }
+  if (empty) return;
   // Toast
   var tc = document.getElementById('toastContainer');
   if (tc) {
