@@ -1050,19 +1050,7 @@ function showTab(id) {
   document.querySelectorAll('.bnav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   window.location.hash = id;
   updateLiveSubscription();
-  if (id === 'status') {
-    loadStatus();
-    if (!window._statusTimer) {
-      var scheduleNext = function() {
-        var ms = 60000 - (Date.now() % 60000) + 500;
-        window._statusTimer = setTimeout(function tick() {
-          if (document.getElementById('p-status').classList.contains('active')) loadStatus();
-          window._statusTimer = setTimeout(tick, 60000 - (Date.now() % 60000) + 500);
-        }, ms);
-      };
-      scheduleNext();
-    }
-  }
+  if (id === 'status') loadStatus();
   if (id === 'report') loadReport();
   if (id === 'clinical') loadSettings();
   if (id === 'bluetooth') loadBle();
@@ -1197,8 +1185,7 @@ function loadStatus() {
 async function ropCmd(action) {
   const cmds = {start:'P S #ROP 0001',standby:'P S #ROP 0000',energy_save:'P S #ROP 0003'};
   try {
-    const r = await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmds[action]})});
-    if (r) setTimeout(loadStatus, 1000);
+    await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmds[action]})});
   } catch(e) { console.error(e); }
 }
 
@@ -1208,7 +1195,6 @@ async function timeAction(action) {
     if (!r) return;
     const d = await r.json();
     showMsg(null, d.result, d.ok === 'true' ? 'ok' : 'err');
-    setTimeout(loadStatus, 1000);
   } catch(e) { showMsg(null, 'Error: ' + e.message, 'err'); }
 }
 

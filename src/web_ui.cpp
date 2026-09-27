@@ -258,6 +258,19 @@ static void fixedJsonAddInt(FixedJson &json, const char *key, long val, bool com
     fixedJsonPrintf(json, "%ld", val);
 }
 
+static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
+    strcpy(esp_time, "--");
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+        struct tm t;
+        localtime_r(&now, &t);
+        snprintf(esp_time, sizeof(esp_time), "%04d-%02d-%02d %02d:%02d",
+                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                 t.tm_hour, t.tm_min);
+    }
+    Air10Clock::status_time(resmed_time);
+}
+
 static size_t buildStatusJson(char *out, size_t cap) {
     if (!out || cap == 0) return 0;
     out[0] = '\0';
@@ -279,18 +292,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
 
     auto &cfg = Config::get();
 
-    char esp_time[20] = "--";
-    time_t now = time(nullptr);
-    if (now > 1700000000) {
-        struct tm t;
-        localtime_r(&now, &t);
-        snprintf(esp_time, sizeof(esp_time), "%04d-%02d-%02d %02d:%02d",
-                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                 t.tm_hour, t.tm_min);
-    }
-
-    char resmed_time[20];
-    Air10Clock::status_time(resmed_time);
+    char esp_time[20], resmed_time[20];
+    statusClocks(esp_time, resmed_time);
 
     FixedJson json = {out, cap, 0, false};
     fixedJsonPut(json, '{');
@@ -1888,11 +1891,15 @@ void WebUI::init(uint16_t port) {
 
 static String build_status_payload(const DeviceStatus::Snapshot &status) {
     const auto &r = status.reading;
+    char esp_time[20], resmed_time[20];
+    statusClocks(esp_time, resmed_time);
 
     String sj;
     sj.reserve(256);
     sj = "{";
     jsonAddString(sj, "system", system_state_name(status.sys), false);
+    jsonAddString(sj, "esp_time", esp_time);
+    jsonAddString(sj, "resmed_time", resmed_time);
     jsonAddInt(sj, "rop", status.rop);
     jsonAddInt(sj, "mhr", status.mhr);
     char mode[24];
