@@ -1150,6 +1150,7 @@ typedef struct {
     uint16_t capacity;
     uint16_t length;
     bool received;
+    bool bdd;
     // The retained payload and its terminator follow this header.
 } single_response_capture_t;
 
@@ -1177,9 +1178,9 @@ static bool capture_variable(const qframe_t *frame, void *context) {
     return capture_response(frame, context, 11);
 }
 
-static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
-                       char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
-                         uart_frame_sink_t sink)
+static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
+                         cmd_priority_t prio, uint16_t output_capacity,
+                         uint16_t timeout_ms, uart_frame_sink_t sink)
 {
     if (timeout_ms == 0) timeout_ms = Config::get().uart_cmd_timeout_ms;
     uart_response_policy_t policy = {};
@@ -1189,31 +1190,23 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     policy.first_timeout_ms = timeout_ms;
     policy.overall_timeout_ms = timeout_ms;
 
-    uint16_t output_capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
-    if (resp_buf && resp_len && *resp_len)
-        output_capacity = min(output_capacity, (uint16_t)(*resp_len - 1));
     bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
     uint16_t capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
     auto *t = create_command(cmd, src, prio, policy, sink,
                               nullptr, sizeof(single_response_capture_t) + capacity + 1);
-    if (!t) {
-        if (resp_len) *resp_len = 0;
-        return false;
-    }
+    if (!t) return nullptr;
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
     capture->capacity = capacity;
-    if (!publish_transaction(t)) {
-        if (resp_len) *resp_len = 0;
-        return false;
-    }
+    capture->bdd = bdd;
+    return publish_transaction(t);
+}
 
-    uint32_t elapsed = millis() - t->queued_ms;
-    uint32_t remaining = elapsed < timeout_ms ? timeout_ms - elapsed : 0;
-    if (!await_transaction(t, remaining)) {
-        Arbiter::cancel_transaction(t);
-        if (resp_len) *resp_len = 0;
-        return false;
-    }
+bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_len) {
+    if (!transaction_done(t)) return false;
+    auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
+    uint16_t output_capacity = resp_buf ? capture->capacity : 0;
+    if (resp_buf && resp_len)
+        output_capacity = *resp_len ? min(output_capacity, uint16_t(*resp_len - 1)) : 0;
     bool ok = t->result.success;
     if (!capture->received) {
         if (resp_len) *resp_len = 0;
@@ -1223,7 +1216,7 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     auto *payload = reinterpret_cast<uint8_t *>(capture + 1);
 
     // BDD baud switching (arbiter mode)
-    if (ok && bdd) {
+    if (ok && capture->bdd) {
         uint32_t new_baud = parse_bdd_baud(payload, min(capture->length, capture->capacity));
         if (new_baud && new_baud != current_baud) {
             uart->updateBaudRate(new_baud);
@@ -1233,14 +1226,40 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
         }
     }
 
-    if (resp_buf && capture->length > 0) {
-        uint16_t copy_len = min(capture->length, output_capacity);
+    if (resp_buf && (!resp_len || *resp_len)) {
+        uint16_t copy_len = min(min(capture->length, capture->capacity), output_capacity);
         memcpy(resp_buf, payload, copy_len);
         resp_buf[copy_len] = '\0';
     }
     if (resp_len) *resp_len = capture->length;
     release_ticket(t);
     return ok;
+}
+
+uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
+                                     cmd_priority_t prio, uint16_t capacity,
+                                     uint16_t timeout_ms) {
+    return begin_read_command(cmd, src, prio,
+        capacity ? min(uint16_t(capacity - 1), uint16_t(QFRAME_MAX_PAYLOAD)) : 0,
+        timeout_ms, capture_single_response);
+}
+
+static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
+                       char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
+                         uart_frame_sink_t sink) {
+    uint16_t capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
+    if (resp_buf && resp_len) capacity = *resp_len ? min(capacity, uint16_t(*resp_len - 1)) : 0;
+    auto *t = begin_read_command(cmd, src, prio, capacity, timeout_ms, sink);
+    if (!t) { if (resp_len) *resp_len = 0; return false; }
+    uint32_t elapsed = millis() - t->queued_ms;
+    uint32_t remaining = elapsed < t->policy.overall_timeout_ms
+        ? t->policy.overall_timeout_ms - elapsed : 0;
+    if (!await_transaction(t, remaining)) {
+        Arbiter::cancel_transaction(t);
+        if (resp_len) *resp_len = 0;
+        return false;
+    }
+    return Arbiter::finish_cmd(t, resp_buf, resp_len);
 }
 
 bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,

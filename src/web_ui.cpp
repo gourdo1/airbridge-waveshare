@@ -1171,6 +1171,68 @@ static void handleBleAction(AsyncWebServerRequest *request) {
 
 extern void dispatch_command(const char *line, String &response);
 
+struct WebCommand {
+    AsyncWebServerRequestPtr request;
+    uart_transaction_t *transaction = nullptr;
+    int rop = -1;
+};
+static WebCommand web_commands[4];
+static SemaphoreHandle_t command_mutex = nullptr;
+
+static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
+    if (!command_mutex || xSemaphoreTake(command_mutex, 0) != pdTRUE) {
+        request->send(503, "application/json", "{\"ok\":\"false\",\"error\":\"command_busy\"}");
+        return;
+    }
+    WebCommand *slot = nullptr;
+    for (auto &pending : web_commands) if (!pending.transaction) { slot = &pending; break; }
+    auto *transaction = slot ? Arbiter::begin_cmd(cmd.c_str(), CMD_SRC_TCP,
+                                                  CMD_PRIO_NORMAL, uint16_t(128)) : nullptr;
+    if (transaction) {
+        slot->request = request->pause();
+        slot->transaction = transaction;
+        slot->rop = cmd.startsWith("P S #ROP ") ? strtoul(cmd.c_str() + 9, nullptr, 16) : -1;
+    }
+    xSemaphoreGive(command_mutex);
+    if (!transaction)
+        request->send(503, "application/json", "{\"ok\":\"false\",\"error\":\"command_unavailable\"}");
+}
+
+static void serviceWebCommands() {
+    if (!command_mutex) return;
+    for (auto &slot : web_commands) {
+        if (xSemaphoreTake(command_mutex, 0) != pdTRUE) return;
+        if (!slot.transaction || (!slot.request.expired() &&
+            !Arbiter::transaction_done(slot.transaction) &&
+            !Arbiter::transaction_expired(slot.transaction))) {
+            xSemaphoreGive(command_mutex);
+            continue;
+        }
+        WebCommand pending = std::move(slot);
+        slot.transaction = nullptr;
+        xSemaphoreGive(command_mutex);
+
+        auto request = pending.request.lock();
+        char response[128] = {};
+        uint16_t length = sizeof(response);
+        bool ok = false;
+        if (request && Arbiter::transaction_done(pending.transaction))
+            ok = Arbiter::finish_cmd(pending.transaction, response, &length);
+        else Arbiter::cancel_transaction(pending.transaction);
+        if (!request) continue;
+
+        if (ok && pending.rop >= 0) {
+            Arbiter::set_cached_rop(pending.rop);
+            WebUI::push_status_event();
+        }
+        String json = "{";
+        jsonAddString(json, "ok", ok ? "true" : "false", false);
+        if (ok && length) jsonAddString(json, "response", response);
+        json += '}';
+        request->send(200, "application/json", json);
+    }
+}
+
 static void handleCmd(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
 
@@ -1183,33 +1245,17 @@ static void handleCmd(AsyncWebServerRequest *request) {
         return;
     }
     String cmd = doc["cmd"].as<const char *>();
-
-    String json = "{";
-
-    if (cmd.startsWith("$")) {
-        // Internal command
-        String response;
-        dispatch_command(cmd.c_str() + 1, response);
-        response.trim();
-        jsonAddString(json, "ok", "true", false);
-        jsonAddString(json, "response", response.c_str());
-    } else {
-        // Q-frame
-        char resp[128] = {};
-        uint16_t resp_len = sizeof(resp);
-        bool ok = Arbiter::send_cmd(cmd.c_str(), CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                     resp, &resp_len);
-        jsonAddString(json, "ok", ok ? "true" : "false", false);
-        if (ok && resp_len > 0) {
-            jsonAddString(json, "response", resp);
-        }
-        if (ok && cmd.startsWith("P S #ROP ")) {
-            int new_rop = (int)strtoul(cmd.c_str() + 9, nullptr, 16);
-            Arbiter::set_cached_rop(new_rop);
-            WebUI::push_status_event();
-        }
+    if (!cmd.startsWith("$")) {
+        queueWebCommand(request, cmd);
+        return;
     }
 
+    String json = "{";
+    String response;
+    dispatch_command(cmd.c_str() + 1, response);
+    response.trim();
+    jsonAddString(json, "ok", "true", false);
+    jsonAddString(json, "response", response.c_str());
     json += '}';
     request->send(200, "application/json", json);
 }
@@ -1765,6 +1811,7 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
 void WebUI::init(uint16_t port) {
     if (port == 0) return;
     ClinicalJobs::init(saveSettings);
+    command_mutex = xSemaphoreCreateMutex();
 
     http = new AsyncWebServer(port);
     events = new AsyncEventSource("/events");
@@ -1904,6 +1951,7 @@ void WebUI::push_status_event() {
 }
 
 void WebUI::handle() {
+    serviceWebCommands();
     if (!events || events->count() == 0) return;
     static uint32_t last_check = 0;
     uint32_t now = millis();

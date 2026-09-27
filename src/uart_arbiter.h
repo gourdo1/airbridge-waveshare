@@ -66,6 +66,13 @@ namespace Arbiter {
                   char *resp_buf, uint16_t *resp_len,
                   uint16_t timeout_ms = 0);  // 0 = use cfg.uart_cmd_timeout_ms
 
+    // Async single R/E response. Capacity includes the terminating byte.
+    // Finish only after transaction_done(); otherwise cancel_transaction().
+    uart_transaction_t *begin_cmd(const char *cmd, cmd_source_t src,
+                                  cmd_priority_t prio, uint16_t capacity,
+                                  uint16_t timeout_ms = 0);
+    bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length);
+
     // Return only the scalar value; a truncated value is a failed read.
     bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                  char *out, uint16_t capacity, uint16_t timeout_ms = 0);
