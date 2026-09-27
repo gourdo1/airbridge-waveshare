@@ -698,6 +698,8 @@ function initSSE() {
   };
   evtSrc.onopen = () => {
     wifiSerial++;
+    otaSerial++;
+    otaStatus = null;
     loadStatus();
     loadExports();
     if (otaWatch || document.getElementById('p-ota').classList.contains('active')) loadOtaStatus();
@@ -2206,6 +2208,7 @@ function renderOtaStatus(d) {
 }
 
 function applyOtaStatus(d) {
+  if (otaStatus && d.revision < otaStatus.revision) return;
   otaStatus = d;
   renderOtaStatus(d);
   finishOtaObservation();
