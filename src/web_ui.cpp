@@ -705,10 +705,6 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
     const String hostname = config.hostname, country = config.wifi_country;
     const String timezone = config.tz, ntp = config.ntp_server;
     const uint8_t mode = config.wifi_mode;
-    if (!json_foreach_kv(body, [](const char *, const char *, void *) {}, nullptr)) {
-        request->send(400, "application/json", "{\"error\":\"bad_json\"}");
-        return;
-    }
     struct Changes { int count = 0; } changes;
     if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         auto &changes = *static_cast<Changes *>(p);
