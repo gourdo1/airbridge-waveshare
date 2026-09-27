@@ -98,6 +98,18 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .stat .k{color:var(--text-dim)}
 .stat .v{color:var(--text);font-weight:500;text-align:right;padding-right:8px}
 
+/* Configuration */
+.config-section{border:1px solid var(--border);border-radius:8px;margin:12px 0;overflow:hidden}
+.config-section summary{cursor:pointer;padding:14px 16px;font-size:14px;font-weight:600;color:var(--text)}
+.config-section[open] summary{border-bottom:1px solid var(--border)}
+.config-section summary:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
+.config-section-fields{padding:0 16px 12px}
+.config-section-title{color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
+[data-config-form] .row{gap:16px}
+[data-config-form] label{min-width:0;overflow-wrap:anywhere}
+[data-config-form] label small{display:block;color:var(--text-dim);font-weight:normal;margin-top:4px;line-height:1.4}
+#configWifi{padding:12px 0;border-bottom:1px solid var(--border);margin-bottom:8px}
+
 /* Device info */
 .device-info{display:grid;grid-template-columns:1fr 1fr;gap:4px}
 .device-info .label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px}
@@ -180,6 +192,8 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
 /* Responsive */
 @media(max-width:768px){
+  [data-config-form] .row{flex-direction:column;align-items:stretch;gap:8px}
+  [data-config-form] .row input,[data-config-form] .row select{width:100%}
   #p-setup .row{flex-direction:column;align-items:stretch;gap:8px}
   #p-setup .row input{width:100%}
   body{display:flex;flex-direction:column;min-height:0;height:100vh;height:100dvh}
@@ -464,18 +478,18 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
       <!-- DEVICE CONFIG -->
       <div class="pane" id="p-device">
-        <div class="card" style="border-left:3px solid var(--accent)">
-          <h3>WiFi Networks</h3>
-          <div id="wifiNetList"></div>
-          <div class="btn-group" style="margin-top:12px">
-            <button class="btn btn-accent" onclick="wifiAddPrompt()">Add Network</button>
-          </div>
-          <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
-          <div class="msg" id="wifiMsg"></div>
-        </div>
         <div class="card">
           <h3>Device Configuration</h3>
           <div class="btn-row"><button class="btn" onclick="startSetup()">Initial setup</button></div>
+          <div id="configWifi" hidden>
+            <h4 class="config-section-title">WiFi networks</h4>
+            <div id="wifiNetList"></div>
+            <div class="btn-group" style="margin-top:12px">
+              <button class="btn btn-accent" onclick="wifiAddPrompt()">Add Network</button>
+            </div>
+            <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
+            <div class="msg" id="wifiMsg"></div>
+          </div>
           <div class="spinner" id="configSpinner"></div>
           <div id="configFields" data-config-form=""></div>
           <div class="btn-row"><button class="btn btn-accent" onclick="saveConfig()">Save & Persist</button></div>
@@ -1492,34 +1506,58 @@ function wifiRemove(idx) {
   wifiAction('remove', null, undefined, idx);
 }
 
-const CFG_SECTIONS = ['WiFi & Network','Firmware Updates','Time & Timezone','Oximetry','SMB','SleepHQ','UART','Logging','Advanced'];
+const CFG_SECTIONS = ['Network','Web access','Time','Oximetry','AirSense UART','SMB','SleepHQ','Firmware updates','Logging'];
 const CFG_META = {
-    hostname:['WiFi & Network','Device hostname (mDNS + AP name)'],wifi_mode:['WiFi & Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['WiFi & Network','Enable hysteresis-based roaming'],wifi_country:['WiFi & Network','ISO 3166 country code (01 = worldwide)'],tcp_port:['WiFi & Network','TCP command port'],debug_port:['WiFi & Network','Debug log stream port (read-only)'],http_port:['WiFi & Network','Web server port'],http_user:['WiFi & Network','Web UI username'],http_pass:['WiFi & Network','Web UI password'],ota_password:['WiFi & Network','ArduinoOTA password'],udp_oxi_port:['WiFi & Network','UDP oximetry port (0=disabled)'],
-    update_url:['Firmware Updates','Release manifest URL (empty disables automatic checks)'],
-    ntp_server:['Time & Timezone','NTP server (empty = DHCP or pool.ntp.org)'],tz:['Time & Timezone','POSIX timezone string'],
+    hostname:['Network','Device hostname (mDNS + AP name)'],wifi_mode:['Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['Network','Enable hysteresis-based roaming'],wifi_country:['Network','ISO 3166 country code (01 = worldwide)'],
+    http_port:['Web access','Web server port'],http_user:['Web access','Web UI username'],http_pass:['Web access','Web UI password'],
+    update_url:['Firmware updates','Release manifest URL (empty disables automatic checks)'],ota_password:['Firmware updates','ArduinoOTA password'],
+    ntp_server:['Time','NTP server (empty = DHCP or pool.ntp.org)'],tz:['Time','POSIX timezone string'],
+    udp_oxi_port:['Oximetry','UDP oximetry port (0=disabled)'],
     oxi_enabled:['Oximetry','Enable BLE oximeter support'],oxi_auto_start:['Oximetry','Auto-start feeding on connect'],oxi_feed_therapy_only:['Oximetry','Only inject during active therapy'],oxi_device_type:['Oximetry','0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A'],oxi_device_addr:['Oximetry','Preferred oximeter MAC'],oxi_interval_ms:['Oximetry','Injection interval (ms)'],oxi_lframe_continuous:['Oximetry','Send L-frames even without valid reading'],oxi_require_known:['Oximetry','Only auto-connect to known devices'],
     smb_enabled:['SMB','Enable SMB synchronization',[['0','disabled'],['1','enabled']]],smb_auto_after_therapy:['SMB','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],smb_endpoint:['SMB','//host/share/optional/path'],smb_user:['SMB','SMB username'],smb_password:['SMB','SMB password'],
     sleephq_enabled:['SleepHQ','Enable SleepHQ synchronization',[['0','disabled'],['1','enabled']]],sleephq_auto_after_therapy:['SleepHQ','Sync backlog at startup and after therapy',[['0','manual'],['1','automatic']]],sleephq_client_id:['SleepHQ','SleepHQ API client ID'],sleephq_client_secret:['SleepHQ','SleepHQ API client secret'],sleephq_team_id:['SleepHQ','Optional team ID (resolved automatically when empty)'],sleephq_device_id:['SleepHQ','Optional SleepHQ device ID'],
-    uart_baud:['UART','AirSense UART baud rate'],uart_cmd_timeout_ms:['UART','Command response timeout (ms)'],uart_max_retries:['UART','Retry count for failed commands'],
-    syslog_en:['Logging','Forward logs to a UDP syslog server',[['0','disabled'],['1','enabled']]],syslog_host:['Logging','Syslog server IPv4 address'],syslog_port:['Logging','Syslog UDP port (1-65535, default 514)'],
-    allow_transparent_during_therapy:['Advanced','Allow raw UART passthrough during therapy'],mitm_mode:['Advanced','0=off, 1=forward, 2=log, 3=filter']
+    uart_baud:['AirSense UART','AirSense UART baud rate'],uart_cmd_timeout_ms:['AirSense UART','Command response timeout (ms)'],uart_max_retries:['AirSense UART','Retry count for failed commands'],tcp_port:['AirSense UART','TCP command port'],
+    allow_transparent_during_therapy:['AirSense UART','Allow raw UART passthrough during therapy'],mitm_mode:['AirSense UART','0=off, 1=forward, 2=log, 3=filter'],
+    syslog_en:['Logging','Forward logs to a UDP syslog server',[['0','disabled'],['1','enabled']]],syslog_host:['Logging','Syslog server IPv4 address'],syslog_port:['Logging','Syslog UDP port (1-65535, default 514)'],debug_port:['Logging','Debug log stream port (read-only)']
   };
 
 let configStorageSupported = false;
 
 function renderConfigFields(root, d) {
+  const grouped = root === document.getElementById('configFields');
+  const wifi = grouped ? document.getElementById('configWifi') : null;
+  const expanded = new Map([...root.querySelectorAll('details')].map(section => [section.dataset.group, section.open]));
   root.innerHTML = '';
   var lastGroup = '';
+  let fields = root;
   var entries = Object.entries(d).sort(function(a,b){var sa=CFG_META[a[0]]?CFG_SECTIONS.indexOf(CFG_META[a[0]][0]):99;var sb=CFG_META[b[0]]?CFG_SECTIONS.indexOf(CFG_META[b[0]][0]):99;return sa-sb});
   for (const [k,v] of entries) {
     if (!configStorageSupported && (k.startsWith('smb_') || k.startsWith('sleephq_'))) continue;
     var meta = CFG_META[k] || ['Other',''];
     if (meta[0] !== lastGroup) {
       lastGroup = meta[0];
-      var hdr = document.createElement('h4');
-      hdr.textContent = lastGroup;
-      hdr.style.cssText = 'color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px';
-      root.appendChild(hdr);
+      if (grouped) {
+        const section = document.createElement('details');
+        section.className = 'config-section';
+        section.dataset.group = lastGroup;
+        section.open = expanded.has(lastGroup) ? expanded.get(lastGroup) : lastGroup !== 'Logging';
+        const heading = document.createElement('summary');
+        heading.textContent = lastGroup;
+        section.appendChild(heading);
+        fields = document.createElement('div');
+        fields.className = 'config-section-fields';
+        section.appendChild(fields);
+        root.appendChild(section);
+        if (lastGroup === 'Network' && wifi) {
+          wifi.hidden = false;
+          fields.appendChild(wifi);
+        }
+      } else {
+        const heading = document.createElement('h4');
+        heading.className = 'config-section-title';
+        heading.textContent = lastGroup;
+        root.appendChild(heading);
+      }
     }
     var row = document.createElement('div'); row.className = 'row';
     var isPass = k.includes('pass') || k.includes('secret');
@@ -1528,13 +1566,13 @@ function renderConfigFields(root, d) {
     label.textContent = k;
     if (meta[1]) {
       var help = document.createElement('small');
-      help.style.cssText = 'color:#555;font-weight:normal';
       help.textContent = meta[1];
-      label.appendChild(document.createElement('br'));
       label.appendChild(help);
     }
     row.appendChild(label);
     var control = document.createElement(opts ? 'select' : 'input');
+    control.id = root.id + '-' + k;
+    label.htmlFor = control.id;
     control.dataset.key = k;
     control.dataset.orig = isPass ? '' : v;
     if (opts) {
@@ -1553,7 +1591,7 @@ function renderConfigFields(root, d) {
     }
     control.value = isPass ? '' : v;
     row.appendChild(control);
-    root.appendChild(row);
+    fields.appendChild(row);
     if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
     if (k === 'tz') attachTzHelper(row.querySelector('input'));
   }
