@@ -51,7 +51,7 @@ void init();
 void therapy_started();
 void therapy_ended();
 void device_restarted();
-bool clock_write_allowed();
+bool clock_write_allowed(const char **reason = nullptr);
 void get_status(Status &out);
 void get_progress(Progress &out);
 

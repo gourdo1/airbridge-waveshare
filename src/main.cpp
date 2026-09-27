@@ -411,7 +411,15 @@ static void sync_resmed_clock() {
     if (!clock_sync_pending || !airsense_present || !WiFiSetup::time_synced()) return;
     if (millis() - airsense_seen_ms > HEALTH_POLL_INTERVAL_MS) return;
     if (Arbiter::get_state() != SYS_IDLE || Arbiter::get_cached_rop() != 0) return;
-    if (!EdfRecorder::clock_write_allowed()) return;
+    static const char *last_blocked = nullptr;
+    const char *blocked = nullptr;
+    if (!EdfRecorder::clock_write_allowed(&blocked)) {
+        if (blocked != last_blocked)
+            Log::logf(CAT_GENERAL, LOG_INFO, "ResMed clock sync deferred: %s\n", blocked);
+        last_blocked = blocked;
+        return;
+    }
+    last_blocked = nullptr;
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;

@@ -11,6 +11,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,7 +140,7 @@ static fs::FS *storage = nullptr;
 static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
 static bool pending_scanned = false;
-static bool str_scan_complete = false;
+static const char *pending_scan_error = nullptr;
 static uint32_t device_generation = 0;
 static uint32_t synced_device_generation = 0;
 static uint32_t synced_str_generation = 0;
@@ -607,7 +608,6 @@ static bool save_pending() {
     }
     portENTER_CRITICAL(&status_mux);
     status.pending_str++;
-    str_scan_complete = false;
     portEXIT_CRITICAL(&status_mux);
     return true;
 }
@@ -2525,36 +2525,26 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
     return success && summary_ready;
 }
 
-static void process_pending() {
-    if (status.active || post_processing_cancelled() ||
-        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0)) return;
-    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
-    const uint32_t device = __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
-    uint32_t generation = 0, saved_day = 0, after = 0;
-    if (!read_u32_variable("ZEN", generation)) return;
-    const bool changed = !have_synced_generation || device != synced_device_generation ||
-                         generation != synced_str_generation;
-    if (!changed && pending_scanned && !status.pending_str) {
-        portENTER_CRITICAL(&status_mux);
-        str_scan_complete = device ==
-            __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
-        status.post_processing = false;
-        portEXIT_CRITICAL(&status_mux);
-        return;
-    }
-    portENTER_CRITICAL(&status_mux);
-    str_scan_complete = false;
-    portEXIT_CRITICAL(&status_mux);
-    if (!read_u32_variable("SSD", saved_day) ||
-        !read_u32_variable("ZEN", after) || after != generation ||
-        !SdStorage::try_acquire()) return;
-    EdfPending::Record selected;
-    char selected_path[80] = {};
+// Caller holds storage access. This inventory does not depend on the catalog or UART.
+static bool scan_pending(EdfPending::Record *selected = nullptr) {
+    if (selected) *selected = {};
     uint32_t count = 0;
+    const char *error = nullptr;
+    errno = 0;
     fs::File dir = storage->open("/airbridge/pending");
+    bool complete = dir ? dir.isDirectory() : errno == ENOENT;
+    if (!complete) error = "STR pending directory unavailable";
     if (dir && dir.isDirectory()) {
-        fs::File item;
-        while ((item = dir.openNextFile())) {
+        while (true) {
+            errno = 0;
+            fs::File item = dir.openNextFile();
+            if (!item) {
+                if (errno) {
+                    complete = false;
+                    error = "STR pending directory read failed";
+                }
+                break;
+            }
             String path = item.path();
             item.close();
             if (!path.endsWith(".str")) continue;
@@ -2569,28 +2559,47 @@ static void process_pending() {
                     continue;
                 }
                 count++;
-                post_error("STR journal quarantine failed");
+                error = "STR journal quarantine failed";
                 continue;
             }
             count++;
             if (result == PendingRead::Unavailable) {
-                post_error("STR pending journal read failed");
+                error = "STR pending journal read failed";
                 continue;
             }
+            if (!selected) continue;
             if (strcmp(candidate.prefix, pending_cursor) <= 0) continue;
-            if (!selected_path[0] || strcmp(candidate.prefix, selected.prefix) < 0) {
-                selected = candidate;
-                snprintf(selected_path, sizeof(selected_path), "%s", path.c_str());
-            }
+            if (!selected->prefix[0] || strcmp(candidate.prefix, selected->prefix) < 0)
+                *selected = candidate;
         }
     }
     dir.close();
     portENTER_CRITICAL(&status_mux);
-    status.pending_str = count;
-    pending_scanned = true;
-    status.post_processing = true;
+    if (complete) status.pending_str = count;
+    pending_scanned = complete;
+    const bool new_error = error && error != pending_scan_error;
+    pending_scan_error = error;
     portEXIT_CRITICAL(&status_mux);
-    SdStorage::release();
+    if (new_error) post_error(error);
+    return complete;
+}
+
+static void sync_pending() {
+    EdfPending::Record selected;
+    if (!pending_scanned || status.pending_str) {
+        if (!SdStorage::try_acquire()) return;
+        const bool scanned = scan_pending(&selected);
+        SdStorage::release();
+        if (!scanned) return;
+    }
+    const uint32_t device = __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
+    uint32_t generation = 0, saved_day = 0, after = 0;
+    if (!read_u32_variable("ZEN", generation)) return;
+    const bool changed = !have_synced_generation || device != synced_device_generation ||
+                         generation != synced_str_generation;
+    if (!changed && !status.pending_str) return;
+    if (!read_u32_variable("SSD", saved_day) ||
+        !read_u32_variable("ZEN", after) || after != generation) return;
 
     uint32_t mid = 0, vid = 0;
     bool success = read_variable("SRN", session_srn, sizeof(session_srn)) &&
@@ -2598,7 +2607,7 @@ static void process_pending() {
                    read_u32_variable("VID", vid) && vid <= UINT16_MAX;
     session_mid = mid;
     session_vid = vid;
-    if (selected_path[0]) {
+    if (selected.prefix[0]) {
         memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
         if (!success || strcmp(session_srn, selected.srn)) {
             post_error("STR pending device unavailable or different");
@@ -2606,14 +2615,14 @@ static void process_pending() {
         } else {
             success = refresh_str_day(selected.native_day, generation, device, true);
         }
-    } else if (count) {
+    } else if (status.pending_str) {
         pending_cursor[0] = 0;
     }
     if (success && changed && saved_day >= 0x1000 && saved_day < 0xffff) {
         // A noon rollover can leave two recorded days to update. Do not
         // require a new save after stop: it may already have completed.
         for (uint16_t day : {uint16_t(saved_day), uint16_t(saved_day - 1)}) {
-            if (selected_path[0] && day == selected.native_day) continue;
+            if (selected.prefix[0] && day == selected.native_day) continue;
             if (!refresh_str_day(day, generation, device, false)) {
                 success = false;
                 break;
@@ -2628,15 +2637,23 @@ static void process_pending() {
         synced_device_generation = device;
         have_synced_generation = true;
     }
-    portENTER_CRITICAL(&status_mux);
-    status.post_processing = false;
-    str_scan_complete = success && !status.pending_str && device ==
-        __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
-    portEXIT_CRITICAL(&status_mux);
     if (success && !status.pending_str && summary_export_pending) {
         (void)ExportSync::request_post_therapy(summary_export_entry);
         summary_export_pending = false;
     }
+}
+
+static void process_pending() {
+    if (status.active || post_processing_cancelled() ||
+        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0)) return;
+    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
+    portENTER_CRITICAL(&status_mux);
+    status.post_processing = true;
+    portEXIT_CRITICAL(&status_mux);
+    sync_pending();
+    portENTER_CRITICAL(&status_mux);
+    status.post_processing = false;
+    portEXIT_CRITICAL(&status_mux);
 }
 
 static bool prepare_storage() {
@@ -2649,10 +2666,11 @@ static bool prepare_storage() {
     if (!SdStorage::try_acquire()) return false;
     storage = SdStorage::filesystem();
     if (storage) {
+        recover_pending();
+        (void)scan_pending();
         recover_partial_outputs();
         recover_identification_files();
         recover_str_file();
-        recover_pending();
         EdfCatalog::init();
         EdfCatalog::Status catalog;
         EdfCatalog::get_status(catalog);
@@ -2830,7 +2848,6 @@ void therapy_ended() {
     ControlEvent event = {ControlKind::Stop, millis()};
     portENTER_CRITICAL(&status_mux);
     latest_stop = event;
-    str_scan_complete = false;
     portEXIT_CRITICAL(&status_mux);
     __atomic_store_n(&therapy_wanted, false, __ATOMIC_RELEASE);
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
@@ -2844,13 +2861,17 @@ void device_restarted() {
     therapy_ended();
 }
 
-bool clock_write_allowed() {
+bool clock_write_allowed(const char **reason) {
     const bool mounted = SdStorage::mounted();
     portENTER_CRITICAL(&status_mux);
-    const bool allowed = ((pending_scanned && str_scan_complete) || !mounted) && !status.active &&
-                         !status.post_processing && !status.pending_str;
+    const char *blocked = status.active ? "EDF recording active" :
+        mounted && pending_scan_error ? pending_scan_error :
+        mounted && !pending_scanned ? "STR pending journal not checked" :
+        status.pending_str ? "STR pending" :
+        status.post_processing ? "STR collection in progress" : nullptr;
     portEXIT_CRITICAL(&status_mux);
-    return allowed;
+    if (reason) *reason = blocked;
+    return !blocked;
 }
 
 void get_status(Status &out) {
@@ -2876,7 +2897,10 @@ void init() {}
 void therapy_started() {}
 void therapy_ended() {}
 void device_restarted() {}
-bool clock_write_allowed() { return true; }
+bool clock_write_allowed(const char **reason) {
+    if (reason) *reason = nullptr;
+    return true;
+}
 void get_progress(Progress &out) { out = {}; }
 
 void get_status(Status &out) {
