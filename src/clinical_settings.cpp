@@ -15,18 +15,21 @@ namespace {
 constexpr uint8_t VALID = 1, CUSTOM = 2;
 const char *const GROUPS[] = {"therapy", "comfort", "accessories", "options", "configuration"};
 
+enum class ReportFormat : uint8_t { Number, Duration, DaysPeriod, Ratio };
+
 struct ReportField {
     const char *cmd;
     const char *label;
-    int16_t divisor;  // -61 minutes H:MM, -60 hours, -3 days/period, -1 I:E
+    int16_t divisor;
     uint8_t decimals;
     const char *unit;
     bool summary;
+    ReportFormat format = ReportFormat::Number;
 };
 
 const ReportField REPORT_FIELDS[] = {
-    {"UQD", "Usage", -61, 0, "", false},
-    {"OND", "Mask On Duration", -61, 0, "", false},
+    {"UQD", "Usage", 60, 0, "", false, ReportFormat::Duration},
+    {"OND", "Mask On Duration", 60, 0, "", false, ReportFormat::Duration},
     {"AQD", "Events/hr", 10, 1, "/hr", false},
     {"MSP", "Median Pressure", 50, 1, "cmH2O", false},
     {"AIS", "AI (All)", 10, 1, "/hr", false},
@@ -40,22 +43,22 @@ const ReportField REPORT_FIELDS[] = {
     {"UAI", "Unknown AI", 10, 1, "/hr", false},
     {"LK9", "Leak P95", 50, 2, "L/s", false},
     {"RIN", "RERA Index", 10, 1, "/hr", false},
-    {"PHM", "Total Used Hrs", 0, 0, "hrs", true},
+    {"PHM", "Total Used Hrs", 1, 0, "hrs", true},
     {"LRD", "Leak", 10, 0, "L/min", true},
-    {"DRD", "Days Used", -3, 0, "", true},
-    {"ZAV", "Vt", 0, 0, "ml", true},
-    {"VRD", "Days 4hrs+", -3, 0, "", true},
+    {"DRD", "Days Used", 1, 0, "", true, ReportFormat::DaysPeriod},
+    {"ZAV", "Vt", 1, 0, "ml", true},
+    {"VRD", "Days 4hrs+", 1, 0, "", true, ReportFormat::DaysPeriod},
     {"ZAR", "RR", 5, 0, "bpm", true},
-    {"WRD", "Avg. Usage", -60, 1, "hrs", true},
+    {"WRD", "Avg. Usage", 60, 1, "hrs", true},
     {"ZAM", "MV", 8, 1, "L/min", true},
-    {"XRD", "Used Hrs", -60, 1, "hrs", true},
+    {"XRD", "Used Hrs", 60, 1, "hrs", true},
     {"ZA2", "TgMV", 8, 1, "L/min", true},
     {"ZAI", "Pressure", 50, 1, "cmH2O", true},
     {"ZA3", "Va", 8, 1, "L/min", true},
     {"ZAE", "Exp. Pressure", 50, 1, "cmH2O", true},
     {"ZAZ", "Ti", 50, 2, "s", true},
     {"ARD", "AHI", 10, 1, "/hr", true},
-    {"ZA1", "I:E", -1, 0, "", true},
+    {"ZA1", "I:E", 100, 0, "", true, ReportFormat::Ratio},
     {"TRD", "Total AI", 10, 1, "/hr", true},
     {"ZAS", "Spont Trig", 2, 1, "%", true},
     {"CRD", "Central AI", 10, 1, "/hr", true},
@@ -272,15 +275,15 @@ bool Cursor::next(const Snapshot &snapshot) {
                 stage_ = DISPLAY_VALUE; integer(",\"raw\":", raw); return true;
             case DISPLAY_VALUE:
                 stage_ = UNITS;
-                if (raw < 0 || (v.divisor == -1 && raw == 0)) {
+                if (raw < 0 || (v.format == ReportFormat::Ratio && raw == 0)) {
                     field(",\"value\":", "--");
-                } else if (v.divisor == -61 || v.divisor == -3) {
-                    if (v.divisor == -61)
+                } else if (v.format == ReportFormat::Duration || v.format == ReportFormat::DaysPeriod) {
+                    if (v.format == ReportFormat::Duration)
                         snprintf(number_, sizeof(number_), "%d:%02d", raw / 60, raw % 60);
                     else
                         snprintf(number_, sizeof(number_), "%d/%d", raw, snapshot.period_);
                     field(",\"value\":", number_);
-                } else if (v.divisor == -1) {
+                } else if (v.format == ReportFormat::Ratio) {
                     decimal(",\"value\":", raw >= 100 ? raw : 100, raw >= 100 ? 100 : raw, 1);
                     if (raw >= 100) strcat(number_, ":1");
                     else {
@@ -288,9 +291,7 @@ bool Cursor::next(const Snapshot &snapshot) {
                         memcpy(number_, "1:", 2);
                     }
                 } else {
-                    decimal(",\"value\":", raw,
-                            v.divisor == -60 ? 60 : v.divisor > 0 ? v.divisor : 1,
-                            v.decimals);
+                    decimal(",\"value\":", raw, v.divisor, v.decimals);
                 }
                 return true;
             case UNITS:
