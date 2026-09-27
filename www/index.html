@@ -2074,11 +2074,13 @@ function toggleOxi() {
 
 function loadBle() {
   if (bleRead) return bleRead;
+  const generation = bleGeneration;
   bleRead = (async () => {
   try {
     const r = await api('/api/ble', undefined, 5000); if (!r) return null;
     if (!r.ok) throw new Error('Oximetry status read failed');
     const d = await r.json();
+    if (generation !== bleGeneration) return;
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
     const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
     for (const [k,v] of Object.entries(fields)) {
@@ -2248,11 +2250,13 @@ function renderOtaStatus(d) {
 }
 
 async function loadOtaStatus(timeoutMs = 5000) {
+  const generation = otaPollGeneration;
   try {
     var r = await api('/api/ota', undefined, timeoutMs);
     if (!r) return {unauthorized:true};
     if (!r.ok) throw new Error('Update status read failed');
     var d = await r.json();
+    if (generation !== otaPollGeneration) return null;
     renderOtaStatus(d);
     return d;
   } catch(e) { return null; }
