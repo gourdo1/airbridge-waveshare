@@ -281,59 +281,13 @@ static bool read_variable(const char *name, char *out, size_t capacity,
                             out, capacity, timeout_ms);
 }
 
-struct StoredCapture {
-    char tag[4];
-    uint16_t day;
-    Air10Stored::Value value;
-    bool received;
-    bool unsupported;
-};
-
-static bool stored_value_sink(const qframe_t *frame, void *context) {
-    StoredCapture *capture = static_cast<StoredCapture *>(context);
-    if (!frame || !capture) return false;
-    if (frame->type == QFRAME_TYPE_E) {
-        capture->unsupported = Air10Stored::unsupported_response(
-            frame->payload, frame->payload_len, capture->tag, capture->day);
-        return true;
-    }
-    capture->received = frame->type == QFRAME_TYPE_R &&
-        Air10Stored::parse_response(frame->payload, frame->payload_len,
-                                    capture->tag, capture->day, capture->value);
-    return capture->received;
-}
-
 static bool read_stored_value(const char *tag, uint16_t epoch_day,
                               Air10Stored::Value &value,
                               uint8_t attempts = STORED_TRANSFER_ATTEMPTS) {
-    if (!attempts) return false;
-    char command[28];
-    snprintf(command, sizeof(command), "G V #%s %04X 0", tag, epoch_day);
-
-    uart_response_policy_t policy = {};
-    policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_E;
-    policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
-    policy.success_types = QFRAME_MASK_R;
-    policy.first_timeout_ms = STORED_TIMEOUT_MS;
-    policy.overall_timeout_ms = STORED_TIMEOUT_MS;
-
     for (uint8_t attempt = 0; attempt < attempts; attempt++) {
         if (post_processing_cancelled()) return false;
-        StoredCapture capture = {};
-        memcpy(capture.tag, tag, 3);
-        capture.day = epoch_day;
-        uart_transaction_result_t result = {};
-        bool completed = Arbiter::transact_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                                  policy, stored_value_sink, &capture,
-                                  &result, sizeof(capture));
-        if (completed && result.protocol_error && capture.unsupported) {
-            value = {};
-            return true;
-        }
-        if (completed && result.success && capture.received) {
-            value = capture.value;
-            return true;
-        }
+        auto result = Air10Stored::read(tag, epoch_day, value, STORED_TIMEOUT_MS, true);
+        if (result != Air10Stored::ReadResult::Failed) return true;
         if (attempt + 1 < attempts) {
             Log::logf(CAT_EDF, LOG_DEBUG,
                       "STR retry %s day=%04X attempt=%u/%u\n",
