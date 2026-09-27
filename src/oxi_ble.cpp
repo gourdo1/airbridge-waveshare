@@ -53,7 +53,31 @@ static inline void set_state(oxi_state_t s) { state = s; state_dirty = true; }
 static volatile bool scan_requested = false;
 static volatile bool active_scan_requested = false;
 typedef enum { CONN_NONE, CONN_AUTO, CONN_USER } connect_mode_t;
-static volatile connect_mode_t connect_mode = CONN_NONE;
+struct ConnectRequest {
+    connect_mode_t mode = CONN_NONE;
+    char addr[18] = {};
+};
+static ConnectRequest pending_connect;
+static portMUX_TYPE connect_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void request_connect(connect_mode_t mode, const char *addr) {
+    ConnectRequest request;
+    request.mode = mode;
+    snprintf(request.addr, sizeof(request.addr), "%s", addr ? addr : "");
+    portENTER_CRITICAL(&connect_mux);
+    if (mode != CONN_AUTO || pending_connect.mode != CONN_USER)
+        pending_connect = request;
+    portEXIT_CRITICAL(&connect_mux);
+}
+
+static bool take_connect_request(ConnectRequest &request) {
+    portENTER_CRITICAL(&connect_mux);
+    request = pending_connect;
+    pending_connect = {};
+    portEXIT_CRITICAL(&connect_mux);
+    return request.mode != CONN_NONE;
+}
+
 static volatile bool disconnect_requested = false;  // drop connection, stay enabled
 static volatile bool disable_requested = false;     // drop connection, disable scanning
 static volatile bool del_one_requested = false;
@@ -70,7 +94,6 @@ static SemaphoreHandle_t lifecycle_mutex = nullptr;
 #define USER_CONNECT_RETRIES  3
 #define USER_RETRY_DELAY_MS   2000
 static volatile bool scan_complete = false;
-static char target_addr[18] = "";
 
 static NimBLEClient *pClient = nullptr;
 
@@ -1066,6 +1089,7 @@ void OxiBle::task(void *param) {
         if (disable_requested) {
             disable_requested = false;
             disconnect_requested = false;
+            request_connect(CONN_NONE, nullptr);
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Disable requested\n");
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
@@ -1074,6 +1098,7 @@ void OxiBle::task(void *param) {
 
         if (disconnect_requested) {
             disconnect_requested = false;
+            request_connect(CONN_NONE, nullptr);
             Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Disconnect requested\n");
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
@@ -1087,7 +1112,7 @@ void OxiBle::task(void *param) {
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
             scan_requested = false;
-            connect_mode = CONN_NONE;
+            request_connect(CONN_NONE, nullptr);
             if (state != OXI_DISABLED) set_state(OXI_DISCONNECTED);
         }
 
@@ -1153,8 +1178,7 @@ void OxiBle::task(void *param) {
                         }
                     }
                     if (found) {
-                        target.toCharArray(target_addr, sizeof(target_addr));
-                        connect_mode = CONN_AUTO;
+                        request_connect(CONN_AUTO, target.c_str());
                         Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Auto-connect triggered\n");
                     }
                 }
@@ -1199,16 +1223,16 @@ void OxiBle::task(void *param) {
             }
         }
 
-        if (connect_mode != CONN_NONE && !ble_suspended) {
-            connect_mode_t mode = connect_mode;
-            connect_mode = CONN_NONE;
+        ConnectRequest connection;
+        if (!ble_suspended && take_connect_request(connection)) {
+            connect_mode_t mode = connection.mode;
             NimBLEDevice::getScan()->stop();
             // Wait for scan to actually stop before connecting
             for (int i = 0; i < 20 && NimBLEDevice::getScan()->isScanning(); i++)
                 vTaskDelay(pdMS_TO_TICKS(50));
             scan_complete = false;  // discard any pending scan-complete trigger
 
-            String addr = target_addr;
+            String addr = connection.addr;
             if (addr.length() == 0 && cfg.oxi_device_addr.length() > 0)
                 addr = cfg.oxi_device_addr;
             if (addr.length() == 0 && scan_result_count > 0)
@@ -1392,9 +1416,7 @@ void OxiBle::start_scan()  { active_scan_requested = true; scan_requested = true
 void OxiBle::stop_scan()   { stop_scan_requested.store(true); }
 
 void OxiBle::connect(const char *addr) {
-    strncpy(target_addr, addr ? addr : "", sizeof(target_addr) - 1);
-    target_addr[sizeof(target_addr) - 1] = '\0';
-    connect_mode = CONN_USER;
+    request_connect(CONN_USER, addr);
 }
 
 void OxiBle::disconnect()  { disconnect_requested = true; }
