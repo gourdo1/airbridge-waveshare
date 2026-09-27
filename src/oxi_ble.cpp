@@ -48,7 +48,12 @@ static const NimBLEUUID WS20A_WRITE_UUID((uint16_t)0xFFE9);
 
 static TaskHandle_t oxi_task_handle = nullptr;
 static volatile oxi_state_t state = OXI_DISABLED;
-static inline void set_state(oxi_state_t s) { state = s; }
+static std::atomic<uint32_t> status_revision{0};
+static inline void set_state(oxi_state_t s) {
+    if (state == s) return;
+    state = s;
+    status_revision.fetch_add(1);
+}
 static volatile bool scan_requested = false;
 static volatile bool active_scan_requested = false;
 typedef enum { CONN_NONE, CONN_AUTO, CONN_USER } connect_mode_t;
@@ -134,6 +139,7 @@ static void known_save() {
         else p.remove(key);
     }
     p.end();
+    status_revision.fetch_add(1);
 }
 
 static bool known_contains(const char *addr) {
@@ -785,6 +791,7 @@ class OxiClientCB : public NimBLEClientCallbacks {
     }
 
     void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
+        status_revision.fetch_add(1);
         if (connInfo.isEncrypted()) {
             Log::logf(CAT_OXI, LOG_INFO, "Encrypted + bonded\n");
         } else {
@@ -1124,6 +1131,7 @@ void OxiBle::task(void *param) {
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             bool ok = do_remove_known(addr);
+            status_revision.fetch_add(1);
             Log::logf(CAT_OXI, LOG_INFO, "Remove-known %s: %s\n",
                       addr, ok ? "done" : "not found");
         }
@@ -1140,6 +1148,7 @@ void OxiBle::task(void *param) {
 
         if (scan_complete) {
             scan_complete = false;
+            status_revision.fetch_add(1);
             last_reconnect = millis();
             if (state == OXI_SCANNING) {
                 Log::logf(CAT_OXI, LOG_DEBUG, "Scan done, %d results\n", scan_result_count);
@@ -1470,6 +1479,7 @@ bool OxiBle::restore_memory(uint32_t timeout_ms) {
 }
 
 oxi_state_t OxiBle::get_state()            { return state; }
+uint32_t OxiBle::revision()               { return status_revision.load(); }
 
 int OxiBle::get_scan_results(oxi_scan_result_t *out, int max) {
     if (!out || max <= 0) return 0;

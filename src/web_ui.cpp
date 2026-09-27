@@ -310,6 +310,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddString(json, "esp_time", esp_time);
     fixedJsonAddString(json, "resmed_time", resmed_time);
     fixedJsonAddString(json, "oxi", oxi_state_name(status.oxi));
+    fixedJsonPrintf(json, ",\"ble_revision\":%u", OxiBle::revision());
     char oxi_addr[32];
     OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
     fixedJsonAddString(json, "oxi_addr", oxi_addr);
@@ -1913,6 +1914,7 @@ static String build_status_payload(const DeviceStatus::Snapshot &status) {
     jsonAddInt(sj, "sd_used_mb", sd.used_bytes / (1024 * 1024));
 #endif
     jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
+    jsonAddUInt32(sj, "ble_revision", OxiBle::revision());
     char oxi_addr[32];
     OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
     jsonAddString(sj, "oxi_addr", oxi_addr);
@@ -1945,11 +1947,13 @@ static bool snapshot_differs(const DeviceStatus::Snapshot &a,
 }
 
 static uint32_t last_status_push = 0;
+static uint32_t last_ble_revision = 0;
 
 void WebUI::push_status_event() {
     if (!events || events->count() == 0) return;
     const auto status = DeviceStatus::snapshot();
     last_published = status;
+    last_ble_revision = OxiBle::revision();
     last_status_push = millis();
     String sj = build_status_payload(status);
     events->send(sj.c_str(), "status", millis());
@@ -1967,6 +1971,7 @@ void WebUI::handle() {
 #endif
 
     if (snapshot_differs(DeviceStatus::snapshot(), last_published) ||
+        OxiBle::revision() != last_ble_revision ||
         millis() - last_status_push >= 10000) {
         WebUI::push_status_event();
     }

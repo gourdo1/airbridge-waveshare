@@ -697,6 +697,7 @@ function initSSE() {
   evtSrc.onopen = () => {
     loadStatus();
     loadExports();
+    if (document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
     if (setupActive() && setupStep === 'network') loadSetupWifi();
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
@@ -717,6 +718,7 @@ function updateStatusFromPush(d) {
 
 var lastBleState = '';
 function updateBleFromPush(d) {
+  if (d.ble_revision !== undefined) bleRevision = d.ble_revision;
   // Update dashboard oxi card from any push
   var st = d.oxi || d.state;
   if (st) {
@@ -754,6 +756,7 @@ function updateBleFromPush(d) {
   if (!pane || !pane.classList.contains('active')) return;
   var g = document.getElementById('bleStatusGrid');
   if (!g || !g.children.length) { loadBle(); return; }
+  if (bleRevision !== bleLoadedRevision) loadBle();
   var fields = {
     state: st, feeding: d.feeding,
     spo2: d.spo2 >= 0 ? d.spo2 + '%' : '--',
@@ -765,23 +768,17 @@ function updateBleFromPush(d) {
   }
   var sp = document.getElementById('bleScanSpinner');
   if (sp) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
-  if (lastBleState === 'SCANNING' && st !== 'SCANNING') loadBle();
-  if (lastBleState !== 'STREAMING' && st === 'STREAMING') loadBle();
-  if (lastBleState === 'STREAMING' && st !== 'STREAMING') loadBle();
   if (pendingConnect) {
     var msgEl = document.getElementById('bleMsg');
     if (st === 'STREAMING') {
       pendingConnect = false;
       showMsg(msgEl, 'Connected', 'ok');
-      loadBle();
     } else if (st === 'DISABLED') {
       pendingConnect = false;
       showMsg(msgEl, 'Connection failed', 'err');
-      loadBle();
     } else if (st === 'DISCONNECTED' && lastBleState !== 'CONNECTING' && lastBleState !== 'BONDING') {
       pendingConnect = false;
       showMsg(msgEl, 'Connection failed', 'err');
-      loadBle();
     }
   }
   lastBleState = st;
@@ -2049,8 +2046,7 @@ function showMsg(el, text, type, timeout) {
 }
 
 // BLE
-let bleTimer = null;
-let bleRead = null, bleGeneration = 0;
+let bleRead = null, bleRevision = null, bleLoadedRevision = null;
 function toggleOxi() {
   var st = document.getElementById('bleStatusGrid');
   var isDisabled = st && st.querySelector('[data-field="state"]') &&
@@ -2060,13 +2056,13 @@ function toggleOxi() {
 
 function loadBle() {
   if (bleRead) return bleRead;
-  const generation = bleGeneration;
+  const revision = bleRevision;
   bleRead = (async () => {
   try {
     const r = await api('/api/ble', undefined, 5000); if (!r) return null;
     if (!r.ok) throw new Error('Oximetry status read failed');
     const d = await r.json();
-    if (generation !== bleGeneration) return;
+    if (revision !== bleRevision) return;
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
     const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
     for (const [k,v] of Object.entries(fields)) {
@@ -2121,33 +2117,18 @@ function loadBle() {
     } else {
       bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No bonded devices</div>';
     }
+    bleLoadedRevision = revision;
     return d;
   } catch(e) { console.error(e); }
-  })().finally(() => { bleRead = null; });
+  })().finally(() => {
+    bleRead = null;
+    if (revision !== bleRevision && document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
+  });
   return bleRead;
 }
 
 async function bleScan() {
-  const generation = ++bleGeneration;
-  if (bleTimer) clearTimeout(bleTimer);
   await bleAction('scan');
-  if (generation !== bleGeneration) return;
-  document.getElementById('bleScanSpinner').style.display = 'inline-block';
-  const deadline = Date.now() + 35000;
-  const poll = async () => {
-    if (generation !== bleGeneration) return;
-    const d = await loadBle();
-    if (generation !== bleGeneration) return;
-    if (d === null || (d && d.state !== 'SCANNING') || Date.now() >= deadline) {
-      bleTimer = null;
-      document.getElementById('bleScanSpinner').style.display = 'none';
-      if (Date.now() >= deadline)
-        showMsg(document.getElementById('bleMsg'), 'Scan status timed out. Refresh to check the result.', 'err');
-      return;
-    }
-    bleTimer = setTimeout(poll, 1500);
-  };
-  bleTimer = setTimeout(poll, 1500);
 }
 
 var pendingConnect = false;
@@ -2165,7 +2146,7 @@ async function bleAction(action, addr) {
     if (!r) return;
     const d = await r.json();
     if (action !== 'scan') showMsg(document.getElementById('bleMsg'), d.result, 'ok');
-    setTimeout(loadBle, 500);
+    loadBle();
   } catch(e) { showMsg(document.getElementById('bleMsg'), 'Error: ' + e.message, 'err'); }
 }
 
