@@ -706,8 +706,6 @@ class OxiScanCB : public NimBLEScanCallbacks {
                        dev->isAdvertisingService(HR_SERVICE_UUID) ||
                        dev->isAdvertisingService(VIATOM_SERVICE_UUID) ||
                        dev->isAdvertisingService(OXYII_SERVICE_UUID) ||
-                       dev->isAdvertisingService(WS20A_NOTIFY_SERVICE_UUID) ||
-                       dev->isAdvertisingService(WS20A_WRITE_SERVICE_UUID) ||
                        has_oximeter_name(name.c_str());
 
         if (is_oxi && scan_mutex && xSemaphoreTake(scan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -1052,6 +1050,7 @@ void OxiBle::task(void *param) {
     }
 
     uint32_t last_reconnect = 0;
+    bool manual_scan = false;
 
     while (true) {
         if (handle_memory_pause()) {
@@ -1059,7 +1058,10 @@ void OxiBle::task(void *param) {
             continue;
         }
 
-        if (stop_scan_requested.exchange(false)) NimBLEDevice::getScan()->stop();
+        if (stop_scan_requested.exchange(false)) {
+            manual_scan = true;
+            NimBLEDevice::getScan()->stop();
+        }
 
         if (disable_requested) {
             disable_requested = false;
@@ -1118,7 +1120,7 @@ void OxiBle::task(void *param) {
             if (state == OXI_SCANNING) {
                 Log::logf(CAT_OXI, LOG_DEBUG, "[OXI] Scan done, %d results\n", scan_result_count);
                 set_state(OXI_DISCONNECTED);
-                if (scan_result_count > 0 && !active_scan_requested) {
+                if (scan_result_count > 0 && !manual_scan && !active_scan_requested) {
                     String target = cfg.oxi_device_addr;
                     bool found = false;
                     if (target.length() > 0) {
@@ -1185,6 +1187,7 @@ void OxiBle::task(void *param) {
                 pScan->setMaxResults(0);  // callbacks own the bounded oximeter list
                 bool active = active_scan_requested;
                 active_scan_requested = false;
+                manual_scan = active;
                 // AirCANnect observer timing; active discovery is user-requested.
                 pScan->setActiveScan(active);
                 pScan->setInterval(active ? 100 : 1000);
