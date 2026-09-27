@@ -3,6 +3,7 @@
 
 namespace OtaManager {
     struct Status {
+        uint32_t revision;
         bool enabled;
         bool checking;
         bool checked;
@@ -25,7 +26,8 @@ namespace OtaManager {
     bool request_check();
     bool request_install();
     void config_changed();
-    void get_status(Status &status);
+    uint32_t revision();
+    bool get_status(Status &status);
 
     bool begin_manual_upload();
     void end_manual_upload(bool success, const char *error = nullptr);

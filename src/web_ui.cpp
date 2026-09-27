@@ -1487,12 +1487,12 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     request->send(200, "application/json", json);
 }
 
-static void sendOtaStatus(AsyncWebServerRequest *request, int status_code) {
-    OtaManager::Status status;
-    OtaManager::get_status(status);
+static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     String json = "{";
     json.reserve(512);
     jsonAddString(json, "version", airbridge_version(), false);
+    jsonAddUInt32(json, "revision", status.revision);
+    jsonAddUInt32(json, "uptime", millis() / 1000);
     jsonAddString(json, "release_target", status.release_target);
     jsonAddBool(json, "enabled", status.enabled);
     jsonAddBool(json, "checking", status.checking);
@@ -1502,13 +1502,40 @@ static void sendOtaStatus(AsyncWebServerRequest *request, int status_code) {
     jsonAddBool(json, "installing", status.installing);
     jsonAddBool(json, "reboot_pending", status.reboot_pending);
     jsonAddInt(json, "progress", status.progress);
-    jsonAddInt(json, "bytes", status.bytes);
-    jsonAddInt(json, "total_size", status.total_size);
-    jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
+    if (full) {
+        jsonAddInt(json, "bytes", status.bytes);
+        jsonAddInt(json, "total_size", status.total_size);
+        jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
+    }
     jsonAddString(json, "update_version", status.update_version);
     jsonAddString(json, "error", status.error);
     json += '}';
-    request->send(status_code, "application/json", json);
+    return json;
+}
+
+static void sendOtaStatus(AsyncWebServerRequest *request, int status_code) {
+    OtaManager::Status status;
+    if (!OtaManager::get_status(status)) {
+        request->send(503, "application/json", "{\"error\":\"ota_status_busy\"}");
+        return;
+    }
+    request->send(status_code, "application/json", buildOtaStatus(status, true));
+}
+
+static bool ota_client_connected = false;
+static void publishOta() {
+    static uint32_t last_revision = UINT32_MAX;
+    const bool connected = __atomic_exchange_n(&ota_client_connected, false, __ATOMIC_ACQ_REL);
+    if (!connected && OtaManager::revision() == last_revision) return;
+    OtaManager::Status status;
+    if (!OtaManager::get_status(status)) {
+        if (connected) __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
+        return;
+    }
+    String json = buildOtaStatus(status, false);
+    if (events->send(json.c_str(), "ota", millis()) == AsyncEventSource::ENQUEUED)
+        last_revision = status.revision;
+    else __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
 }
 
 static void handleOtaStatus(AsyncWebServerRequest *request) {
@@ -1823,11 +1850,12 @@ void WebUI::init(uint16_t port) {
         if (checkAuth(request)) next();
     };
     events->addMiddleware(authenticate_events);
-#if AB_STORAGE_HAS_SDCARD
     events->onConnect([](AsyncEventSourceClient *) {
+        __atomic_store_n(&ota_client_connected, true, __ATOMIC_RELEASE);
+#if AB_STORAGE_HAS_SDCARD
         __atomic_store_n(&export_client_connected, true, __ATOMIC_RELEASE);
-    });
 #endif
+    });
     live_events->addMiddleware(authenticate_events);
     live_events->onConnect([](AsyncEventSourceClient *) {
         LiveWebConsumer::acquire();
@@ -1966,6 +1994,7 @@ void WebUI::handle() {
     uint32_t now = millis();
     if (uint32_t(now - last_check) < 100) return;
     last_check = now;
+    publishOta();
 #if AB_STORAGE_HAS_SDCARD
     publishExports();
 #endif

@@ -12,6 +12,7 @@
 #include "uart_arbiter.h"
 
 #include <ArduinoOTA.h>
+#include <atomic>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
@@ -59,6 +60,7 @@ struct RuntimeStatus {
 };
 
 static RuntimeStatus runtime;
+static std::atomic<uint32_t> status_revision{0};
 static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
@@ -69,8 +71,13 @@ bool lock(TickType_t timeout = portMAX_DELAY) {
     return !mutex || xSemaphoreTakeRecursive(mutex, timeout) == pdTRUE;
 }
 
-void unlock() {
+void unlock(bool changed = false) {
+    if (changed) status_revision.fetch_add(1);
     if (mutex) xSemaphoreGiveRecursive(mutex);
+}
+
+uint8_t progress_percent(size_t bytes, size_t total) {
+    return total ? (uint8_t)min((size_t)100, bytes * 100 / total) : 0;
 }
 
 void set_error_locked(const char *error) {
@@ -113,7 +120,7 @@ void finish_check(const OtaRelease::Manifest *manifest,
     }
     if (artifact && update_available) available_artifact = *artifact;
     if (error) set_error_locked(error);
-    unlock();
+    unlock(true);
     if (error) {
         Log::logf(CAT_OTA, LOG_WARN, "Release check failed: %s\n", error);
     } else {
@@ -201,7 +208,7 @@ void abort_install(const char *error) {
         runtime.reboot_pending = false;
         runtime.reboot_at_ms = 0;
         set_error_locked(error);
-        unlock();
+        unlock(true);
     }
     Arbiter::set_state(SYS_IDLE);
     Log::logf(CAT_OTA, LOG_ERROR, "Release install failed: %s\n",
@@ -230,8 +237,9 @@ bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
     if (esp_ota_write(install_handle, data, len) != ESP_OK) return false;
 
     if (lock()) {
+        uint8_t before = progress_percent(runtime.bytes, runtime.total_size);
         runtime.bytes += len;
-        unlock();
+        unlock(before != progress_percent(runtime.bytes, runtime.total_size));
     }
     return true;
 }
@@ -292,7 +300,7 @@ void install_task(void *) {
         runtime.reboot_pending = true;
         runtime.reboot_at_ms = millis() + REBOOT_DELAY_MS;
         runtime.error[0] = '\0';
-        unlock();
+        unlock(true);
     }
     Log::logf(CAT_OTA, LOG_INFO,
               "Release %s installed to '%s', rebooting\n",
@@ -329,7 +337,7 @@ void init() {
     runtime.initialized = cfg.wifi_mode != WIFI_MODE_OFF;
     runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
     runtime.next_check_ms = millis() + INITIAL_CHECK_DELAY_MS;
-    unlock();
+    unlock(true);
 
     if (!runtime.initialized) return;
     ArduinoOTA.setHostname(cfg.hostname.c_str());
@@ -347,7 +355,7 @@ void init() {
                 runtime.error[0] = '\0';
                 claimed = true;
             }
-            unlock();
+            unlock(claimed);
         }
         if (!claimed) {
             Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA collision\n");
@@ -363,9 +371,10 @@ void init() {
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         if (!lock(pdMS_TO_TICKS(10))) return;
+        uint8_t before = progress_percent(runtime.bytes, runtime.total_size);
         runtime.bytes = progress;
         runtime.total_size = total;
-        unlock();
+        unlock(before != progress_percent(runtime.bytes, runtime.total_size));
     });
 
     ArduinoOTA.onError([](ota_error_t error) {
@@ -373,7 +382,7 @@ void init() {
             runtime.operation = OP_NONE;
             snprintf(runtime.error, sizeof(runtime.error),
                      "arduino_ota_%u", (unsigned)error);
-            unlock();
+            unlock(true);
         }
         Arbiter::set_state(SYS_IDLE);
         Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA error %u\n", error);
@@ -411,6 +420,7 @@ void handle() {
                 if (!runtime.resmed_started)
                     set_error_locked("resmed_ota_start_failed");
                 runtime.resmed_started = false;
+                status_revision.fetch_add(1);
             }
         }
         unlock();
@@ -462,16 +472,16 @@ bool request_check() {
         snprintf(work_url, sizeof(work_url), "%s", cfg.update_url.c_str());
         runtime.operation = OP_CHECK;
         runtime.error[0] = '\0';
-        unlock();
+        unlock(true);
         if (start_worker(check_task, "ota_check")) return true;
         if (lock()) {
             runtime.operation = OP_NONE;
             set_error_locked("update_task_alloc_failed");
-            unlock();
+            unlock(true);
         }
         return false;
     }
-    unlock();
+    unlock(true);
     return false;
 }
 
@@ -496,17 +506,17 @@ bool request_install() {
         runtime.total_size = available_artifact.size;
         runtime.error[0] = '\0';
         Arbiter::set_state(SYS_OTA_ESP);
-        unlock();
+        unlock(true);
         if (start_worker(install_task, "ota_install")) return true;
         if (lock()) {
             runtime.operation = OP_NONE;
             set_error_locked("install_task_alloc_failed");
-            unlock();
+            unlock(true);
         }
         Arbiter::set_state(SYS_IDLE);
         return false;
     }
-    unlock();
+    unlock(true);
     return false;
 }
 
@@ -522,12 +532,15 @@ void config_changed() {
     runtime.error[0] = '\0';
     available_artifact = {};
     runtime.next_check_ms = millis() + INITIAL_CHECK_DELAY_MS;
-    unlock();
+    unlock(true);
 }
 
-void get_status(Status &status) {
+uint32_t revision() { return status_revision.load(); }
+
+bool get_status(Status &status) {
     memset(&status, 0, sizeof(status));
-    if (!lock(pdMS_TO_TICKS(50))) return;
+    if (!lock(pdMS_TO_TICKS(50))) return false;
+    status.revision = status_revision.load();
     status.enabled = runtime.enabled;
     status.checking = runtime.operation == OP_CHECK;
     status.checked = runtime.checked;
@@ -539,9 +552,7 @@ void get_status(Status &status) {
     status.reboot_pending = runtime.reboot_pending;
     status.bytes = runtime.bytes;
     status.total_size = runtime.total_size;
-    status.progress = runtime.total_size
-        ? (uint8_t)min((size_t)100, runtime.bytes * 100 / runtime.total_size)
-        : 0;
+    status.progress = progress_percent(runtime.bytes, runtime.total_size);
     status.last_check_age_ms = runtime.last_check_ms
         ? millis() - runtime.last_check_ms : 0;
     snprintf(status.release_target, sizeof(status.release_target), "%s",
@@ -550,6 +561,7 @@ void get_status(Status &status) {
              runtime.update_version);
     snprintf(status.error, sizeof(status.error), "%s", runtime.error);
     unlock();
+    return true;
 }
 
 bool begin_manual_upload() {
@@ -566,7 +578,7 @@ bool begin_manual_upload() {
     } else {
         set_error_locked("ota_busy");
     }
-    unlock();
+    unlock(true);
     return allowed;
 }
 
@@ -574,7 +586,7 @@ void end_manual_upload(bool success, const char *error) {
     if (!lock()) return;
     if (runtime.operation == OP_MANUAL) runtime.operation = OP_NONE;
     if (!success) set_error_locked(error ? error : "upload_failed");
-    unlock();
+    unlock(true);
 }
 
 bool begin_resmed_flash() {
@@ -591,15 +603,16 @@ bool begin_resmed_flash() {
     } else {
         set_error_locked("ota_busy");
     }
-    unlock();
+    unlock(true);
     return allowed;
 }
 
 void cancel_resmed_flash_claim() {
     if (!lock()) return;
-    if (runtime.operation == OP_RESMED && !runtime.resmed_started)
+    bool cancelled = runtime.operation == OP_RESMED && !runtime.resmed_started;
+    if (cancelled)
         runtime.operation = OP_NONE;
-    unlock();
+    unlock(cancelled);
 }
 
 bool busy() {

@@ -679,6 +679,9 @@ function initSSE() {
       applyExports(data);
     } catch(ex) { console.error(ex); }
   });
+  evtSrc.addEventListener('ota', e => {
+    try { otaSerial++; applyOtaStatus(JSON.parse(e.data)); } catch(ex) { console.error(ex); }
+  });
   evtSrc.addEventListener('flash', e => {
     try { updateFlashFromPush(JSON.parse(e.data)); } catch(ex) {}
   });
@@ -691,12 +694,14 @@ function initSSE() {
   evtSrc.onerror = () => {
     exportsFresh = false;
     renderExports();
+    if (otaWatch) showMsg(document.getElementById('otaReleaseMsg'), 'Connection lost; waiting for device...', 'err', 0);
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '#555';
   };
   evtSrc.onopen = () => {
     loadStatus();
     loadExports();
+    if (otaWatch || document.getElementById('p-ota').classList.contains('active')) loadOtaStatus();
     if (document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
     if (setupActive() && setupStep === 'network') loadSetupWifi();
     var li = document.getElementById('liveIndicator');
@@ -2182,7 +2187,7 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
 });
 
 let otaStatusTimer = null;
-let otaPollGeneration = 0;
+let otaRead = null, otaStatus = null, otaWatch = null, otaSerial = 0;
 
 function renderOtaStatus(d) {
   var target = document.getElementById('espFwTarget');
@@ -2216,81 +2221,72 @@ function renderOtaStatus(d) {
   else if (d.error) showMsg(msgEl, d.error, 'err', 0);
 }
 
-async function loadOtaStatus(timeoutMs = 5000) {
-  const generation = otaPollGeneration;
+function applyOtaStatus(d) {
+  otaStatus = d;
+  renderOtaStatus(d);
+  if (!otaWatch || d.checking || d.installing || d.reboot_pending) return;
+  var message = '', type = 'ok';
+  if (d.error) { message = d.error; type = 'err'; }
+  else if (otaWatch.restarting) {
+    if (d.version === otaWatch.version && !(d.uptime < otaWatch.uptime)) return;
+    message = 'Device is back online with firmware ' + (d.version || '--') + '.';
+  } else if (d.checked) {
+    message = d.update_available ? 'Version ' + d.update_version + ' is available.' : 'This device is up to date.';
+  } else return;
+  clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
+  showMsg(document.getElementById('otaReleaseMsg'), message, type, 0);
+}
+
+function loadOtaStatus() {
+  if (otaRead) return otaRead;
+  const serial = otaSerial;
+  otaRead = (async () => {
   try {
-    var r = await api('/api/ota', undefined, timeoutMs);
-    if (!r) return {unauthorized:true};
+    var r = await api('/api/ota', undefined, 5000);
+    if (!r) {
+      clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
+      return null;
+    }
     if (!r.ok) throw new Error('Update status read failed');
     var d = await r.json();
-    if (generation !== otaPollGeneration) return null;
-    renderOtaStatus(d);
+    if (serial !== otaSerial) return otaStatus;
+    applyOtaStatus(d);
     return d;
   } catch(e) { return null; }
+  })().finally(() => { otaRead = null; });
+  return otaRead;
 }
 
-function pollOtaStatus(restarting) {
+function watchOta(restarting, baseline) {
   if (otaStatusTimer) clearTimeout(otaStatusTimer);
-  const generation = ++otaPollGeneration;
-  const deadline = Date.now() + 120000;
-  let unavailable = false;
-  var poll = async function() {
-    if (generation !== otaPollGeneration) return;
+  otaWatch = {restarting, version:baseline.version, uptime:baseline.uptime};
+  otaStatusTimer = setTimeout(() => {
     otaStatusTimer = null;
-    if (Date.now() >= deadline) {
-      showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status.', 'err', 0);
-      return;
-    }
-    var d = await loadOtaStatus(Math.min(5000, deadline - Date.now()));
-    if (generation !== otaPollGeneration || (d && d.unauthorized)) return;
-    if (!d) {
-      if (!unavailable)
-        showMsg(document.getElementById('otaReleaseMsg'), restarting ? 'Waiting for device...' : 'Update status unavailable; reconnecting...', 'ok', 0);
-      unavailable = true;
-      otaStatusTimer = setTimeout(poll, Math.max(0, Math.min(2000, deadline - Date.now())));
-      return;
-    }
-    unavailable = false;
-    if (d.checking || d.installing || d.reboot_pending) {
-      otaStatusTimer = setTimeout(poll, 1000);
-    } else if (d.error) {
-      showMsg(document.getElementById('otaReleaseMsg'), d.error, 'err', 0);
-    } else if (restarting) {
-      showMsg(document.getElementById('otaReleaseMsg'), 'Device is back online with firmware ' + (d.version || '--') + '.', 'ok', 0);
-    } else if (d.update_available) {
-      showMsg(document.getElementById('otaReleaseMsg'), 'Version ' + d.update_version + ' is available.', 'ok', 0);
-    } else if (d.checked && !d.error) {
-      showMsg(document.getElementById('otaReleaseMsg'), 'This device is up to date.', 'ok');
-    }
-  };
-  otaStatusTimer = setTimeout(poll, 500);
+    otaWatch = null;
+    showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status. Refresh to check the device.', 'err', 0);
+  }, 120000);
 }
 
-async function otaCheckRelease() {
+async function otaAction(action) {
+  const restarting = action === 'install';
+  const baseline = otaStatus || lastStatus;
+  const serial = otaSerial;
   var msgEl = document.getElementById('otaReleaseMsg');
-  showMsg(msgEl, 'Checking for updates...', 'ok', 0);
+  showMsg(msgEl, restarting ? 'Starting release update...' : 'Checking for updates...', 'ok', 0);
   try {
-    var r = await api('/api/ota/check', {method:'POST'});
+    var r = await api('/api/ota/' + action, {method:'POST'});
     if (!r) return;
     var d = await r.json();
-    renderOtaStatus(d);
-    if (!r.ok) throw new Error(d.error || 'Update check rejected');
-    pollOtaStatus(false);
+    if (!r.ok) throw new Error(d.error || 'Update request rejected');
+    watchOta(restarting, baseline);
+    const newerPush = serial !== otaSerial && otaStatus &&
+      (otaStatus.revision > d.revision || otaStatus.version !== baseline.version || otaStatus.uptime < baseline.uptime);
+    applyOtaStatus(newerPush ? otaStatus : d);
   } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
 }
 
-async function otaInstallRelease() {
-  var msgEl = document.getElementById('otaReleaseMsg');
-  showMsg(msgEl, 'Starting release update...', 'ok', 0);
-  try {
-    var r = await api('/api/ota/install', {method:'POST'});
-    if (!r) return;
-    var d = await r.json();
-    renderOtaStatus(d);
-    if (!r.ok) throw new Error(d.error || 'Update install rejected');
-    pollOtaStatus(true);
-  } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
-}
+function otaCheckRelease() { return otaAction('check'); }
+function otaInstallRelease() { return otaAction('install'); }
 
 // Upload
 const dz = document.getElementById('dropZone'), fi = document.getElementById('fileInput');
