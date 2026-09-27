@@ -320,6 +320,20 @@ static void fixedJsonAddInt(FixedJson &json, const char *key, long val, bool com
     fixedJsonPrintf(json, "%ld", val);
 }
 
+static void jsonAddString(FixedJson &json, const char *key, const char *val,
+                           bool comma = true) {
+    fixedJsonAddString(json, key, val, comma);
+}
+
+static void jsonAddInt(FixedJson &json, const char *key, int val, bool comma = true) {
+    fixedJsonAddInt(json, key, val, comma);
+}
+
+static void jsonAddUInt32(FixedJson &json, const char *key, uint32_t val,
+                          bool comma = true) {
+    fixedJsonPrintf(json, "%s\"%s\":%lu", comma ? "," : "", key, (unsigned long)val);
+}
+
 static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
     strcpy(esp_time, "--");
     time_t now = time(nullptr);
@@ -333,15 +347,73 @@ static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
     Air10Clock::status_time(resmed_time);
 }
 
+enum StatusFields : uint8_t {
+    STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
+    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_ALL = 31,
+};
+
+template<class Output>
+static void appendStatusIdentity(Output &json, bool comma = true) {
+    jsonAddString(json, "version", airbridge_version(), comma);
+    jsonAddString(json, "built", airbridge_build_date());
+    jsonAddString(json, "pna", Config::get().device_pna.c_str());
+    jsonAddString(json, "srn", Config::get().device_srn.c_str());
+}
+
+template<class Output>
+static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &status,
+                                uint8_t fields) {
+    if (fields & STATUS_THERAPY) {
+        jsonAddString(json, "system", system_state_name(status.sys));
+        jsonAddInt(json, "rop", status.rop);
+        jsonAddInt(json, "mhr", status.mhr);
+        char mode[24];
+        ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
+        jsonAddString(json, "mode", mode);
+    }
+    if (fields & STATUS_HEALTH) {
+        char esp_time[20], resmed_time[20];
+        statusClocks(esp_time, resmed_time);
+        jsonAddString(json, "esp_time", esp_time);
+        jsonAddString(json, "resmed_time", resmed_time);
+#if AB_STORAGE_HAS_SDCARD
+        SdStorage::Status sd;
+        SdStorage::get_status(sd);
+        jsonAddString(json, "sd", !sd.supported ? "unsupported" :
+                       sd.mounted ? "mounted" : "unavailable");
+        jsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
+        jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+#else
+        jsonAddString(json, "sd", "unsupported");
+#endif
+        jsonAddInt(json, "heap", ESP.getFreeHeap());
+        jsonAddInt(json, "rssi", WiFi.RSSI());
+        jsonAddInt(json, "uptime", millis() / 1000);
+    }
+    if (fields & STATUS_OXI) {
+        const auto &r = status.reading;
+        jsonAddString(json, "oxi", oxi_state_name(status.oxi));
+        jsonAddUInt32(json, "ble_revision", OxiBle::revision());
+        char oxi_addr[32];
+        OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
+        jsonAddString(json, "oxi_addr", oxi_addr);
+        jsonAddString(json, "feeding", status.feeding ? "yes" : "no");
+        jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
+        jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
+    }
+    if (fields & STATUS_CONFIG) {
+        jsonAddUInt32(json, "config_revision", Config::revision());
+        jsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
+    }
+    if (fields & STATUS_IDENTITY) appendStatusIdentity(json);
+}
+
 static size_t buildStatusJson(char *out, size_t cap) {
     if (!out || cap == 0) return 0;
     out[0] = '\0';
 
     const auto status = DeviceStatus::snapshot();
-    const auto &r = status.reading;
 #if AB_STORAGE_HAS_SDCARD
-    SdStorage::Status sd;
-    SdStorage::get_status(sd);
     EdfRecorder::Status edf;
     EdfRecorder::get_status(edf);
     EdfCatalog::Status catalog;
@@ -352,43 +424,11 @@ static size_t buildStatusJson(char *out, size_t cap) {
     ExportSync::get_sleephq_status(sleephq_status);
 #endif
 
-    auto &cfg = Config::get();
-
-    char esp_time[20], resmed_time[20];
-    statusClocks(esp_time, resmed_time);
-
     FixedJson json = {out, cap, 0, false};
     fixedJsonPut(json, '{');
-    fixedJsonAddString(json, "version", airbridge_version(), false);
-    fixedJsonAddString(json, "built", airbridge_build_date());
-    fixedJsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
-    fixedJsonPrintf(json, ",\"config_revision\":%u", Config::revision());
-    fixedJsonAddString(json, "system", system_state_name(status.sys));
-    fixedJsonAddInt(json, "rop", status.rop);
-    char mode[24];
-    ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
-    fixedJsonAddString(json, "mode", mode);
-    fixedJsonAddString(json, "pna", cfg.device_pna.c_str());
-    fixedJsonAddString(json, "srn", cfg.device_srn.c_str());
-    fixedJsonAddString(json, "esp_time", esp_time);
-    fixedJsonAddString(json, "resmed_time", resmed_time);
-    fixedJsonAddString(json, "oxi", oxi_state_name(status.oxi));
-    fixedJsonPrintf(json, ",\"ble_revision\":%u", OxiBle::revision());
-    char oxi_addr[32];
-    OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
-    fixedJsonAddString(json, "oxi_addr", oxi_addr);
-    fixedJsonAddString(json, "feeding", status.feeding ? "yes" : "no");
-    fixedJsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
-    fixedJsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
-    fixedJsonAddInt(json, "heap", ESP.getFreeHeap());
-    fixedJsonAddInt(json, "rssi", WiFi.RSSI());
-    fixedJsonAddInt(json, "mhr", status.mhr);
-    fixedJsonAddInt(json, "uptime", millis() / 1000);
+    appendStatusIdentity(json, false);
+    appendStatusFields(json, status, STATUS_ALL & ~STATUS_IDENTITY);
 #if AB_STORAGE_HAS_SDCARD
-    fixedJsonAddString(json, "sd", !sd.supported ? "unsupported" :
-                       sd.mounted ? "mounted" : "unavailable");
-    fixedJsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
-    fixedJsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
     fixedJsonAddString(json, "edf", !edf.supported ? "unsupported" :
                        edf.active ? "recording" :
                        edf.post_processing ? "post-processing" :
@@ -423,7 +463,6 @@ static size_t buildStatusJson(char *out, size_t cap) {
     fixedJsonAddString(json, "sleephq_error",
                        sleephq_status.last_error);
 #else
-    fixedJsonAddString(json, "sd", "unsupported");
     fixedJsonAddString(json, "edf", "unsupported");
     fixedJsonAddString(json, "smb_sync", "unsupported");
     fixedJsonAddString(json, "sleephq_sync", "unsupported");
@@ -2083,11 +2122,6 @@ void WebUI::init(uint16_t port) {
     Log::logf(CAT_WEB, LOG_INFO, "HTTP server on port %d\n", port);
 }
 
-enum StatusFields : uint8_t {
-    STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
-    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_ALL = 31,
-};
-
 static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
                              const DeviceStatus::Snapshot &b) {
     uint8_t fields = 0;
@@ -2103,55 +2137,9 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
 
 static String build_status_payload(const DeviceStatus::Snapshot &status,
                                    uint8_t fields = STATUS_ALL) {
-    const auto &r = status.reading;
     String sj = "{";
     jsonAddUInt32(sj, "sample_ms", millis(), false);
-    if (fields & STATUS_THERAPY) {
-        jsonAddString(sj, "system", system_state_name(status.sys));
-        jsonAddInt(sj, "rop", status.rop);
-        jsonAddInt(sj, "mhr", status.mhr);
-        char mode[24];
-        ClinicalSettings::mode_label(status.mop, mode, sizeof(mode));
-        jsonAddString(sj, "mode", mode);
-    }
-    if (fields & STATUS_HEALTH) {
-        char esp_time[20], resmed_time[20];
-        statusClocks(esp_time, resmed_time);
-        jsonAddString(sj, "esp_time", esp_time);
-        jsonAddString(sj, "resmed_time", resmed_time);
-#if AB_STORAGE_HAS_SDCARD
-        SdStorage::Status sd;
-        SdStorage::get_status(sd);
-        jsonAddString(sj, "sd", sd.mounted ? "mounted" : "unavailable");
-        jsonAddInt(sj, "sd_total_mb", sd.card_bytes / (1024 * 1024));
-        jsonAddInt(sj, "sd_used_mb", sd.used_bytes / (1024 * 1024));
-#else
-        jsonAddString(sj, "sd", "unsupported");
-#endif
-        jsonAddInt(sj, "heap", ESP.getFreeHeap());
-        jsonAddInt(sj, "rssi", WiFi.RSSI());
-        jsonAddInt(sj, "uptime", millis() / 1000);
-    }
-    if (fields & STATUS_OXI) {
-        jsonAddString(sj, "oxi", oxi_state_name(status.oxi));
-        jsonAddUInt32(sj, "ble_revision", OxiBle::revision());
-        char oxi_addr[32];
-        OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
-        jsonAddString(sj, "oxi_addr", oxi_addr);
-        jsonAddString(sj, "feeding", status.feeding ? "yes" : "no");
-        jsonAddInt(sj, "spo2", r.valid ? r.spo2 : -1);
-        jsonAddInt(sj, "pulse", r.valid ? r.pulse_bpm : -1);
-    }
-    if (fields & STATUS_CONFIG) {
-        jsonAddUInt32(sj, "config_revision", Config::revision());
-        jsonAddInt(sj, "onboarding_complete", Config::onboarding_complete());
-    }
-    if (fields & STATUS_IDENTITY) {
-        jsonAddString(sj, "version", airbridge_version());
-        jsonAddString(sj, "built", airbridge_build_date());
-        jsonAddString(sj, "pna", Config::get().device_pna.c_str());
-        jsonAddString(sj, "srn", Config::get().device_srn.c_str());
-    }
+    appendStatusFields(sj, status, fields);
     sj += '}';
     return sj;
 }
