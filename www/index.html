@@ -2213,6 +2213,7 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
 });
 
 let otaStatusTimer = null;
+let otaPollGeneration = 0;
 
 function renderOtaStatus(d) {
   var target = document.getElementById('espFwTarget');
@@ -2246,10 +2247,11 @@ function renderOtaStatus(d) {
   else if (d.error) showMsg(msgEl, d.error, 'err', 0);
 }
 
-async function loadOtaStatus() {
+async function loadOtaStatus(timeoutMs = 5000) {
   try {
-    var r = await api('/api/ota');
-    if (!r) return null;
+    var r = await api('/api/ota', undefined, timeoutMs);
+    if (!r) return {unauthorized:true};
+    if (!r.ok) throw new Error('Update status read failed');
     var d = await r.json();
     renderOtaStatus(d);
     return d;
@@ -2258,20 +2260,26 @@ async function loadOtaStatus() {
 
 function pollOtaStatus(restarting) {
   if (otaStatusTimer) clearTimeout(otaStatusTimer);
-  var started = Date.now();
+  const generation = ++otaPollGeneration;
+  const deadline = Date.now() + 120000;
+  let unavailable = false;
   var poll = async function() {
-    if (Date.now() - started > 120000) {
+    if (generation !== otaPollGeneration) return;
+    otaStatusTimer = null;
+    if (Date.now() >= deadline) {
       showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status.', 'err', 0);
       return;
     }
-    var d = await loadOtaStatus();
+    var d = await loadOtaStatus(Math.min(5000, deadline - Date.now()));
+    if (generation !== otaPollGeneration || (d && d.unauthorized)) return;
     if (!d) {
-      if (restarting) {
-        showMsg(document.getElementById('otaReleaseMsg'), 'Device restarting...', 'ok', 0);
-        otaStatusTimer = setTimeout(poll, 2000);
-      }
+      if (!unavailable)
+        showMsg(document.getElementById('otaReleaseMsg'), restarting ? 'Waiting for device...' : 'Update status unavailable; reconnecting...', 'ok', 0);
+      unavailable = true;
+      otaStatusTimer = setTimeout(poll, Math.max(0, Math.min(2000, deadline - Date.now())));
       return;
     }
+    unavailable = false;
     if (d.checking || d.installing || d.reboot_pending) {
       otaStatusTimer = setTimeout(poll, 1000);
     } else if (d.error) {
