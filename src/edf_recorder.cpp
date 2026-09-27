@@ -168,35 +168,6 @@ static char recording_id[81] = {};
 static char start_date[9] = {};
 static char start_time[9] = {};
 static char session_directory[40] = {};
-static Progress *progress = nullptr;
-static bool progress_live = false;
-
-static void publish_progress(bool active, bool new_segment = false) {
-    if (!progress) return;
-    Progress next = {};
-    next.active = active;
-    if (active) {
-        memcpy(next.directory, session_directory, sizeof(next.directory));
-        memcpy(next.prefix, status.file_prefix, sizeof(next.prefix));
-        memcpy(next.recording_id, recording_id, sizeof(next.recording_id));
-        memcpy(next.start_date, start_date, sizeof(next.start_date));
-        memcpy(next.start_time, start_time, sizeof(next.start_time));
-        size_t index = 0;
-        for (const OutputFile *file : {&brp.output, &pld.output, &sad.output, &eve, &csl}) {
-            FileProgress &out = next.files[index++];
-            if (!file->open || file->failed || !file->schema) continue;
-            out.schema = file->schema;
-            out.records = file->records;
-            out.readable_bytes = file->records ? Air10Edf::header_size(*file->schema) +
-                uint64_t(file->records) * Air10Edf::record_size(*file->schema) : 0;
-        }
-    }
-    portENTER_CRITICAL(&status_mux);
-    next.revision = progress->revision + 1;
-    next.segment = progress->segment + (new_segment ? 1 : 0);
-    *progress = next;
-    portEXIT_CRITICAL(&status_mux);
-}
 static uint16_t session_mid = 0;
 static uint16_t session_vid = 0;
 static char session_srn[24] = {};
@@ -1746,13 +1717,11 @@ static bool append_output_record(OutputFile &output,
         output.file.close();
         output.open = false;
         status_error("SD record write failed", output.schema->suffix);
-        if (progress_live) publish_progress(true);
         return false;
     }
     output.rest_crc = crc32_ieee_update(output.rest_crc, data, len);
     output.records++;
     output.file.flush();
-    if (progress_live) publish_progress(true);
     return true;
 }
 
@@ -2340,8 +2309,6 @@ static void start_session(const ControlEvent &event) {
 
     strcpy(wave_tag, "TCE");
     capture_active = true;
-    progress_live = true;
-    publish_progress(true, true);
     acquire_streams();
     Log::logf(CAT_EDF, LOG_INFO,
               "recording %s/%s MID=%u VID=%u\n",
@@ -2359,8 +2326,6 @@ static void update_record_status() {
 }
 
 static void close_segment() {
-    progress_live = false;
-    publish_progress(false);
     bool complete = write_current_record(brp);
     complete = write_current_record(pld) && complete;
     complete = write_current_record(sad) && complete;
@@ -2417,8 +2382,6 @@ static bool advance_segment(uint32_t captured_ms) {
         return false;
     }
     reset_session_state(event, true);
-    progress_live = true;
-    publish_progress(true, true);
     Log::logf(CAT_EDF, LOG_INFO, "noon rollover %s/%s\n",
               status.therapy_day, status.file_prefix);
     return true;
@@ -2762,12 +2725,6 @@ static void recorder_task(void *) {
 
 void init() {
     if (status.ready) return;
-    if (!progress) {
-        progress = static_cast<Progress *>(aircannect::Memory::alloc_large(sizeof(Progress)));
-        if (!progress) { status_error("progress allocation failed"); return; }
-        *progress = {};
-    }
-
     raw_queue_capacity = RAW_QUEUE_CAPACITY_PSRAM;
     raw_queue_storage = static_cast<uint8_t *>(aircannect::Memory::alloc_large(
         sizeof(RawFrame) * raw_queue_capacity, false));
@@ -2880,13 +2837,6 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
-void get_progress(Progress &out) {
-    portENTER_CRITICAL(&status_mux);
-    out = progress ? *progress : Progress{};
-    portEXIT_CRITICAL(&status_mux);
-}
-
-
 }  // namespace EdfRecorder
 
 #else
@@ -2901,7 +2851,6 @@ bool clock_write_allowed(const char **reason) {
     if (reason) *reason = nullptr;
     return true;
 }
-void get_progress(Progress &out) { out = {}; }
 
 void get_status(Status &out) {
     out = {};
