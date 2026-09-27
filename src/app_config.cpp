@@ -14,6 +14,7 @@
 static Preferences prefs;
 static AirBridgeConfig cfg;
 static uint32_t config_revision = 0;
+static uint32_t section_revisions[static_cast<size_t>(Config::Section::Logging) + 1] = {};
 static uint32_t device_revision = 0;
 static bool onboarding_done = false;
 static bool onboarding_stored = false;
@@ -110,6 +111,7 @@ static void reset_value(const KVEntry &entry) {
 
 static void apply_defaults() {
     for (const KVEntry &entry : kv_table) reset_value(entry);
+    for (auto &revision : section_revisions) __atomic_add_fetch(&revision, 1, __ATOMIC_RELEASE);
     cfg.wifi_net_count = 0;
     for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
         cfg.wifi_nets[i].ssid = "";
@@ -245,6 +247,7 @@ static bool load_values() {
             }
         }
     }
+    for (auto &revision : section_revisions) __atomic_add_fetch(&revision, 1, __ATOMIC_RELEASE);
     return legacy;
 }
 
@@ -319,8 +322,9 @@ bool Config::complete_onboarding(const char *user, const char *password) {
     return true;
 }
 
-uint32_t Config::revision() {
-    return __atomic_load_n(&config_revision, __ATOMIC_ACQUIRE);
+uint32_t Config::revision(Section section) {
+    return __atomic_load_n(section == Section::All ? &config_revision :
+        &section_revisions[static_cast<size_t>(section)], __ATOMIC_ACQUIRE);
 }
 
 void Config::reset_defaults() {
@@ -400,12 +404,27 @@ bool Config::set_value(const char *key, const char *value) {
 
     for (const KVEntry &entry : kv_table) {
         if (strcasecmp(key, entry.key) == 0) {
+            bool changed = false;
             switch (entry.type) {
-            case KVEntry::STR:  *(String*)entry.ptr = value; break;
-            case KVEntry::U8:   *(uint8_t*)entry.ptr = atoi(value); break;
-            case KVEntry::U16:  *(uint16_t*)entry.ptr = atoi(value); break;
-            case KVEntry::BOOL: *(bool*)entry.ptr = (atoi(value) != 0); break;
+            case KVEntry::STR:
+                changed = *(String*)entry.ptr != value;
+                *(String*)entry.ptr = value;
+                break;
+            case KVEntry::U8:
+                changed = *(uint8_t*)entry.ptr != static_cast<uint8_t>(atoi(value));
+                *(uint8_t*)entry.ptr = atoi(value);
+                break;
+            case KVEntry::U16:
+                changed = *(uint16_t*)entry.ptr != static_cast<uint16_t>(atoi(value));
+                *(uint16_t*)entry.ptr = atoi(value);
+                break;
+            case KVEntry::BOOL:
+                changed = *(bool*)entry.ptr != (atoi(value) != 0);
+                *(bool*)entry.ptr = (atoi(value) != 0);
+                break;
             }
+            if (changed) __atomic_add_fetch(&section_revisions[static_cast<size_t>(entry.section)],
+                                             1, __ATOMIC_RELEASE);
             return true;
         }
     }

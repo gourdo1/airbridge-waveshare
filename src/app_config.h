@@ -82,7 +82,7 @@ namespace Config {
     void init();
     void load();
     bool save();
-    uint32_t revision();
+    uint32_t revision(Section section = Section::All);
     void reset_defaults();
 
     bool onboarding_complete();
