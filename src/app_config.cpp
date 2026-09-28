@@ -81,7 +81,6 @@ static const KVEntry kv_table[] = {
     KV_U16("http_port", "http_port", http_port, 80, Access),
     KV_STR("http_user", "http_user", http_user, "admin", Access),
     KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
-    KV_SECRET("ota_password", "ota_pass", ota_password, "airbridge", Updates),
     KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),

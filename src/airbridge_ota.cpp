@@ -13,7 +13,6 @@
 #include "airsense_state.h"
 #include "wifi_setup.h"
 
-#include <ArduinoOTA.h>
 #include <atomic>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
@@ -38,7 +37,6 @@ enum Operation : uint8_t {
     OP_CHECK,
     OP_INSTALL,
     OP_MANUAL,
-    OP_ARDUINO,
     OP_RESMED,
 };
 
@@ -62,7 +60,6 @@ struct RuntimeStatus {
 static RuntimeStatus runtime;
 static std::atomic<uint32_t> status_revision{0};
 static const char *last_blocked = nullptr;
-static bool last_arduino_allowed = false;
 static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
@@ -353,7 +350,6 @@ const char *cached_start_blocked() {
             runtime.operation == OP_NONE && !runtime.reboot_pending)
             status_revision.fetch_add(1);
         last_blocked = blocked;
-        last_arduino_allowed = inputs.device_idle && !inputs.resmed_active && inputs.background_idle;
         previous = inputs;
         observed = true;
     }
@@ -374,51 +370,6 @@ void init() {
     unlock(true);
 
     if (!runtime.initialized) return;
-    ArduinoOTA.setHostname(cfg.hostname.c_str());
-    ArduinoOTA.setPort(DEFAULT_OTA_PORT);
-    if (cfg.ota_password.length() > 0)
-        ArduinoOTA.setPassword(cfg.ota_password.c_str());
-
-    ArduinoOTA.onStart([]() {
-        bool claimed = false;
-        if (lock()) {
-            if (runtime.operation == OP_NONE && !runtime.reboot_pending) {
-                runtime.operation = OP_ARDUINO;
-                runtime.bytes = 0;
-                runtime.total_size = 0;
-                claimed = true;
-            }
-            unlock(claimed);
-        }
-        if (!claimed) {
-            Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA collision\n");
-            return;
-        }
-        Log::logf(CAT_OTA, LOG_INFO, "ArduinoOTA start\n");
-        Arbiter::set_state(SYS_OTA_ESP);
-    });
-
-    ArduinoOTA.onEnd([]() {
-        Log::logf(CAT_OTA, LOG_INFO, "ArduinoOTA complete\n");
-    });
-
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        if (!lock(pdMS_TO_TICKS(10))) return;
-        runtime.bytes = progress;
-        runtime.total_size = total;
-        unlock();
-    });
-
-    ArduinoOTA.onError([](ota_error_t error) {
-        if (lock()) {
-            runtime.operation = OP_NONE;
-            unlock(true);
-        }
-        Arbiter::set_state(SYS_IDLE);
-        Log::logf(CAT_OTA, LOG_ERROR, "ArduinoOTA error %u\n", error);
-    });
-
-    ArduinoOTA.begin();
     Log::logf(CAT_OTA, LOG_DEBUG,
               "Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
 }
@@ -435,17 +386,11 @@ void request_reboot() {
 
 void handle() {
     bool initialized = false;
-    bool poll_arduino = false;
-    bool arduino_active = false;
-    bool arduino_allowed = false;
     bool reboot = false;
     bool auto_check = false;
     const char *blocked = "ota_unavailable";
     if (lock(pdMS_TO_TICKS(10))) {
         initialized = runtime.initialized;
-        poll_arduino = runtime.operation == OP_NONE ||
-                       runtime.operation == OP_ARDUINO;
-        arduino_active = runtime.operation == OP_ARDUINO;
         reboot = runtime.reboot_pending &&
                  deadline_due(millis(), runtime.reboot_at_ms);
         auto_check = runtime.enabled && runtime.operation == OP_NONE &&
@@ -466,7 +411,6 @@ void handle() {
             }
         }
         blocked = cached_start_blocked();
-        arduino_allowed = arduino_active || last_arduino_allowed;
         unlock();
     }
     if (!initialized) return;
@@ -474,11 +418,6 @@ void handle() {
         delay(50);
         ESP.restart();
         return;
-    }
-    if (poll_arduino && arduino_allowed && lock(pdMS_TO_TICKS(10))) {
-        if (runtime.operation == OP_NONE || runtime.operation == OP_ARDUINO)
-            ArduinoOTA.handle();
-        unlock();
     }
     if (auto_check && !blocked) {
         if (!request_check() && lock(pdMS_TO_TICKS(10))) {

@@ -66,7 +66,6 @@
 
 
 #define DEFAULT_HOSTNAME    "airbridge"
-#define DEFAULT_OTA_PORT    3232
 
 #ifndef AB_OTA_RELEASE_TARGET
 #if defined(AB_BOARD_WROOM_S3)

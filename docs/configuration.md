@@ -67,7 +67,6 @@ log warning and the previous setting stays in effect.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ota_password` | airbridge | ArduinoOTA password |
 | `update_url` | GitHub latest-release manifest | Release manifest URL; empty disables update checks |
 
 Update checks are automatic. Installing an available update requires
