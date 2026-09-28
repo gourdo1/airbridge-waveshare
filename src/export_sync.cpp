@@ -50,6 +50,8 @@ enum class RequestKind : uint8_t {
     PostTherapy,
     ManualSmb,
     ManualSleepHq,
+    StartupSmb,
+    StartupSleepHq,
     CheckSmb,
     CheckSleepHq,
 };
@@ -1035,7 +1037,9 @@ static void run_logged(const Request &request, const char *name,
                         bool (*run)(const Request &), void (*snapshot)(T &)) {
     const uint32_t started = millis();
     Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s\n", name,
-              request.kind == RequestKind::PostTherapy ? "post_therapy" : "requested");
+              request.kind == RequestKind::PostTherapy ? "post_therapy" :
+              request.kind == RequestKind::StartupSmb ||
+              request.kind == RequestKind::StartupSleepHq ? "startup" : "manual");
     bool success = run(request);
     T result;
     snapshot(result);
@@ -1087,9 +1091,9 @@ static void export_task(void *) {
         if (generation_aborted(request.generation)) { storage.end(); continue; }
         request_backlog_refresh();
 
-        if (request.kind == RequestKind::ManualSmb) {
+        if (request.kind == RequestKind::ManualSmb || request.kind == RequestKind::StartupSmb) {
             run_logged(request, "SMB", run_smb, get_status);
-        } else if (request.kind == RequestKind::ManualSleepHq) {
+        } else if (request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq) {
             run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
         } else {
             const AirBridgeConfig &config = Config::get();
@@ -1117,7 +1121,7 @@ const char *state_name(State value) {
     return "unknown";
 }
 
-static const char *enqueue_request(bool smb, bool check);
+static const char *enqueue_request(bool smb, bool check, bool startup = false);
 
 void init() {
     if (request_queue || !SdStorage::mounted()) return;
@@ -1145,11 +1149,11 @@ void init() {
                           ? State::Idle : State::Disabled);
     if (Config::get().smb_enabled &&
         Config::get().smb_auto_after_therapy) {
-        (void)enqueue_request(true, false);
+        (void)enqueue_request(true, false, true);
     }
     if (Config::get().sleephq_enabled &&
         Config::get().sleephq_auto_after_therapy) {
-        (void)enqueue_request(false, false);
+        (void)enqueue_request(false, false, true);
     }
 }
 
@@ -1189,7 +1193,7 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     return true;
 }
 
-static const char *enqueue_request(bool smb, bool check) {
+static const char *enqueue_request(bool smb, bool check, bool startup) {
     if (!request_queue) return "unavailable";
     if (AirSenseState::rop() == 1) return "not_idle";
     if (__atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return "busy";
@@ -1197,7 +1201,8 @@ static const char *enqueue_request(bool smb, bool check) {
         return "busy";
     Request request = {};
     request.kind = check ? (smb ? RequestKind::CheckSmb : RequestKind::CheckSleepHq)
-                         : (smb ? RequestKind::ManualSmb : RequestKind::ManualSleepHq);
+                         : startup ? (smb ? RequestKind::StartupSmb : RequestKind::StartupSleepHq)
+                                   : (smb ? RequestKind::ManualSmb : RequestKind::ManualSleepHq);
     request.generation =
         __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
     request.config_revision = Config::revision(smb ? Config::Section::Smb : Config::Section::SleepHq);
