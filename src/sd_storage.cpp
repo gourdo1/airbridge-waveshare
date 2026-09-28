@@ -185,7 +185,7 @@ void init() {
 #if AB_STORAGE_HAS_SDCARD
     if (mounted()) return;
     if (!init_worker())
-        Log::logf(CAT_GENERAL, LOG_WARN, "[SD] auxiliary I/O unavailable; recorder only\n");
+        Log::logf(CAT_STORAGE, LOG_WARN, "auxiliary I/O unavailable; recorder only\n");
 
     bool pins_ok;
     if (AB_SDMMC_WIDTH == 1) {
@@ -198,20 +198,20 @@ void init() {
     }
     if (!pins_ok) {
         mount_error("pin configuration failed");
-        Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] pin configuration failed\n");
+        Log::logf(CAT_STORAGE, LOG_ERROR, "pin configuration failed\n");
         return;
     }
 
     const bool one_bit = AB_SDMMC_WIDTH == 1;
     if (!SD_MMC.begin("/sdcard", one_bit, false, AB_SDMMC_FREQ_KHZ, 8)) {
         mount_error("mount failed");
-        Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] mount failed\n");
+        Log::logf(CAT_STORAGE, LOG_ERROR, "mount failed\n");
         return;
     }
     if (SD_MMC.cardType() == CARD_NONE) {
         SD_MMC.end();
         mount_error("no card");
-        Log::logf(CAT_GENERAL, LOG_WARN, "[SD] no card detected\n");
+        Log::logf(CAT_STORAGE, LOG_WARN, "no card detected\n");
         return;
     }
 
@@ -223,8 +223,8 @@ void init() {
     status.error[0] = 0;
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_GENERAL, LOG_INFO,
-              "[SD] mounted width=%u freq=%ukHz size=%lluMB\n",
+    Log::logf(CAT_STORAGE, LOG_INFO,
+              "mounted width=%u freq=%ukHz size=%lluMB\n",
               AB_SDMMC_WIDTH, AB_SDMMC_FREQ_KHZ,
               static_cast<unsigned long long>(card_bytes / (1024 * 1024)));
 #endif
@@ -286,7 +286,7 @@ void release() {
     Request request = {};
     request.kind = Request::Release;
     if (!dispatch(request, true))
-        Log::logf(CAT_GENERAL, LOG_ERROR, "[SD] release by non-owner\n");
+        Log::logf(CAT_STORAGE, LOG_ERROR, "release by non-owner\n");
 #endif
 }
 

@@ -608,7 +608,7 @@ static bool run_journal(SdStorage::Session &storage, const StatePaths &paths,
                 return false;
             }
             publish(progress, callback, callback_context);
-            Log::logf(CAT_EXPORT, LOG_INFO,
+            Log::logf(CAT_EXPORT, LOG_DEBUG,
                       "[SLEEPHQ] uploaded %s bytes=%llu import=%lu\n",
                       spec.local_path,
                       static_cast<unsigned long long>(result.bytes),
@@ -825,7 +825,7 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
         return false;
     }
 
-    Log::logf(CAT_EXPORT, LOG_INFO,
+    Log::logf(CAT_EXPORT, LOG_DEBUG,
               "[SLEEPHQ] import created id=%lu day=%s\n",
               static_cast<unsigned long>(journal.import_id),
               journal.therapy_day);

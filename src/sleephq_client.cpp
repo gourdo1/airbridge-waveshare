@@ -170,7 +170,7 @@ bool SleepHqClient::ensure_connected(
     if (!client_.connect(SLEEPHQ_HOST, SLEEPHQ_PORT,
                          SLEEPHQ_CONNECT_TIMEOUT_MS)) {
         set_error("connect_failed");
-        Log::logf(CAT_EXPORT, LOG_WARN, "[SLEEPHQ] connect failed\n");
+        Log::logf(CAT_EXPORT, LOG_DEBUG, "[SLEEPHQ] connect failed\n");
         return false;
     }
     if (!operation_allows(operation)) {
@@ -1020,7 +1020,7 @@ bool SleepHqClient::upload_file_once(const SleepHqUploadRequest &request,
 
         const uint32_t now_ms = millis();
         if (static_cast<int32_t>(now_ms - next_progress_ms) >= 0) {
-            Log::logf(CAT_EXPORT, LOG_INFO,
+            Log::logf(CAT_EXPORT, LOG_DEBUG,
                       "[SLEEPHQ] upload progress path=%s bytes=%llu/%llu "
                       "elapsed_ms=%lu\n",
                       request.path,
@@ -1062,7 +1062,7 @@ bool SleepHqClient::upload_file_once(const SleepHqUploadRequest &request,
     const uint32_t upload_elapsed_ms = millis() - upload_started_ms;
     if (response_ok &&
         upload_elapsed_ms >= SLEEPHQ_UPLOAD_PROGRESS_INTERVAL_MS) {
-        Log::logf(CAT_EXPORT, LOG_INFO,
+        Log::logf(CAT_EXPORT, LOG_DEBUG,
                   "[SLEEPHQ] upload complete path=%s bytes=%llu elapsed_ms=%lu\n",
                   request.path,
                   static_cast<unsigned long long>(out.bytes),

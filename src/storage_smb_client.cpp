@@ -454,7 +454,7 @@ StorageSmbOperationResult StorageSmbClient::resolve_host(
         }
 
         Log::logf(CAT_EXPORT,
-                  LOG_INFO,
+                  LOG_DEBUG,
                   "[SMB] resolved host=%s address=%s ms=%lu\n",
                   host,
                   resolved_address_,
@@ -484,7 +484,7 @@ StorageSmbOperationResult StorageSmbClient::resolve_host(
     host_resolution_state_.store(
         static_cast<uint8_t>(HostResolutionState::Pending),
         std::memory_order_release);
-    Log::logf(CAT_EXPORT, LOG_INFO, "[SMB] resolving host=%s\n", host);
+    Log::logf(CAT_EXPORT, LOG_DEBUG, "[SMB] resolving host=%s\n", host);
 
     ip_addr_t address = {};
     err_t rc = ERR_OK;
@@ -687,7 +687,7 @@ StorageSmbOperationResult StorageSmbClient::step_connect(
             return StorageSmbOperationResult::Error;
         }
 
-        Log::logf(CAT_EXPORT, LOG_INFO,
+        Log::logf(CAT_EXPORT, LOG_DEBUG,
                   "[SMB] connecting //%s/%s\n", server_, share_);
 
         const int rc = smb2_connect_share_async(
@@ -710,7 +710,7 @@ StorageSmbOperationResult StorageSmbClient::step_connect(
         char error[AC_STORAGE_ERROR_MAX] = {};
         set_smb_error(error, sizeof(error), "connect", status);
         set_error(error_out, error_out_size, error);
-        Log::logf(CAT_EXPORT, LOG_WARN,
+        Log::logf(CAT_EXPORT, LOG_DEBUG,
                   "[SMB] connect failed error=%s\n", error);
         smb2_destroy_context(ctx_);
         ctx_ = nullptr;
@@ -891,7 +891,7 @@ StorageSmbOperationResult StorageSmbClient::step_mkdir(
     set_smb_error(error_out, error_out_size, "mkdir", status);
     clear_operation();
     Log::logf(CAT_EXPORT,
-              LOG_WARN,
+              LOG_DEBUG,
               "[SMB] mkdir failed path=%s error=%s\n",
               remote_path ? remote_path : "--",
               error_out && error_out[0] ? error_out : "mkdir_failed");

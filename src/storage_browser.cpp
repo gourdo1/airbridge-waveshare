@@ -384,8 +384,8 @@ void produce(void *context) {
         mutation.changed = changed;
         snprintf(mutation.error, sizeof(mutation.error), "%s", error ? error : "");
         portEXIT_CRITICAL(&mutation_mux);
-        Log::logf(CAT_GENERAL, success ? LOG_INFO : LOG_WARN,
-            "[SD] %s %s: %s (%u changed)\n",
+        Log::logf(CAT_STORAGE, success ? LOG_INFO : LOG_WARN,
+            "%s %s: %s (%u changed)\n",
             job->request.kind == Kind::Rename ? "rename" : "delete",
             job->request.path, error ? error : "done", changed);
         job->ready(success ? 200 : 409, error, nullptr, changed);

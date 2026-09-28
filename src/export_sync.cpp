@@ -397,7 +397,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
         return false;
     }
     note_uploaded(sent);
-    Log::logf(CAT_EXPORT, LOG_INFO,
+    Log::logf(CAT_EXPORT, LOG_DEBUG,
               "[SMB] uploaded %s bytes=%llu\n", local_path,
               static_cast<unsigned long long>(sent));
     return true;
@@ -809,7 +809,7 @@ static void run_check(const Request &request) {
     set_check(smb, request.generation, success ? CheckState::Passed : CheckState::Failed,
               request.config_revision, success ? "" : error[0] ? error : "check_failed");
     __atomic_store_n(&check_pending, false, __ATOMIC_RELEASE);
-    Log::logf(CAT_EXPORT, success ? LOG_INFO : LOG_WARN, "[%s] Check %s%s%s\n",
+    Log::logf(CAT_EXPORT, success ? LOG_INFO : LOG_ERROR, "[%s] Check %s%s%s\n",
               smb ? "SMB" : "SLEEPHQ", success ? "passed" : "failed",
               error[0] ? ": " : "", error);
 }
@@ -966,9 +966,9 @@ static void run_logged(const Request &request, const char *name,
     if (!success && (generation_aborted(request.generation) || !storage.valid())) {
         Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted by storage change or therapy\n", name);
     } else if (!success) {
-        Log::logf(CAT_EXPORT, LOG_WARN, "[%s] Sync failed: %s\n", name, result.last_error);
+        Log::logf(CAT_EXPORT, LOG_ERROR, "[%s] Sync failed: %s\n", name, result.last_error);
     } else if (result.state == State::Disabled) {
-        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync skipped: disabled\n", name);
+        Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Sync skipped: disabled\n", name);
     } else {
         Log::logf(CAT_EXPORT, LOG_INFO,
                   "[%s] Sync complete uploaded=%u skipped=%u bytes=%llu elapsed=%ums\n",

@@ -194,14 +194,18 @@ static void status_error(const char *message, const char *file = nullptr) {
               file ? file : "", file ? ": " : "", message ? message : "error");
 }
 
+static bool post_error_active = false;
+
 static void post_error(const char *message) {
     portENTER_CRITICAL(&status_mux);
+    bool changed = !post_error_active || strcmp(status.last_error, message ? message : "post-processing error") != 0;
+    post_error_active = true;
     status.post_errors++;
     strncpy(status.last_error, message ? message : "post-processing error",
             sizeof(status.last_error) - 1);
     status.last_error[sizeof(status.last_error) - 1] = 0;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_EDF, LOG_ERROR, "%s\n",
+    Log::logf(CAT_EDF, changed ? LOG_ERROR : LOG_DEBUG, "%s\n",
               message ? message : "post-processing error");
 }
 
@@ -436,7 +440,7 @@ static void resolve_schemas(uint16_t mid, uint16_t vid) {
         StreamSchema queried;
         if (query_schema(queried, tags[i])) {
             stream_schemas[i] = queried;
-            Log::logf(CAT_EDF, LOG_INFO,
+            Log::logf(CAT_EDF, LOG_DEBUG,
                       "%s schema from firmware (%u fields)\n",
                       tags[i], queried.field_count);
         }
@@ -726,7 +730,9 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
     content_len = 0;
     bool built = true;
     bool cancelled = false;
+    const char *failed_tag = "";
     for (const char *tag : tags) {
+        failed_tag = tag;
         if (post_processing_cancelled()) {
             cancelled = true;
             built = false;
@@ -735,7 +741,7 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
         char value[128] = {};
         if (!read_variable(tag, value, sizeof(value), 1000) ||
             strchr(value, '\r') || strchr(value, '\n')) {
-            Log::logf(CAT_EDF, LOG_WARN,
+            Log::logf(CAT_EDF, LOG_DEBUG,
                       "Identification read failed for %s\n", tag);
             built = false;
             break;
@@ -753,7 +759,11 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
         content_len += static_cast<size_t>(line_len);
     }
     if (!built) {
-        if (!cancelled) post_error("Identification collection failed");
+        if (!cancelled) {
+            char error[96];
+            snprintf(error, sizeof(error), "Identification collection failed: tag=%s", failed_tag);
+            post_error(error);
+        }
         return false;
     }
     return !post_processing_cancelled();
@@ -862,17 +872,21 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
 
     size_t offset = 0;
     bool complete = true;
+    const char *failed_tag = "";
+    const char *failure = "render failed";
     for (uint8_t signal = 0; signal + 1 < schema.signal_count; signal++) {
         if (post_processing_cancelled()) {
             complete = false;
             break;
         }
         const char *tag = Air10Edf::str_signal_tag(signal);
+        failed_tag = tag;
         Air10Stored::Value value = {};
         if (strcmp(tag, "THD") == 0) {
             value = therapy_duration;
         } else if (!read_stored_value(tag, session_native_day, value)) {
-            Log::logf(CAT_EDF, LOG_WARN,
+            failure = "read failed";
+            Log::logf(CAT_EDF, LOG_DEBUG,
                       "STR read failed for %s day=%04X\n",
                       tag, session_native_day);
             complete = false;
@@ -880,12 +894,14 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         }
         const uint16_t expected = schema.signals[signal].samples_per_record;
         if (offset + expected > sample_count) {
+            failure = "schema exceeds record";
             complete = false;
             break;
         }
         if (!value.present) {
             if (strcmp(tag, "LSD") == 0 || strcmp(tag, "THD") == 0) {
-                Log::logf(CAT_EDF, LOG_WARN,
+                failure = "required value missing";
+                Log::logf(CAT_EDF, LOG_DEBUG,
                           "required STR value missing for %s day=%04X\n",
                           tag, session_native_day);
                 complete = false;
@@ -895,7 +911,8 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
             continue;
         }
         if (value.sample_count != expected) {
-            Log::logf(CAT_EDF, LOG_WARN,
+            failure = "unexpected sample count";
+            Log::logf(CAT_EDF, LOG_DEBUG,
                       "STR value invalid for %s day=%04X count=%u\n",
                       tag, session_native_day, value.sample_count);
             complete = false;
@@ -903,7 +920,8 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         }
         if (strcmp(tag, "LSD") == 0 &&
             static_cast<uint16_t>(value.samples[0]) != session_native_day) {
-            Log::logf(CAT_EDF, LOG_WARN,
+            failure = "date mismatch";
+            Log::logf(CAT_EDF, LOG_DEBUG,
                       "STR date mismatch wanted=%04X got=%04X\n",
                       session_native_day,
                       static_cast<uint16_t>(value.samples[0]));
@@ -921,8 +939,12 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
                                         record, capacity, written) &&
         written == Air10Edf::record_size(schema);
     aircannect::Memory::free(samples);
-    if (!rendered && !post_processing_cancelled())
-        post_error("STR record collection failed");
+    if (!rendered && !post_processing_cancelled()) {
+        char error[96];
+        snprintf(error, sizeof(error), "STR day=%04X tag=%s: %s",
+                 session_native_day, failed_tag, failure);
+        post_error(error);
+    }
     return rendered;
 }
 
@@ -1281,7 +1303,7 @@ static bool update_str_file(const uint8_t *incoming_record,
         post_error("STR publish failed");
         return false;
     }
-    Log::logf(CAT_EDF, LOG_INFO,
+    Log::logf(CAT_EDF, LOG_DEBUG,
               "STR timeline %04X-%04X records=%u fillers=%u "
               "replaced=%u discarded=%u\n",
               plan.start_day, plan.end_day, plan.record_count,
@@ -2546,13 +2568,17 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
             summary_export_pending = true;
         }
         if (success && summary_ready && !record)
-            Log::logf(CAT_EDF, LOG_INFO, "no stored STR for day=%04X ZEN=%lu\n",
+            Log::logf(CAT_EDF, LOG_DEBUG, "no stored STR for day=%04X ZEN=%lu\n",
                       day, static_cast<unsigned long>(generation));
     } else {
         success = false;
     }
     aircannect::Memory::free(entries);
     aircannect::Memory::free(record);
+    if (success && summary_ready && post_error_active) {
+        post_error_active = false;
+        Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered day=%04X\n", day);
+    }
     return success && summary_ready;
 }
 
@@ -2860,7 +2886,7 @@ void init() {
     portENTER_CRITICAL(&status_mux);
     status.ready = true;
     portEXIT_CRITICAL(&status_mux);
-    Log::logf(CAT_EDF, LOG_INFO,
+    Log::logf(CAT_EDF, LOG_DEBUG,
               "recorder ready queue=%u (%s)\n",
               raw_queue_capacity,
               raw_queue_capacity == RAW_QUEUE_CAPACITY_PSRAM ? "PSRAM" : "internal");
