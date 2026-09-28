@@ -1910,7 +1910,7 @@ function renderExports(changed = null) {
     } else {
       files.push('pending unknown');
     }
-    text('files', files.join(' \u00b7 '));
+    text('files', state.backlog_state === 'unconfigured' ? '\u2014' : files.join(' \u00b7 '));
     text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
     text('error', [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
       .filter((error, index, errors) => error && errors.indexOf(error) === index).join('; '));
