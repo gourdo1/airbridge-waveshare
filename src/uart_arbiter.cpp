@@ -565,6 +565,8 @@ static void transparent_sniff_tx(const uint8_t *data, size_t len) {
 static void rx_task(void *param) {
     uint8_t buf[64];
     qframe_parser_init(&rx_parser);
+    bool crc_failed = false;
+    bool queue_failed = false;
 
     while (true) {
         portENTER_CRITICAL(&transparent_mux);
@@ -651,6 +653,8 @@ static void rx_task(void *param) {
                 // Complete frame
                 const qframe_t *f = qframe_parser_frame(&rx_parser);
                 if (f && f->crc_valid) {
+                    if (crc_failed) Log::logf(CAT_ARB, LOG_INFO, "RX CRC recovered\n");
+                    crc_failed = false;
                     dispatch_frame_listeners(f);
                     if (f->type == QFRAME_TYPE_L) {
                         // Unsolicited live stream sample. Route to LiveStream
@@ -674,7 +678,7 @@ static void rx_task(void *param) {
                         }
                         if (push_result == RX_PUSH_STORED_DROPPED_OLD) {
                             stat_error++;
-                            Log::logf(CAT_ARB, LOG_WARN,
+                            Log::logf(CAT_ARB, queue_failed ? LOG_DEBUG : LOG_WARN,
                                       "RX queue full, dropped queued frame t=%lu\n",
                                       millis());
                         } else if (push_result == RX_PUSH_DROPPED_FULL) {
@@ -683,10 +687,16 @@ static void rx_task(void *param) {
                                       "RX queue full, dropped incoming frame t=%lu\n",
                                       millis());
                         }
+                        bool dropped = push_result != RX_PUSH_STORED;
+                        if (queue_failed && !dropped)
+                            Log::logf(CAT_ARB, LOG_INFO, "RX queue recovered\n");
+                        queue_failed = dropped;
                     }
                 } else {
                     stat_error++;
-                    Log::logf(CAT_ARB, LOG_WARN, "RX frame CRC error t=%lu\n", millis());
+                    Log::logf(CAT_ARB, crc_failed ? LOG_DEBUG : LOG_WARN,
+                              "RX frame CRC error t=%lu\n", millis());
+                    crc_failed = true;
                 }
                 qframe_parser_reset(&rx_parser);
             }
@@ -773,7 +783,7 @@ static void arbiter_task(void *param) {
         if (!transaction_source_allowed(t)) {
             t->result.success = false;
             stat_error++;
-            Log::logf(CAT_ARB, LOG_WARN,
+            Log::logf(CAT_ARB, LOG_DEBUG,
                       "TX blocked by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
@@ -787,7 +797,7 @@ static void arbiter_task(void *param) {
             current_ticket = nullptr;
             t->result.success = false;
             stat_error++;
-            Log::logf(CAT_ARB, LOG_WARN,
+            Log::logf(CAT_ARB, LOG_DEBUG,
                       "TX blocked before write by state=%s src=%d t=%lu\n",
                       system_state_name(sys_state), t->source, millis());
             finish_ticket(t);
@@ -860,7 +870,7 @@ static void arbiter_task(void *param) {
                                                QFRAME_MASK_E;
                 if (!mask || !(accepted & mask) ||
                     !qframe_response_matches(t->frame, t->frame_len, rx)) {
-                    Log::logf(CAT_ARB, LOG_WARN,
+                    Log::logf(CAT_ARB, LOG_DEBUG,
                               "Ignored unexpected RX type=%c (%s) ticket=%lu\n",
                               (char)rx.type, qframe_type_name(rx.type),
                               (unsigned long)t->ticket_id);

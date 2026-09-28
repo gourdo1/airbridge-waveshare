@@ -46,7 +46,7 @@ void NetworkHints::init() {
     }
     prefs.end();
     hint_count = n;
-    Log::logf(CAT_WIFI, LOG_INFO, "Hints: loaded %d entries\n", hint_count);
+    Log::logf(CAT_WIFI, LOG_DEBUG, "Hints: loaded %d entries\n", hint_count);
 }
 
 void NetworkHints::save() {
@@ -125,7 +125,7 @@ void NetworkHints::clear_all() {
     memset(hints, 0, sizeof(hints));
     hint_count = 0;
     save();
-    Log::logf(CAT_WIFI, LOG_INFO, "Hints cleared\n");
+    Log::logf(CAT_WIFI, LOG_DEBUG, "Hints cleared\n");
 }
 
 int NetworkHints::count() { return hint_count; }

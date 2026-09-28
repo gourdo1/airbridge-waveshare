@@ -59,13 +59,13 @@ static int create_stream(const char *tag, decode_fn_t decode_fn,
         portENTER_CRITICAL(&data_mux);
         streams[i].in_use = true;
         portEXIT_CRITICAL(&data_mux);
-        Log::logf(CAT_STREAM, LOG_INFO,
-                  "[LS] stream '%s' registered%s\n", streams[i].tag,
+        Log::logf(CAT_STREAM, LOG_DEBUG,
+                  "stream '%s' registered%s\n", streams[i].tag,
                   decode_fn ? "" : " (raw)");
         return i;
     }
     Log::logf(CAT_STREAM, LOG_WARN,
-              "[LS] stream table full, '%c%c%c' rejected\n",
+              "stream table full, '%c%c%c' rejected\n",
               tag[0], tag[1], tag[2]);
     return -1;
 }
@@ -87,13 +87,13 @@ void init() {
     if (initialized) return;
     control_mutex = xSemaphoreCreateMutex();
     if (!control_mutex) {
-        Log::logf(CAT_STREAM, LOG_ERROR, "[LS] control mutex init failed\n");
+        Log::logf(CAT_STREAM, LOG_ERROR, "control mutex init failed\n");
         return;
     }
     memset(streams, 0, sizeof(streams));
     memset(consumers, 0, sizeof(consumers));
     initialized = true;
-    Log::logf(CAT_STREAM, LOG_INFO, "[LS] broker init\n");
+    Log::logf(CAT_STREAM, LOG_DEBUG, "broker init\n");
 }
 
 bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_size) {
@@ -109,8 +109,8 @@ bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_siz
         streams[sidx].decode_fn = decode_fn;
         streams[sidx].sample_size = sample_size;
         portEXIT_CRITICAL(&data_mux);
-        Log::logf(CAT_STREAM, LOG_INFO,
-                  "[LS] stream '%s' decoder attached\n", streams[sidx].tag);
+        Log::logf(CAT_STREAM, LOG_DEBUG,
+                  "stream '%s' decoder attached\n", streams[sidx].tag);
         return true;
     }
     return create_stream(tag, decode_fn, sample_size) >= 0;
@@ -124,7 +124,7 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
     int sidx = find_stream_idx(tag);
     if (sidx < 0) {
         Log::logf(CAT_STREAM, LOG_WARN,
-                  "[LS] subscribe to unknown tag '%c%c%c'\n",
+                  "subscribe to unknown tag '%c%c%c'\n",
                   tag[0], tag[1], tag[2]);
         return -1;
     }
@@ -137,7 +137,7 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
         }
     }
     if (cidx < 0) {
-        Log::logf(CAT_STREAM, LOG_WARN, "[LS] consumer table full\n");
+        Log::logf(CAT_STREAM, LOG_WARN, "consumer table full\n");
         return -1;
     }
 
@@ -153,11 +153,11 @@ consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {
         (!streams[sidx].subscribed || streams[sidx].sync_pending)) {
         if (device_subscribe(sidx, true)) {
             streams[sidx].subscribed = true;
-            Log::logf(CAT_STREAM, LOG_INFO,
-                      "[LS] %s subscribed (refs=1)\n", streams[sidx].tag);
+            Log::logf(CAT_STREAM, LOG_DEBUG,
+                      "%s subscribed (refs=1)\n", streams[sidx].tag);
         } else {
             Log::logf(CAT_STREAM, LOG_DEBUG,
-                      "[LS] %s subscribe failed (will retry on resync)\n",
+                      "%s subscribe failed (will retry on resync)\n",
                       streams[sidx].tag);
         }
     }
@@ -195,11 +195,11 @@ void unsubscribe(consumer_handle_t h) {
             (streams[sidx].subscribed || streams[sidx].sync_pending)) {
             if (device_subscribe(sidx, false)) {
                 streams[sidx].subscribed = false;
-                Log::logf(CAT_STREAM, LOG_INFO,
-                          "[LS] %s unsubscribed (refs=0)\n", streams[sidx].tag);
+                Log::logf(CAT_STREAM, LOG_DEBUG,
+                          "%s unsubscribed (refs=0)\n", streams[sidx].tag);
             } else {
                 Log::logf(CAT_STREAM, LOG_WARN,
-                          "[LS] %s unsubscribe failed (refs=0)\n", streams[sidx].tag);
+                          "%s unsubscribe failed (refs=0)\n", streams[sidx].tag);
             }
         }
     }
@@ -219,7 +219,7 @@ static int8_t acquire_raw(const char *tag, cmd_source_t source,
     if (!streams[sidx].subscribed || streams[sidx].sync_pending) {
         if (!device_subscribe(sidx, true, source)) {
             Log::logf(CAT_STREAM, LOG_WARN,
-                      "[LS] %s subscribe to %s failed\n",
+                      "%s subscribe to %s failed\n",
                       owner, streams[sidx].tag);
             // Keep the slot so resync can stop a stream whose ACK was lost.
             return -1;
@@ -227,8 +227,8 @@ static int8_t acquire_raw(const char *tag, cmd_source_t source,
         streams[sidx].subscribed = true;
     }
     streams[sidx].ref_count++;
-    Log::logf(CAT_STREAM, LOG_INFO,
-              "[LS] %s %s lease acquired (refs=%u)\n",
+    Log::logf(CAT_STREAM, LOG_DEBUG,
+              "%s %s lease acquired (refs=%u)\n",
               streams[sidx].tag, owner, streams[sidx].ref_count);
     return (int8_t)sidx;
 }
@@ -248,12 +248,12 @@ static void release_raw(int8_t h, cmd_source_t source, const char *owner) {
             streams[h].subscribed = false;
         } else {
             Log::logf(CAT_STREAM, LOG_WARN,
-                      "[LS] %s unsubscribe from %s failed\n",
+                      "%s unsubscribe from %s failed\n",
                       owner, streams[h].tag);
         }
     }
-    Log::logf(CAT_STREAM, LOG_INFO,
-              "[LS] %s %s lease released (refs=%u)\n",
+    Log::logf(CAT_STREAM, LOG_DEBUG,
+              "%s %s lease released (refs=%u)\n",
               streams[h].tag, owner, streams[h].ref_count);
     if (streams[h].ref_count == 0 && !streams[h].subscribed &&
         !streams[h].sync_pending &&
@@ -289,11 +289,11 @@ static bool suspend_with_source(cmd_source_t src) {
             (!streams[i].subscribed && !streams[i].sync_pending)) continue;
         if (device_subscribe(i, false, src)) {
             streams[i].subscribed = false;
-            Log::logf(CAT_STREAM, LOG_INFO, "[LS] %s suspended\n", streams[i].tag);
+            Log::logf(CAT_STREAM, LOG_DEBUG, "%s suspended\n", streams[i].tag);
         } else {
             ok = false;
             Log::logf(CAT_STREAM, LOG_ERROR,
-                      "[LS] %s suspend failed\n", streams[i].tag);
+                      "%s suspend failed\n", streams[i].tag);
         }
     }
     return ok;
@@ -316,8 +316,8 @@ void resume() {
             (!streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, true)) {
                 streams[i].subscribed = true;
-                Log::logf(CAT_STREAM, LOG_INFO,
-                          "[LS] %s resumed\n", streams[i].tag);
+                Log::logf(CAT_STREAM, LOG_DEBUG,
+                          "%s resumed\n", streams[i].tag);
             }
         }
     }
@@ -332,15 +332,15 @@ void resync() {
             (!streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, true)) {
                 streams[i].subscribed = true;
-                Log::logf(CAT_STREAM, LOG_INFO,
-                          "[LS] %s re-subscribed\n", streams[i].tag);
+                Log::logf(CAT_STREAM, LOG_DEBUG,
+                          "%s re-subscribed\n", streams[i].tag);
             }
         } else if (streams[i].ref_count == 0 &&
                    (streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, false)) {
                 streams[i].subscribed = false;
-                Log::logf(CAT_STREAM, LOG_INFO,
-                          "[LS] %s unsubscribed (retry)\n", streams[i].tag);
+                Log::logf(CAT_STREAM, LOG_DEBUG,
+                          "%s unsubscribed (retry)\n", streams[i].tag);
             }
         }
         if (streams[i].ref_count == 0 && !streams[i].subscribed &&
@@ -360,8 +360,8 @@ void reattach() {
         streams[i].subscribed = false;
         if (device_subscribe(i, true)) {
             streams[i].subscribed = true;
-            Log::logf(CAT_STREAM, LOG_INFO,
-                      "[LS] %s reattached\n", streams[i].tag);
+            Log::logf(CAT_STREAM, LOG_DEBUG,
+                      "%s reattached\n", streams[i].tag);
         }
     }
 }

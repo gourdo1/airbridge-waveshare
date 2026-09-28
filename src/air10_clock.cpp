@@ -94,7 +94,7 @@ static bool push_time_to_resmed() {
     if (!ok_dac) {
         // A device error is terminal until TIMESYNC; a timeout can be retried.
         if (resp[0]) clock_sync_pending = false;
-        Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed date %s: %s\n",
+        Log::logf(CAT_TIME, LOG_WARN, "ResMed date %s: %s\n",
                   resp[0] ? "rejected (use TIMESYNC to retry)" : "timeout", resp);
         return false;
     }
@@ -104,16 +104,16 @@ static bool push_time_to_resmed() {
     bool ok_tic = Arbiter::send_cmd(tic_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
     if (!ok_tic && resp[0]) {
         clock_sync_pending = false;
-        Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed time rejected (use TIMESYNC to retry): %s\n", resp);
+        Log::logf(CAT_TIME, LOG_WARN, "ResMed time rejected (use TIMESYNC to retry): %s\n", resp);
         return false;
     }
 
     if (ok_dac && ok_tic) {
-        Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] ResMed clock set: %02d%02d%04d %02d%02d%02d\n",
+        Log::logf(CAT_TIME, LOG_INFO, "ResMed clock set: %02d%02d%04d %02d%02d%02d\n",
                   t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
                   t.tm_hour, t.tm_min, t.tm_sec);
     } else {
-        Log::logf(CAT_GENERAL, LOG_WARN, "[INIT] ResMed clock set failed (dac=%d tic=%d)\n",
+        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock set failed (dac=%d tic=%d)\n",
                   ok_dac, ok_tic);
     }
     return ok_dac && ok_tic;
@@ -124,8 +124,6 @@ bool Air10Clock::pull_time(bool force) {
     if (!Air10Clock::read(t) ||
         !WiFiSetup::set_fallback_time(t.year, t.month, t.day,
                                       t.hour, t.minute, t.second, force)) return false;
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Time from ResMed: %04d-%02d-%02d %02d:%02d:%02d\n",
-              t.year, t.month, t.day, t.hour, t.minute, t.second);
     return true;
 }
 
@@ -136,7 +134,7 @@ void Air10Clock::handle() {
     const char *blocked = nullptr;
     if (!EdfRecorder::clock_write_allowed(&blocked)) {
         if (blocked != last_blocked)
-            Log::logf(CAT_GENERAL, LOG_INFO, "ResMed clock sync deferred: %s\n", blocked);
+            Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock sync deferred: %s\n", blocked);
         last_blocked = blocked;
         return;
     }

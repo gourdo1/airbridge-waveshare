@@ -118,7 +118,7 @@ static void poll_therapy_state() {
     } else {
         airsense_present = false;
         consecutive_timeouts++;
-        Log::logf(CAT_HEALTH, consecutive_timeouts >= 2 ? LOG_WARN : LOG_DEBUG,
+        Log::logf(CAT_HEALTH, LOG_DEBUG,
                   "ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
                   consecutive_timeouts, millis(), millis() - t0);
 
@@ -128,7 +128,7 @@ static void poll_therapy_state() {
                 current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
                 if (current == SYS_THERAPY) EdfRecorder::request_stop();
                 Arbiter::set_state(SYS_ERROR);
-                Log::logf(CAT_HEALTH, LOG_ERROR, "UART unresponsive, entering ERROR state\n");
+                Log::logf(CAT_HEALTH, LOG_WARN, "AirSense unavailable: UART unresponsive\n");
             }
         }
     }

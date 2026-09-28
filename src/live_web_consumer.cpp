@@ -70,12 +70,12 @@ static void do_subscribe() {
     if (handle >= 0) return;
     handle = LiveStream::subscribe(LivePmd::TAG, on_pmd, nullptr);
     if (handle < 0) {
-        Log::logf(CAT_STREAM, LOG_WARN, "[LWC] subscribe to PMD failed\n");
+        Log::logf(CAT_STREAM, LOG_WARN, "web: subscribe to PMD failed\n");
     } else {
         portENTER_CRITICAL(&ring_mux);
         int clients = client_count;
         portEXIT_CRITICAL(&ring_mux);
-        Log::logf(CAT_STREAM, LOG_INFO, "[LWC] consumer registered (clients=%d)\n",
+        Log::logf(CAT_STREAM, LOG_DEBUG, "web: consumer registered (clients=%d)\n",
                   clients);
     }
 }
@@ -88,7 +88,7 @@ static void do_unsubscribe() {
     ring_count = 0;
     sent_seq = head;
     portEXIT_CRITICAL(&ring_mux);
-    Log::logf(CAT_STREAM, LOG_INFO, "[LWC] unsubscribed (idle)\n");
+    Log::logf(CAT_STREAM, LOG_DEBUG, "web: unsubscribed (idle)\n");
 }
 
 void init() {
