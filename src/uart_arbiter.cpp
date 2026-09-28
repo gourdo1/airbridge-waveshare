@@ -435,12 +435,10 @@ static void transparent_tx_handle_frame() {
 
     transparent_tx_payload[min((size_t)transparent_tx_payload_len,
                                sizeof(transparent_tx_payload) - 1)] = '\0';
-#ifndef FIRMWARE_MIGRATE
     if (transparent_tx_payload_len >= 4 &&
         memcmp(transparent_tx_payload, "P F ", 4) == 0) {
         CustomSettings::invalidate("external flash");
     }
-#endif
 
     uint32_t new_baud = parse_bdd_baud(transparent_tx_payload,
                                        transparent_tx_payload_len);
@@ -454,9 +452,7 @@ static void transparent_tx_handle_frame() {
     const char *reboot_cmd = transparent_reboot_command(transparent_tx_payload,
                                                         transparent_tx_payload_len);
     if (reboot_cmd) {
-#ifndef FIRMWARE_MIGRATE
         CustomSettings::invalidate(reboot_cmd);
-#endif
         transparent_schedule_reboot_baud(reboot_cmd);
     }
 }
@@ -1069,11 +1065,9 @@ static uart_transaction_t *create_command(
     int frame_len = qframe_encoded_size(reinterpret_cast<const uint8_t *>(cmd), payload_len);
     if (frame_len < 0) return nullptr;
 
-#ifndef FIRMWARE_MIGRATE
     const char *reboot_cmd = transparent_reboot_command(
         reinterpret_cast<const uint8_t *>(cmd), strlen(cmd));
     if (reboot_cmd) CustomSettings::invalidate(reboot_cmd);
-#endif
 
     auto *t = allocate_transaction(frame_len, src, prio, policy, sink, false, context_size);
     if (!t) return nullptr;
