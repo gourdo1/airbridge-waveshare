@@ -683,7 +683,7 @@ static void rx_task(void *param) {
                                       millis());
                         } else if (push_result == RX_PUSH_DROPPED_FULL) {
                             stat_error++;
-                            Log::logf(CAT_ARB, LOG_WARN,
+                            Log::logf(CAT_ARB, queue_failed ? LOG_DEBUG : LOG_WARN,
                                       "RX queue full, dropped incoming frame t=%lu\n",
                                       millis());
                         }

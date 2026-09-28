@@ -56,13 +56,13 @@ static void udp_task(void *param) {
         }
 
         if (buf[0] != UDP_MAGIC_0 || buf[1] != UDP_MAGIC_1) {
-            Log::logf(CAT_OXI, LOG_WARN, "UDP bad magic %02X %02X\n",
+            Log::logf(CAT_OXI, LOG_DEBUG, "UDP bad magic %02X %02X\n",
                       buf[0], buf[1]);
             continue;
         }
 
         if (buf[2] & 0xE0) {
-            Log::logf(CAT_OXI, LOG_WARN, "UDP bad flags %02X\n", buf[2]);
+            Log::logf(CAT_OXI, LOG_DEBUG, "UDP bad flags %02X\n", buf[2]);
             continue;
         }
 

@@ -881,6 +881,7 @@ static esp_err_t apply_fallback_time(void *ctx) {
     if (ntp_synced && !fallback->force) return ESP_OK;
     struct timeval tv = { .tv_sec = fallback->epoch, .tv_usec = 0 };
     fallback->applied = settimeofday(&tv, nullptr) == 0;
+    if (fallback->applied) ntp_synced = false;
     return ESP_OK;
 }
 

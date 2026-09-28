@@ -560,8 +560,8 @@ static int saveSettings(const String &body, String &json) {
     String errors = ctx.errors;
     if (ctx.lan_changed) CustomSettings::invalidate("LAN write");
     Log::logf(CAT_CONFIG, errors.length() ? LOG_WARN : LOG_INFO,
-              "AirSense: Save applied=%d%s\n", count,
-              errors.length() ? " with rejected or failed fields" : "");
+              "AirSense: Save applied=%d%s%.64s\n", count,
+              errors.length() ? " failed=" : "", errors.c_str());
 
     json = "{";
     jsonAddInt(json, "saved", count, false);
