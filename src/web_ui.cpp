@@ -789,6 +789,7 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddBool(json, "enabled", enabled);
         jsonAddBool(json, "automatic", automatic);
         jsonAddUInt32(json, "files_seen", status.files_seen);
+        jsonAddString(json, "current_day", status.current_day);
         jsonAddBool(json, "backlog_known", status.backlog.known);
         jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         char bytes[48];
@@ -806,7 +807,6 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddUInt32(json, "files_uploaded", status.files_uploaded);
         jsonAddUInt32(json, "files_skipped", status.files_skipped);
         jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
-        jsonAddString(json, "current_day", status.current_day);
         jsonAddString(json, "error", status.last_error);
     }
     if (fields & EXPORT_CHECK) {
@@ -838,7 +838,7 @@ static uint8_t exportChanges(const T &a, const T &b) {
     uint8_t fields = 0;
     if (a.state != b.state || a.has_files != b.has_files ||
         a.files_uploaded != b.files_uploaded || a.files_skipped != b.files_skipped ||
-        a.last_sync_epoch != b.last_sync_epoch || strcmp(a.current_day, b.current_day) ||
+        a.last_sync_epoch != b.last_sync_epoch ||
         strcmp(a.last_error, b.last_error)) fields |= EXPORT_RUN;
     if (a.check.state != b.check.state || strcmp(a.check.error, b.check.error))
         fields |= EXPORT_CHECK;

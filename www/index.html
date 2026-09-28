@@ -1855,9 +1855,7 @@ function createSyncCards() {
     card.innerHTML = `<div class="card-header"><span class="label">${name}</span><span class="badge" data-sync="state">--</span></div>
       <div class="time-row"><span class="label">Endpoint</span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
       <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">&mdash;</span></div>
-      <div class="time-row"><span class="label">Therapy day</span><span class="value" data-sync="day">&mdash;</span></div>
       <div class="time-row"><span class="label">Files</span><span class="value sync-value" data-sync="files">&mdash;</span></div>
-      <div class="time-row"><span class="label">Pending</span><span class="value sync-value" data-sync="backlog">&mdash;</span></div>
       <div class="time-row"><span class="label">Connection check</span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
       <div class="sync-note" data-sync="import"></div>
       <div class="sync-note" data-sync="availability"></div>
@@ -1900,15 +1898,22 @@ function renderExports(changed = null) {
     text('endpoint', id === 'smb' ? state.endpoint || 'Not configured' :
       'SleepHQ' + (state.team_id ? ' / Team ' + state.team_id : '') + (state.device_id ? ' / Device ' + state.device_id : ''));
     text('last', state.last_sync_epoch ? new Date(state.last_sync_epoch * 1000).toLocaleString() : '\u2014');
-    text('day', state.state === 'working' && state.current_day ?
-      state.current_day.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3') : '\u2014');
-    text('files', state.has_files ? state.files_uploaded + ' uploaded, ' + state.files_skipped + ' skipped' : '\u2014');
-    text('backlog', ['ready', 'confirming'].includes(state.backlog_state) ? state.backlog_files + ' files' +
-      (state.backlog_waiting ? ', ' + state.backlog_waiting + ' sessions not ready' : '') +
-      (state.backlog_state === 'confirming' ? ', awaiting confirmation' : '') :
-      state.backlog_state === 'error' ? state.backlog_error : '\u2014');
+    const files = [];
+    if (state.has_files) {
+      files.push(state.files_uploaded + ' uploaded');
+      if (state.files_skipped) files.push(state.files_skipped + ' skipped');
+    }
+    if (['ready', 'confirming'].includes(state.backlog_state)) {
+      files.push(state.backlog_files + ' pending');
+      if (state.backlog_waiting) files.push(state.backlog_waiting + ' sessions not ready');
+      if (state.backlog_state === 'confirming') files.push('awaiting confirmation');
+    } else {
+      files.push('pending unknown');
+    }
+    text('files', files.join(' \u00b7 '));
     text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
-    text('error', state.error || '');
+    text('error', [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
+      .filter((error, index, errors) => error && errors.indexOf(error) === index).join('; '));
     text('check-result', state.check_state === 'passed' ? 'Passed' :
       state.check_state === 'failed' ? state.check_error || 'Failed' :
       ['pending','working'].includes(state.check_state) ? 'Checking...' : '\u2014');
