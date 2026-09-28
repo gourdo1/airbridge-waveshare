@@ -95,18 +95,17 @@ void setup() {
     // because that step calls NetworkHints::upsert with legacy hint values.
     NetworkHints::init();
     Config::load();
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] Config loaded\n");
+    Log::logf(CAT_CONFIG, LOG_DEBUG, "Configuration loaded\n");
 
     SdStorage::init();
     CustomSettings::init();
 
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX);
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] UART arbiter started\n");
+    Log::logf(CAT_ARB, LOG_DEBUG, "Initialization returned\n");
 
     bool wifi_ok = WiFiSetup::init();
 
     TcpBridge::init();
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] TCP bridge started\n");
 
     if (wifi_ok) {
         auto &cfg = Config::get();
@@ -125,13 +124,12 @@ void setup() {
     OxiArbiter::init();
     OxiBle::init();
     OxiUdp::init();
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] BLE oximetry started\n");
 
     LiveStream::init();
     LiveWebConsumer::init();
     EdfRecorder::init();
 
-    Log::logf(CAT_GENERAL, LOG_INFO, "[INIT] All systems go\n");
+    Log::logf(CAT_GENERAL, LOG_DEBUG, "Startup initialization complete\n");
 }
 
 void loop() {

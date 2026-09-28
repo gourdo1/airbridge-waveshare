@@ -125,7 +125,7 @@ void finish_check(const OtaRelease::Manifest *manifest,
     if (error) {
         Log::logf(CAT_OTA, LOG_WARN, "Release check failed: %s\n", error);
     } else {
-        Log::logf(CAT_OTA, LOG_INFO, "Release check: latest=%s available=%d\n",
+        Log::logf(CAT_OTA, update_available ? LOG_INFO : LOG_DEBUG, "Release check: latest=%s available=%d\n",
                   manifest ? manifest->version : "?", update_available);
     }
 }
@@ -419,7 +419,7 @@ void init() {
     });
 
     ArduinoOTA.begin();
-    Log::logf(CAT_OTA, LOG_INFO,
+    Log::logf(CAT_OTA, LOG_DEBUG,
               "Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
 }
 

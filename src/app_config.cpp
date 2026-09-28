@@ -160,7 +160,7 @@ static void load_wifi_nets(bool migrate = true) {
             wp.getBytes("profiles", &stored, sizeof(stored)) != sizeof(stored) ||
             !decode_wifi_nets(stored)) {
             cfg.wifi_net_count = 0;
-            Log::logf(CAT_WIFI, LOG_ERROR, "invalid saved profiles\n");
+            Log::logf(CAT_CONFIG, LOG_ERROR, "Invalid saved WiFi profiles\n");
         }
         wp.end();
         return;
@@ -286,19 +286,32 @@ static bool store_onboarding_marker() {
 }
 
 bool Config::save() {
-    if (!store_onboarding_marker()) { load_values(); return false; }
+    if (!store_onboarding_marker()) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: onboarding marker\n");
+        load_values();
+        return false;
+    }
     nvs_handle_t handle;
-    if (nvs_open("airbridge", NVS_READWRITE, &handle) != ESP_OK) { load_values(); return false; }
-    esp_err_t error = ESP_OK;
+    esp_err_t error = nvs_open("airbridge", NVS_READWRITE, &handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: NVS open: %s\n", esp_err_to_name(error));
+        load_values();
+        return false;
+    }
+    const char *stage = "commit";
     for (const KVEntry &entry : kv_table) {
         error = store_value(handle, entry);
-        if (error != ESP_OK) break;
+        if (error != ESP_OK) { stage = entry.nvs_key; break; }
     }
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
-    if (error != ESP_OK) load_values();
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: %s: %s\n", stage, esp_err_to_name(error));
+        load_values();
+    }
     apply_syslog();
     __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+    if (error == ESP_OK) Log::logf(CAT_CONFIG, LOG_INFO, "Configuration saved\n");
     return error == ESP_OK;
 }
 
@@ -483,11 +496,21 @@ bool Config::save_wifi_nets() {
         strcpy(stored.entries[i].pass, net.pass.c_str());
     }
     nvs_handle_t handle;
-    if (nvs_open("wnet", NVS_READWRITE, &handle) != ESP_OK) return failed();
-    esp_err_t error = nvs_set_blob(handle, "profiles", &stored, sizeof(stored));
-    if (error == ESP_OK) error = nvs_commit(handle);
+    esp_err_t error = nvs_open("wnet", NVS_READWRITE, &handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "WiFi profiles: NVS open failed: %s\n", esp_err_to_name(error));
+        return failed();
+    }
+    const char *stage = "write";
+    error = nvs_set_blob(handle, "profiles", &stored, sizeof(stored));
+    if (error == ESP_OK) { stage = "commit"; error = nvs_commit(handle); }
     nvs_close(handle);
-    return error == ESP_OK ? true : failed();
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "WiFi profiles: %s failed: %s\n", stage, esp_err_to_name(error));
+        return failed();
+    }
+    Log::logf(CAT_CONFIG, LOG_INFO, "WiFi profiles saved count=%u\n", stored.count);
+    return true;
 }
 
 bool Config::add_network(const char *ssid, const char *pass) {

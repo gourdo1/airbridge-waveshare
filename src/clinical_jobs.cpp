@@ -100,12 +100,15 @@ void worker(void *) {
         }
         const char *operation = job->kind == Kind::Write ? "write" :
                                 job->kind == Kind::Report ? "report" : "read";
-        Log::logf(CAT_WEB, code == 200 ? LOG_DEBUG : LOG_WARN,
-                  "[CLINICAL] %s job=%u status=%d elapsed=%ums%s\n",
-                  operation, job->id, code, (unsigned)(millis() - active_since),
-                  code == 504 && job->kind == Kind::Write ? " possibly partially applied" : "");
-        if (code != 200)
-            Log::logf(CAT_WEB, LOG_DEBUG, "[CLINICAL] reason: %.90s\n", result.c_str());
+        log_cat_t category = job->kind == Kind::Report ? CAT_REPORT : CAT_CONFIG;
+        if (code != 200) {
+            Log::logf(category, code >= 500 ? LOG_ERROR : LOG_WARN,
+                      "%s failed status=%d reason=%.64s%s\n", operation, code, result.c_str(),
+                      code == 504 && job->kind == Kind::Write ? "; partial write possible" : "");
+        } else {
+            Log::logf(category, LOG_DEBUG, "%s job=%u elapsed=%ums\n",
+                      operation, job->id, (unsigned)(millis() - active_since));
+        }
         xSemaphoreTake(mutex, portMAX_DELAY);
         job->result = std::move(result);
         job->code = code;
@@ -127,7 +130,7 @@ bool start_worker() {
             worker, "clinical", 6144, nullptr, 2, &created_task, 0,
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created == pdPASS) task = created_task;
-    else Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Worker allocation failed\n");
+    else Log::logf(CAT_WEB, LOG_ERROR, "Settings/report worker allocation failed\n");
     return created == pdPASS;
 }
 }
@@ -136,7 +139,7 @@ void init(Handler callback) {
     if (mutex) return;
     handler = callback;
     mutex = xSemaphoreCreateMutex();
-    if (!mutex) Log::logf(CAT_WEB, LOG_ERROR, "[CLINICAL] Mutex allocation failed\n");
+    if (!mutex) Log::logf(CAT_WEB, LOG_ERROR, "Settings/report mutex allocation failed\n");
 }
 
 void tick() {

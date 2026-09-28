@@ -163,7 +163,7 @@ query_result_t query_value(const char *command, char *response,
     value = qframe_response_value(response);
     if (ok && value) return QUERY_OK;
     if (command[0] == 'G')
-        Log::logf(CAT_WEB, LOG_DEBUG, "[SETTINGS] %s: %s\n", command,
+        Log::logf(CAT_CONFIG, LOG_DEBUG, "AirSense: %s: %s\n", command,
                   value ? value : "no response");
     return value ? QUERY_ERROR : QUERY_TIMEOUT;
 }
@@ -268,7 +268,7 @@ bool discover_enum_options_locked(cached_entry_t &entry,
 bool discover_locked() {
     char command[20] = "G C &CSG";
     auto fail = [&](const char *stage) {
-        Log::logf(CAT_WEB, LOG_WARN, "[SETTINGS] Discovery failed: %s (%s)\n",
+        Log::logf(CAT_CONFIG, LOG_WARN, "AirSense: Discovery failed: %s (%s)\n",
                   command, stage);
         return false;
     };
@@ -277,8 +277,8 @@ bool discover_locked() {
     query_result_t result = query_value("G C &CSG", response, sizeof(response), value);
     if (result == QUERY_ERROR && error_is(value, "6009")) {
         reset_cache_locked(CACHE_UNSUPPORTED);
-        Log::logf(CAT_WEB, LOG_DEBUG,
-                  "[SETTINGS] Airbreak custom registry unavailable\n");
+        Log::logf(CAT_CONFIG, LOG_DEBUG,
+                  "AirSense: Airbreak custom registry unavailable\n");
         return true;
     }
     if (result != QUERY_OK) return fail("header query");
@@ -287,8 +287,8 @@ bool discover_locked() {
     if (!CustomSettingsProtocol::parse_header(value, header)) return fail("header syntax");
     if (!CustomSettingsProtocol::supported_version(header.version)) {
         reset_cache_locked(CACHE_INCOMPATIBLE);
-        Log::logf(CAT_WEB, LOG_WARN,
-                  "[SETTINGS] Unsupported custom registry version %02X\n",
+        Log::logf(CAT_CONFIG, LOG_WARN,
+                  "AirSense: Unsupported custom registry version %02X\n",
                   header.version);
         return true;
     }
@@ -385,8 +385,8 @@ bool discover_locked() {
         }
     }
     cache_state = CACHE_READY;
-    Log::logf(CAT_WEB, LOG_INFO,
-              "[SETTINGS] Cached %u custom settings (%u options, %u text bytes)\n",
+    Log::logf(CAT_CONFIG, LOG_DEBUG,
+              "AirSense: Cached %u custom settings (%u options, %u text bytes)\n",
               current->entry_count, current->option_count, current->text_size);
     return true;
 }
@@ -410,8 +410,8 @@ bool ensure_loaded_locked() {
         uint32_t language = 0;
         if (read_raw_locked("LAN", language)) {
             if (language_known && language != cached_language) {
-                Log::logf(CAT_WEB, LOG_INFO,
-                          "[SETTINGS] LAN changed, refreshing custom registry\n");
+                Log::logf(CAT_CONFIG, LOG_DEBUG,
+                          "AirSense: LAN changed, refreshing custom registry\n");
                 if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
                 invalidate("LAN change");
                 loaded_generation = generation();
@@ -580,7 +580,7 @@ bool write_raw(const char *name, uint32_t value) {
 
 void invalidate(const char *reason) {
     __atomic_add_fetch(&invalidation_generation, 1, __ATOMIC_ACQ_REL);
-    Log::logf(CAT_WEB, LOG_INFO, "[SETTINGS] Cache invalidated (%s)\n",
+    Log::logf(CAT_CONFIG, LOG_DEBUG, "AirSense: Cache invalidated (%s)\n",
               reason ? reason : "unknown");
 }
 
