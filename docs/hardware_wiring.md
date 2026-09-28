@@ -9,7 +9,7 @@ Module symbols show solder-pad names, not IC pin numbers.
 ## XIAO ESP32-S3 Plus + SD
 
 Build env: `xiao-esp32s3-plus-sdmmc4`.
-KiCad: [xiao_sd.kicad_pro](../hardware/wiring/xiao_sd/xiao_sd.kicad_pro),
+[KiCad project](../hardware/wiring/xiao_sd/),
 PDF: [wiring_xiao_sd.pdf](../hardware/schematics/wiring_xiao_sd.pdf).
 
 ![XIAO + SD wiring](../hardware/schematics/wiring_xiao_sd.png)
@@ -41,7 +41,7 @@ SD:
 ## XIAO ESP32-S3 Plus without SD
 
 Build env: `xiao-esp32s3-plus`.
-KiCad: [xiao.kicad_pro](../hardware/wiring/xiao/xiao.kicad_pro),
+[KiCad project](../hardware/wiring/xiao/),
 PDF: [wiring_xiao_no-sd.pdf](../hardware/schematics/wiring_xiao_no-sd.pdf).
 
 ![XIAO wiring](../hardware/schematics/wiring_xiao_no-sd.png)
@@ -51,7 +51,7 @@ Same as above without the SD part.
 ## M5Stamp Pico (legacy)
 
 Build env: `m5stamp-pico`.
-KiCad: [pico.kicad_pro](../hardware/wiring/pico/pico.kicad_pro),
+[KiCad project](../hardware/wiring/pico/),
 PDF: [wiring_pico.pdf](../hardware/schematics/wiring_pico.pdf).
 
 ![M5Stamp Pico wiring](../hardware/schematics/wiring_pico.png)

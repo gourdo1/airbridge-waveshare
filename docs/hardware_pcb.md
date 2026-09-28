@@ -16,7 +16,7 @@ Build env: `xiao-esp32s3-plus-sdmmc4`. GPIO and SD features:
 
 ## Interface board
 
-KiCad: [interface.kicad_pro](../hardware/pcb/board_interface/interface.kicad_pro),
+[KiCad project](../hardware/pcb/board_interface/),
 PDF: [board_interface.pdf](../hardware/schematics/board_interface.pdf).
 
 ![interface schematic](../hardware/schematics/board_interface.png)
@@ -50,7 +50,7 @@ AirSense TX/RX go through 100 Ω series resistors to the interboard connector.
 
 ## Main board
 
-KiCad: [main.kicad_pro](../hardware/pcb/board_main_xiao/main.kicad_pro),
+[KiCad project](../hardware/pcb/board_main_xiao/),
 PDF: [board_main_xiao.pdf](../hardware/schematics/board_main_xiao.pdf).
 
 ![main schematic](../hardware/schematics/board_main_xiao.png)
