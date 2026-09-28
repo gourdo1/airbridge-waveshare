@@ -4,7 +4,7 @@ Settings are stored in NVS (non-volatile storage) and persist across reboots.
 
 ## How to configure
 
-**Web UI:** Device tab -> edit fields -> Save
+**Web UI:** Config tab -> choose a category -> edit fields -> Save & Persist
 
 **CLI:** `$CONFIG key value` then `$CONFIG SAVE`
 
@@ -31,26 +31,24 @@ top-level WiFi-related config keys are:
 |-----|---------|-------------|
 | `hostname` | airbridge | Device hostname (mDNS + softAP SSID prefix) |
 | `wifi_mode` | 1 | Operating mode, see table below |
-| `wifi_roam` | true | Enable hysteresis-based roaming (8 dB threshold) |
+| `wifi_roam` | true | Roam automatically between saved networks |
 | `wifi_country` | 01 | ISO 3166 country code; "01" = worldwide |
-| `tcp_port` | 23 | TCP command port |
-| `debug_port` | 8023 | Debug log stream port (read-only) |
 
 **`wifi_mode` values:**
 
 | Value | Name | Behavior |
 |-------|------|----------|
-| 0 | auto | STA-first; on failure, automatic AP+STA fallback. AP tears itself down 2 minutes after STA recovers and the AP is client-free. |
-| 1 | AP only | softAP only, no STA attempts. Fast boot, useful as a setup-only or bench device. |
+| 0 | auto | Connect to a saved network; use AP fallback while disconnected. |
+| 1 | AP only | Access point only; does not connect to saved networks. |
 | 2 | off | WiFi disabled entirely (serial/UART only). |
-| 3 | STA only | STA only, never falls back to AP. On total STA failure, keeps retrying scans every 30 s. |
-| 4 | STA+AP always | softAP up from boot alongside STA. AP is never torn down. |
+| 3 | STA only | Connect to saved networks without AP fallback. |
+| 4 | STA+AP always | Keep the access point available while connecting to saved networks. |
 
 The softAP (when used) is named `<hostname>_<MAC>` with password `airbridge`,
 and serves the web UI at `192.168.4.1`.
 
-When station mode is configured but no networks reachable, the device tries
-SmartConfig for 60 seconds, then falls back per the mode table above.
+When station mode is enabled but no networks are saved, the device tries
+SmartConfig. Saved but unreachable networks use the selected mode's fallback.
 
 The `wifi_country` key affects channel allocation and TX power limits per
 regulatory domain. Use a 2-letter ISO code (`US`, `DE`, `JP`, `PL`, ...) or
@@ -88,9 +86,10 @@ confirmation on the OTA tab.
 | `ntp_server` | *(empty)* | NTP server address. Empty = use DHCP-provided server, or pool.ntp.org as fallback |
 | `tz` | UTC0 | POSIX timezone string (e.g. `CET-1CEST,M3.5.0,M10.5.0/3`) |
 
-The web UI Device tab has a timezone helper that detects your browser's timezone and generates the POSIX string.
+**Config > Time** includes a helper for detecting your browser's timezone.
 
-When NTP syncs, the ResMed device clock is set automatically. If NTP is unavailable, the ResMed clock is used as fallback for the ESP system time.
+The ResMed clock is synchronized from NTP while the device is idle. If NTP
+is unavailable, the ResMed clock supplies an approximate time for AirBridge.
 
 ### Storage export
 
@@ -117,13 +116,14 @@ only while therapy is inactive.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `oxi_enabled` | true | Enable BLE oximeter support |
+| `oxi_require_known` | false | Only auto-connect to known devices |
 | `oxi_auto_start` | true | Start feeding data automatically on connect |
 | `oxi_feed_therapy_only` | false | Only inject readings during active therapy |
 | `oxi_interval_ms` | 500 | Injection interval in milliseconds |
 | `oxi_lframe_continuous` | true | Send L-frames even when no valid reading (keeps link alive) |
 | `udp_oxi_port` | 8025 | UDP oximetry listener port, 0 = disabled |
 
-BLE oximeters are managed from the **Bluetooth** tab. For UDP oximetry, see [udp_oximetry.md](udp_oximetry.md).
+BLE oximeters are managed from the **Oximetry** tab. For UDP oximetry, see [udp_oximetry.md](udp_oximetry.md).
 
 Only one source feeds at a time. First to deliver data wins, 10 seconds of silence releases.
 
@@ -131,6 +131,8 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `tcp_port` | 23 | TCP command port |
+| `allow_transparent_during_therapy` | false | Allow raw UART passthrough during therapy |
 | `uart_cmd_timeout_ms` | 500 | Command response timeout |
 | `uart_max_retries` | 3 | Retry count for failed commands |
 
@@ -138,15 +140,10 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `debug_port` | 8023 | Debug log stream port (read-only) |
 | `syslog_en` | 0 | Enable UDP syslog forwarding |
 | `syslog_host` | *(empty)* | Syslog server IPv4 address; required for forwarding |
 | `syslog_port` | 514 | Syslog server UDP port (1-65535) |
-
-### Advanced
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `allow_transparent_during_therapy` | false | Allow raw UART passthrough during therapy |
 
 ## CLI commands
 
