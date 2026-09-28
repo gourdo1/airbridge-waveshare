@@ -4,7 +4,6 @@
 #include "network_hints.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include <esp_smartconfig.h>
 #include <esp_sntp.h>
 #include <esp_netif.h>
 #include <time.h>
@@ -19,7 +18,6 @@ typedef enum {
     WF_CONNECTED,
     WF_ROAM_SCAN,       // scanning for a better AP
     WF_AP_FALLBACK,     // AP+STA mode, periodically retrying STA
-    WF_SMARTCONFIG,
 } wifi_state_t;
 
 static wifi_state_t wf_state = WF_OFF;
@@ -64,7 +62,6 @@ static uint32_t last_ap_retry = 0;
 
 #define HINT_TIMEOUT_MS         5000
 #define CONNECT_TIMEOUT_MS      15000
-#define SMARTCONFIG_TIMEOUT_MS  60000
 #define CONNECT_RETRIES         2
 #define STA_RESTART_SETTLE_MS   100
 
@@ -451,15 +448,6 @@ static void enter_ap_fallback() {
 }
 
 
-static bool try_smartconfig() {
-    Log::logf(CAT_WIFI, LOG_INFO, "SmartConfig waiting...\n");
-    WiFi.mode(WIFI_STA);
-    WiFi.beginSmartConfig();
-    set_state(WF_SMARTCONFIG);
-    return true;  // non-blocking, check() handles the rest
-}
-
-
 static void apply_country_code() {
     auto &cfg = Config::get();
     if (cfg.wifi_country.length() < 2) return;
@@ -517,11 +505,7 @@ bool WiFiSetup::init() {
         begin_connect(0, true);
         return true;
     }
-    // Slot list empty (virgin device or all networks removed): try
-    // SmartConfig. The runtime "configured but unreachable" path goes
-    // through AP fallback instead (handled in WF_SCANNING/WF_CONNECTING),
-    // so this branch only ever fires when wifi_net_count == 0.
-    try_smartconfig();
+    enter_ap_fallback();
     return true;
 }
 
@@ -537,7 +521,6 @@ void WiFiSetup::profiles_changed() {
 static void apply_network_config() {
     status_revision.fetch_add(1);
     const auto &cfg = Config::get();
-    if (wf_state == WF_SMARTCONFIG) WiFi.stopSmartConfig();
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
     clear_scan();
     got_ip = false;
@@ -673,16 +656,12 @@ void WiFiSetup::check() {
             process_scan_results();
             if (scan_candidate_count > 0) {
                 begin_connect_candidate(0);
-            } else if (cfg.wifi_net_count > 0) {
-                // No known APs visible - AP fallback
-                enter_ap_fallback();
             } else {
-                try_smartconfig();
+                enter_ap_fallback();
             }
         } else if (result == WIFI_SCAN_FAILED) {
             Log::logf(CAT_WIFI, LOG_WARN, "Scan failed\n");
-            if (cfg.wifi_net_count > 0) enter_ap_fallback();
-            else try_smartconfig();
+            enter_ap_fallback();
         }
         break;
     }
@@ -834,30 +813,6 @@ void WiFiSetup::check() {
             set_state(WF_SCANNING);
         }
         break;
-
-    case WF_SMARTCONFIG:
-        if (WiFi.smartConfigDone()) {
-            WiFi.stopSmartConfig();
-            Log::logf(CAT_WIFI, LOG_INFO, "SmartConfig: got '%s'\n", WiFi.SSID().c_str());
-            // add to list, replace oldest if full
-            if (cfg.wifi_net_count == WIFI_MAX_NETWORKS) {
-                if (!Config::remove_network(0))
-                    Log::logf(CAT_WIFI, LOG_WARN, "SmartConfig: NVS removal failed\n");
-            }
-            if (!Config::add_network(WiFi.SSID().c_str(), WiFi.psk().c_str()))
-                Log::logf(CAT_WIFI, LOG_WARN, "SmartConfig: NVS save failed\n");
-            cfg.wifi_mode = WIFI_MODE_AUTO;
-            Config::save();
-
-            uint8_t idx = find_net_by_ssid(WiFi.SSID().c_str());
-            if (idx != 0xFF) begin_connect(idx, false);
-            else set_state(WF_CONNECTING);  // already began in SmartConfig
-        } else if (elapsed > SMARTCONFIG_TIMEOUT_MS) {
-            WiFi.stopSmartConfig();
-            Log::logf(CAT_WIFI, LOG_WARN, "SmartConfig timeout\n");
-            enter_ap_fallback();
-        }
-        break;
     }
 }
 
@@ -940,7 +895,6 @@ const char *WiFiSetup::state_name() {
         case WF_CONNECTED:    return "connected";
         case WF_ROAM_SCAN:    return "roaming";
         case WF_AP_FALLBACK:  return "ap_fallback";
-        case WF_SMARTCONFIG:  return "smartconfig";
         default:              return "?";
     }
 }

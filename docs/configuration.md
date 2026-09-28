@@ -47,8 +47,8 @@ top-level WiFi-related config keys are:
 The softAP (when used) is named `<hostname>_<MAC>` with password `airbridge`,
 and serves the web UI at `192.168.4.1`.
 
-When station mode is enabled but no networks are saved, the device tries
-SmartConfig. Saved but unreachable networks use the selected mode's fallback.
+With no saved networks, Auto and STA+AP modes provide an access point for
+setup. STA-only does not start an access point.
 
 The `wifi_country` key affects channel allocation and TX power limits per
 regulatory domain. Use a 2-letter ISO code (`US`, `DE`, `JP`, `PL`, ...) or
