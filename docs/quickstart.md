@@ -1,27 +1,35 @@
 # Quick Start
 
 ## What you need
-<!-- TODO: rework with SD/non-SD hardware selection -->
-- M5Stamp Pico (ESP32-PICO-D4) or XIAO ESP32S3 Plus
-- MP1584 buck converter (24V to 3.3V)
+- AirBridge hardware: the PCB, or a hand-wired XIAO ESP32-S3 Plus with or
+  without SD. See [hardware.md](hardware.md) for variants and which features
+  need SD.
 - AirSense 10 with edge connector access
-- USB-to-serial adapter (3.3V) for initial flash
 - PlatformIO installed
 
 ## Wiring
 
-See [hardware.md](hardware.md) for the pinout, wiring diagram, and power notes.
+PCB: [hardware_pcb.md](hardware_pcb.md).
+Hand-wired: [hardware_wiring.md](hardware_wiring.md).
 
 ## Flash firmware
 
-```bash
-pio run -e m5stamp-pico -t upload
-```
-
-For the XIAO ESP32S3 Plus SDMMC4 build:
+XIAO with SD (PCB or hand-wired):
 
 ```bash
 pio run -e xiao-esp32s3-plus-sdmmc4 -t upload
+```
+
+XIAO without SD:
+
+```bash
+pio run -e xiao-esp32s3-plus -t upload
+```
+
+M5Stamp Pico (legacy; needs a 3.3 V USB-to-serial adapter):
+
+```bash
+pio run -e m5stamp-pico -t upload
 ```
 
 ## Configure WiFi
