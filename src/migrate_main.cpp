@@ -27,7 +27,7 @@ void setup() {
     Log::init();
 
     Log::boot();
-    Log::printf("Heap: %d bytes\n", ESP.getFreeHeap());
+    Log::logf(CAT_GENERAL, LOG_DEBUG, "Heap: %d bytes\n", ESP.getFreeHeap());
 
     Config::init();
     NetworkHints::init();

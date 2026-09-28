@@ -88,7 +88,7 @@ void setup() {
         Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
 
     Log::boot();
-    Log::printf("Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
+    Log::logf(CAT_GENERAL, LOG_DEBUG, "Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();
     // NetworkHints must come up before Config::load runs the wnet migration,

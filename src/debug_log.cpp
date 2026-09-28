@@ -1,6 +1,7 @@
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "build_info.h"
+#include "wifi_setup.h"
 #include <esp_system.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
@@ -10,6 +11,8 @@
 #include <Preferences.h>
 #include "nvs_optional.h"
 #include <stdarg.h>
+#include <sys/time.h>
+#include <time.h>
 
 static Preferences log_prefs;
 
@@ -22,6 +25,7 @@ static constexpr size_t SYSLOG_QUEUE_DEPTH = 8;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
 
 struct SyslogRecord {
+    int64_t epoch_ms;
     uint8_t cat;
     uint8_t level;
     char text[128];
@@ -64,8 +68,13 @@ void Log::init() {
         SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
     bool stored = open_optional_preferences(log_prefs, "log_levels");
     for (int i = 0; i < CAT_COUNT; i++) {
+        log_level_t fallback = LOG_INFO;
+        if (i == CAT_STORAGE || i == CAT_TIME) fallback = cat_levels[CAT_GENERAL];
+        if (i == CAT_TIME && cat_levels[CAT_WIFI] < fallback) fallback = cat_levels[CAT_WIFI];
+        if (i == CAT_CONFIG || i == CAT_REPORT) fallback = cat_levels[CAT_WEB];
         cat_levels[i] = stored ? (log_level_t)log_prefs.getUChar(
-            Log::cat_name((log_cat_t)i), LOG_INFO) : LOG_INFO;
+            Log::cat_name((log_cat_t)i), fallback) : fallback;
+        if (cat_levels[i] > LOG_DEBUG) cat_levels[i] = fallback;
     }
     log_prefs.end();
 }
@@ -93,12 +102,19 @@ static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
 }
 
 void Log::boot() {
-    if (!log_mutex) return;
+    if (!log_mutex || cat_levels[CAT_GENERAL] < LOG_INFO) return;
     SyslogRecord record = boot_record();
     xSemaphoreTake(log_mutex, portMAX_DELAY);
     enqueue(local_queue, local_head, local_count, record);
     boot_pending = true;
     xSemaphoreGive(log_mutex);
+}
+
+static size_t format_record(const SyslogRecord &record, char *line, size_t capacity) {
+    return snprintf(line, capacity, "[%s][%s]%s%s",
+        Log::level_name((log_level_t)record.level),
+        Log::cat_name((log_cat_t)record.cat),
+        record.text[0] == '[' ? "" : " ", record.text);
 }
 
 static void poll_local() {
@@ -121,9 +137,8 @@ static void poll_local() {
         local_head = (local_head + 1) % SYSLOG_QUEUE_DEPTH;
         local_count--;
         char line[160];
-        size_t len = snprintf(line, sizeof(line), "[%s][%s] %s\n",
-            Log::level_name((log_level_t)record.level),
-            Log::cat_name((log_cat_t)record.cat), record.text);
+        size_t len = format_record(record, line, sizeof(line));
+        line[len++] = '\n';
         // Registered sinks must be nonblocking. Serial has its own partial line.
         for (int j = 0; j < output_count; j++)
             outputs[j]->write((const uint8_t *)line, len);
@@ -218,10 +233,21 @@ void Log::poll() {
         static const uint8_t severity[] = {3, 4, 6, 7};
         unsigned pri = 16 * 8 + (record.level <= LOG_DEBUG
                                  ? severity[record.level] : 6);
-        char payload[256];
+        char timestamp[25] = "-";
+        if (record.epoch_ms) {
+            time_t seconds = record.epoch_ms / 1000;
+            struct tm utc;
+            gmtime_r(&seconds, &utc);
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &utc);
+            snprintf(timestamp + 19, sizeof(timestamp) - 19, ".%03uZ",
+                     (unsigned)(record.epoch_ms % 1000));
+        }
+        char line[160];
+        format_record(record, line, sizeof(line));
+        char payload[320];
         int len = snprintf(payload, sizeof(payload),
-                           "<%u>1 - %s airbridge - %s - %s", pri, hostname,
-                           cat_name((log_cat_t)record.cat), record.text);
+                           "<%u>1 %s %s airbridge - %s - %s", pri, timestamp, hostname,
+                           cat_name((log_cat_t)record.cat), line);
 
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) return;
@@ -292,6 +318,10 @@ const char *Log::cat_name(log_cat_t cat) {
         case CAT_EXPORT:  return "EXPORT";
         case CAT_EDF:     return "EDF";
         case CAT_STREAM:  return "STREAM";
+        case CAT_STORAGE: return "STORAGE";
+        case CAT_TIME:    return "TIME";
+        case CAT_CONFIG:  return "CONFIG";
+        case CAT_REPORT:  return "REPORT";
         default:          return "?";
     }
 }
@@ -324,6 +354,11 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
     SyslogRecord record = {};
     record.cat = cat;
     record.level = lvl;
+    if (WiFiSetup::time_synced()) {
+        struct timeval now;
+        if (gettimeofday(&now, nullptr) == 0)
+            record.epoch_ms = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
+    }
     int len = vsnprintf(record.text, sizeof(record.text), fmt, args);
     if (len <= 0) return;
     if (len >= (int)sizeof(record.text)) {
@@ -339,13 +374,6 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
         enqueue(syslog_queue, syslog_head, syslog_count, record);
         xSemaphoreGive(log_mutex);
     }
-}
-
-void Log::printf(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    log_dispatch(CAT_GENERAL, LOG_INFO, fmt, args);
-    va_end(args);
 }
 
 void Log::logf(log_cat_t cat, log_level_t lvl, const char *fmt, ...) {

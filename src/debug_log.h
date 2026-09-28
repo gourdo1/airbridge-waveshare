@@ -23,6 +23,10 @@ typedef enum {
     CAT_EXPORT,
     CAT_EDF,
     CAT_STREAM,
+    CAT_STORAGE,
+    CAT_TIME,
+    CAT_CONFIG,
+    CAT_REPORT,
     CAT_COUNT
 } log_cat_t;
 
@@ -34,8 +38,6 @@ namespace Log {
     bool configure_syslog(bool enabled, const char *host, uint16_t port,
                           const char *hostname);
     void poll();
-
-    void printf(const char *fmt, ...);
 
     void logf(log_cat_t cat, log_level_t lvl, const char *fmt, ...);
 
