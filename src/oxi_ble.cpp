@@ -1150,7 +1150,6 @@ void OxiBle::task(void *param) {
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             do_clear_all_known();
-
         }
 
         if (scan_complete) {
@@ -1306,8 +1305,9 @@ void OxiBle::task(void *param) {
                             vTaskDelay(pdMS_TO_TICKS(500));
                             ok = pClient->connect(bleAddr);
                             if (!ok) {
+                                connect_error = pClient->getLastError();
                                 Log::logf(CAT_OXI, LOG_DEBUG, "Post-bond-delete retry failed (err=%d)\n",
-                                          pClient->getLastError());
+                                          connect_error);
                             }
                         }
                     }
@@ -1375,7 +1375,8 @@ void OxiBle::task(void *param) {
                 if (!connected) {
                     bool cancelled = disconnect_requested || disable_requested;
                     bool repeated = strcmp(failed_addr, addr.c_str()) == 0 &&
-                                    last_failure == failure && last_connect_error == connect_error;
+                                    last_failure && strcmp(last_failure, failure) == 0 &&
+                                    last_connect_error == connect_error;
                     Log::logf(CAT_OXI, cancelled ? LOG_DEBUG :
                               mode == CONN_USER ? LOG_ERROR : repeated ? LOG_DEBUG : LOG_WARN,
                               "Sensor connect %s addr=%s stage=%s error=%d\n",

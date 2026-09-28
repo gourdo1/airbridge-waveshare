@@ -188,4 +188,4 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$REBOOT` | Restart device |
 
 Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`,
-`EXPORT`, `EDF`, `STREAM`, `ALL`
+`EXPORT`, `EDF`, `STREAM`, `STORAGE`, `TIME`, `CONFIG`, `REPORT`, `ALL`
