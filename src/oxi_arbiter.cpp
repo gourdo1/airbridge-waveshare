@@ -72,10 +72,10 @@ static void inject_lframe() {
 
     if (current.valid != last_valid) {
         if (current.valid)
-            Log::logf(CAT_OXI, LOG_INFO, "Finger detected: SpO2=%d%% HR=%d bpm (%s)\n",
-                      current.spo2, current.pulse_bpm, src_name(current_source));
+            Log::logf(CAT_OXI, LOG_DEBUG, "Valid readings from %s: SpO2=%d%% HR=%d bpm\n",
+                      src_name(current_source), current.spo2, current.pulse_bpm);
         else
-            Log::logf(CAT_OXI, LOG_INFO, "Finger lost\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "Readings invalid\n");
         last_valid = current.valid;
     }
 
@@ -163,9 +163,8 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
     portEXIT_CRITICAL(&reading_mux);
 
     if (source_claimed) {
-        Log::logf(CAT_OXI, LOG_INFO, "Source active: %s\n", src_name(src));
-        if (feed_started)
-            Log::logf(CAT_OXI, LOG_INFO, "Feeding started\n");
+        Log::logf(CAT_OXI, LOG_INFO, "Source active: %s%s\n", src_name(src),
+                  feed_started ? "; feeding started" : "");
         Arbiter::lcd_message("Oximeter Connected", 15000);
     }
 }
@@ -240,10 +239,8 @@ void OxiArbiter::poll() {
     }
     portEXIT_CRITICAL(&reading_mux);
     if (timed_out_source != OXI_SRC_NONE) {
-        Log::logf(CAT_OXI, LOG_INFO, "Source %s timed out\n",
-                  src_name(timed_out_source));
-        if (feed_stopped)
-            Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped after source timeout\n");
+        Log::logf(CAT_OXI, LOG_WARN, "Source %s timed out%s\n",
+                  src_name(timed_out_source), feed_stopped ? "; feeding stopped" : "");
     }
 
     // inject at configured interval

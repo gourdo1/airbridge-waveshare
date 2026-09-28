@@ -18,7 +18,7 @@ static void udp_task(void *param) {
     auto &cfg = Config::get();
     uint16_t port = cfg.udp_oxi_port;
     if (port == 0) {
-        Log::logf(CAT_OXI, LOG_INFO, "UDP disabled (port=0)\n");
+        Log::logf(CAT_OXI, LOG_DEBUG, "UDP disabled (port=0)\n");
         vTaskDelete(NULL);
         return;
     }
@@ -50,7 +50,7 @@ static void udp_task(void *param) {
         vTaskDelay(1);  // yield after each packet
 
         if (len != UDP_PACKET_SIZE) {
-            Log::logf(CAT_OXI, LOG_WARN, "UDP bad length %d (expected %d)\n",
+            Log::logf(CAT_OXI, LOG_DEBUG, "UDP bad length %d (expected %d)\n",
                       len, UDP_PACKET_SIZE);
             continue;
         }

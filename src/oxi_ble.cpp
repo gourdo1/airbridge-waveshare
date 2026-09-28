@@ -97,6 +97,7 @@ static SemaphoreHandle_t lifecycle_mutex = nullptr;
 #define USER_CONNECT_RETRIES  3
 #define USER_RETRY_DELAY_MS   2000
 static volatile bool scan_complete = false;
+static int scan_end_reason = 0;
 
 static NimBLEClient *pClient = nullptr;
 
@@ -398,7 +399,7 @@ static void viatom_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, siz
         } else {
             OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
             if (++viatom_invalid_count >= VIATOM_MAX_INVALID) {
-                Log::logf(CAT_OXI, LOG_INFO, "Viatom: no valid data for %d readings, disconnecting\n",
+                Log::logf(CAT_OXI, LOG_WARN, "Viatom: no valid data for %d readings, disconnecting\n",
                           VIATOM_MAX_INVALID);
                 disconnect_requested = true;
             }
@@ -660,7 +661,7 @@ static void oxyii_poll(uint32_t now_ms) {
         if (oxyii_send_auth(now_ms)) {
             oxyii_need_auth = false;
             oxyii_need_setup = true;
-            Log::logf(CAT_OXI, LOG_INFO, "OxyII auth sent, starting setup\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "OxyII auth sent, starting setup\n");
         } else {
             oxyii_log_problem(OXYII_CMD_AUTH, "write failed");
         }
@@ -751,8 +752,7 @@ class OxiScanCB : public NimBLEScanCallbacks {
     }
 
     void onScanEnd(const NimBLEScanResults &results, int reason) override {
-        Log::logf(CAT_OXI, scan_result_count || reason ? LOG_INFO : LOG_DEBUG,
-                  "Scan complete, %d oximeters found (reason=%d)\n", scan_result_count, reason);
+        scan_end_reason = reason;
         scan_complete = true;
     }
 };
@@ -761,11 +761,13 @@ static OxiScanCB scanCB;
 
 class OxiClientCB : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient *client) override {
-        Log::logf(CAT_OXI, LOG_INFO, "Connected\n");
+        Log::logf(CAT_OXI, LOG_DEBUG, "BLE link established\n");
     }
 
     void onDisconnect(NimBLEClient *client, int reason) override {
-        Log::logf(CAT_OXI, LOG_INFO, "Disconnected (reason=0x%X)\n", reason);
+        Log::logf(CAT_OXI, state == OXI_STREAMING ? LOG_INFO : LOG_DEBUG,
+                  "BLE disconnected addr=%s reason=0x%X\n",
+                  client->getPeerAddress().toString().c_str(), reason);
         viatom_write_chr = nullptr;
         oxyii_reset();
         ws20a_write_chr = nullptr;
@@ -792,9 +794,9 @@ class OxiClientCB : public NimBLEClientCallbacks {
     void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
         status_revision.fetch_add(1);
         if (connInfo.isEncrypted()) {
-            Log::logf(CAT_OXI, LOG_INFO, "Encrypted + bonded\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "Encrypted + bonded\n");
         } else {
-            Log::logf(CAT_OXI, LOG_WARN, "Auth complete (no encryption)\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "Auth complete (no encryption)\n");
         }
     }
 };
@@ -847,11 +849,11 @@ static bool subscribe_services(NimBLEClient *cl) {
                     Log::logf(CAT_OXI, LOG_DEBUG, "Subscribed OxyII notify\n");
                     got_spo2 = got_hr = true;
                 } else {
-                    Log::logf(CAT_OXI, LOG_WARN, "OxyII notification subscribe failed\n");
+                    Log::logf(CAT_OXI, LOG_DEBUG, "OxyII notification subscribe failed\n");
                     oxyii_reset();
                 }
             } else {
-                Log::logf(CAT_OXI, LOG_WARN,
+                Log::logf(CAT_OXI, LOG_DEBUG,
                           "OxyII characteristics unavailable: notify=%d write=%d\n",
                           oxyiiNotify && oxyiiNotify->canNotify(), oxyiiWrite != nullptr);
             }
@@ -898,10 +900,10 @@ static bool subscribe_services(NimBLEClient *cl) {
                     ws20a_write_chr = nullptr;
                 }
             } else {
-                Log::logf(CAT_OXI, LOG_WARN, "WS20A notification subscribe failed\n");
+                Log::logf(CAT_OXI, LOG_DEBUG, "WS20A notification subscribe failed\n");
             }
         } else if (wsNotifySvc || wsWriteSvc) {
-            Log::logf(CAT_OXI, LOG_WARN,
+            Log::logf(CAT_OXI, LOG_DEBUG,
                       "WS20A characteristics unavailable: notify=%d write=%d\n",
                       can_subscribe, can_write);
         }
@@ -1021,7 +1023,8 @@ static bool handle_memory_pause() {
         memory_pause.compare_exchange_strong(phase, MemoryPause::Releasing)) {
         bool idle = !pClient->isConnected() && !OxiArbiter::is_feeding();
         if (idle) {
-            Log::logf(CAT_OXI, LOG_INFO,
+            if (Log::get_cat_level(CAT_OXI) >= LOG_DEBUG)
+                Log::logf(CAT_OXI, LOG_DEBUG,
                       "Before OTA pause: internal=%u largest=%u\n",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -1031,7 +1034,8 @@ static bool handle_memory_pause() {
             xSemaphoreGive(lifecycle_mutex);
             scan_complete = false;
             if (state != OXI_DISABLED) set_state(OXI_DISCONNECTED);
-            Log::logf(CAT_OXI, released ? LOG_INFO : LOG_ERROR,
+            if (!released || Log::get_cat_level(CAT_OXI) >= LOG_DEBUG)
+                Log::logf(CAT_OXI, released ? LOG_DEBUG : LOG_ERROR,
                       "OTA memory release: %s internal=%u largest=%u\n",
                       released ? "done" : "failed",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -1049,7 +1053,8 @@ static bool handle_memory_pause() {
             restored = init_stack();
             xSemaphoreGive(lifecycle_mutex);
             if (restored) released = false;
-            Log::logf(CAT_OXI, restored ? LOG_INFO : LOG_ERROR,
+            if (!restored || Log::get_cat_level(CAT_OXI) >= LOG_DEBUG)
+                Log::logf(CAT_OXI, restored ? LOG_DEBUG : LOG_ERROR,
                       "OTA memory restore: %s internal=%u largest=%u\n",
                       restored ? "done" : "failed",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -1079,6 +1084,9 @@ void OxiBle::task(void *param) {
 
     uint32_t last_reconnect = 0;
     bool manual_scan = false;
+    char failed_addr[18] = {};
+    const char *last_failure = nullptr;
+    int last_connect_error = 0;
 
     while (true) {
         if (handle_memory_pause()) {
@@ -1112,7 +1120,7 @@ void OxiBle::task(void *param) {
 
         if (suspend_enter_requested) {
             suspend_enter_requested = false;
-            Log::logf(CAT_OXI, LOG_INFO, "Suspend: stopping scan and dropping connection\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "Suspend: stopping scan and dropping connection\n");
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
@@ -1125,24 +1133,24 @@ void OxiBle::task(void *param) {
             del_one_requested = false;
             char addr[18];
             strncpy(addr, del_one_addr, sizeof(addr));
-            Log::logf(CAT_OXI, LOG_INFO, "Remove-known requested: %s\n", addr);
+            Log::logf(CAT_OXI, LOG_DEBUG, "Remove-known requested: %s\n", addr);
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             bool ok = do_remove_known(addr);
             status_revision.fetch_add(1);
-            Log::logf(CAT_OXI, LOG_INFO, "Remove-known %s: %s\n",
+            Log::logf(CAT_OXI, LOG_DEBUG, "Remove-known %s: %s\n",
                       addr, ok ? "done" : "not found");
         }
 
         if (del_all_requested) {
             del_all_requested = false;
-            Log::logf(CAT_OXI, LOG_INFO, "Clear-all-known requested\n");
+            Log::logf(CAT_OXI, LOG_DEBUG, "Clear-all-known requested\n");
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             do_clear_all_known();
-            Log::logf(CAT_OXI, LOG_INFO, "All known devices cleared\n");
+
         }
 
         if (scan_complete) {
@@ -1150,7 +1158,10 @@ void OxiBle::task(void *param) {
             status_revision.fetch_add(1);
             last_reconnect = millis();
             if (state == OXI_SCANNING) {
-                Log::logf(CAT_OXI, LOG_DEBUG, "Scan done, %d results\n", scan_result_count);
+                Log::logf(CAT_OXI, manual_scan ? LOG_INFO : LOG_DEBUG,
+                          "%s scan ended candidates=%d reason=%d\n",
+                          manual_scan ? "Manual" : "Background",
+                          scan_result_count, scan_end_reason);
                 set_state(OXI_DISCONNECTED);
                 if (scan_result_count > 0 && !manual_scan && !active_scan_requested) {
                     for (int i = 0; i < scan_result_count; i++) {
@@ -1242,12 +1253,14 @@ void OxiBle::task(void *param) {
                 device_needs_encryption = strncasecmp(dev_name.c_str(), "Nonin", 5) == 0 ||
                                           NimBLEDevice::isBonded(bleAddr);
                 bool connected = false;
+                const char *failure = "connect";
+                int connect_error = 0;
 
                 for (int attempt = 1; attempt <= max_attempts; attempt++) {
                     if (disconnect_requested || disable_requested) break;
 
                     if (attempt > 1) {
-                        Log::logf(CAT_OXI, LOG_INFO, "Retry %d/%d after %dms\n",
+                        Log::logf(CAT_OXI, LOG_DEBUG, "Retry %d/%d after %dms\n",
                                   attempt, max_attempts, USER_RETRY_DELAY_MS);
                         vTaskDelay(pdMS_TO_TICKS(USER_RETRY_DELAY_MS));
                     }
@@ -1261,9 +1274,11 @@ void OxiBle::task(void *param) {
                     pClient->cancelConnect();
                     vTaskDelay(pdMS_TO_TICKS(500));
 
+                    failure = "connect";
+                    connect_error = 0;
                     // connect
                     set_state(OXI_CONNECTING);
-                    Log::logf(CAT_OXI, LOG_INFO, "Connecting to %s (type=%d, %s, attempt %d/%d)...\n",
+                    Log::logf(CAT_OXI, LOG_DEBUG, "Connecting to %s (type=%d, %s, attempt %d/%d)...\n",
                               addr.c_str(), atype, mode == CONN_USER ? "user" : "auto",
                               attempt, max_attempts);
 
@@ -1271,7 +1286,8 @@ void OxiBle::task(void *param) {
 
                     if (!ok) {
                         int err = pClient->getLastError();
-                        Log::logf(CAT_OXI, LOG_WARN, "connect() failed (err=%d)\n", err);
+                        connect_error = err;
+                        Log::logf(CAT_OXI, LOG_DEBUG, "connect() failed (err=%d)\n", err);
 
                         // EALREADY: previous connect still in flight
                         if (err == 2) {
@@ -1279,7 +1295,7 @@ void OxiBle::task(void *param) {
                             for (int i = 0; i < 50 && !pClient->isConnected(); i++)
                                 vTaskDelay(pdMS_TO_TICKS(200));
                             ok = pClient->isConnected();
-                            Log::logf(CAT_OXI, LOG_INFO, "Pending connect %s\n", ok ? "succeeded" : "failed");
+                            Log::logf(CAT_OXI, LOG_DEBUG, "Pending connect %s\n", ok ? "succeeded" : "failed");
                             if (ok) vTaskDelay(pdMS_TO_TICKS(500));
                         }
 
@@ -1290,7 +1306,7 @@ void OxiBle::task(void *param) {
                             vTaskDelay(pdMS_TO_TICKS(500));
                             ok = pClient->connect(bleAddr);
                             if (!ok) {
-                                Log::logf(CAT_OXI, LOG_WARN, "Post-bond-delete retry failed (err=%d)\n",
+                                Log::logf(CAT_OXI, LOG_DEBUG, "Post-bond-delete retry failed (err=%d)\n",
                                           pClient->getLastError());
                             }
                         }
@@ -1300,20 +1316,22 @@ void OxiBle::task(void *param) {
 
                     // encrypt for devices that require it 
                     if (device_needs_encryption) {
+                        failure = "encryption";
                         set_state(OXI_BONDING);
                         Log::logf(CAT_OXI, LOG_DEBUG, "Initiating encryption\n");
 
                         bool secured = pClient->secureConnection(false);
+                        connect_error = secured ? 0 : pClient->getLastError();
                         Log::logf(CAT_OXI, LOG_DEBUG, "Encryption: secure=%d connected=%d err=%d\n",
                                   secured, pClient->isConnected(), pClient->getLastError());
 
                         if (!pClient->isConnected()) {
-                            Log::logf(CAT_OXI, LOG_WARN, "Lost connection during encryption\n");
+                            Log::logf(CAT_OXI, LOG_DEBUG, "Lost connection during encryption\n");
                             continue;
                         }
 
                         if (!secured) {
-                            Log::logf(CAT_OXI, LOG_WARN, "Encryption failed, disconnecting to retry\n");
+                            Log::logf(CAT_OXI, LOG_DEBUG, "Encryption failed, disconnecting to retry\n");
                             pClient->disconnect();
                             vTaskDelay(pdMS_TO_TICKS(500));
                             continue;
@@ -1323,15 +1341,17 @@ void OxiBle::task(void *param) {
                     }
 
                     // subscribe
+                    failure = "subscription";
+                    connect_error = 0;
                     if (!subscribe_services(pClient)) {
-                        Log::logf(CAT_OXI, LOG_WARN, "No suitable services, disconnecting\n");
+                        Log::logf(CAT_OXI, LOG_DEBUG, "No suitable services, disconnecting\n");
                         pClient->disconnect();
                         continue;
                     }
 
                     // Final check - onDisconnect may have fired during subscribe
                     if (!pClient->isConnected()) {
-                        Log::logf(CAT_OXI, LOG_WARN, "Connection lost after subscribe\n");
+                        Log::logf(CAT_OXI, LOG_DEBUG, "Connection lost after subscribe\n");
                         continue;
                     }
 
@@ -1339,19 +1359,32 @@ void OxiBle::task(void *param) {
                     set_viatom_datetime();
                     OxiArbiter::set_source_id(pClient->getPeerAddress().toString().c_str());
                     set_state(OXI_STREAMING);
-                    Log::logf(CAT_OXI, LOG_INFO, oxyii_write_chr
-                        ? "Subscribed, initializing OxyII\n" : "Streaming started\n");
+                    Log::logf(CAT_OXI, LOG_INFO, "Sensor subscribed addr=%s name=\"%s\"%s\n",
+                              addr.c_str(), dev_name.c_str(),
+                              oxyii_write_chr ? "; initializing OxyII" : "");
 
                     if (mode == CONN_USER && !device_needs_encryption) {
                         known_add(addr.c_str());
                     }
+                    failed_addr[0] = 0;
+                    last_failure = nullptr;
                     connected = true;
                     break;
                 }
 
                 if (!connected) {
-                    Log::logf(CAT_OXI, LOG_WARN, "Connect sequence failed after %d attempt(s)\n",
-                              max_attempts);
+                    bool cancelled = disconnect_requested || disable_requested;
+                    bool repeated = strcmp(failed_addr, addr.c_str()) == 0 &&
+                                    last_failure == failure && last_connect_error == connect_error;
+                    Log::logf(CAT_OXI, cancelled ? LOG_DEBUG :
+                              mode == CONN_USER ? LOG_ERROR : repeated ? LOG_DEBUG : LOG_WARN,
+                              "Sensor connect %s addr=%s stage=%s error=%d\n",
+                              cancelled ? "cancelled" : "failed", addr.c_str(), failure, connect_error);
+                    if (!cancelled) {
+                        strlcpy(failed_addr, addr.c_str(), sizeof(failed_addr));
+                        last_failure = failure;
+                        last_connect_error = connect_error;
+                    }
                     if (pClient->isConnected()) pClient->disconnect();
                     set_state(OXI_DISCONNECTED);
                     last_reconnect = millis();
@@ -1420,7 +1453,7 @@ void OxiBle::suspend() {
 void OxiBle::resume() {
     if (ble_suspended) {
         ble_suspended = false;
-        Log::logf(CAT_OXI, LOG_INFO, "Resumed\n");
+        Log::logf(CAT_OXI, LOG_DEBUG, "Resumed\n");
         // Task's auto-reconnect will pick up from OXI_DISCONNECTED.
     }
 }
