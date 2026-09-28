@@ -99,7 +99,8 @@ struct BacklogEntry {
 };
 static BacklogEntry *backlog_entries = nullptr;
 static uint32_t backlog_entry_count = 0;
-static bool roots_confirmed = false;
+static bool roots_cached = false;
+static uint32_t roots_pending = 0;
 static uint32_t roots_endpoint = 0;
 static uint32_t roots_catalog_generation = 0;
 
@@ -317,8 +318,141 @@ static void note_uploaded(uint64_t bytes) {
     publish_change();
 }
 
+static uint32_t endpoint_hash(const SmbConfig &config) {
+    uint32_t crc = crc32_ieee_initial();
+    crc = crc32_ieee_update(crc,
+        reinterpret_cast<const uint8_t *>(config.endpoint),
+        strlen(config.endpoint));
+    const uint8_t newline = '\n';
+    crc = crc32_ieee_update(crc, &newline, 1);
+    crc = crc32_ieee_update(crc,
+        reinterpret_cast<const uint8_t *>(config.user), strlen(config.user));
+    return crc32_ieee_finish(crc);
+}
+
+static bool state_marker_path(const SmbConfig &config,
+                              const char *name,
+                              char *directory, size_t directory_size,
+                              char *path, size_t path_size) {
+    const uint32_t hash = endpoint_hash(config);
+    const int dir_len = snprintf(directory, directory_size,
+                                 "/airbridge/smb_%08lx",
+                                 static_cast<unsigned long>(hash));
+    const int path_len = snprintf(path, path_size, "%s/%s.done",
+                                  directory, name);
+    return dir_len > 0 && static_cast<size_t>(dir_len) < directory_size &&
+           path_len > 0 && static_cast<size_t>(path_len) < path_size;
+}
+
+static bool write_smb_marker(const char *directory, const char *path,
+                              const uint8_t *marker, size_t marker_size) {
+    char partial[88];
+    if (snprintf(partial, sizeof(partial), "%s.part", path) >=
+        static_cast<int>(sizeof(partial))) return false;
+    return storage.run([&](fs::FS &fs) {
+        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
+        fs.remove(partial);
+        fs::File file = fs.open(partial, FILE_WRITE);
+        const bool written = file && file.write(marker, marker_size) == marker_size;
+        if (file) {
+            file.flush();
+            file.close();
+        }
+        if (!written) {
+            fs.remove(partial);
+            return false;
+        }
+        if (fs.exists(path)) fs.remove(path);
+        if (!fs.rename(partial, path)) {
+            fs.remove(partial);
+            return false;
+        }
+        return true;
+    });
+}
+
+static bool write_state_marker(const SmbConfig &config,
+                               const EdfCatalog::Entry &entry) {
+    char directory[48];
+    char path[80];
+    if (!state_marker_path(config, entry.file_prefix, directory, sizeof(directory),
+                           path, sizeof(path))) return false;
+    uint8_t marker[12] = {'A', 'B', 'S', 'M', 1, entry.flags, 0, 0};
+    SdStorage::put_le32(marker + 8, entry.finalized_epoch);
+    return write_smb_marker(directory, path, marker, sizeof(marker));
+}
+
+static bool state_marker_exists(const SmbConfig &config,
+                                const EdfCatalog::Entry &entry) {
+    char directory[48];
+    char path[80];
+    if (!state_marker_path(config, entry.file_prefix, directory, sizeof(directory),
+                           path, sizeof(path))) return false;
+    SdStorage::Reader file;
+    if (!file.open(storage, path)) return false;
+    uint8_t marker[12];
+    const bool valid = file && file.size() == sizeof(marker) &&
+        file.read(marker, sizeof(marker)) == sizeof(marker) &&
+        memcmp(marker, "ABSM", 4) == 0 && marker[4] == 1 &&
+        marker[5] == entry.flags &&
+        (static_cast<uint32_t>(marker[8]) |
+         static_cast<uint32_t>(marker[9]) << 8 |
+         static_cast<uint32_t>(marker[10]) << 16 |
+         static_cast<uint32_t>(marker[11]) << 24) == entry.finalized_epoch;
+    if (file) file.close();
+    return valid;
+}
+
+struct RootFileState {
+    bool exists = false;
+    bool confirmed = false;
+    char directory[48];
+    char path[80];
+    uint8_t marker[20] = {'A', 'B', 'S', 'R', 1};
+};
+
+static bool read_root_state(const SmbConfig &config, const char *path,
+                             uint8_t *buffer, size_t buffer_size,
+                             RootFileState &out, char *error, size_t error_size) {
+    if (!state_marker_path(config, path + 1, out.directory, sizeof(out.directory),
+                           out.path, sizeof(out.path))) return false;
+    if (!storage.run([&](fs::FS &fs) { out.exists = fs.exists(path); return true; }))
+        return false;
+    if (!out.exists) return true;
+
+    SdStorage::Reader input;
+    if (!input.open(storage, path)) {
+        snprintf(error, error_size, "local_open:%s", path);
+        return false;
+    }
+    const uint64_t size = input.size();
+    uint32_t crc = crc32_ieee_initial();
+    for (uint64_t remaining = size; remaining;) {
+        const size_t wanted = remaining < buffer_size ? remaining : buffer_size;
+        if (input.read(buffer, wanted) != wanted) {
+            copy_text(error, error_size, "local_read_short");
+            return false;
+        }
+        crc = crc32_ieee_update(crc, buffer, wanted);
+        remaining -= wanted;
+    }
+    input.close();
+    SdStorage::put_le32(out.marker + 8, static_cast<uint32_t>(size));
+    SdStorage::put_le32(out.marker + 12, static_cast<uint32_t>(size >> 32));
+    SdStorage::put_le32(out.marker + 16, crc32_ieee_finish(crc));
+
+    SdStorage::Reader marker;
+    if (marker.open(storage, out.path)) {
+        uint8_t saved[sizeof(out.marker)];
+        out.confirmed = marker.size() == sizeof(saved) &&
+            marker.read(saved, sizeof(saved)) == sizeof(saved) &&
+            memcmp(saved, out.marker, sizeof(saved)) == 0;
+    }
+    return storage.valid();
+}
+
 static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
-                          bool mutable_file, uint8_t *buffer,
+                          const RootFileState *root, uint8_t *buffer,
                           size_t buffer_size, RunContext &run,
                           char *error, size_t error_size) {
     note_seen();
@@ -340,7 +474,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
         input.close();
         return false;
     }
-    if (!mutable_file && remote_stat.exists && !remote_stat.directory &&
+    if ((!root || root->confirmed) && remote_stat.exists && !remote_stat.directory &&
         remote_stat.size == local_size) {
         input.close();
         note_skipped();
@@ -356,6 +490,14 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
             input.close();
             return false;
         }
+    }
+    // A failed overwrite must not leave confirmation of the previous contents.
+    if (root) roots_cached = false;
+    if (root && !storage.run([&](fs::FS &fs) {
+        return !fs.exists(root->path) || fs.remove(root->path);
+    })) {
+        copy_text(error, error_size, "state_marker_remove");
+        return false;
     }
     if (!wait_open(client, remote, run, error, error_size)) {
         input.close();
@@ -397,95 +539,15 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
         return false;
     }
     note_uploaded(sent);
+    if (root && !write_smb_marker(root->directory, root->path,
+                                  root->marker, sizeof(root->marker))) {
+        copy_text(error, error_size, "state_marker_write");
+        return false;
+    }
     Log::logf(CAT_EXPORT, LOG_DEBUG,
               "[SMB] uploaded %s bytes=%llu\n", local_path,
               static_cast<unsigned long long>(sent));
     return true;
-}
-
-static uint32_t endpoint_hash(const SmbConfig &config) {
-    uint32_t crc = crc32_ieee_initial();
-    crc = crc32_ieee_update(crc,
-        reinterpret_cast<const uint8_t *>(config.endpoint),
-        strlen(config.endpoint));
-    const uint8_t newline = '\n';
-    crc = crc32_ieee_update(crc, &newline, 1);
-    crc = crc32_ieee_update(crc,
-        reinterpret_cast<const uint8_t *>(config.user), strlen(config.user));
-    return crc32_ieee_finish(crc);
-}
-
-static bool state_marker_path(const SmbConfig &config,
-                              const EdfCatalog::Entry &entry,
-                              char *directory, size_t directory_size,
-                              char *path, size_t path_size) {
-    const uint32_t hash = endpoint_hash(config);
-    const int dir_len = snprintf(directory, directory_size,
-                                 "/airbridge/smb_%08lx",
-                                 static_cast<unsigned long>(hash));
-    const int path_len = snprintf(path, path_size, "%s/%s.done",
-                                  directory, entry.file_prefix);
-    return dir_len > 0 && static_cast<size_t>(dir_len) < directory_size &&
-           path_len > 0 && static_cast<size_t>(path_len) < path_size;
-}
-
-static bool write_state_marker(const SmbConfig &config,
-                               const EdfCatalog::Entry &entry) {
-    char directory[48];
-    char path[80];
-    char partial[88];
-    if (!state_marker_path(config, entry, directory, sizeof(directory),
-                           path, sizeof(path)) ||
-        snprintf(partial, sizeof(partial), "%s.part", path) >=
-            static_cast<int>(sizeof(partial))) {
-        return false;
-    }
-    uint8_t marker[12] = {'A', 'B', 'S', 'M', 1, entry.flags, 0, 0};
-    marker[8] = static_cast<uint8_t>(entry.finalized_epoch);
-    marker[9] = static_cast<uint8_t>(entry.finalized_epoch >> 8);
-    marker[10] = static_cast<uint8_t>(entry.finalized_epoch >> 16);
-    marker[11] = static_cast<uint8_t>(entry.finalized_epoch >> 24);
-    return storage.run([&](fs::FS &fs) {
-        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
-        fs.remove(partial);
-        fs::File file = fs.open(partial, FILE_WRITE);
-        const bool written = file && file.write(marker, sizeof(marker)) == sizeof(marker);
-        if (file) {
-            file.flush();
-            file.close();
-        }
-        if (!written) {
-            fs.remove(partial);
-            return false;
-        }
-        if (fs.exists(path)) fs.remove(path);
-        if (!fs.rename(partial, path)) {
-            fs.remove(partial);
-            return false;
-        }
-        return true;
-    });
-}
-
-static bool state_marker_exists(const SmbConfig &config,
-                                const EdfCatalog::Entry &entry) {
-    char directory[48];
-    char path[80];
-    if (!state_marker_path(config, entry, directory, sizeof(directory),
-                           path, sizeof(path))) return false;
-    SdStorage::Reader file;
-    if (!file.open(storage, path)) return false;
-    uint8_t marker[12];
-    const bool valid = file && file.size() == sizeof(marker) &&
-        file.read(marker, sizeof(marker)) == sizeof(marker) &&
-        memcmp(marker, "ABSM", 4) == 0 && marker[4] == 1 &&
-        marker[5] == entry.flags &&
-        (static_cast<uint32_t>(marker[8]) |
-         static_cast<uint32_t>(marker[9]) << 8 |
-         static_cast<uint32_t>(marker[10]) << 16 |
-         static_cast<uint32_t>(marker[11]) << 24) == entry.finalized_epoch;
-    if (file) file.close();
-    return valid;
 }
 
 static bool sync_session_files(StorageSmbClient &client,
@@ -497,26 +559,26 @@ static bool sync_session_files(StorageSmbClient &client,
     for (const char *suffix : SESSION_SUFFIXES) {
         snprintf(path, sizeof(path), "/DATALOG/%s/%s_%s.edf",
                  entry.therapy_day, entry.file_prefix, suffix);
-        if (!sync_smb_file(client, path, false, buffer, buffer_size,
+        if (!sync_smb_file(client, path, nullptr, buffer, buffer_size,
                            run, error, error_size)) return false;
         snprintf(path, sizeof(path), "/DATALOG/%s/%s_%s.crc",
                  entry.therapy_day, entry.file_prefix, suffix);
-        if (!sync_smb_file(client, path, false, buffer, buffer_size,
+        if (!sync_smb_file(client, path, nullptr, buffer, buffer_size,
                            run, error, error_size)) return false;
     }
     return true;
 }
 
-static bool sync_root_files(StorageSmbClient &client,
+static bool sync_root_files(StorageSmbClient &client, const SmbConfig &config,
                             uint8_t *buffer, size_t buffer_size,
                             RunContext &run,
                             char *error, size_t error_size) {
     for (const char *path : ROOT_FILES) {
-        bool exists = false;
-        if (!storage.run([&](fs::FS &fs) { exists = fs.exists(path); return true; }))
+        RootFileState state;
+        if (!read_root_state(config, path, buffer, buffer_size, state, error, error_size))
             return false;
-        if (!exists) continue;
-        if (!sync_smb_file(client, path, true, buffer, buffer_size,
+        if (!state.exists) continue;
+        if (!sync_smb_file(client, path, &state, buffer, buffer_size,
                            run, error, error_size)) return false;
     }
     return true;
@@ -619,7 +681,7 @@ static bool run_smb(const Request &request) {
             }
         }
         if (success)
-            success = sync_root_files(client, buffer, buffer_size, run,
+            success = sync_root_files(client, config, buffer, buffer_size, run,
                                       error, sizeof(error));
     }
 
@@ -637,7 +699,8 @@ static bool run_smb(const Request &request) {
     status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
     status.current_day[0] = 0;
     portEXIT_CRITICAL(&status_mux);
-    roots_confirmed = true;
+    roots_pending = 0;
+    roots_cached = true;
     roots_endpoint = endpoint_hash(config);
     roots_catalog_generation = catalog.generation;
     publish_change();
@@ -827,7 +890,7 @@ static void refresh_backlog() {
         !AirSenseState::device_standby() || !storage.begin()) return;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
     const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
-    if (files_changed) roots_confirmed = false;
+    if (files_changed) roots_cached = false;
 
     Backlog smb = {}, shq = {};
     smb.config_revision = smb_revision;
@@ -925,16 +988,29 @@ static void refresh_backlog() {
             return;
         }
     }
-    if (smb.known && (!roots_confirmed || roots_endpoint != endpoint_hash(smb_config) ||
+    if (smb.known && (!roots_cached || roots_endpoint != endpoint_hash(smb_config) ||
                       roots_catalog_generation != catalog.generation)) {
-        if (!storage.run([&](fs::FS &fs) {
-            for (const char *path : ROOT_FILES) if (fs.exists(path)) ++smb.files;
-            return true;
-        })) {
-            smb.known = false;
-            copy_text(smb.error, sizeof(smb.error), "storage_unavailable");
+        uint8_t *buffer = static_cast<uint8_t *>(
+            aircannect::Memory::alloc_large(SdStorage::READ_CHUNK_BYTES));
+        uint32_t pending = 0;
+        smb.known = buffer != nullptr;
+        if (!buffer) copy_text(smb.error, sizeof(smb.error), "backlog_alloc");
+        for (const char *path : ROOT_FILES) {
+            if (!smb.known) break;
+            RootFileState state;
+            smb.known = read_root_state(smb_config, path, buffer,
+                SdStorage::READ_CHUNK_BYTES, state, smb.error, sizeof(smb.error));
+            if (state.exists && !state.confirmed) ++pending;
+        }
+        aircannect::Memory::free(buffer);
+        roots_cached = smb.known;
+        if (roots_cached) {
+            roots_pending = pending;
+            roots_endpoint = endpoint_hash(smb_config);
+            roots_catalog_generation = catalog.generation;
         }
     }
+    if (smb.known) smb.files += roots_pending;
     if (!storage.valid() || Config::revision(Config::Section::Smb) != smb_revision ||
         Config::revision(Config::Section::SleepHq) != shq_revision) {
         // An interrupted marker read is not evidence that the marker is absent.
