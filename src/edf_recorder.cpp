@@ -2028,10 +2028,10 @@ static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
         case 5: label = "Arousal"; break;
         default: return;
     }
-    const uint32_t end = relative_ms(raw.captured_ms) / 1000;
+    const uint32_t onset = relative_ms(raw.captured_ms) / 1000;
     const uint32_t safe_duration = duration > 0 ? duration : 0;
-    append_annotation(eve, end > safe_duration ? end - safe_duration : 0,
-                      safe_duration, label);
+    // Native EVE timestamps the reported event, without subtracting DUR.
+    append_annotation(eve, onset, safe_duration, label);
 }
 
 static uint32_t csr_onset(const RawFrame &raw, int32_t event_time) {
