@@ -102,6 +102,7 @@ struct alignas(std::max_align_t) uart_transaction_t {
     void *sink_context;
     size_t context_size;
     uint32_t queued_ms;
+    uint32_t sent_after_ms;
     unsigned references;
 
     uart_transaction_result_t result;
@@ -810,6 +811,7 @@ static void arbiter_task(void *param) {
             t->lcd_step == LcdStep::Expire) lcd_clear_at = 0;
         if (t->policy.accepted_types) Arbiter::clear_rx_frames();
 
+        __atomic_store_n(&t->sent_after_ms, millis() - t->queued_ms, __ATOMIC_RELEASE);
         uart->write(t->frame, t->frame_len);
         uart->flush();
         stat_tx++;
@@ -996,6 +998,7 @@ static uart_transaction_t *allocate_transaction(uint16_t frame_len,
     t->sink = sink;
     t->references = auto_release ? 1 : 2;
     t->queued_ms = millis();
+    t->sent_after_ms = UINT32_MAX;
     t->context_size = context_size;
     t->lcd_step = lcd_step;
     if (context_size) {
@@ -1259,7 +1262,9 @@ uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
 
 static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                        char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
-                         uart_frame_sink_t sink, bool *missing = nullptr) {
+                         uart_frame_sink_t sink, bool *missing = nullptr,
+                         Arbiter::VarReadTrace *trace = nullptr) {
+    if (trace) *trace = {};
     if (missing) *missing = false;
     uint16_t capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
     if (resp_buf && resp_len) capacity = *resp_len ? min(capacity, uint16_t(*resp_len - 1)) : 0;
@@ -1268,14 +1273,31 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     uint32_t elapsed = millis() - t->queued_ms;
     uint32_t remaining = elapsed < t->policy.overall_timeout_ms
         ? t->policy.overall_timeout_ms - elapsed : 0;
-    if (!await_transaction(t, remaining)) {
+    const bool completed = await_transaction(t, remaining);
+    if (trace) {
+        const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
+        elapsed = millis() - t->queued_ms;
+        trace->sent = sent_after != UINT32_MAX;
+        trace->queue_ms = trace->sent ? sent_after : elapsed;
+        trace->wait_ms = trace->sent ? elapsed - sent_after : 0;
+        // The worker's result is readable only after completion, not on timeout.
+        trace->outcome = !completed ? "deadline" :
+            t->result.timed_out ? "timeout" :
+            t->result.protocol_error ? "device_error" :
+            t->result.sink_failed ? "sink_failed" :
+            t->result.success ? "ok" : "blocked";
+    }
+    if (!completed) {
         Arbiter::cancel_transaction(t);
         if (resp_len) *resp_len = 0;
         return false;
     }
     if (missing)
         *missing = static_cast<single_response_capture_t *>(t->sink_context)->missing;
-    return Arbiter::finish_cmd(t, resp_buf, resp_len);
+    bool ok = Arbiter::finish_cmd(t, resp_buf, resp_len);
+    if (trace && !ok && strcmp(trace->outcome, "ok") == 0)
+        trace->outcome = "no_value";
+    return ok;
 }
 
 bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
@@ -1286,7 +1308,9 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
 
 Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
                                     cmd_priority_t prio, char *out,
-                                    uint16_t capacity, uint16_t timeout_ms) {
+                                    uint16_t capacity, uint16_t timeout_ms,
+                                    VarReadTrace *trace) {
+    if (trace) { *trace = {}; trace->outcome = "invalid_request"; }
     if (out && capacity) out[0] = 0;
     if (!name || strlen(name) != 3 || !out || capacity < 2) return VarResult::Failed;
     char command[9];
@@ -1294,20 +1318,28 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
     uint16_t length = capacity;
     bool missing;
     bool ok = read_command(command, src, prio, out, &length, timeout_ms,
-                            capture_variable, &missing);
-    if (missing) return VarResult::Missing;
-    if (!ok || length >= capacity) { out[0] = 0; return VarResult::Failed; }
+                            capture_variable, &missing, trace);
+    if (missing) {
+        if (trace) trace->outcome = "missing";
+        return VarResult::Missing;
+    }
+    if (!ok || length >= capacity) {
+        if (trace && ok) trace->outcome = "truncated";
+        out[0] = 0;
+        return VarResult::Failed;
+    }
     return VarResult::Ok;
 }
 
 Arbiter::VarResult Arbiter::read_var_hex(const char *name, cmd_source_t src,
                                         cmd_priority_t prio, uint32_t &out,
-                                        uint16_t timeout_ms) {
+                                        uint16_t timeout_ms, VarReadTrace *trace) {
     char text[9];
-    VarResult result = read_var(name, src, prio, text, sizeof(text), timeout_ms);
+    VarResult result = read_var(name, src, prio, text, sizeof(text), timeout_ms, trace);
     if (result != VarResult::Ok) return result;
-    return aircannect::parse_hex(text, strlen(text), out)
-        ? VarResult::Ok : VarResult::Failed;
+    if (aircannect::parse_hex(text, strlen(text), out)) return VarResult::Ok;
+    if (trace) trace->outcome = "invalid_hex";
+    return VarResult::Failed;
 }
 
 bool Arbiter::get_var(const char *name, cmd_source_t src, cmd_priority_t prio,

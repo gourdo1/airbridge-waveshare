@@ -282,9 +282,16 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
 
 static bool read_numeric_variable(const char *name, int16_t &value) {
     uint32_t parsed = 0;
-    if (Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                             parsed, POLL_TIMEOUT_MS) != Arbiter::VarResult::Ok ||
-        parsed > INT16_MAX) {
+    Arbiter::VarReadTrace trace;
+    const auto result = Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                                             parsed, POLL_TIMEOUT_MS, &trace);
+    if (result != Arbiter::VarResult::Ok || parsed > INT16_MAX) {
+        // Temporary capture of PLD failures, without logging live UART frames.
+        Log::logf(CAT_EDF, LOG_WARN,
+                  "PLD #%s result=%s queue=%lums sent=%u wait=%lums t=%lu\n",
+                  name, result == Arbiter::VarResult::Ok ? "out_of_range" : trace.outcome,
+                  static_cast<unsigned long>(trace.queue_ms), unsigned(trace.sent),
+                  static_cast<unsigned long>(trace.wait_ms), millis());
         return false;
     }
     value = static_cast<int16_t>(parsed);

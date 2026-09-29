@@ -62,6 +62,14 @@ typedef int8_t uart_frame_listener_t;
 namespace Arbiter {
     enum class VarResult { Ok, Missing, Failed };
 
+    // Temporary, opt-in PLD diagnostics; wait_ms includes caller wake-up time.
+    struct VarReadTrace {
+        uint32_t queue_ms = 0;
+        uint32_t wait_ms = 0;
+        bool sent = false;
+        const char *outcome = "not_queued";
+    };
+
     void init(HardwareSerial &serial, int rx_pin, int tx_pin);
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
@@ -77,9 +85,11 @@ namespace Arbiter {
 
     // Return only the scalar value; a truncated value is a failed read.
     VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,
-                       char *out, uint16_t capacity, uint16_t timeout_ms = 0);
+                       char *out, uint16_t capacity, uint16_t timeout_ms = 0,
+                       VarReadTrace *trace = nullptr);
     VarResult read_var_hex(const char *name, cmd_source_t src, cmd_priority_t prio,
-                           uint32_t &out, uint16_t timeout_ms = 0);
+                           uint32_t &out, uint16_t timeout_ms = 0,
+                           VarReadTrace *trace = nullptr);
     bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                  char *out, uint16_t capacity, uint16_t timeout_ms = 0);
 
