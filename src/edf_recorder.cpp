@@ -2412,10 +2412,12 @@ static void update_record_status() {
     portEXIT_CRITICAL(&status_mux);
 }
 
-static void close_segment() {
-    bool complete = write_current_record(brp);
-    complete = write_current_record(pld) && complete;
-    complete = write_current_record(sad) && complete;
+static void close_segment(uint32_t captured_ms) {
+    const uint32_t records = min(relative_ms(captured_ms), segment_duration_ms) / 60000;
+    // Flush elapsed full minutes only; the unfinished tail stays in RAM.
+    bool complete = advance_record(brp, records);
+    complete = advance_record(pld, records) && complete;
+    complete = advance_record(sad, records) && complete;
     update_record_status();
 
     // Attempt every finalization even after an earlier output failed.
@@ -2446,7 +2448,7 @@ static bool advance_segment(uint32_t captured_ms) {
 
     const uint32_t boundary = session_start_capture_ms + segment_duration_ms;
     const uint32_t seconds = segment_duration_ms / 1000;
-    close_segment();
+    close_segment(boundary);
     session_clock.native_start += seconds;
     session_clock.captured_ms = boundary;
     session_native_day = Air10Clock::therapy_day(session_clock.native_start);
@@ -2479,13 +2481,16 @@ static void stop_session(const ControlEvent &event) {
     capture_active = false;
     release_streams();
     RawFrame raw;
-    while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE)
-        process_raw_frame(raw);
+    while (xQueueReceive(raw_queue, &raw, 0) == pdTRUE) {
+        // Frames arriving after Stop must not extend or roll over the segment.
+        if (int32_t(raw.captured_ms - event.captured_ms) < 0)
+            process_raw_frame(raw);
+    }
     if (status.active) {
         // Do not create an empty next-day segment for a stop exactly at noon.
         if (relative_ms(event.captured_ms) > segment_duration_ms)
             (void)advance_segment(event.captured_ms - 1);
-        if (status.active) close_segment();
+        if (status.active) close_segment(event.captured_ms);
     }
 
     portENTER_CRITICAL(&status_mux);
