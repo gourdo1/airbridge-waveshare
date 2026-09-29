@@ -205,7 +205,6 @@ void Log::poll() {
     for (size_t i = 0; i < SYSLOG_SEND_BUDGET; i++) {
         if (xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
         if (!syslog_queue || !network_ready) {
-            syslog_head = syslog_count = 0;
             xSemaphoreGive(log_mutex);
             if (fd >= 0) close(fd);
             fd = -1;
