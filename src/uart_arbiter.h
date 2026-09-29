@@ -62,10 +62,12 @@ typedef int8_t uart_frame_listener_t;
 namespace Arbiter {
     enum class VarResult { Ok, Missing, Failed };
 
-    // Temporary, opt-in PLD diagnostics; wait_ms includes caller wake-up time.
+    // Temporary diagnostics. RX is matching-response handling, not wire arrival.
     struct VarReadTrace {
         uint32_t queue_ms = 0;
         uint32_t wait_ms = 0;
+        uint32_t sent_ms = 0;
+        uint32_t received_ms = 0;
         bool sent = false;
         const char *outcome = "not_queued";
     };

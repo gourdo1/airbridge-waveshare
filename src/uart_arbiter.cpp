@@ -1155,6 +1155,7 @@ bool Arbiter::transact_cmd(const char *cmd,
 }
 
 typedef struct {
+    uint32_t received_ms;
     uint16_t capacity;
     uint16_t length;
     bool received;
@@ -1166,6 +1167,7 @@ typedef struct {
 static bool capture_response(const qframe_t *frame, void *context, uint16_t offset) {
     single_response_capture_t *capture =
         static_cast<single_response_capture_t *>(context);
+    capture->received_ms = millis();
     uint16_t length = frame->payload_len - offset;
     uint16_t len = min(length, capture->capacity);
     auto *payload = reinterpret_cast<uint8_t *>(capture + 1);
@@ -1280,6 +1282,10 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
         trace->sent = sent_after != UINT32_MAX;
         trace->queue_ms = trace->sent ? sent_after : elapsed;
         trace->wait_ms = trace->sent ? elapsed - sent_after : 0;
+        trace->sent_ms = trace->sent ? t->queued_ms + sent_after : 0;
+        if (completed)
+            trace->received_ms = static_cast<single_response_capture_t *>(
+                t->sink_context)->received_ms;
         // The worker's result is readable only after completion, not on timeout.
         trace->outcome = !completed ? "deadline" :
             t->result.timed_out ? "timeout" :
@@ -1294,6 +1300,17 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     }
     if (missing)
         *missing = static_cast<single_response_capture_t *>(t->sink_context)->missing;
+    if (Log::get_cat_level(CAT_TIME) >= LOG_DEBUG &&
+        (strcmp(cmd, "G S #TIC") == 0 || strcmp(cmd, "G S #STK") == 0)) {
+        const auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
+        const auto *payload = reinterpret_cast<const char *>(capture + 1);
+        const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
+        Log::logf(CAT_TIME, LOG_DEBUG,
+                  "probe %s tx=%lu rx=%lu value=%.*s\n", cmd + 5,
+                  sent_after == UINT32_MAX ? 0UL : (unsigned long)(t->queued_ms + sent_after),
+                  (unsigned long)capture->received_ms,
+                  int(min(capture->length, capture->capacity)), payload);
+    }
     bool ok = Arbiter::finish_cmd(t, resp_buf, resp_len);
     if (trace && !ok && strcmp(trace->outcome, "ok") == 0)
         trace->outcome = "no_value";

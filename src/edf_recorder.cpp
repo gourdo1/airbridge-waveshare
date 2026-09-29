@@ -280,7 +280,8 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
     return false;
 }
 
-static bool read_numeric_variable(const char *name, int16_t &value) {
+static bool read_numeric_variable(const char *name, int16_t &value,
+                                  uint32_t slot) {
     uint32_t parsed = 0;
     Arbiter::VarReadTrace trace;
     const auto result = Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
@@ -295,6 +296,10 @@ static bool read_numeric_variable(const char *name, int16_t &value) {
         return false;
     }
     value = static_cast<int16_t>(parsed);
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "PLD #%s slot=%lu raw=%d tx=%lu rx=%lu\n", name,
+              (unsigned long)slot, int(value),
+              (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms);
     return true;
 }
 
@@ -1945,6 +1950,10 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                          const DecodedFrame &decoded) {
     uint32_t sample_ms = relative_ms(raw.captured_ms);
     if (!wave_clock.initialized) {
+        Log::logf(CAT_EDF, LOG_DEBUG,
+                  "BRP first seq=%u rx=%lu relative=%lu payload=%.*s\n",
+                  unsigned(decoded.sequence), (unsigned long)raw.captured_ms,
+                  (unsigned long)sample_ms, int(raw.len), raw.payload);
         wave_clock.initialized = true;
         wave_clock.relative_ms = sample_ms;
     } else {
@@ -1954,9 +1963,13 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                                    static_cast<uint32_t>(delta) * 40;
         const int32_t drift = static_cast<int32_t>(sample_ms - predicted);
         if (delta == 0) return;
-        if (delta > 32 || drift > 400 || drift < -400)
+        if (delta > 32 || drift > 400 || drift < -400) {
+            Log::logf(CAT_EDF, LOG_DEBUG,
+                      "BRP resync seq=%u delta=%u rx=%lu drift=%ld\n",
+                      unsigned(decoded.sequence), unsigned(delta),
+                      (unsigned long)raw.captured_ms, (long)drift);
             wave_clock.relative_ms = sample_ms;
-        else
+        } else
             wave_clock.relative_ms = predicted;
     }
     wave_clock.last_sequence = decoded.sequence;
@@ -2003,7 +2016,7 @@ static void sample_pld() {
 
     for (const auto &source : sources) {
         int16_t value = EDF_MISSING;
-        (void)read_numeric_variable(source.tag, value);
+        (void)read_numeric_variable(source.tag, value, absolute_slot);
         store_sample(pld, source.label, record, slot, value);
     }
 }
@@ -2039,6 +2052,9 @@ static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
     }
     const uint32_t onset = relative_ms(raw.captured_ms) / 1000;
     const uint32_t safe_duration = duration > 0 ? duration : 0;
+    Log::logf(CAT_EDF, LOG_DEBUG, "APN rx=%lu type=%d duration=%lu onset=%lu\n",
+              (unsigned long)raw.captured_ms, int(event_type),
+              (unsigned long)safe_duration, (unsigned long)onset);
     // Native EVE timestamps the reported event, without subtracting DUR.
     append_annotation(eve, onset, safe_duration, label);
 }
@@ -2184,6 +2200,11 @@ static bool anchor_session_clock(const ControlEvent &event) {
     }
     session_clock.native_start = Air10Clock::civil_seconds(native_now) -
         static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "anchor start_ms=%lu clock_ms=%lu tic=%02d:%02d:%02d native=%lld\n",
+              (unsigned long)event.captured_ms, (unsigned long)clock_ms,
+              native_now.hour, native_now.minute, native_now.second,
+              (long long)session_clock.native_start);
     const int64_t day = (session_clock.native_start - 43200) / 86400;
     if (day < 0x1000 || day >= 0xffff) {
         status_error("therapy day is outside Air10 range");
