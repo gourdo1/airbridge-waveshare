@@ -55,6 +55,8 @@ static uint8_t connect_retries = 0;
 static uint32_t last_roam_check = 0;
 static uint8_t low_rssi_count = 0;
 static bool roaming_suspended = false;
+static bool roam_connecting = false;
+static uint8_t roam_target[6] = {};
 static std::atomic<uint8_t> reconfigure_pending{0};
 
 #define AP_RETRY_INTERVAL_MS    30000
@@ -393,15 +395,23 @@ static void process_scan_results() {
 
 static void on_connected() {
     auto &cfg = Config::get();
-    Log::logf(CAT_WIFI, LOG_INFO, "Connected to '%s' (%s)\n",
-              WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    uint8_t *bssid = WiFi.BSSID();
+    if (roam_connecting && bssid) {
+        Log::logf(CAT_WIFI, LOG_INFO,
+                  "Roaming complete: '%s' %02X:%02X:%02X:%02X:%02X:%02X, IP=%s\n",
+                  WiFi.SSID().c_str(), bssid[0], bssid[1], bssid[2],
+                  bssid[3], bssid[4], bssid[5], WiFi.localIP().toString().c_str());
+    } else {
+        Log::logf(CAT_WIFI, LOG_INFO, "Connected to '%s' (%s)\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    }
+    roam_connecting = false;
 
     connect_idx = find_net_by_ssid(WiFi.SSID().c_str());
 
     // Persist the BSSID+channel we just connected on so the next reboot can
     // fast-path. If we got here via a PMF retry, mark that flag in the hint
     // so subsequent reconnects skip the doomed first attempt.
-    uint8_t *bssid = WiFi.BSSID();
     if (bssid) {
         NetworkHints::upsert(WiFi.SSID().c_str(), bssid, WiFi.channel(),
                              pending_pmf_disable);
@@ -520,6 +530,7 @@ void WiFiSetup::profiles_changed() {
 
 static void apply_network_config() {
     status_revision.fetch_add(1);
+    roam_connecting = false;
     const auto &cfg = Config::get();
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
     clear_scan();
@@ -585,11 +596,22 @@ static void apply_profile_changes() {
             if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
             clear_scan();
             scan_candidate_count = 0;
+            roam_connecting = false;
             set_state(WF_CONNECTED);
             return;
         }
     }
     apply_network_config();
+}
+
+static void log_roaming_failed() {
+    if (!roam_connecting) return;
+    Log::logf(CAT_WIFI, LOG_WARN,
+              "Roaming failed: %02X:%02X:%02X:%02X:%02X:%02X, connection timeout, last_reason=%u; resuming recovery\n",
+              roam_target[0], roam_target[1], roam_target[2],
+              roam_target[3], roam_target[4], roam_target[5],
+              (unsigned)last_disconnect_reason);
+    roam_connecting = false;
 }
 
 void WiFiSetup::check() {
@@ -681,6 +703,7 @@ void WiFiSetup::check() {
                 // while STA is still connecting makes esp_wifi_set_config fail.
                 retry_current_connect();
             } else {
+                log_roaming_failed();
                 stop_sta_attempt();
                 try_pos++;
                 if (try_pos < scan_candidate_count) {
@@ -697,6 +720,7 @@ void WiFiSetup::check() {
 
     case WF_PMF_RETRY:
         if (elapsed > CONNECT_TIMEOUT_MS) {
+            log_roaming_failed();
             Log::logf(CAT_WIFI, LOG_WARN, "PMF retry timed out, last_reason=%u\n",
                       (unsigned)last_disconnect_reason);
             stop_sta_attempt();
@@ -774,14 +798,16 @@ void WiFiSetup::check() {
                 int8_t candidate_rssi = scan_candidates[0].rssi;
                 if (candidate_rssi > current_rssi + ROAM_HYSTERESIS_DB) {
                     should_switch = true;
+                    memcpy(roam_target, scan_candidates[0].bssid, sizeof(roam_target));
+                    roam_connecting = true;
                     Log::logf(CAT_WIFI, LOG_INFO,
-                              "Candidate '%s' bssid=%02X:%02X:%02X:%02X:%02X:%02X "
-                              "%d dBm beats current %d dBm by >=%d\n",
+                              "Roaming '%s': %02X:%02X:%02X:%02X:%02X:%02X (%d dBm) -> "
+                              "%02X:%02X:%02X:%02X:%02X:%02X (%d dBm)\n",
                               cfg.wifi_nets[scan_candidates[0].net_idx].ssid.c_str(),
-                              scan_candidates[0].bssid[0], scan_candidates[0].bssid[1],
-                              scan_candidates[0].bssid[2], scan_candidates[0].bssid[3],
-                              scan_candidates[0].bssid[4], scan_candidates[0].bssid[5],
-                              candidate_rssi, current_rssi, ROAM_HYSTERESIS_DB);
+                              cur_bssid[0], cur_bssid[1], cur_bssid[2],
+                              cur_bssid[3], cur_bssid[4], cur_bssid[5], current_rssi,
+                              roam_target[0], roam_target[1], roam_target[2],
+                              roam_target[3], roam_target[4], roam_target[5], candidate_rssi);
                 } else {
                     Log::logf(CAT_WIFI, LOG_DEBUG,
                               "Candidate %d dBm vs current %d dBm (<%d hysteresis), staying\n",
