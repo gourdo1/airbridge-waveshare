@@ -1993,7 +1993,9 @@ static void sample_pld() {
     };
 
     const uint32_t elapsed = relative_ms(millis());
-    const uint32_t absolute_slot = elapsed / 2000;
+    if (elapsed < 2000) return;
+    // Native PLD captures sample zero after the first two-second interval.
+    const uint32_t absolute_slot = elapsed / 2000 - 1;
     if (absolute_slot == last_pld_slot) return;
     last_pld_slot = absolute_slot;
     const uint32_t record = absolute_slot / 30;
