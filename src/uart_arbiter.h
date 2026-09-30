@@ -52,9 +52,18 @@ typedef struct {
     bool timed_out;
     bool protocol_error;
     bool sink_failed;
+    bool send_window_missed;
     uint8_t terminal_type;
     uint16_t frame_count;
+    int32_t send_lateness_us;
 } uart_transaction_result_t;
+
+// Optional monotonic (esp_timer) TX window; zero disables scheduling.
+struct uart_send_window_t {
+    int64_t not_before_us = 0;
+    int64_t before_us = 0;
+    bool idle_only = false;
+};
 
 struct uart_transaction_t;
 typedef int8_t uart_frame_listener_t;
@@ -82,8 +91,10 @@ namespace Arbiter {
     // Finish only after transaction_done(); otherwise cancel_transaction().
     uart_transaction_t *begin_cmd(const char *cmd, cmd_source_t src,
                                   cmd_priority_t prio, uint16_t capacity,
-                                  uint16_t timeout_ms = 0);
-    bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length);
+                                  uint16_t timeout_ms = 0,
+                                  const uart_send_window_t &window = {});
+    bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length,
+                    uart_transaction_result_t *result = nullptr);
 
     // Return only the scalar value; a truncated value is a failed read.
     VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,

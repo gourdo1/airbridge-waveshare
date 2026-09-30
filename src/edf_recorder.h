@@ -30,7 +30,9 @@ void init();
 void therapy_started();
 void request_stop();
 void device_restarted();
-bool clock_write_allowed(const char **reason = nullptr);
+// Reserve the native clock until end_clock_write(); defer new STR collection.
+bool begin_clock_write(const char **reason = nullptr);
+void end_clock_write();
 void get_status(Status &out);
 
 }  // namespace EdfRecorder

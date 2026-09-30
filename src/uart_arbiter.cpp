@@ -5,6 +5,7 @@
 #include "custom_settings.h"
 #include "hex_util.h"
 #include <freertos/queue.h>
+#include <esp_timer.h>
 #include <atomic>
 #include <cstddef>
 
@@ -103,6 +104,7 @@ struct alignas(std::max_align_t) uart_transaction_t {
     size_t context_size;
     uint32_t queued_ms;
     uint32_t sent_after_ms;
+    uart_send_window_t send_window;
     unsigned references;
 
     uart_transaction_result_t result;
@@ -139,7 +141,6 @@ static bool pq_remove(uart_transaction_t *t) {
         if (pq.tickets[i] != t) continue;
         for (int j = i; j + 1 < pq.count; j++) pq.tickets[j] = pq.tickets[j + 1];
         pq.count--;
-        xSemaphoreTake(pq.available, 0);
         removed = true;
         break;
     }
@@ -150,7 +151,7 @@ static bool pq_remove(uart_transaction_t *t) {
 static void pq_init() {
     pq.count = 0;
     pq.mutex = xSemaphoreCreateMutex();
-    pq.available = xSemaphoreCreateCounting(ARBITER_QUEUE_DEPTH, 0);
+    pq.available = xSemaphoreCreateBinary();
 }
 
 static bool pq_push(uart_transaction_t *t, TickType_t wait = portMAX_DELAY) {
@@ -166,33 +167,38 @@ static bool pq_push(uart_transaction_t *t, TickType_t wait = portMAX_DELAY) {
 }
 
 static uart_transaction_t* pq_pop(TickType_t wait) {
-    if (xSemaphoreTake(pq.available, wait) != pdTRUE) {
-        return nullptr;
-    }
-    xSemaphoreTake(pq.mutex, portMAX_DELAY);
-
-    // Cancellation may remove a ticket after this task took its wake token.
-    if (pq.count == 0) {
-        xSemaphoreGive(pq.mutex);
-        return nullptr;
-    }
-    // highest prio value wins, then FIFO by ticket_id
-    int best = 0;
-    for (int i = 1; i < pq.count; i++) {
-        if (pq.tickets[i]->priority > pq.tickets[best]->priority ||
-            (pq.tickets[i]->priority == pq.tickets[best]->priority &&
-             pq.tickets[i]->ticket_id < pq.tickets[best]->ticket_id)) {
-            best = i;
+    const TickType_t started = xTaskGetTickCount();
+    for (;;) {
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        TickType_t remaining = elapsed < wait ? wait - elapsed : 0;
+        xSemaphoreTake(pq.mutex, portMAX_DELAY);
+        const int64_t now_us = esp_timer_get_time();
+        int best = -1;
+        for (int i = 0; i < pq.count; i++) {
+            const auto *candidate = pq.tickets[i];
+            const int64_t delay_us = candidate->send_window.not_before_us - now_us;
+            if (delay_us > 0 && !__atomic_load_n(&candidate->cancelled, __ATOMIC_ACQUIRE) &&
+                uint32_t(millis() - candidate->queued_ms) < candidate->policy.overall_timeout_ms) {
+                const int64_t tick_us = int64_t(portTICK_PERIOD_MS) * 1000;
+                remaining = min(remaining, TickType_t((delay_us + tick_us - 1) / tick_us));
+                continue;
+            }
+            // Highest eligible priority wins, then FIFO. Future work does not reserve UART.
+            if (best < 0 || candidate->priority > pq.tickets[best]->priority ||
+                (candidate->priority == pq.tickets[best]->priority &&
+                 candidate->ticket_id < pq.tickets[best]->ticket_id)) best = i;
         }
+        if (best >= 0) {
+            auto *t = pq.tickets[best];
+            for (int i = best; i + 1 < pq.count; i++) pq.tickets[i] = pq.tickets[i + 1];
+            pq.count--;
+            xSemaphoreGive(pq.mutex);
+            return t;
+        }
+        xSemaphoreGive(pq.mutex);
+        if (!remaining) return nullptr;
+        xSemaphoreTake(pq.available, remaining);
     }
-    uart_transaction_t *t = pq.tickets[best];
-    // Remove by shifting
-    for (int i = best; i < pq.count - 1; i++) {
-        pq.tickets[i] = pq.tickets[i + 1];
-    }
-    pq.count--;
-    xSemaphoreGive(pq.mutex);
-    return t;
 }
 
 static uint32_t parse_bdd_baud(const uint8_t *payload, uint16_t len);
@@ -706,6 +712,7 @@ static void lcd_check();
 static bool lcd_advance(uart_transaction_t *t);
 
 static bool transaction_source_allowed(const uart_transaction_t *t) {
+    if (t->send_window.idle_only && sys_state != SYS_IDLE) return false;
     if (t->lcd_step != LcdStep::None &&
         sys_state != SYS_IDLE && sys_state != SYS_THERAPY) return false;
     return uart_source_allowed(t->source);
@@ -811,6 +818,16 @@ static void arbiter_task(void *param) {
             t->lcd_step == LcdStep::Expire) lcd_clear_at = 0;
         if (t->policy.accepted_types) Arbiter::clear_rx_frames();
 
+        const int64_t sent_us = esp_timer_get_time();
+        if (t->send_window.before_us && sent_us >= t->send_window.before_us) {
+            t->result.send_window_missed = true;
+            current_ticket = nullptr;
+            finish_ticket(t);
+            t = nullptr;
+            continue;
+        }
+        if (t->send_window.before_us)
+            t->result.send_lateness_us = int32_t(sent_us - t->send_window.not_before_us);
         __atomic_store_n(&t->sent_after_ms, millis() - t->queued_ms, __ATOMIC_RELEASE);
         uart->write(t->frame, t->frame_len);
         uart->flush();
@@ -1198,15 +1215,22 @@ static bool capture_variable(const qframe_t *frame, void *context) {
 
 static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
                          cmd_priority_t prio, uint16_t output_capacity,
-                         uint16_t timeout_ms, uart_frame_sink_t sink)
+                         uint16_t timeout_ms, uart_frame_sink_t sink,
+                         const uart_send_window_t &window = {})
 {
     if (timeout_ms == 0) timeout_ms = Config::get().uart_cmd_timeout_ms;
+    const int64_t delay_us = max(int64_t(0), window.not_before_us - esp_timer_get_time());
+    // Scheduled commands are bounded to the next second, not long-lived jobs.
+    if ((window.not_before_us || window.before_us) &&
+        (window.not_before_us <= 0 || window.before_us <= window.not_before_us ||
+         delay_us > 1000000))
+        return nullptr;
     uart_response_policy_t policy = {};
     policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = timeout_ms;
-    policy.overall_timeout_ms = timeout_ms;
+    policy.overall_timeout_ms = timeout_ms + uint32_t((delay_us + 999) / 1000);
 
     bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
     uint16_t capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
@@ -1216,11 +1240,14 @@ static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
     capture->capacity = capacity;
     capture->bdd = bdd;
+    t->send_window = window;
     return publish_transaction(t);
 }
 
-bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_len) {
+bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_len,
+                         uart_transaction_result_t *result) {
     if (!transaction_done(t)) return false;
+    if (result) *result = t->result;
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
     uint16_t output_capacity = resp_buf ? capture->capacity : 0;
     if (resp_buf && resp_len)
@@ -1256,10 +1283,10 @@ bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_l
 
 uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
                                      cmd_priority_t prio, uint16_t capacity,
-                                     uint16_t timeout_ms) {
+                                     uint16_t timeout_ms, const uart_send_window_t &window) {
     return begin_read_command(cmd, src, prio,
         capacity ? min(uint16_t(capacity - 1), uint16_t(QFRAME_MAX_PAYLOAD)) : 0,
-        timeout_ms, capture_single_response);
+        timeout_ms, capture_single_response, window);
 }
 
 static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,

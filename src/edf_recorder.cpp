@@ -141,6 +141,7 @@ static fs::FS *storage = nullptr;
 static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
 static bool pending_scanned = false;
+static bool clock_write_active = false;
 static const char *pending_scan_error = nullptr;
 static uint32_t device_generation = 0;
 static uint32_t synced_device_generation = 0;
@@ -2749,10 +2750,14 @@ static void sync_pending() {
 static void process_pending() {
     if (status.active || post_processing_cancelled() ||
         (next_pending_ms && int32_t(millis() - next_pending_ms) < 0)) return;
-    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
     portENTER_CRITICAL(&status_mux);
+    if (clock_write_active) {
+        portEXIT_CRITICAL(&status_mux);
+        return;
+    }
     status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
+    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
     sync_pending();
     portENTER_CRITICAL(&status_mux);
     status.post_processing = false;
@@ -2962,17 +2967,25 @@ void device_restarted() {
     request_stop();
 }
 
-bool clock_write_allowed(const char **reason) {
+bool begin_clock_write(const char **reason) {
     const bool mounted = SdStorage::mounted();
     portENTER_CRITICAL(&status_mux);
     const char *blocked = status.active ? "EDF recording active" :
         mounted && pending_scan_error ? pending_scan_error :
         mounted && !pending_scanned ? "STR pending journal not checked" :
         status.pending_str ? "STR pending" :
-        status.post_processing ? "STR collection in progress" : nullptr;
+        status.post_processing ? "STR collection in progress" :
+        clock_write_active ? "clock write already active" : nullptr;
+    if (!blocked) clock_write_active = true;
     portEXIT_CRITICAL(&status_mux);
     if (reason) *reason = blocked;
     return !blocked;
+}
+
+void end_clock_write() {
+    portENTER_CRITICAL(&status_mux);
+    clock_write_active = false;
+    portEXIT_CRITICAL(&status_mux);
 }
 
 void get_status(Status &out) {
@@ -2991,10 +3004,11 @@ void init() {}
 void therapy_started() {}
 void request_stop() {}
 void device_restarted() {}
-bool clock_write_allowed(const char **reason) {
+bool begin_clock_write(const char **reason) {
     if (reason) *reason = nullptr;
     return true;
 }
+void end_clock_write() {}
 
 void get_status(Status &out) {
     out = {};
