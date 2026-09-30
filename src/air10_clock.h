@@ -9,6 +9,19 @@ struct Calendar {
     int year, month, day, hour, minute, second;
 };
 
+// Native civil time mapped to ESP uptime, not to NTP. Uncertainty describes
+// the measured edge bracket; it does not include unmeasured long-term drift.
+struct PhaseAnchor {
+    int64_t civil_ms = 0;
+    uint32_t captured_ms = 0;
+    uint32_t generation = 0;
+    uint16_t uncertainty_ms = 0;
+
+    int64_t native_at_ms(uint32_t now_ms) const {
+        return civil_ms + int32_t(now_ms - captured_ms);
+    }
+};
+
 // Queued UART read of DAC/TIC, bracketed by DAC across midnight.
 bool read(Calendar &out, uint16_t timeout_ms = 0, uint32_t *captured_ms = nullptr);
 
@@ -16,6 +29,11 @@ bool read(Calendar &out, uint16_t timeout_ms = 0, uint32_t *captured_ms = nullpt
 void poll_status();
 void status_time(char (&out)[20]);
 void invalidate();
+
+// Copy a recent idle measurement for a session; check it against clock resets
+// without expiring the frozen session anchor during therapy.
+bool phase_anchor(PhaseAnchor &out);
+bool phase_unchanged(const PhaseAnchor &anchor);
 
 // Called from the main loop; applies NTP time after therapy and pending STR.
 void handle();

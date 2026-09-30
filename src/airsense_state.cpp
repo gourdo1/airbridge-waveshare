@@ -93,7 +93,6 @@ static void poll_therapy_state() {
             poll_device_uptime();
             Config::refresh_device_info();
             poll_therapy_mode();
-            Air10Clock::poll_status();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = cached_rop.load();
             cached_rop = new_rop;
@@ -114,6 +113,7 @@ static void poll_therapy_state() {
             if (new_rop != prev_rop) {
                 WebUI::push_status_event();
             }
+            Air10Clock::poll_status();
         }
     } else {
         airsense_present = false;

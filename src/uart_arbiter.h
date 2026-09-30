@@ -71,7 +71,7 @@ typedef int8_t uart_frame_listener_t;
 namespace Arbiter {
     enum class VarResult { Ok, Missing, Failed };
 
-    // Temporary diagnostics. RX is matching-response handling, not wire arrival.
+    // RX is matching-response handling, not wire arrival or device sample time.
     struct VarReadTrace {
         uint32_t queue_ms = 0;
         uint32_t wait_ms = 0;
@@ -94,7 +94,8 @@ namespace Arbiter {
                                   uint16_t timeout_ms = 0,
                                   const uart_send_window_t &window = {});
     bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length,
-                    uart_transaction_result_t *result = nullptr);
+                    uart_transaction_result_t *result = nullptr,
+                    VarReadTrace *trace = nullptr);
 
     // Return only the scalar value; a truncated value is a failed read.
     VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,

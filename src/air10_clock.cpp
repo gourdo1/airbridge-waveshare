@@ -6,6 +6,7 @@
 #include "edf_recorder.h"
 #include "debug_log.h"
 #include "qframe.h"
+#include "board.h"
 #include <Arduino.h>
 #include <atomic>
 #include <esp_timer.h>
@@ -15,6 +16,8 @@ static constexpr uint32_t DEVICE_TIME_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t DEVICE_TIME_MAX_AGE_MS = 90000;
 static constexpr uint16_t CLOCK_TIMEOUT_MS = 500;
 static constexpr int64_t CLOCK_SEND_WINDOW_US = 10000;
+static constexpr uint32_t PHASE_PROBE_BUDGET_MS = 1500;
+static constexpr uint32_t PHASE_MAX_BRACKET_MS = 200;
 
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
@@ -30,6 +33,22 @@ static char clock_sync_tic[16];
 static portMUX_TYPE device_time_mux = portMUX_INITIALIZER_UNLOCKED;
 static char device_time[20] = "--";
 static uint32_t device_time_ms = 0;
+
+struct ClockObservation {
+    int64_t civil = 0;
+    uint32_t sent_ms = 0;
+    uint32_t received_ms = 0;
+};
+
+// Shared clock observations; only handle()/poll_status() own probe tickets.
+static Air10Clock::PhaseAnchor device_phase;
+static uint32_t phase_generation = 1;
+static ClockObservation last_clock_read;
+static ClockObservation phase_previous;
+static char phase_date[9];
+static uint32_t phase_started_ms = 0, phase_probe_generation = 0;
+static bool phase_measuring = false;
+static uart_transaction_t *phase_ticket = nullptr;
 
 void Air10Clock::status_time(char (&out)[20]) {
     system_state_t state = Arbiter::get_state();
@@ -48,20 +67,61 @@ static void publish_device_time(const char *text) {
     portEXIT_CRITICAL(&device_time_mux);
 }
 
-void Air10Clock::invalidate() { publish_device_time("--"); }
+void Air10Clock::invalidate() {
+    portENTER_CRITICAL(&device_time_mux);
+    device_phase = {};
+    last_clock_read = {};
+    phase_generation++;
+    portEXIT_CRITICAL(&device_time_mux);
+    publish_device_time("--");
+}
+
+bool Air10Clock::phase_anchor(PhaseAnchor &out) {
+    portENTER_CRITICAL(&device_time_mux);
+    out = device_phase;
+    portEXIT_CRITICAL(&device_time_mux);
+    if (out.generation && uint32_t(millis() - out.captured_ms) < DEVICE_TIME_MAX_AGE_MS)
+        return true;
+    out = {};
+    return false;
+}
+
+bool Air10Clock::phase_unchanged(const PhaseAnchor &anchor) {
+    portENTER_CRITICAL(&device_time_mux);
+    const bool valid = anchor.generation && anchor.generation == phase_generation;
+    portEXIT_CRITICAL(&device_time_mux);
+    return valid;
+}
+
+static void observe_clock_read(const Air10Clock::Calendar &value,
+                                const Arbiter::VarReadTrace &trace) {
+    const int64_t civil = Air10Clock::civil_seconds(value);
+    portENTER_CRITICAL(&device_time_mux);
+    if (device_phase.generation &&
+        (device_phase.native_at_ms(trace.received_ms) + device_phase.uncertainty_ms < civil * 1000 ||
+         device_phase.native_at_ms(trace.sent_ms) - device_phase.uncertainty_ms >= (civil + 1) * 1000)) {
+        device_phase = {};
+        phase_generation++;
+    }
+    last_clock_read = {civil, trace.sent_ms, trace.received_ms};
+    portEXIT_CRITICAL(&device_time_mux);
+}
 
 bool Air10Clock::read(Calendar &out, uint16_t timeout_ms, uint32_t *captured_ms) {
     for (uint8_t attempt = 0; attempt < 2; attempt++) {
         char before[9], tic[7], after[9];
+        Arbiter::VarReadTrace trace;
         if (!Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
                               before, sizeof(before), timeout_ms) ||
-            !Arbiter::get_var("TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                              tic, sizeof(tic), timeout_ms)) return false;
+            Arbiter::read_var("TIC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                              tic, sizeof(tic), timeout_ms, &trace) != Arbiter::VarResult::Ok)
+            return false;
         const uint32_t sampled_ms = millis();
         if (!Arbiter::get_var("DAC", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
                               after, sizeof(after), timeout_ms)) return false;
         if (strcmp(before, after) != 0) continue;
         if (!parse_calendar(before, tic, out)) return false;
+        observe_clock_read(out, trace);
         if (captured_ms) *captured_ms = sampled_ms;
         return true;
     }
@@ -77,10 +137,86 @@ void Air10Clock::poll_status() {
 
     char text[20] = "--";
     Air10Clock::Calendar t;
-    if (Air10Clock::read(t, CLOCK_TIMEOUT_MS))
+    if (Air10Clock::read(t, CLOCK_TIMEOUT_MS)) {
         snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
                  t.year, t.month, t.day, t.hour, t.minute);
+        if (AB_STORAGE_HAS_SDCARD && AirSenseState::device_standby() &&
+            !clock_sync_ticket && !phase_measuring) {
+            portENTER_CRITICAL(&device_time_mux);
+            phase_previous = last_clock_read;
+            phase_probe_generation = phase_generation;
+            portEXIT_CRITICAL(&device_time_mux);
+            snprintf(phase_date, sizeof(phase_date), "%02d%02d%04d", t.day, t.month, t.year);
+            phase_started_ms = millis();
+            phase_measuring = true;
+        }
+    }
     publish_device_time(text);
+}
+
+static void stop_phase_measurement() {
+    if (phase_ticket) Arbiter::cancel_transaction(phase_ticket);
+    phase_ticket = nullptr;
+    phase_measuring = false;
+}
+
+static void handle_phase_measurement() {
+    if (!phase_measuring) return;
+    portENTER_CRITICAL(&device_time_mux);
+    const bool unchanged = phase_probe_generation == phase_generation;
+    portEXIT_CRITICAL(&device_time_mux);
+    if (!unchanged || !AirSenseState::device_standby() || clock_sync_ticket ||
+        uint32_t(millis() - phase_started_ms) >= PHASE_PROBE_BUDGET_MS) {
+        stop_phase_measurement();
+        return;
+    }
+
+    if (phase_ticket) {
+        if (!Arbiter::transaction_done(phase_ticket)) return;
+        char response[32] = {};
+        uint16_t length = sizeof(response);
+        Arbiter::VarReadTrace trace;
+        const bool ok = Arbiter::finish_cmd(phase_ticket, response, &length, nullptr, &trace);
+        phase_ticket = nullptr;
+        Air10Clock::Calendar value;
+        const char *tic = qframe_response_value(response);
+        if (!ok || !trace.sent || length >= sizeof(response) ||
+            !Air10Clock::parse_calendar(phase_date, tic, value)) {
+            stop_phase_measurement();
+            return;
+        }
+        int64_t civil = Air10Clock::civil_seconds(value);
+        if (civil == phase_previous.civil - 86399) civil += 86400;
+        if (civil != phase_previous.civil) {
+            const uint32_t width = trace.received_ms - phase_previous.sent_ms;
+            if (civil == phase_previous.civil + 1 && width <= PHASE_MAX_BRACKET_MS) {
+                // The edge is after the old read's TX and before the new RX.
+                // RX(old)..RX(new) would claim precision the protocol lacks.
+                Air10Clock::PhaseAnchor measured;
+                measured.civil_ms = civil * 1000;
+                measured.captured_ms = phase_previous.sent_ms + width / 2;
+                measured.uncertainty_ms = (width + 1) / 2;
+                measured.generation = phase_probe_generation;
+                portENTER_CRITICAL(&device_time_mux);
+                if (phase_generation == measured.generation) device_phase = measured;
+                portEXIT_CRITICAL(&device_time_mux);
+                Log::logf(CAT_TIME, LOG_DEBUG,
+                          "RTC phase civil=%lld mono=%lu uncertainty=%ums\n",
+                          (long long)civil, (unsigned long)measured.captured_ms,
+                          unsigned(measured.uncertainty_ms));
+            } else if (civil != phase_previous.civil + 1) {
+                Air10Clock::invalidate();
+            }
+            stop_phase_measurement();
+            return;
+        }
+        phase_previous = {civil, trace.sent_ms, trace.received_ms};
+    }
+
+    const uart_send_window_t idle_only = {0, 0, true};
+    phase_ticket = Arbiter::begin_cmd("G S #TIC", CMD_SRC_INTERNAL,
+        CMD_PRIO_NORMAL, 32, CLOCK_TIMEOUT_MS, idle_only);
+    if (!phase_ticket) stop_phase_measurement();
 }
 
 void Air10Clock::request_sync(bool manual) {
@@ -109,6 +245,8 @@ static bool write_clock_value(const char *command) {
 }
 
 static void push_time_to_resmed() {
+    stop_phase_measurement();
+    Air10Clock::invalidate();
     struct tm t;
     time_t now = time(nullptr);
     localtime_r(&now, &t);
@@ -206,6 +344,7 @@ bool Air10Clock::pull_time(bool force) {
 }
 
 void Air10Clock::handle() {
+    handle_phase_measurement();
     const bool auto_enabled = Config::get().resmed_time;
     static bool was_auto_enabled = true;
     if (auto_enabled && !was_auto_enabled) request_sync();

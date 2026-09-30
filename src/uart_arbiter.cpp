@@ -1244,10 +1244,31 @@ static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
     return publish_transaction(t);
 }
 
+static void read_trace(const uart_transaction_t *t, bool completed,
+                       Arbiter::VarReadTrace &trace) {
+    trace = {};
+    const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
+    const uint32_t elapsed = millis() - t->queued_ms;
+    trace.sent = sent_after != UINT32_MAX;
+    trace.queue_ms = trace.sent ? sent_after : elapsed;
+    trace.wait_ms = trace.sent ? elapsed - sent_after : 0;
+    trace.sent_ms = trace.sent ? t->queued_ms + sent_after : 0;
+    if (completed)
+        trace.received_ms = static_cast<const single_response_capture_t *>(
+            t->sink_context)->received_ms;
+    // Worker-owned fields may only be read after completion.
+    trace.outcome = !completed ? "deadline" :
+        t->result.timed_out ? "timeout" :
+        t->result.protocol_error ? "device_error" :
+        t->result.sink_failed ? "sink_failed" :
+        t->result.success ? "ok" : "blocked";
+}
+
 bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_len,
-                         uart_transaction_result_t *result) {
+                         uart_transaction_result_t *result, VarReadTrace *trace) {
     if (!transaction_done(t)) return false;
     if (result) *result = t->result;
+    if (trace) read_trace(t, true, *trace);
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
     uint16_t output_capacity = resp_buf ? capture->capacity : 0;
     if (resp_buf && resp_len)
@@ -1303,23 +1324,7 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     uint32_t remaining = elapsed < t->policy.overall_timeout_ms
         ? t->policy.overall_timeout_ms - elapsed : 0;
     const bool completed = await_transaction(t, remaining);
-    if (trace) {
-        const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
-        elapsed = millis() - t->queued_ms;
-        trace->sent = sent_after != UINT32_MAX;
-        trace->queue_ms = trace->sent ? sent_after : elapsed;
-        trace->wait_ms = trace->sent ? elapsed - sent_after : 0;
-        trace->sent_ms = trace->sent ? t->queued_ms + sent_after : 0;
-        if (completed)
-            trace->received_ms = static_cast<single_response_capture_t *>(
-                t->sink_context)->received_ms;
-        // The worker's result is readable only after completion, not on timeout.
-        trace->outcome = !completed ? "deadline" :
-            t->result.timed_out ? "timeout" :
-            t->result.protocol_error ? "device_error" :
-            t->result.sink_failed ? "sink_failed" :
-            t->result.success ? "ok" : "blocked";
-    }
+    if (trace) read_trace(t, completed, *trace);
     if (!completed) {
         Arbiter::cancel_transaction(t);
         if (resp_len) *resp_len = 0;
