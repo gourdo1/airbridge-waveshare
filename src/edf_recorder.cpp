@@ -166,6 +166,7 @@ static size_t header_capacity = 0;
 static uint32_t session_start_capture_ms = 0;
 static uint32_t segment_duration_ms = 0;
 static Air10Clock::Anchor session_clock;
+static Air10Clock::PhaseAnchor session_event_clock;
 static uint16_t session_native_day = 0;
 static char recording_id[81] = {};
 static char start_date[9] = {};
@@ -2051,7 +2052,17 @@ static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
         case 5: label = "Arousal"; break;
         default: return;
     }
-    const uint32_t onset = relative_ms(raw.captured_ms) / 1000;
+    int64_t elapsed_ms = relative_ms(raw.captured_ms);
+    if (session_event_clock.generation) {
+        if (Air10Clock::phase_unchanged(session_event_clock)) {
+            elapsed_ms = session_event_clock.native_at_ms(raw.captured_ms) -
+                         session_clock.native_start * 1000;
+        } else {
+            session_event_clock = {};
+            Log::logf(CAT_EDF, LOG_DEBUG, "APN clock phase invalidated; using relative time\n");
+        }
+    }
+    const uint32_t onset = elapsed_ms > 0 ? uint32_t(elapsed_ms / 1000) : 0;
     const uint32_t safe_duration = duration > 0 ? duration : 0;
     Log::logf(CAT_EDF, LOG_DEBUG, "APN rx=%lu type=%d duration=%lu onset=%lu\n",
               (unsigned long)raw.captured_ms, int(event_type),
@@ -2191,6 +2202,7 @@ static void clear_session_memory(bool remove_partial) {
 
 static bool anchor_session_clock(const ControlEvent &event) {
     session_clock = {};
+    session_event_clock = {};
     session_clock.captured_ms = event.captured_ms;
     Air10Clock::Calendar native_now;
     uint32_t clock_ms = 0;
@@ -2201,6 +2213,16 @@ static bool anchor_session_clock(const ControlEvent &event) {
     }
     session_clock.native_start = Air10Clock::civil_seconds(native_now) -
         static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
+    if (Air10Clock::phase_anchor(session_event_clock)) {
+        Log::logf(CAT_EDF, LOG_DEBUG,
+                  "APN clock phase offset=%lldms uncertainty=%ums age=%lums\n",
+                  (long long)(session_event_clock.native_at_ms(event.captured_ms) -
+                              session_clock.native_start * 1000),
+                  unsigned(session_event_clock.uncertainty_ms),
+                  (unsigned long)(clock_ms - session_event_clock.captured_ms));
+    } else {
+        Log::logf(CAT_EDF, LOG_DEBUG, "APN clock phase unavailable; using relative time\n");
+    }
     Log::logf(CAT_EDF, LOG_DEBUG,
               "anchor start_ms=%lu clock_ms=%lu tic=%02d:%02d:%02d native=%lld\n",
               (unsigned long)event.captured_ms, (unsigned long)clock_ms,
