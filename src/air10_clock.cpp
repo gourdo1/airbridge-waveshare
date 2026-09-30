@@ -4,6 +4,7 @@
 #include "wifi_setup.h"
 #include "edf_recorder.h"
 #include "debug_log.h"
+#include "qframe.h"
 #include <Arduino.h>
 #include <atomic>
 
@@ -75,6 +76,23 @@ void Air10Clock::request_sync() {
     clock_sync_attempted = false;
 }
 
+static bool write_clock_value(const char *command) {
+    char response[64] = {};
+    uint16_t length = sizeof(response);
+    bool ok = Arbiter::send_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                response, &length);
+    const char *value = qframe_response_value(response);
+    // The device can refuse the change and return R with its unchanged value.
+    if (ok && value && strcmp(value, command + 9) == 0) return true;
+
+    const bool rejected = !ok && response[0];
+    if (rejected) clock_sync_pending = false;
+    Log::logf(CAT_TIME, LOG_WARN, "ResMed clock write %s: %s -> %s\n",
+              rejected ? "rejected (use TIMESYNC to retry)" : "not applied; will retry",
+              command, response[0] ? response : "timeout");
+    return false;
+}
+
 static bool push_time_to_resmed() {
     if (!WiFiSetup::time_synced()) return false;
 
@@ -88,35 +106,40 @@ static bool push_time_to_resmed() {
     snprintf(tic_cmd, sizeof(tic_cmd), "P S #TIC %02d%02d%02d",
              t.tm_hour, t.tm_min, t.tm_sec);
 
-    char resp[64] = {};
-    uint16_t resp_len = sizeof(resp);
-    bool ok_dac = Arbiter::send_cmd(dac_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
-    if (!ok_dac) {
-        // A device error is terminal until TIMESYNC; a timeout can be retried.
-        if (resp[0]) clock_sync_pending = false;
-        Log::logf(CAT_TIME, LOG_WARN, "ResMed date %s: %s\n",
-                  resp[0] ? "rejected (use TIMESYNC to retry)" : "timeout", resp);
-        return false;
-    }
+    if (!write_clock_value(dac_cmd)) return false;
     publish_device_time("--");
-    resp[0] = '\0';
-    resp_len = sizeof(resp);
-    bool ok_tic = Arbiter::send_cmd(tic_cmd, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, resp, &resp_len);
-    if (!ok_tic && resp[0]) {
-        clock_sync_pending = false;
-        Log::logf(CAT_TIME, LOG_WARN, "ResMed time rejected (use TIMESYNC to retry): %s\n", resp);
+    const uint32_t write_ms = millis();
+    if (!write_clock_value(tic_cmd)) return false;
+
+    Air10Clock::Calendar observed;
+    uint32_t read_ms;
+    if (!Air10Clock::read(observed, CLOCK_TIMEOUT_MS, &read_ms)) {
+        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock verification read failed\n");
         return false;
     }
 
-    if (ok_dac && ok_tic) {
-        Log::logf(CAT_TIME, LOG_INFO, "ResMed clock set: %02d%02d%04d %02d%02d%02d\n",
-                  t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
-                  t.tm_hour, t.tm_min, t.tm_sec);
-    } else {
-        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock set failed (dac=%d tic=%d)\n",
-                  ok_dac, ok_tic);
+    const Air10Clock::Calendar requested = {
+        t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+        t.tm_hour, t.tm_min, t.tm_sec,
+    };
+    const int64_t advance = Air10Clock::civil_seconds(observed) -
+                            Air10Clock::civil_seconds(requested);
+    // RTC reads have whole-second precision; bound advancement by UART time.
+    const uint32_t max_advance = uint32_t(read_ms - write_ms) / 1000 + 1;
+    char text[20];
+    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+             observed.year, observed.month, observed.day, observed.hour, observed.minute);
+    publish_device_time(text);
+    if (advance < 0 || advance > max_advance) {
+        Log::logf(CAT_TIME, LOG_WARN,
+                  "ResMed clock verification failed; will retry: requested=%s %s actual=%s:%02d\n",
+                  dac_cmd + 9, tic_cmd + 9, text, observed.second);
+        return false;
     }
-    return ok_dac && ok_tic;
+
+    Log::logf(CAT_TIME, LOG_INFO, "ResMed clock synchronized: %s:%02d\n",
+              text, observed.second);
+    return true;
 }
 
 bool Air10Clock::pull_time(bool force) {
