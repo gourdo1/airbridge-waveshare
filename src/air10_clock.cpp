@@ -1,4 +1,5 @@
 #include "air10_clock.h"
+#include "app_config.h"
 #include "airsense_state.h"
 #include "uart_arbiter.h"
 #include "wifi_setup.h"
@@ -15,8 +16,11 @@ static constexpr uint32_t DEVICE_TIME_MAX_AGE_MS = 90000;
 static constexpr uint16_t CLOCK_TIMEOUT_MS = 500;
 static constexpr int64_t CLOCK_SEND_WINDOW_US = 10000;
 
-static std::atomic<bool> clock_sync_requested{true};
+static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
+static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
+static std::atomic<uint8_t> clock_sync_requests{CLOCK_SYNC_AUTO};
 static bool clock_sync_pending = false;
+static bool clock_sync_manual = false;
 static uint32_t clock_sync_attempt_ms = 0;
 static bool clock_sync_attempted = false;
 static uart_transaction_t *clock_sync_ticket = nullptr;
@@ -79,8 +83,8 @@ void Air10Clock::poll_status() {
     publish_device_time(text);
 }
 
-void Air10Clock::request_sync() {
-    clock_sync_requested = true;
+void Air10Clock::request_sync(bool manual) {
+    clock_sync_requests.fetch_or(manual ? CLOCK_SYNC_MANUAL : CLOCK_SYNC_AUTO);
 }
 
 static bool clock_write_applied(const char *command, bool ok, const char *response) {
@@ -202,23 +206,33 @@ bool Air10Clock::pull_time(bool force) {
 }
 
 void Air10Clock::handle() {
-    if (clock_sync_requested.exchange(false)) {
+    const bool auto_enabled = Config::get().resmed_time;
+    static bool was_auto_enabled = true;
+    if (auto_enabled && !was_auto_enabled) request_sync();
+    was_auto_enabled = auto_enabled;
+
+    const uint8_t requests = clock_sync_requests.exchange(0);
+    if (requests) {
         if (clock_sync_ticket) {
             Arbiter::cancel_transaction(clock_sync_ticket);
             EdfRecorder::end_clock_write();
         }
         clock_sync_ticket = nullptr;
+        clock_sync_manual = (requests & CLOCK_SYNC_MANUAL) ||
+                            (clock_sync_pending && clock_sync_manual);
         clock_sync_pending = true;
         clock_sync_attempted = false;
     }
     if (!clock_sync_pending) return;
-    if (!AirSenseState::present_recently() || !WiFiSetup::time_synced() ||
+    const bool disabled = !auto_enabled && !clock_sync_manual;
+    if (disabled || !AirSenseState::present_recently() || !WiFiSetup::time_synced() ||
         !AirSenseState::device_standby()) {
         if (clock_sync_ticket) {
             Arbiter::cancel_transaction(clock_sync_ticket);
             EdfRecorder::end_clock_write();
         }
         clock_sync_ticket = nullptr;
+        if (disabled) clock_sync_pending = false;
         return;
     }
     if (clock_sync_ticket) {

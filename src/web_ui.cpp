@@ -1911,7 +1911,7 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
         result = "NTP resync triggered";
         ok = true;
     } else if (action == "sync_to_resmed") {
-        Air10Clock::request_sync();
+        Air10Clock::request_sync(true);
         ok = true;
         result = "ResMed clock sync requested";
     } else if (action == "sync_from_resmed") {

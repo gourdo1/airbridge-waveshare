@@ -19,7 +19,8 @@ void invalidate();
 
 // Called from the main loop; applies NTP time after therapy and pending STR.
 void handle();
-void request_sync();
+// Manual requests bypass the autosync setting, not standby/STR safety gates.
+void request_sync(bool manual = false);
 bool pull_time(bool force = false);
 
 inline bool parse_calendar(const char *dac, const char *tic, Calendar &out) {

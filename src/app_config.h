@@ -52,6 +52,7 @@ struct AirBridgeConfig {
 
     String      ntp_server;         // empty = DHCP or pool.ntp.org
     String      tz;                 // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
+    bool        resmed_time;        // automatically push NTP time to ResMed
 
     uint16_t    udp_oxi_port;       // UDP oximetry port, 0=disabled
 

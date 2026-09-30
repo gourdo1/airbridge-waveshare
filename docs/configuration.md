@@ -78,11 +78,12 @@ confirmation on the OTA tab.
 |-----|---------|-------------|
 | `ntp_server` | *(empty)* | NTP server address. Empty = use DHCP-provided server, or pool.ntp.org as fallback |
 | `tz` | UTC0 | POSIX timezone string (e.g. `CET-1CEST,M3.5.0,M10.5.0/3`) |
+| `resmed_time` | 1 | Automatically synchronize the ResMed clock from NTP while idle. `0` disables automatic synchronization; manual sync remains available |
 
 **Config > Time** includes a helper for detecting your browser's timezone.
 
-The ResMed clock is synchronized from NTP while the device is idle. If NTP
-is unavailable, the ResMed clock supplies an approximate time for AirBridge.
+If NTP is unavailable, the ResMed clock supplies an approximate time for
+AirBridge, independently of `resmed_time`.
 
 ### Storage export
 

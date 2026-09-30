@@ -84,6 +84,7 @@ static const KVEntry kv_table[] = {
     KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
+    KV_BOOL("resmed_time", "resmed_time", resmed_time, true, Time),
     KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025, Oximetry),
     KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false, Smb),
     KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb, "0=Manual", "1=Automatic"),

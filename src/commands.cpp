@@ -310,7 +310,7 @@ void dispatch_command(const char *line, String &response) {
     }
 
     if (upper == "TIMESYNC") {
-        Air10Clock::request_sync();
+        Air10Clock::request_sync(true);
         response = "OK: resmed clock sync will retry\n";
         return;
     }
