@@ -192,6 +192,7 @@ static PbtSample pbt_samples[PBT_SAMPLE_COUNT];
 static uint8_t pbt_sample_count = 0;
 static uint8_t pbt_next_sample = 0;
 static uint32_t last_pld_slot = UINT32_MAX;
+static uint32_t pld_series_ms = 0;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
 static void status_error(const char *message, const char *file = nullptr) {
@@ -2047,41 +2048,88 @@ static void sample_pld() {
         {"TRRatio.2s", "RTR"},
     };
 
-    const uint32_t elapsed = relative_ms(millis());
-    if (elapsed < 2000) return;
-    // Native PLD captures sample zero after the first two-second interval.
-    const uint32_t absolute_slot = elapsed / 2000 - 1;
-    if (absolute_slot == last_pld_slot) return;
+    const uint32_t started_ms = millis();
+    const uint32_t elapsed = relative_ms(started_ms);
+    // Center the measured query burst on the capture target, not on slot onset.
+    // Half a slot bounds anticipation even after a congested/failed series.
+    const uint32_t lead_ms = min(pld_series_ms / 2, uint32_t(1000));
+    if (elapsed + lead_ms < 2000) return;
+    const uint32_t absolute_slot = (elapsed + lead_ms) / 2000 - 1;
+    if (last_pld_slot != UINT32_MAX && absolute_slot <= last_pld_slot) return;
     last_pld_slot = absolute_slot;
     const uint32_t record = absolute_slot / 30;
     const uint16_t slot = absolute_slot % 30;
     const uint32_t segment_start = session_clock.captured_ms;
     const uint32_t target_ms = segment_start + (absolute_slot + 1) * 2000;
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
+    PbtSample selected_pbt = {};
     const PbtSample *pbt = nullptr;
-    bool pbt_selected = false;
-
-    for (const auto &source : sources) {
-        if (source.pbt && pbt_schema && !pbt_selected) {
-            // Pressure reads give the next PBT time to arrive, without a new wait.
-            drain_raw_frames(0);
-            if (!status.active || segment_start != session_clock.captured_ms) return;
-            pbt = nearest_pbt(target_ms);
-            pbt_selected = true;
+    auto collect_frames = [&]() {
+        drain_raw_frames(0);
+        if (!status.active || segment_start != session_clock.captured_ms ||
+            !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
+            int32_t(millis() - target_ms) >= 2000) {
+            Log::logf(CAT_EDF, LOG_DEBUG, "PLD series slot=%lu interrupted\n",
+                      (unsigned long)absolute_slot);
+            return false;
         }
-        int16_t value = EDF_MISSING;
-        if (source.pbt && pbt &&
-            decoded_value(*pbt_schema, pbt->frame, source.tag, value) && value >= 0) {
+        const PbtSample *candidate = pbt_schema ? nearest_pbt(target_ms) : nullptr;
+        if (candidate && (!pbt || abs(int32_t(candidate->received_ms - target_ms)) <
+                                 abs(int32_t(pbt->received_ms - target_ms)))) {
+            selected_pbt = *candidate;
+            pbt = &selected_pbt;
+        }
+        return true;
+    };
+
+    constexpr size_t count = sizeof(sources) / sizeof(sources[0]);
+    int16_t values[count];
+    uint32_t deferred = 0;
+    uint8_t queries = 0, streamed = 0;
+    if (!collect_frames()) return;
+    for (size_t i = 0; i < count; i++) {
+        values[i] = EDF_MISSING;
+        const auto &source = sources[i];
+        if (source.pbt && pbt_schema && schema_has_field(*pbt_schema, source.tag)) {
+            deferred |= uint32_t(1) << i;
+            continue;
+        }
+        (void)read_numeric_variable(source.tag, values[i], absolute_slot);
+        queries++;
+        if (!collect_frames()) return;
+    }
+
+    // Freeze one frame for all covered fields; only failed fields need late G S.
+    for (size_t i = 0; i < count; i++) {
+        if (!(deferred & (uint32_t(1) << i))) continue;
+        const auto &source = sources[i];
+        if (pbt && decoded_value(*pbt_schema, pbt->frame, source.tag, values[i]) &&
+            values[i] >= 0) {
+            streamed++;
             Log::logf(CAT_EDF, LOG_DEBUG,
                       "PLD #%s slot=%lu raw=%d pbt_rx=%lu\n", source.tag,
-                      (unsigned long)absolute_slot, int(value),
+                      (unsigned long)absolute_slot, int(values[i]),
                       (unsigned long)pbt->received_ms);
         } else {
-            value = EDF_MISSING;
-            (void)read_numeric_variable(source.tag, value, absolute_slot);
+            values[i] = EDF_MISSING;
+            (void)read_numeric_variable(source.tag, values[i], absolute_slot);
+            queries++;
+            drain_raw_frames(0);
+            if (!status.active || segment_start != session_clock.captured_ms ||
+                !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE)) return;
         }
-        store_sample(pld, source.label, record, slot, value);
     }
+    const uint32_t finished_ms = millis();
+    pld_series_ms = finished_ms - started_ms;
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "PLD series slot=%lu target=%lu start=%lu end=%lu queries=%u pbt=%u\n",
+              (unsigned long)absolute_slot, (unsigned long)target_ms,
+              (unsigned long)started_ms, (unsigned long)finished_ms,
+              unsigned(queries), unsigned(streamed));
+    // Do not publish an obsolete burst into a previous slot after a long stall.
+    if (int32_t(finished_ms - target_ms) >= 2000) return;
+    for (size_t i = 0; i < count; i++)
+        store_sample(pld, sources[i].label, record, slot, values[i]);
 }
 
 static bool append_annotation(OutputFile &output, uint32_t onset,
@@ -2443,6 +2491,7 @@ static void reset_session_state(bool rollover = false) {
     pbt_sample_count = 0;
     pbt_next_sample = 0;
     last_pld_slot = UINT32_MAX;
+    pld_series_ms = 0;
     last_oxi_slot = UINT32_MAX;
     if (!rollover) xQueueReset(raw_queue);
 }
