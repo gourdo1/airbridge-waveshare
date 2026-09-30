@@ -42,7 +42,7 @@ constexpr uint16_t RAW_QUEUE_CAPACITY_PSRAM = 128;
 constexpr uint16_t RAW_QUEUE_CAPACITY_FALLBACK = 48;
 constexpr uint16_t RAW_PAYLOAD_MAX = 64;
 constexpr uint8_t STREAM_FIELD_MAX = 8;
-constexpr uint8_t STREAM_COUNT = 4;
+constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
 constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
@@ -424,6 +424,19 @@ static void fallback_schemas(uint16_t mid, uint16_t vid) {
                        ? "CSR:04" : "CET:05 CSR:04");
     }
 
+    const char *pbt = nullptr;
+    if (profile == 7 || profile == 8)
+        pbt = "LKF:02 TIP:03 TEP:03";
+    else if (profile == 5)
+        pbt = "MV5:02 TGT:02 RRR:02 LKF:02 TIP:03 TEP:03";
+    else if (profile == 9)
+        pbt = "MV5:02 RRR:02 LKF:02 TIP:03 TEP:03 AAV:02";
+    else if (profile)
+        pbt = "MV5:02 RRR:02 LKF:02 TIP:03 TEP:03";
+
+    if (pbt) set_schema(stream_schemas[4], "PBT", pbt);
+    else reset_schema(stream_schemas[4], "PBT");
+
     if (!profile) {
         Log::logf(CAT_EDF, LOG_WARN,
                   "unknown MID=%04X VID=%04X, using common AirSense schema\n",
@@ -448,7 +461,7 @@ static bool schema_has_field(const StreamSchema &schema, const char *name) {
 static void resolve_schemas(uint16_t mid, uint16_t vid) {
     fallback_schemas(mid, vid);
     static const char *tags[STREAM_COUNT] = {
-        "PMD", "TCE", "APN", "CSN",
+        "PMD", "TCE", "APN", "CSN", "PBT",
     };
     for (uint8_t i = 0; i < STREAM_COUNT; i++) {
         StreamSchema queried;
