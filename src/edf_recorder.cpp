@@ -45,6 +45,8 @@ constexpr uint8_t STREAM_FIELD_MAX = 8;
 constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
+constexpr uint8_t PBT_SAMPLE_COUNT = 4;
+constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
@@ -90,6 +92,11 @@ struct StreamSchema {
 struct DecodedFrame {
     uint8_t sequence;
     int32_t values[STREAM_FIELD_MAX];
+};
+
+struct PbtSample {
+    uint32_t received_ms;
+    DecodedFrame frame;
 };
 
 struct OutputFile {
@@ -182,6 +189,9 @@ static uint16_t identification_mid = 0, identification_vid = 0;
 static char identification_srn[24] = {};
 
 static WaveClock wave_clock = {};
+static PbtSample pbt_samples[PBT_SAMPLE_COUNT];
+static uint8_t pbt_sample_count = 0;
+static uint8_t pbt_next_sample = 0;
 static uint32_t last_pld_slot = UINT32_MAX;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
@@ -1960,6 +1970,7 @@ static uint32_t relative_ms(uint32_t captured_ms) {
 }
 
 static bool advance_segment(uint32_t captured_ms);
+static void drain_raw_frames(TickType_t wait);
 
 static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                          const DecodedFrame &decoded) {
@@ -2003,20 +2014,37 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
         store_sample(brp, "TrigCycEvt.40ms", record, slot, value);
 }
 
+static const PbtSample *nearest_pbt(uint32_t target_ms) {
+    const PbtSample *nearest = nullptr;
+    uint32_t distance = PBT_SAMPLE_WINDOW_MS + 1;
+    for (uint8_t i = 0; i < pbt_sample_count; i++) {
+        const int32_t offset = static_cast<int32_t>(pbt_samples[i].received_ms - target_ms);
+        if (offset < -int32_t(PBT_SAMPLE_WINDOW_MS) ||
+            offset > int32_t(PBT_SAMPLE_WINDOW_MS)) continue;
+        const uint32_t candidate = offset < 0 ? -offset : offset;
+        if (candidate < distance) {
+            nearest = &pbt_samples[i];
+            distance = candidate;
+        }
+    }
+    return nearest;
+}
+
 static void sample_pld() {
     if (!status.active) return;
     static const struct {
         const char *label;
         const char *tag;
+        bool pbt = false;
     } sources[] = {
         {"MaskPress.2s", "MKF"}, {"Press.2s", "MKI"},
-        {"EprPress.2s", "MKE"},  {"Leak.2s", "LKF"},
-        {"RespRate.2s", "RRR"},  {"TidVol.2s", "TDD"},
-        {"MinVent.2s", "MV5"},   {"TgtVent.2s", "TGT"},
+        {"EprPress.2s", "MKE"},  {"Leak.2s", "LKF", true},
+        {"RespRate.2s", "RRR", true}, {"TidVol.2s", "TDD"},
+        {"MinVent.2s", "MV5", true}, {"TgtVent.2s", "TGT", true},
         {"IERatio.2s", "IER"},   {"Snore.2s", "SNI"},
         {"FlowLim.2s", "FFL"},   {"B5ITime.2s", "IN5"},
         {"B5ETime.2s", "EX5"},   {"Ti.2s", "INT"},
-        {"AlvMinVent.2s", "AAV"}, {"CLRatio.2s", "RCR"},
+        {"AlvMinVent.2s", "AAV", true}, {"CLRatio.2s", "RCR"},
         {"TRRatio.2s", "RTR"},
     };
 
@@ -2028,10 +2056,31 @@ static void sample_pld() {
     last_pld_slot = absolute_slot;
     const uint32_t record = absolute_slot / 30;
     const uint16_t slot = absolute_slot % 30;
+    const uint32_t segment_start = session_start_capture_ms;
+    const uint32_t target_ms = segment_start + (absolute_slot + 1) * 2000;
+    const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
+    const PbtSample *pbt = nullptr;
+    bool pbt_selected = false;
 
     for (const auto &source : sources) {
+        if (source.pbt && pbt_schema && !pbt_selected) {
+            // Pressure reads give the next PBT time to arrive, without a new wait.
+            drain_raw_frames(0);
+            if (!status.active || segment_start != session_start_capture_ms) return;
+            pbt = nearest_pbt(target_ms);
+            pbt_selected = true;
+        }
         int16_t value = EDF_MISSING;
-        (void)read_numeric_variable(source.tag, value, absolute_slot);
+        if (source.pbt && pbt &&
+            decoded_value(*pbt_schema, pbt->frame, source.tag, value) && value >= 0) {
+            Log::logf(CAT_EDF, LOG_DEBUG,
+                      "PLD #%s slot=%lu raw=%d pbt_rx=%lu\n", source.tag,
+                      (unsigned long)absolute_slot, int(value),
+                      (unsigned long)pbt->received_ms);
+        } else {
+            value = EDF_MISSING;
+            (void)read_numeric_variable(source.tag, value, absolute_slot);
+        }
         store_sample(pld, source.label, record, slot, value);
     }
 }
@@ -2132,6 +2181,24 @@ static void process_raw_frame(const RawFrame &raw) {
     if (strcmp(tag, wave_tag) == 0) process_wave(raw, *schema, decoded);
     else if (strcmp(tag, "APN") == 0) process_apnea(raw, *schema, decoded);
     else if (strcmp(tag, "CSN") == 0) process_csr(raw, *schema, decoded);
+    else if (strcmp(tag, "PBT") == 0) {
+        pbt_samples[pbt_next_sample] = {raw.captured_ms, decoded};
+        pbt_next_sample = (pbt_next_sample + 1) % PBT_SAMPLE_COUNT;
+        if (pbt_sample_count < PBT_SAMPLE_COUNT) pbt_sample_count++;
+        Log::logf(CAT_EDF, LOG_DEBUG, "PBT seq=%u rx=%lu\n",
+                  unsigned(decoded.sequence), (unsigned long)raw.captured_ms);
+    }
+}
+
+static void drain_raw_frames(TickType_t wait) {
+    RawFrame raw;
+    if (xQueueReceive(raw_queue, &raw, wait) != pdTRUE) return;
+    uint16_t processed = 0;
+    do {
+        if (status.active) process_raw_frame(raw);
+    } while (++processed < raw_queue_capacity &&
+             __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) &&
+             xQueueReceive(raw_queue, &raw, 0) == pdTRUE);
 }
 
 static void sample_oximetry() {
@@ -2161,7 +2228,8 @@ static bool frame_sink(const qframe_t *frame, void *) {
 
     const bool wanted = memcmp(wave_tag, frame->payload, 3) == 0 ||
                         memcmp("APN", frame->payload, 3) == 0 ||
-                        memcmp("CSN", frame->payload, 3) == 0;
+                        memcmp("CSN", frame->payload, 3) == 0 ||
+                        memcmp("PBT", frame->payload, 3) == 0;
     if (!wanted) return true;
 
     RawFrame raw = {};
@@ -2200,6 +2268,7 @@ static void acquire_streams() {
     }
     acquire_stream(1, "APN");
     acquire_stream(2, "CSN");
+    acquire_stream(3, "PBT");
 }
 
 static void clear_session_memory(bool remove_partial) {
@@ -2380,6 +2449,8 @@ static void reset_session_state(const ControlEvent &event, bool rollover = false
     session_start_capture_ms = event.captured_ms;
     segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.native_start);
     wave_clock = {};
+    pbt_sample_count = 0;
+    pbt_next_sample = 0;
     last_pld_slot = UINT32_MAX;
     last_oxi_slot = UINT32_MAX;
     if (!rollover) xQueueReset(raw_queue);
@@ -2882,15 +2953,7 @@ static void recorder_task(void *) {
         }
         retry_recording();
 
-        RawFrame raw;
-        if (xQueueReceive(raw_queue, &raw, pdMS_TO_TICKS(20)) == pdTRUE) {
-            uint16_t processed = 0;
-            do {
-                if (status.active) process_raw_frame(raw);
-            } while (++processed < raw_queue_capacity &&
-                     __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) &&
-                     xQueueReceive(raw_queue, &raw, 0) == pdTRUE);
-        }
+        drain_raw_frames(pdMS_TO_TICKS(20));
         if (uxQueueMessagesWaiting(raw_queue) == 0) {
             if (status.active) (void)advance_segment(millis());
             sample_pld();
