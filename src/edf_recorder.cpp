@@ -170,10 +170,9 @@ static OutputFile csl;
 static uint8_t *header_buffer = nullptr;
 static size_t header_capacity = 0;
 
-static uint32_t session_start_capture_ms = 0;
 static uint32_t segment_duration_ms = 0;
 static Air10Clock::Anchor session_clock;
-static Air10Clock::PhaseAnchor session_event_clock;
+static Air10Clock::PhaseAnchor session_phase;
 static uint16_t session_native_day = 0;
 static char recording_id[81] = {};
 static char start_date[9] = {};
@@ -1966,7 +1965,7 @@ static void store_sample(Accumulator &accumulator, const char *label,
 }
 
 static uint32_t relative_ms(uint32_t captured_ms) {
-    return static_cast<uint32_t>(captured_ms - session_start_capture_ms);
+    return static_cast<uint32_t>(captured_ms - session_clock.captured_ms);
 }
 
 static bool advance_segment(uint32_t captured_ms);
@@ -2056,7 +2055,7 @@ static void sample_pld() {
     last_pld_slot = absolute_slot;
     const uint32_t record = absolute_slot / 30;
     const uint16_t slot = absolute_slot % 30;
-    const uint32_t segment_start = session_start_capture_ms;
+    const uint32_t segment_start = session_clock.captured_ms;
     const uint32_t target_ms = segment_start + (absolute_slot + 1) * 2000;
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     const PbtSample *pbt = nullptr;
@@ -2066,7 +2065,7 @@ static void sample_pld() {
         if (source.pbt && pbt_schema && !pbt_selected) {
             // Pressure reads give the next PBT time to arrive, without a new wait.
             drain_raw_frames(0);
-            if (!status.active || segment_start != session_start_capture_ms) return;
+            if (!status.active || segment_start != session_clock.captured_ms) return;
             pbt = nearest_pbt(target_ms);
             pbt_selected = true;
         }
@@ -2114,17 +2113,7 @@ static void process_apnea(const RawFrame &raw, const StreamSchema &schema,
         case 5: label = "Arousal"; break;
         default: return;
     }
-    int64_t elapsed_ms = relative_ms(raw.captured_ms);
-    if (session_event_clock.generation) {
-        if (Air10Clock::phase_unchanged(session_event_clock)) {
-            elapsed_ms = session_event_clock.native_at_ms(raw.captured_ms) -
-                         session_clock.native_start * 1000;
-        } else {
-            session_event_clock = {};
-            Log::logf(CAT_EDF, LOG_DEBUG, "APN clock phase invalidated; using relative time\n");
-        }
-    }
-    const uint32_t onset = elapsed_ms > 0 ? uint32_t(elapsed_ms / 1000) : 0;
+    const uint32_t onset = relative_ms(raw.captured_ms) / 1000;
     const uint32_t safe_duration = duration > 0 ? duration : 0;
     Log::logf(CAT_EDF, LOG_DEBUG, "APN rx=%lu type=%d duration=%lu onset=%lu\n",
               (unsigned long)raw.captured_ms, int(event_type),
@@ -2159,7 +2148,7 @@ static void process_csr(const RawFrame &raw, const StreamSchema &schema,
 
 static void process_raw_frame(const RawFrame &raw) {
     if (raw.len < 5 || !status.active || !advance_segment(raw.captured_ms)) return;
-    if (int32_t(raw.captured_ms - session_start_capture_ms) < 0) {
+    if (int32_t(raw.captured_ms - session_clock.captured_ms) < 0) {
         portENTER_CRITICAL(&status_mux);
         status.raw_dropped++;
         portEXIT_CRITICAL(&status_mux);
@@ -2284,7 +2273,7 @@ static void clear_session_memory(bool remove_partial) {
 
 static bool anchor_session_clock(const ControlEvent &event) {
     session_clock = {};
-    session_event_clock = {};
+    session_phase = {};
     session_clock.captured_ms = event.captured_ms;
     Air10Clock::Calendar native_now;
     uint32_t clock_ms = 0;
@@ -2295,15 +2284,18 @@ static bool anchor_session_clock(const ControlEvent &event) {
     }
     session_clock.native_start = Air10Clock::civil_seconds(native_now) -
         static_cast<uint32_t>(clock_ms - event.captured_ms) / 1000;
-    if (Air10Clock::phase_anchor(session_event_clock)) {
+    if (Air10Clock::phase_anchor(session_phase)) {
+        const int64_t start_ms = session_phase.native_at_ms(event.captured_ms);
+        session_clock.native_start = start_ms / 1000;
+        // Map the full-second header to the same monotonic origin for every file.
+        const uint32_t fraction_ms = static_cast<uint32_t>(start_ms % 1000);
+        session_clock.captured_ms = event.captured_ms - fraction_ms;
         Log::logf(CAT_EDF, LOG_DEBUG,
-                  "APN clock phase offset=%lldms uncertainty=%ums age=%lums\n",
-                  (long long)(session_event_clock.native_at_ms(event.captured_ms) -
-                              session_clock.native_start * 1000),
-                  unsigned(session_event_clock.uncertainty_ms),
-                  (unsigned long)(clock_ms - session_event_clock.captured_ms));
+                  "clock phase offset=%lums uncertainty=%ums age=%lums\n",
+                  (unsigned long)fraction_ms, unsigned(session_phase.uncertainty_ms),
+                  (unsigned long)(clock_ms - session_phase.captured_ms));
     } else {
-        Log::logf(CAT_EDF, LOG_DEBUG, "APN clock phase unavailable; using relative time\n");
+        Log::logf(CAT_EDF, LOG_DEBUG, "clock phase unavailable; using whole-second read\n");
     }
     Log::logf(CAT_EDF, LOG_DEBUG,
               "anchor start_ms=%lu clock_ms=%lu tic=%02d:%02d:%02d native=%lld\n",
@@ -2445,8 +2437,7 @@ static bool begin_segment_files(const Air10Edf::Schema &brp_schema,
     return false;
 }
 
-static void reset_session_state(const ControlEvent &event, bool rollover = false) {
-    session_start_capture_ms = event.captured_ms;
+static void reset_session_state(bool rollover = false) {
     segment_duration_ms = Air10Clock::milliseconds_to_noon(session_clock.native_start);
     wave_clock = {};
     pbt_sample_count = 0;
@@ -2487,7 +2478,7 @@ static void start_session(const ControlEvent &event) {
     const Air10Edf::Schema &brp_layout = Air10Edf::brp_schema(tcv);
     const Air10Edf::Schema &pld_layout = Air10Edf::pld_schema();
 
-    reset_session_state(event);
+    reset_session_state();
     if (!begin_segment_files(brp_layout, pld_layout)) {
         status_error("session buffer or file initialization failed");
         clear_session_memory(true);
@@ -2571,10 +2562,10 @@ static void close_segment(uint32_t captured_ms) {
 }
 
 static bool advance_segment(uint32_t captured_ms) {
-    if (int32_t(captured_ms - session_start_capture_ms) < 0) return true;
+    if (int32_t(captured_ms - session_clock.captured_ms) < 0) return true;
     if (relative_ms(captured_ms) < segment_duration_ms) return true;
 
-    const uint32_t boundary = session_start_capture_ms + segment_duration_ms;
+    const uint32_t boundary = session_clock.captured_ms + segment_duration_ms;
     const uint32_t seconds = segment_duration_ms / 1000;
     close_segment(boundary);
     session_clock.native_start += seconds;
@@ -2598,7 +2589,7 @@ static bool advance_segment(uint32_t captured_ms) {
         status_error("noon segment initialization failed");
         return false;
     }
-    reset_session_state(event, true);
+    reset_session_state(true);
     Log::logf(CAT_EDF, LOG_INFO, "noon rollover %s/%s\n",
               status.therapy_day, status.file_prefix);
     return true;
@@ -2916,6 +2907,12 @@ static void poll_recording_state() {
     if (next_recording_state_ms && int32_t(millis() - next_recording_state_ms) < 0)
         return;
     next_recording_state_ms = millis() + RECORDING_STATE_POLL_MS;
+    if (status.active && session_phase.generation &&
+        !Air10Clock::phase_unchanged(session_phase)) {
+        session_phase = {};
+        // Changing one channel's origin here would disagree with existing headers.
+        Log::logf(CAT_EDF, LOG_WARN, "clock phase invalidated; keeping recording timeline\n");
+    }
     uint32_t zle = 0;
     if (!read_u32_variable("ZLE", zle) || zle > 1) return;
     // ROP may have changed while the queued read was in flight.
