@@ -114,6 +114,8 @@ static bool device_needs_encryption = false;  // Nonin needs it, Viatom/O2Ring d
 struct KnownDevice : oxi_known_device_t {
     uint8_t addr_type = 1;
     OxiBlePolicy::Holdoff holdoff;
+    uint32_t advertisements = 0;
+    uint32_t first_advertisement_ms = 0;
 };
 static KnownDevice known_devices[MAX_KNOWN_DEVICES];
 static int known_count = 0;
@@ -128,6 +130,11 @@ struct ObservedDevice {
     char addr[18] = {};
     char name[32] = {};
     uint8_t addr_type = 0;
+    int8_t rssi = 0;
+    uint32_t received_ms = 0;
+    uint32_t observing_ms = 0;
+    uint32_t first_advertisement_ms = 0;
+    uint32_t advertisements = 0;
 };
 static ObservedDevice observed_device;
 
@@ -299,7 +306,10 @@ static void known_clear() {
 static void update_observer(bool active) {
     portENTER_CRITICAL(&known_mux);
     uint32_t now = millis();
-    if (active && !observing) observing_since = now;
+    if (active && !observing) {
+        observing_since = now;
+        for (int i = 0; i < known_count; i++) known_devices[i].advertisements = 0;
+    }
     observing = active;
     if (!active) observed_pending = false;
     for (int i = 0; i < known_count; i++)
@@ -308,12 +318,14 @@ static void update_observer(bool active) {
 }
 
 static void hold_autoconnect(const char *addr, bool charging, bool until_absent) {
+    uint32_t now = millis();
     portENTER_CRITICAL(&known_mux);
     int index = known_index(addr);
-    if (index >= 0) known_devices[index].holdoff.start(millis(), charging, until_absent);
+    if (index >= 0) known_devices[index].holdoff.start(now, charging, until_absent);
     portEXIT_CRITICAL(&known_mux);
-    Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect holdoff addr=%s duration=%lus clear=%s\n",
-              addr, (unsigned long)((charging ? OxiBlePolicy::CHARGING_HOLDOFF_MS :
+    Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect holdoff addr=%s at=%lu duration=%lus clear=%s\n",
+              addr, (unsigned long)now,
+              (unsigned long)((charging ? OxiBlePolicy::CHARGING_HOLDOFF_MS :
                                        OxiBlePolicy::RECONNECT_HOLDOFF_MS) / 1000),
               until_absent ? "absent or deadline" : "deadline");
 }
@@ -864,6 +876,7 @@ class OxiScanCB : public NimBLEScanCallbacks {
         if (background && index >= 0) {
             uint32_t now = millis();
             auto &device = known_devices[index];
+            if (!device.advertisements++) device.first_advertisement_ms = now;
             device.holdoff.update(now, true, observing_since);
             device.holdoff.last_seen = now;
             if (device.autoconnect && !device.holdoff.active &&
@@ -871,6 +884,11 @@ class OxiScanCB : public NimBLEScanCallbacks {
                 strlcpy(observed_device.addr, addr, sizeof(observed_device.addr));
                 strlcpy(observed_device.name, name.c_str(), sizeof(observed_device.name));
                 observed_device.addr_type = address.getType();
+                observed_device.rssi = dev->getRSSI();
+                observed_device.received_ms = now;
+                observed_device.observing_ms = observing_since;
+                observed_device.first_advertisement_ms = device.first_advertisement_ms;
+                observed_device.advertisements = device.advertisements;
                 observed_pending = true;
             }
         }
@@ -1424,10 +1442,20 @@ void OxiBle::task(void *param) {
         }
         observed_pending = false;
         portEXIT_CRITICAL(&known_mux);
-        if (have_automatic) request_connect(CONN_AUTO, automatic.addr);
+        if (have_automatic) {
+            Log::logf(CAT_OXI, LOG_DEBUG,
+                      "Auto-connect advertisement addr=%s at=%lu observing=%lu first=%lu count=%lu rssi=%d handoff=%lums\n",
+                      automatic.addr, (unsigned long)automatic.received_ms,
+                      (unsigned long)automatic.observing_ms,
+                      (unsigned long)automatic.first_advertisement_ms,
+                      (unsigned long)automatic.advertisements, automatic.rssi,
+                      (unsigned long)(millis() - automatic.received_ms));
+            request_connect(CONN_AUTO, automatic.addr);
+        }
 
         ConnectRequest connection;
         if (!ble_suspended && take_connect_request(connection)) {
+            uint32_t sequence_started_ms = millis();
             connect_mode_t mode = connection.mode;
             update_observer(false);
             NimBLEDevice::getScan()->stop();
@@ -1498,7 +1526,12 @@ void OxiBle::task(void *param) {
                               addr.c_str(), atype, mode == CONN_USER ? "user" : "auto",
                               attempt, max_attempts);
 
+                    uint32_t connect_started_ms = millis();
                     bool ok = pClient->connect(bleAddr);
+                    Log::logf(CAT_OXI, LOG_DEBUG,
+                              "BLE connect addr=%s at=%lu elapsed=%lums ok=%d\n",
+                              addr.c_str(), (unsigned long)connect_started_ms,
+                              (unsigned long)(millis() - connect_started_ms), ok);
 
                     if (!ok) {
                         int err = pClient->getLastError();
@@ -1584,6 +1617,10 @@ void OxiBle::task(void *param) {
                     ble_samples.subscribed(millis());
                     portEXIT_CRITICAL(&sample_mux);
                     set_state(OXI_STREAMING);
+                    Log::logf(CAT_OXI, LOG_DEBUG,
+                              "BLE setup addr=%s at=%lu elapsed=%lums\n",
+                              addr.c_str(), (unsigned long)millis(),
+                              (unsigned long)(millis() - sequence_started_ms));
                     Log::logf(CAT_OXI, LOG_INFO, "Sensor subscribed addr=%s name=\"%s\"%s\n",
                               addr.c_str(), dev_name.c_str(),
                               oxyii_write_chr ? "; initializing OxyII" : "");
@@ -1651,7 +1688,9 @@ void OxiBle::task(void *param) {
             if (scanner->start(0)) {
                 scan_retry_at = 0;
                 set_state(OXI_OBSERVING);
-                Log::logf(CAT_OXI, LOG_DEBUG, "Known sensor observation started\n");
+                Log::logf(CAT_OXI, LOG_DEBUG,
+                          "Known sensor observation started at=%lu interval=1000ms window=20ms\n",
+                          (unsigned long)observing_since);
             } else {
                 update_observer(false);
                 scan_retry_at = millis() + 1000;
