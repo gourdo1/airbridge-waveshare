@@ -1293,6 +1293,7 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
         if (i > 0) json += ',';
         json += '{';
         jsonAddString(json, "addr", known[i].addr, false);
+        jsonAddString(json, "name", known[i].name);
         jsonAddBool(json, "autoconnect", known[i].autoconnect);
         json += '}';
     }

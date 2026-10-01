@@ -177,7 +177,9 @@ void dispatch_command(const char *line, String &response) {
             if (!count) response = "(no known sensors)\n";
             for (int i = 0; i < count; i++) {
                 response += String(devices[i].addr) + " autoconnect=" +
-                            (devices[i].autoconnect ? "on\n" : "off\n");
+                            (devices[i].autoconnect ? "on" : "off");
+                if (devices[i].name[0]) response += " name=" + String(devices[i].name);
+                response += '\n';
             }
         } else if (sub.startsWith("AUTOCONNECT ")) {
             String args = cmd.substring(16);

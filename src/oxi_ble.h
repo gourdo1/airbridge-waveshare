@@ -33,6 +33,7 @@ constexpr int KNOWN_DEVICE_LIMIT = 4;
 
 struct oxi_known_device_t {
     char addr[18] = {};
+    char name[32] = {};
     bool autoconnect = true;
 };
 

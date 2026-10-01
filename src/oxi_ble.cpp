@@ -188,6 +188,9 @@ static void known_load() {
         device.autoconnect = p.getBool(auto_key, true);
         auto_key[0] = 't';
         device.addr_type = p.getUChar(auto_key, 1);
+        auto_key[0] = 'n';
+        if (p.isKey(auto_key))
+            strlcpy(device.name, p.getString(auto_key, "").c_str(), sizeof(device.name));
         portENTER_CRITICAL(&known_mux);
         known_devices[known_count++] = device;
         portEXIT_CRITICAL(&known_mux);
@@ -222,29 +225,48 @@ static bool known_contains(const char *addr) {
     return found;
 }
 
-static bool known_add(const char *addr, uint8_t addr_type, bool legacy = false) {
+static bool known_add(const char *addr, uint8_t addr_type, bool legacy = false,
+                      const char *name = nullptr) {
     if (!known_store_mutex) return false;
     xSemaphoreTake(known_store_mutex, portMAX_DELAY);
     portENTER_CRITICAL(&known_mux);
     bool exists = known_index(addr) >= 0;
     bool room = known_count < (legacy ? MAX_KNOWN_DEVICES : KNOWN_DEVICE_LIMIT);
     portEXIT_CRITICAL(&known_mux);
+    char learned_name[sizeof(known_devices[0].name)] = {};
+    if (name) strlcpy(learned_name, name, sizeof(learned_name));
+    bool metadata_saved = true;
+    bool name_saved = false;
     char type_key[15];
     Preferences type_prefs;
     if ((exists || room) && autoconnect_key(addr, type_key) && type_prefs.begin("oxi_known", false)) {
         type_key[0] = 't';
         if (type_prefs.getUChar(type_key, 0xFF) != addr_type)
-            type_prefs.putUChar(type_key, addr_type);
+            metadata_saved = type_prefs.putUChar(type_key, addr_type) > 0;
+        // Empty passive advertisements must not erase a previously learned name.
+        if (learned_name[0]) {
+            type_key[0] = 'n';
+            name_saved = type_prefs.isKey(type_key) &&
+                         type_prefs.getString(type_key, "") == learned_name;
+            if (!name_saved) name_saved = type_prefs.putString(type_key, learned_name) > 0;
+            metadata_saved = metadata_saved && name_saved;
+        }
         type_prefs.end();
+    } else if (exists || room) {
+        metadata_saved = false;
     }
     if (exists) {
         portENTER_CRITICAL(&known_mux);
-        known_devices[known_index(addr)].addr_type = addr_type;
+        auto &device = known_devices[known_index(addr)];
+        device.addr_type = addr_type;
+        bool renamed = name_saved && strcmp(device.name, learned_name) != 0;
+        if (renamed) strlcpy(device.name, learned_name, sizeof(device.name));
         portEXIT_CRITICAL(&known_mux);
+        if (renamed) status_revision.fetch_add(1);
     }
     if (exists || !room) {
         xSemaphoreGive(known_store_mutex);
-        return exists;
+        return exists && metadata_saved;
     }
 
     bool autoconnect = true;
@@ -257,13 +279,14 @@ static bool known_add(const char *addr, uint8_t addr_type, bool legacy = false) 
     portENTER_CRITICAL(&known_mux);
     auto &device = known_devices[known_count++];
     strlcpy(device.addr, addr, sizeof(device.addr));
+    if (name_saved) strlcpy(device.name, learned_name, sizeof(device.name));
     device.autoconnect = autoconnect;
     device.addr_type = addr_type;
     portEXIT_CRITICAL(&known_mux);
     bool saved = known_save();
     xSemaphoreGive(known_store_mutex);
     Log::logf(CAT_OXI, LOG_INFO, "Added known device: %s\n", addr);
-    return saved;
+    return saved && metadata_saved;
 }
 
 static bool known_remove(const char *addr) {
@@ -283,6 +306,8 @@ static bool known_remove(const char *addr) {
             p.remove(key);
             key[0] = 't';
             p.remove(key);
+            key[0] = 'n';
+            if (p.isKey(key)) p.remove(key);
             p.end();
         }
         Log::logf(CAT_OXI, LOG_INFO, "Removed known device: %s\n", addr);
@@ -1629,7 +1654,8 @@ void OxiBle::task(void *param) {
                               addr.c_str(), dev_name.c_str(),
                               oxyii_write_chr ? "; initializing OxyII" : "");
 
-                    if (mode == CONN_USER && !known_add(addr.c_str(), atype)) {
+                    if ((mode == CONN_USER || known_contains(addr.c_str())) &&
+                        !known_add(addr.c_str(), atype, false, dev_name.c_str())) {
                         Log::logf(CAT_OXI, LOG_WARN, "Sensor connected but not saved: known list full or NVS write failed\n");
                     }
                     failed_addr[0] = 0;
