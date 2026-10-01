@@ -171,9 +171,10 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
 
 void OxiArbiter::start_feed() {
     portENTER_CRITICAL(&reading_mux);
+    bool changed = !feeding;
     feeding = true;
     portEXIT_CRITICAL(&reading_mux);
-    Log::logf(CAT_OXI, LOG_INFO, "Feeding started\n");
+    if (changed) Log::logf(CAT_OXI, LOG_INFO, "Feeding started\n");
 }
 
 void OxiArbiter::stop_feed(oxi_source_t source) {
@@ -182,9 +183,10 @@ void OxiArbiter::stop_feed(oxi_source_t source) {
         portEXIT_CRITICAL(&reading_mux);
         return;
     }
+    bool changed = feeding;
     feeding = false;
     portEXIT_CRITICAL(&reading_mux);
-    Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped\n");
+    if (changed) Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped\n");
 }
 
 bool OxiArbiter::is_feeding() {
