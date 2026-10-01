@@ -96,7 +96,7 @@ struct TimedFrame {
 };
 
 struct PressureSample {
-    uint32_t received_ms;
+    uint32_t sample_ms;
     int16_t value;
 };
 
@@ -290,7 +290,7 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
 
 static bool read_numeric_variable(const char *name, int16_t &value,
                                   uint32_t slot, uint32_t target_ms,
-                                  uint8_t &queries, Arbiter::VarReadTrace *timing = nullptr) {
+                                  uint8_t &queries) {
     const int32_t offset = static_cast<int32_t>(millis() - target_ms);
     if (offset >= PLD_SAMPLE_WINDOW_MS) {
         Log::logf(CAT_EDF, LOG_DEBUG,
@@ -324,7 +324,6 @@ static bool read_numeric_variable(const char *name, int16_t &value,
         return false;
     }
     value = static_cast<int16_t>(parsed);
-    if (timing) *timing = trace;
     Log::logf(CAT_EDF, LOG_DEBUG,
               "PLD #%s slot=%lu raw=%d tx=%lu rx=%lu\n", name,
               (unsigned long)slot, int(value),
@@ -1806,12 +1805,12 @@ static bool mean_mkp(uint32_t target_ms, int16_t &value) {
     for (uint16_t i = 0; i < mkp_count; i++) {
         const auto &sample = mkp_history[(mkp_next + MKP_HISTORY_COUNT - 1 - i) %
                                           MKP_HISTORY_COUNT];
-        const int32_t age = int32_t(target_ms - sample.received_ms);
+        const int32_t age = int32_t(target_ms - sample.sample_ms);
         if (age < 0) continue;
         // Bound sample-and-hold to two nominal periods; never bridge a stall.
-        if (end - sample.received_ms > 80) return false;
+        if (end - sample.sample_ms > 80) return false;
         const uint32_t begin = age >= MKP_WINDOW_MS
-            ? target_ms - MKP_WINDOW_MS : sample.received_ms;
+            ? target_ms - MKP_WINDOW_MS : sample.sample_ms;
         weighted += int64_t(sample.value) * (end - begin);
         if (age >= MKP_WINDOW_MS) {
             value = weighted / MKP_WINDOW_MS;
@@ -1820,19 +1819,6 @@ static bool mean_mkp(uint32_t target_ms, int16_t &value) {
         end = begin;
     }
     return false;
-}
-
-static void compare_mask_pressure(int16_t actual, const Arbiter::VarReadTrace &trace) {
-    if (!mkp_history) return;
-    int16_t at_tx = EDF_MISSING, at_rx = EDF_MISSING;
-    int16_t at_mid = EDF_MISSING;
-    (void)mean_mkp(trace.sent_ms, at_tx);
-    (void)mean_mkp(trace.received_ms, at_rx);
-    (void)mean_mkp(trace.sent_ms + (trace.received_ms - trace.sent_ms) / 2, at_mid);
-    Log::logf(CAT_EDF, LOG_DEBUG,
-              "MKF compare raw=%d mean_tx=%d mean_mid=%d mean_rx=%d tx=%lu rx=%lu\n",
-              int(actual), int(at_tx), int(at_mid), int(at_rx),
-              (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms);
 }
 
 static void process_wave(const RawFrame &raw, const StreamSchema &schema,
@@ -1858,6 +1844,7 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                       unsigned(decoded.sequence), unsigned(delta),
                       (unsigned long)raw.captured_ms, (long)drift);
             wave_clock.relative_ms = sample_ms;
+            mkp_count = mkp_next = 0;
         } else
             wave_clock.relative_ms = predicted;
     }
@@ -1873,9 +1860,22 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
     if (decoded_value(schema, decoded, "MKP", value)) {
         store_sample(brp, "Press.40ms", record, slot, value);
         if (mkp_history && value >= 0) {
-            mkp_history[mkp_next] = {raw.captured_ms, value};
-            mkp_next = (mkp_next + 1) % MKP_HISTORY_COUNT;
-            if (mkp_count < MKP_HISTORY_COUNT) mkp_count++;
+            const uint32_t position = session_clock.captured_ms + record * 60000 + slot * 40;
+            bool replaced = false;
+            if (mkp_count) {
+                auto &last = mkp_history[(mkp_next + MKP_HISTORY_COUNT - 1) % MKP_HISTORY_COUNT];
+                if (position == last.sample_ms) {
+                    last.value = value;
+                    replaced = true;
+                } else if (int32_t(position - last.sample_ms) < 0) {
+                    mkp_count = mkp_next = 0;
+                }
+            }
+            if (!replaced) {
+                mkp_history[mkp_next] = {position, value};
+                mkp_next = (mkp_next + 1) % MKP_HISTORY_COUNT;
+                if (mkp_count < MKP_HISTORY_COUNT) mkp_count++;
+            }
         }
     }
     if (decoded_value(schema, decoded, "TCV", value))
@@ -1927,7 +1927,7 @@ static void sample_pld() {
         const char *tag;
         bool pbt = false;
     } sources[] = {
-        {"MaskPress.2s", "MKF"}, {"Press.2s", "MKI"},
+        {"Press.2s", "MKI"},
         {"EprPress.2s", "MKE"},  {"Leak.2s", "LKF", true},
         {"RespRate.2s", "RRR", true}, {"TidVol.2s", "TDD"},
         {"MinVent.2s", "MV5", true}, {"TgtVent.2s", "TGT", true},
@@ -1986,17 +1986,12 @@ static void sample_pld() {
             deferred |= uint32_t(1) << i;
             continue;
         }
-        Arbiter::VarReadTrace trace;
-        const bool have_value = read_numeric_variable(source.tag, values[i], absolute_slot,
-                                                       target_ms, queries, &trace);
+        (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
         if (!collect_frames()) return;
-        if (have_value && strcmp(source.tag, "MKF") == 0)
-            compare_mask_pressure(values[i], trace);
     }
 
-    // A next-minute slot may be collected early, but advancing its accumulator
-    // must wait for the boundary. Keep draining BRP and local SAD meanwhile.
-    while (int32_t(millis() - (segment_start + record * 60000)) < 0) {
+    // Stream-derived values need data through the target; never flush a minute early.
+    while (int32_t(millis() - target_ms) < 0) {
         if (!collect_frames(pdMS_TO_TICKS(20))) return;
     }
 
@@ -2029,6 +2024,9 @@ static void sample_pld() {
     if (int32_t(finished_ms - target_ms) >= 2000) return;
     for (size_t i = 0; i < count; i++)
         store_sample(pld, sources[i].label, record, slot, values[i]);
+    int16_t mask_pressure = EDF_MISSING;
+    (void)mean_mkp(target_ms, mask_pressure);
+    store_sample(pld, "MaskPress.2s", record, slot, mask_pressure);
     int16_t inspiration = EDF_MISSING;
     (void)brh_inspiration(target_ms, inspiration);
     store_sample(pld, "Ti.2s", record, slot, inspiration);
@@ -2342,12 +2340,9 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
 
     if (!header_buffer) return false;
 
-    // Optional shadow comparison only; a failed allocation cannot stop EDF.
-    if (Log::get_cat_level(CAT_EDF) == LOG_DEBUG) {
-        mkp_history = static_cast<PressureSample *>(aircannect::Memory::alloc_large(
-            MKP_HISTORY_COUNT * sizeof(PressureSample)));
-        if (!mkp_history) Log::logf(CAT_EDF, LOG_DEBUG, "MKF comparison unavailable: memory\n");
-    }
+    mkp_history = static_cast<PressureSample *>(aircannect::Memory::alloc_large(
+        MKP_HISTORY_COUNT * sizeof(PressureSample)));
+    if (!mkp_history) return false;
 
     if (!initialize_accumulator(brp, brp_schema) ||
         !initialize_accumulator(pld, pld_schema) ||
