@@ -8,7 +8,7 @@ constexpr uint32_t ABSENCE_MS = 30000;
 constexpr uint32_t NOTIFY_TIMEOUT_MS = 10000;
 constexpr uint32_t INVALID_TIMEOUT_MS = 30000;
 constexpr uint32_t RECONNECT_HOLDOFF_MS = 180000;
-constexpr uint32_t CHARGING_HOLDOFF_MS = 1800000;
+constexpr uint32_t CHARGING_HOLDOFF_MS = 15000;
 
 struct Holdoff {
     uint32_t deadline = 0;

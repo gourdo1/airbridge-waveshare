@@ -118,6 +118,7 @@ static bool device_needs_encryption = false;  // Nonin needs it, Viatom/O2Ring d
 struct KnownDevice : oxi_known_device_t {
     uint8_t addr_type = 1;
     OxiBlePolicy::Holdoff holdoff;
+    bool charging = false;
     uint32_t advertisements = 0;
     uint32_t first_advertisement_ms = 0;
 };
@@ -223,6 +224,19 @@ static bool known_contains(const char *addr) {
     bool found = known_index(addr) >= 0;
     portEXIT_CRITICAL(&known_mux);
     return found;
+}
+
+static bool known_set_charging(const char *addr, bool charging) {
+    // Unsaved manual connections have no previous charging state.
+    bool changed = charging;
+    portENTER_CRITICAL(&known_mux);
+    int index = known_index(addr);
+    if (index >= 0) {
+        changed = known_devices[index].charging != charging;
+        known_devices[index].charging = charging;
+    }
+    portEXIT_CRITICAL(&known_mux);
+    return changed;
 }
 
 static bool known_add(const char *addr, uint8_t addr_type, bool legacy = false,
@@ -966,7 +980,9 @@ class OxiClientCB : public NimBLEClientCallbacks {
     }
 
     void onDisconnect(NimBLEClient *client, int reason) override {
-        Log::logf(CAT_OXI, state == OXI_STREAMING ? LOG_INFO : LOG_DEBUG,
+        bool established = state == OXI_STREAMING &&
+                           (!viatom_write_chr || viatom_initial_probe.load());
+        Log::logf(CAT_OXI, established ? LOG_INFO : LOG_DEBUG,
                   "BLE disconnected addr=%s reason=0x%X\n",
                   client->getPeerAddress().toString().c_str(), reason);
         viatom_write_chr = nullptr;
@@ -1298,6 +1314,7 @@ void OxiBle::task(void *param) {
     char failed_addr[18] = {};
     const char *last_failure = nullptr;
     int last_connect_error = 0;
+    char connected_name[32] = {};
 
     while (true) {
         if (handle_memory_pause()) {
@@ -1347,15 +1364,24 @@ void OxiBle::task(void *param) {
         if (disconnect_requested || charging || data_problem != OxiBlePolicy::Disconnect::None) {
             disconnect_requested = false;
             request_connect(CONN_NONE, nullptr);
-            const char *reason = charging ? "charging" :
-                data_problem == OxiBlePolicy::Disconnect::Silent ? "no samples for 10s" :
-                data_problem == OxiBlePolicy::Disconnect::Invalid ? "invalid samples for 30s" : "requested";
-            Log::logf(CAT_OXI, data_problem == OxiBlePolicy::Disconnect::Silent ? LOG_WARN : LOG_INFO,
-                      "Sensor disconnect: %s\n", reason);
-            if (pClient->isConnected()) {
+            const auto addr = pClient->getPeerAddress().toString();
+            if (charging) {
+                bool changed = known_set_charging(addr.c_str(), true);
+                Log::logf(CAT_OXI, changed ? LOG_INFO : LOG_DEBUG,
+                          "Sensor charging addr=%s; retry in %lus\n", addr.c_str(),
+                          (unsigned long)(OxiBlePolicy::CHARGING_HOLDOFF_MS / 1000));
+                // The expected disconnect of a charging probe is not a link failure.
+                set_state(OXI_DISCONNECTED);
+            } else {
+                const char *reason = data_problem == OxiBlePolicy::Disconnect::Silent ? "no samples for 10s" :
+                    data_problem == OxiBlePolicy::Disconnect::Invalid ? "invalid samples for 30s" : "requested";
+                Log::logf(CAT_OXI, data_problem == OxiBlePolicy::Disconnect::Silent ? LOG_WARN : LOG_INFO,
+                          "Sensor disconnect: %s\n", reason);
+            }
+            if (charging || pClient->isConnected()) {
                 // Sparse passive observation cannot prove an idle sensor powered off.
-                bool until_absent = charging || data_problem == OxiBlePolicy::Disconnect::None;
-                hold_autoconnect(pClient->getPeerAddress().toString().c_str(), charging, until_absent);
+                bool until_absent = !charging && data_problem == OxiBlePolicy::Disconnect::None;
+                hold_autoconnect(addr.c_str(), charging, until_absent);
             }
             update_observer(false);
             NimBLEDevice::getScan()->stop();
@@ -1650,7 +1676,10 @@ void OxiBle::task(void *param) {
                               "BLE setup addr=%s at=%lu elapsed=%lums\n",
                               addr.c_str(), (unsigned long)millis(),
                               (unsigned long)(millis() - sequence_started_ms));
-                    Log::logf(CAT_OXI, LOG_INFO, "Sensor subscribed addr=%s name=\"%s\"%s\n",
+                    strlcpy(connected_name, dev_name.c_str(), sizeof(connected_name));
+                    Log::logf(CAT_OXI, viatom_write_chr ? LOG_DEBUG : LOG_INFO,
+                              "%s addr=%s name=\"%s\"%s\n",
+                              viatom_write_chr ? "Sensor probe subscribed" : "Sensor subscribed",
                               addr.c_str(), dev_name.c_str(),
                               oxyii_write_chr ? "; initializing OxyII" : "");
 
@@ -1733,6 +1762,10 @@ void OxiBle::task(void *param) {
         if (state == OXI_STREAMING && viatom_write_chr && pClient->isConnected()) {
             static uint32_t last_viatom_poll = 0;
             if (viatom_time_pending.exchange(false) && !charging_requested.load()) {
+                const auto addr = pClient->getPeerAddress().toString();
+                bool charging_ended = known_set_charging(addr.c_str(), false);
+                Log::logf(CAT_OXI, LOG_INFO, "Sensor subscribed addr=%s name=\"%s\"%s\n",
+                          addr.c_str(), connected_name, charging_ended ? "; charging ended" : "");
                 set_viatom_datetime();
                 last_viatom_poll = millis();
             } else if (millis() - last_viatom_poll >= 2000) {
