@@ -260,6 +260,22 @@ static bool clock_write_applied(const char *command, bool ok, const char *respon
     Log::logf(CAT_TIME, LOG_WARN, "ResMed clock write %s: %s -> %s\n",
               rejected ? "rejected (use TIMESYNC to retry)" : "not applied; will retry",
               command, response[0] ? response : "timeout");
+    if (ok && value && Log::get_cat_level(CAT_TIME) >= LOG_DEBUG) {
+        // Native setters may leave the value unchanged despite an R reply.
+        // Observe their state guards after refusal, without inferring a cause.
+        static const char *tags[] = {"ZRM", "MST"};
+        for (const char *tag : tags) {
+            char state[16] = {};
+            Arbiter::VarReadTrace trace;
+            (void)Arbiter::read_var(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                   state, sizeof(state), CLOCK_TIMEOUT_MS, &trace);
+            Log::logf(CAT_TIME, LOG_DEBUG,
+                      "Clock refusal #%s=%s result=%s tx=%lu rx=%lu queue=%lums wait=%lums\n",
+                      tag, state[0] ? state : "--", trace.outcome,
+                      (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms,
+                      (unsigned long)trace.queue_ms, (unsigned long)trace.wait_ms);
+        }
+    }
     return false;
 }
 
@@ -311,17 +327,19 @@ static bool finish_clock_sync() {
     char response[64] = {};
     uint16_t length = sizeof(response);
     uart_transaction_result_t result = {};
-    bool ok = Arbiter::finish_cmd(clock_sync_ticket, response, &length, &result);
+    Arbiter::VarReadTrace trace;
+    bool ok = Arbiter::finish_cmd(clock_sync_ticket, response, &length, &result, &trace);
     clock_sync_ticket = nullptr;
     if (result.send_window_missed) {
         Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock TX window missed; will retry\n");
         return false;
     }
-    if (!clock_write_applied(clock_sync_tic, ok, response)) return false;
     Log::logf(CAT_TIME, LOG_DEBUG,
-              "ResMed clock TIC=%s edge_us=%lld TX late=%ldus\n",
+              "ResMed clock TIC=%s edge_us=%lld sent=%u TX late=%ldus tx=%lu rx=%lu result=%s\n",
               clock_sync_tic + 9, (long long)clock_sync_edge_us,
-              (long)result.send_lateness_us);
+              unsigned(trace.sent), (long)result.send_lateness_us,
+              (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms, trace.outcome);
+    if (!clock_write_applied(clock_sync_tic, ok, response)) return false;
 
     Air10Clock::Calendar observed;
     if (!Air10Clock::read(observed, CLOCK_TIMEOUT_MS)) {
