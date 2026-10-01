@@ -20,6 +20,10 @@
 #define OXI_TASK_PRIO       4
 #define SCAN_DURATION_MS    10000
 
+// The 20 ms / 1 s observer missed an advertising O2Ring for tens of seconds.
+static constexpr uint16_t OBSERVE_INTERVAL_MS = 100;
+static constexpr uint16_t OBSERVE_WINDOW_MS = 50;
+
 static const NimBLEUUID PLX_SERVICE_UUID((uint16_t)0x1822);
 static const NimBLEUUID PLX_CONTINUOUS_UUID((uint16_t)0x2A5F);
 static const NimBLEUUID PLX_SPOT_UUID((uint16_t)0x2A5E);
@@ -1682,15 +1686,16 @@ void OxiBle::task(void *param) {
             scanner->setDuplicateFilter(false);
             scanner->setMaxResults(0);
             scanner->setActiveScan(false);
-            scanner->setInterval(1000);
-            scanner->setWindow(20);
+            scanner->setInterval(OBSERVE_INTERVAL_MS);
+            scanner->setWindow(OBSERVE_WINDOW_MS);
             update_observer(true);
             if (scanner->start(0)) {
                 scan_retry_at = 0;
                 set_state(OXI_OBSERVING);
                 Log::logf(CAT_OXI, LOG_DEBUG,
-                          "Known sensor observation started at=%lu interval=1000ms window=20ms\n",
-                          (unsigned long)observing_since);
+                          "Known sensor observation started at=%lu interval=%ums window=%ums\n",
+                          (unsigned long)observing_since, OBSERVE_INTERVAL_MS,
+                          OBSERVE_WINDOW_MS);
             } else {
                 update_observer(false);
                 scan_retry_at = millis() + 1000;
