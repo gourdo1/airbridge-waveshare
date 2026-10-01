@@ -307,14 +307,15 @@ static void update_observer(bool active) {
     portEXIT_CRITICAL(&known_mux);
 }
 
-static void hold_autoconnect(const char *addr, bool charging) {
+static void hold_autoconnect(const char *addr, bool charging, bool until_absent) {
     portENTER_CRITICAL(&known_mux);
     int index = known_index(addr);
-    if (index >= 0) known_devices[index].holdoff.start(millis(), charging);
+    if (index >= 0) known_devices[index].holdoff.start(millis(), charging, until_absent);
     portEXIT_CRITICAL(&known_mux);
-    Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect holdoff addr=%s duration=%lus\n",
+    Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect holdoff addr=%s duration=%lus clear=%s\n",
               addr, (unsigned long)((charging ? OxiBlePolicy::CHARGING_HOLDOFF_MS :
-                                       OxiBlePolicy::RECONNECT_HOLDOFF_MS) / 1000));
+                                       OxiBlePolicy::RECONNECT_HOLDOFF_MS) / 1000),
+              until_absent ? "absent or deadline" : "deadline");
 }
 
 
@@ -1304,8 +1305,11 @@ void OxiBle::task(void *param) {
                 data_problem == OxiBlePolicy::Disconnect::Invalid ? "invalid samples for 30s" : "requested";
             Log::logf(CAT_OXI, data_problem == OxiBlePolicy::Disconnect::Silent ? LOG_WARN : LOG_INFO,
                       "Sensor disconnect: %s\n", reason);
-            if (pClient->isConnected())
-                hold_autoconnect(pClient->getPeerAddress().toString().c_str(), charging);
+            if (pClient->isConnected()) {
+                // Sparse passive observation cannot prove an idle sensor powered off.
+                bool until_absent = charging || data_problem == OxiBlePolicy::Disconnect::None;
+                hold_autoconnect(pClient->getPeerAddress().toString().c_str(), charging, until_absent);
+            }
             update_observer(false);
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
