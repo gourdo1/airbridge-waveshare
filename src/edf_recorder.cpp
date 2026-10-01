@@ -47,6 +47,7 @@ constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 120;
 constexpr uint8_t PBT_SAMPLE_COUNT = 4;
 constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
+constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
 constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
@@ -293,9 +294,18 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
 }
 
 static bool read_numeric_variable(const char *name, int16_t &value,
-                                  uint32_t slot) {
+                                  uint32_t slot, uint32_t target_ms,
+                                  uint8_t &queries) {
+    const int32_t offset = static_cast<int32_t>(millis() - target_ms);
+    if (offset > PLD_SAMPLE_WINDOW_MS) {
+        Log::logf(CAT_EDF, LOG_DEBUG,
+                  "PLD #%s slot=%lu skipped offset=%ldms\n",
+                  name, (unsigned long)slot, (long)offset);
+        return false;
+    }
     uint32_t parsed = 0;
     Arbiter::VarReadTrace trace;
+    queries++;
     const auto result = Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
                                              parsed, POLL_TIMEOUT_MS, &trace);
     if (result != Arbiter::VarResult::Ok || parsed > INT16_MAX) {
@@ -305,6 +315,15 @@ static bool read_numeric_variable(const char *name, int16_t &value,
                   name, result == Arbiter::VarResult::Ok ? "out_of_range" : trace.outcome,
                   static_cast<unsigned long>(trace.queue_ms), unsigned(trace.sent),
                   static_cast<unsigned long>(trace.wait_ms), millis());
+        return false;
+    }
+    const int32_t sent_offset = static_cast<int32_t>(trace.sent_ms - target_ms);
+    const int32_t received_offset = static_cast<int32_t>(trace.received_ms - target_ms);
+    if (sent_offset < -int32_t(PLD_SAMPLE_WINDOW_MS) ||
+        received_offset > PLD_SAMPLE_WINDOW_MS) {
+        Log::logf(CAT_EDF, LOG_DEBUG,
+                  "PLD #%s slot=%lu discarded tx_offset=%ldms rx_offset=%ldms\n",
+                  name, (unsigned long)slot, (long)sent_offset, (long)received_offset);
         return false;
     }
     value = static_cast<int16_t>(parsed);
@@ -2050,17 +2069,19 @@ static void sample_pld() {
 
     const uint32_t started_ms = millis();
     const uint32_t elapsed = relative_ms(started_ms);
-    // Center the measured query burst on the capture target, not on slot onset.
-    // Half a slot bounds anticipation even after a congested/failed series.
-    const uint32_t lead_ms = min(pld_series_ms / 2, uint32_t(1000));
+    // The acquisition target and the EDF slot now share the same timestamp.
+    const uint32_t lead_ms = min(pld_series_ms / 2, uint32_t(PLD_SAMPLE_WINDOW_MS));
     if (elapsed + lead_ms < 2000) return;
-    const uint32_t absolute_slot = (elapsed + lead_ms) / 2000 - 1;
+    const uint32_t absolute_slot = (elapsed + lead_ms) / 2000;
     if (last_pld_slot != UINT32_MAX && absolute_slot <= last_pld_slot) return;
-    last_pld_slot = absolute_slot;
     const uint32_t record = absolute_slot / 30;
+    // Advancing the accumulator flushes the preceding minute. Do not do that
+    // before the minute has elapsed, even if a short burst finishes early.
+    if (record > elapsed / 60000 || absolute_slot * 2000 >= segment_duration_ms) return;
+    last_pld_slot = absolute_slot;
     const uint16_t slot = absolute_slot % 30;
     const uint32_t segment_start = session_clock.captured_ms;
-    const uint32_t target_ms = segment_start + (absolute_slot + 1) * 2000;
+    const uint32_t target_ms = segment_start + absolute_slot * 2000;
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     PbtSample selected_pbt = {};
     const PbtSample *pbt = nullptr;
@@ -2094,8 +2115,7 @@ static void sample_pld() {
             deferred |= uint32_t(1) << i;
             continue;
         }
-        (void)read_numeric_variable(source.tag, values[i], absolute_slot);
-        queries++;
+        (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
         if (!collect_frames()) return;
     }
 
@@ -2112,8 +2132,7 @@ static void sample_pld() {
                       (unsigned long)pbt->received_ms);
         } else {
             values[i] = EDF_MISSING;
-            (void)read_numeric_variable(source.tag, values[i], absolute_slot);
-            queries++;
+            (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
             drain_raw_frames(0);
             if (!status.active || segment_start != session_clock.captured_ms ||
                 !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE)) return;
