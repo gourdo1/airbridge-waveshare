@@ -1991,6 +1991,7 @@ static uint32_t relative_ms(uint32_t captured_ms) {
 
 static bool advance_segment(uint32_t captured_ms);
 static void drain_raw_frames(TickType_t wait);
+static void sample_oximetry();
 
 static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                          const DecodedFrame &decoded) {
@@ -2095,6 +2096,7 @@ static void sample_pld() {
                       (unsigned long)absolute_slot);
             return false;
         }
+        sample_oximetry();
         const PbtSample *candidate = pbt_schema ? nearest_pbt(target_ms) : nullptr;
         if (candidate && (!pbt || abs(int32_t(candidate->received_ms - target_ms)) <
                                  abs(int32_t(pbt->received_ms - target_ms)))) {
@@ -2263,22 +2265,26 @@ static void sample_oximetry() {
     oxi_reading_t reading;
     OxiArbiter::snapshot(reading);
     const uint32_t now = millis();
+    const uint32_t elapsed = min(relative_ms(now), segment_duration_ms);
     const int32_t sample_ms = static_cast<int32_t>(reading.timestamp_ms - session_clock.captured_ms);
     if (reading.valid && sample_ms >= 0 && uint32_t(sample_ms) < segment_duration_ms &&
         static_cast<int32_t>(now - reading.timestamp_ms) >= 0) {
-        const uint32_t absolute_slot = uint32_t(sample_ms) / 1000;
-        const uint32_t record = absolute_slot / 60;
-        // Use the first received reading in each second; never backfill a
-        // closed record or repeat an old reading into a later second.
-        if ((last_oxi_slot == UINT32_MAX || absolute_slot > last_oxi_slot) &&
-            record >= sad.current_record) {
+        const uint32_t first_slot = uint32_t(sample_ms) / 1000;
+        const uint32_t last_slot = min(first_slot + 1, elapsed / 1000);
+        // Viatom updates every two seconds. Hold once on the 1 Hz EDF grid,
+        // but never predict a future slot or extend a silent source further.
+        for (uint32_t absolute_slot = first_slot; absolute_slot <= last_slot;
+             absolute_slot++) {
+            const uint32_t record = absolute_slot / 60;
+            if (absolute_slot * 1000 >= segment_duration_ms ||
+                (last_oxi_slot != UINT32_MAX && absolute_slot <= last_oxi_slot) ||
+                record < sad.current_record) continue;
             last_oxi_slot = absolute_slot;
             const uint16_t slot = absolute_slot % 60;
             store_sample(sad, "Pulse.1s", record, slot, reading.pulse_bpm);
             store_sample(sad, "SpO2.1s", record, slot, reading.spo2);
         }
     }
-    const uint32_t elapsed = min(relative_ms(now), segment_duration_ms);
     (void)advance_record(sad, elapsed / 60000);
 }
 
