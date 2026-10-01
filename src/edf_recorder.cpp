@@ -194,7 +194,6 @@ static PbtSample pbt_samples[PBT_SAMPLE_COUNT];
 static uint8_t pbt_sample_count = 0;
 static uint8_t pbt_next_sample = 0;
 static uint32_t last_pld_slot = UINT32_MAX;
-static uint32_t pld_series_ms = 0;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
 static void status_error(const char *message, const char *file = nullptr) {
@@ -2071,15 +2070,14 @@ static void sample_pld() {
 
     const uint32_t started_ms = millis();
     const uint32_t elapsed = relative_ms(started_ms);
-    // The acquisition target and the EDF slot now share the same timestamp.
-    const uint32_t lead_ms = min(pld_series_ms / 2, uint32_t(PLD_SAMPLE_WINDOW_MS));
+    // A short previous burst does not predict the next 40/80 ms response mix.
+    // Use the full acquisition window without moving the EDF target.
+    const uint32_t lead_ms = PLD_SAMPLE_WINDOW_MS;
     if (elapsed + lead_ms < 2000) return;
     const uint32_t absolute_slot = (elapsed + lead_ms) / 2000;
     if (last_pld_slot != UINT32_MAX && absolute_slot <= last_pld_slot) return;
     const uint32_t record = absolute_slot / 30;
-    // Advancing the accumulator flushes the preceding minute. Do not do that
-    // before the minute has elapsed, even if a short burst finishes early.
-    if (record > elapsed / 60000 || absolute_slot * 2000 >= segment_duration_ms) return;
+    if (absolute_slot * 2000 >= segment_duration_ms) return;
     last_pld_slot = absolute_slot;
     const uint16_t slot = absolute_slot % 30;
     const uint32_t segment_start = session_clock.captured_ms;
@@ -2087,8 +2085,8 @@ static void sample_pld() {
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     PbtSample selected_pbt = {};
     const PbtSample *pbt = nullptr;
-    auto collect_frames = [&]() {
-        drain_raw_frames(0);
+    auto collect_frames = [&](TickType_t wait = 0) {
+        drain_raw_frames(wait);
         if (!status.active || segment_start != session_clock.captured_ms ||
             !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
             int32_t(millis() - target_ms) >= 2000) {
@@ -2122,6 +2120,12 @@ static void sample_pld() {
         if (!collect_frames()) return;
     }
 
+    // A next-minute slot may be collected early, but advancing its accumulator
+    // must wait for the boundary. Keep draining BRP and local SAD meanwhile.
+    while (int32_t(millis() - (segment_start + record * 60000)) < 0) {
+        if (!collect_frames(pdMS_TO_TICKS(20))) return;
+    }
+
     // Freeze one frame for all covered fields; only failed fields need late G S.
     for (size_t i = 0; i < count; i++) {
         if (!(deferred & (uint32_t(1) << i))) continue;
@@ -2142,7 +2146,6 @@ static void sample_pld() {
         }
     }
     const uint32_t finished_ms = millis();
-    pld_series_ms = finished_ms - started_ms;
     Log::logf(CAT_EDF, LOG_DEBUG,
               "PLD series slot=%lu target=%lu start=%lu end=%lu queries=%u pbt=%u\n",
               (unsigned long)absolute_slot, (unsigned long)target_ms,
@@ -2522,7 +2525,6 @@ static void reset_session_state(bool rollover = false) {
     pbt_sample_count = 0;
     pbt_next_sample = 0;
     last_pld_slot = UINT32_MAX;
-    pld_series_ms = 0;
     last_oxi_slot = UINT32_MAX;
     if (!rollover) xQueueReset(raw_queue);
 }
