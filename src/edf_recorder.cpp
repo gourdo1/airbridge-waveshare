@@ -2259,21 +2259,26 @@ static void drain_raw_frames(TickType_t wait) {
 
 static void sample_oximetry() {
     if (!status.active) return;
-    const uint32_t elapsed = relative_ms(millis());
-    const uint32_t absolute_slot = elapsed / 1000;
-    if (absolute_slot == last_oxi_slot) return;
-    last_oxi_slot = absolute_slot;
-    const uint32_t record = absolute_slot / 60;
-    const uint16_t slot = absolute_slot % 60;
-
     oxi_reading_t reading;
     OxiArbiter::snapshot(reading);
-    const bool fresh = reading.valid &&
-                       static_cast<uint32_t>(millis() - reading.timestamp_ms) <= 10000;
-    store_sample(sad, "Pulse.1s", record, slot,
-                 fresh ? reading.pulse_bpm : EDF_MISSING);
-    store_sample(sad, "SpO2.1s", record, slot,
-                 fresh ? reading.spo2 : EDF_MISSING);
+    const uint32_t now = millis();
+    const int32_t sample_ms = static_cast<int32_t>(reading.timestamp_ms - session_clock.captured_ms);
+    if (reading.valid && sample_ms >= 0 && uint32_t(sample_ms) < segment_duration_ms &&
+        static_cast<int32_t>(now - reading.timestamp_ms) >= 0) {
+        const uint32_t absolute_slot = uint32_t(sample_ms) / 1000;
+        const uint32_t record = absolute_slot / 60;
+        // Use the first received reading in each second; never backfill a
+        // closed record or repeat an old reading into a later second.
+        if ((last_oxi_slot == UINT32_MAX || absolute_slot > last_oxi_slot) &&
+            record >= sad.current_record) {
+            last_oxi_slot = absolute_slot;
+            const uint16_t slot = absolute_slot % 60;
+            store_sample(sad, "Pulse.1s", record, slot, reading.pulse_bpm);
+            store_sample(sad, "SpO2.1s", record, slot, reading.spo2);
+        }
+    }
+    const uint32_t elapsed = min(relative_ms(now), segment_duration_ms);
+    (void)advance_record(sad, elapsed / 60000);
 }
 
 static bool frame_sink(const qframe_t *frame, void *) {
