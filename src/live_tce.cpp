@@ -1,7 +1,8 @@
 #include "live_tce.h"
 #include "air10_stream.h"
 #include "live_stream.h"
-#include "uart_arbiter.h"
+#include "airsense_state.h"
+#include <Arduino.h>
 
 namespace LiveTce {
 
@@ -12,13 +13,14 @@ static Air10Stream::Schema schema;
 static portMUX_TYPE schema_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool prepare() {
-    uint32_t mid = 0, vid = 0;
-    if (Arbiter::read_var_hex("MID", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, mid) !=
-            Arbiter::VarResult::Ok || mid > UINT16_MAX ||
-        Arbiter::read_var_hex("VID", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, vid) !=
-            Arbiter::VarResult::Ok || vid > UINT16_MAX) return false;
+    AirSenseState::Identity identity;
+    if (!AirSenseState::identity(identity)) {
+        AirSenseState::request_refresh();
+        return false;
+    }
     Air10Stream::Schema resolved = {};
-    if (!Air10Stream::resolve_schema(resolved, TAG, mid, vid)) return false;
+    if (!Air10Stream::resolve_schema(resolved, TAG, identity.mid, identity.vid) ||
+        identity.generation != AirSenseState::identity_generation()) return false;
     portENTER_CRITICAL(&schema_mux);
     schema = resolved;
     portEXIT_CRITICAL(&schema_mux);

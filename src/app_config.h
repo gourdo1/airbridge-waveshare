@@ -67,10 +67,6 @@ struct AirBridgeConfig {
     String      sleephq_client_secret;
     String      sleephq_team_id;
     String      sleephq_device_id;
-
-    // Runtime cache
-    String      device_pna;         // #PNA
-    String      device_srn;         // #SRN
 };
 
 namespace Config {
@@ -92,10 +88,6 @@ namespace Config {
     bool is_sensitive(const char *key);
     bool get_value(const char *key, String &out);
     bool set_value(const char *key, const char *value);
-
-    void refresh_device_info();
-    uint32_t device_info_revision();
-    void invalidate_device_info();
 
     String dump();
 

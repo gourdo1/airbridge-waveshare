@@ -52,12 +52,13 @@ void dispatch_command(const char *line, String &response) {
     if (upper == "STATUS") {
         const auto status = DeviceStatus::snapshot();
         const auto &r = status.reading;
-        auto &cfg = Config::get();
+        AirSenseState::Identity identity;
+        AirSenseState::identity(identity);
 
         response.reserve(512);
         response = "system: " + String(system_state_name(status.sys)) + "\n";
-        if (!cfg.device_pna.isEmpty())
-            response += "device: " + cfg.device_pna + " (" + cfg.device_srn + ")\n";
+        if (identity.valid)
+            response += "device: " + String(identity.pna) + " (" + identity.srn + ")\n";
         response += "oxi: " + String(oxi_state_name(status.oxi)) + "\n";
         if (r.valid) {
             response += "spo2: " + String(r.spo2) + "%\n";

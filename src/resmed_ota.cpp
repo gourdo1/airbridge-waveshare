@@ -6,6 +6,7 @@
 #include "app_config.h"
 #include "live_stream.h"
 #include "custom_settings.h"
+#include "airsense_state.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
@@ -543,6 +544,7 @@ static void flash_task(void *param) {
         if (!check_bid(part, 0, p->force_blx)) goto cleanup;
     }
 
+    AirSenseState::invalidate_identity();
     if (!enter_bootloader()) goto cleanup;
     if (flash_cancel) goto cleanup;
 
@@ -623,7 +625,6 @@ static void flash_task(void *param) {
         if (app_running) {
             strncpy(flash_phase, "Complete", sizeof(flash_phase));
             Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Flash complete, device running\n");
-            Config::invalidate_device_info();
         } else if (!flash_cancel) {
             snprintf(flash_error, sizeof(flash_error),
                      "Device did not return to app after flash");

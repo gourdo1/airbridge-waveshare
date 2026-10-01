@@ -29,7 +29,6 @@ void init();
 // Detailed capture follows ZLE; system standby/connection loss can also stop it.
 void therapy_started();
 void request_stop();
-void device_restarted();
 // Reserve the native clock until end_clock_write(); defer new STR collection.
 bool begin_clock_write(const char **reason = nullptr);
 void end_clock_write();

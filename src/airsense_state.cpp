@@ -2,7 +2,7 @@
 #include "uart_arbiter.h"
 #include "device_uptime.h"
 #include "air10_clock.h"
-#include "app_config.h"
+#include "hex_util.h"
 #include "custom_settings.h"
 #include "live_stream.h"
 #include "edf_recorder.h"
@@ -24,6 +24,76 @@ bool airsense_present = false;
 std::atomic<int> cached_rop{-1}, cached_mhr{-1}, cached_mop{-1};
 std::atomic<bool> refresh_requested{false};
 DeviceUptime::Tracker device_uptime;
+Identity device_identity;
+portMUX_TYPE identity_mux = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<uint32_t> device_revision{0};
+const char *identity_failed_tag = nullptr, *identity_failure = nullptr;
+
+static bool read_identity_field(const char *tag, char *out, size_t capacity,
+                                 uint16_t *number = nullptr) {
+    Arbiter::VarReadTrace trace;
+    auto result = Arbiter::read_var(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
+                                    out, capacity, HEALTH_TIMEOUT_MS, &trace);
+    uint32_t parsed = 0;
+    if (result == Arbiter::VarResult::Ok) {
+        if (!out[0] || strchr(out, '\r') || strchr(out, '\n')) {
+            result = Arbiter::VarResult::Failed;
+            trace.outcome = "invalid_text";
+        } else if (number && !aircannect::parse_hex(out, strlen(out), parsed)) {
+            result = Arbiter::VarResult::Failed;
+            trace.outcome = "invalid_hex";
+        } else if (number && parsed > UINT16_MAX) {
+            result = Arbiter::VarResult::Failed;
+            trace.outcome = "out_of_range";
+        }
+    }
+    if (result != Arbiter::VarResult::Ok) {
+        const bool changed = !identity_failed_tag || strcmp(identity_failed_tag, tag) ||
+            !identity_failure || strcmp(identity_failure, trace.outcome);
+        identity_failed_tag = tag;
+        identity_failure = trace.outcome;
+        Log::logf(CAT_HEALTH, changed ? LOG_WARN : LOG_DEBUG,
+                  "Identity #%s result=%s queue=%lums sent=%u wait=%lums value=%s\n",
+                  tag, trace.outcome, (unsigned long)trace.queue_ms,
+                  unsigned(trace.sent), (unsigned long)trace.wait_ms, out);
+        return false;
+    }
+    if (number) *number = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+static void refresh_identity() {
+    Identity current;
+    identity(current);
+    if (!current.valid) {
+        if (!read_identity_field("SRN", current.srn, sizeof(current.srn)) ||
+            !read_identity_field("MID", current.mid_text, sizeof(current.mid_text), &current.mid) ||
+            !read_identity_field("VID", current.vid_text, sizeof(current.vid_text), &current.vid))
+            return;
+        portENTER_CRITICAL(&identity_mux);
+        const bool same_device = current.generation == device_identity.generation;
+        if (same_device) {
+            current.valid = true;
+            device_identity = current;
+            ++device_revision;
+        }
+        portEXIT_CRITICAL(&identity_mux);
+        if (!same_device) {
+            Log::logf(CAT_HEALTH, LOG_DEBUG, "Identity invalidated during read\n");
+            return;
+        }
+        identity_failed_tag = identity_failure = nullptr;
+    }
+    if (!current.pna[0] && read_identity_field("PNA", current.pna, sizeof(current.pna))) {
+        portENTER_CRITICAL(&identity_mux);
+        if (current.generation == device_identity.generation) {
+            memcpy(device_identity.pna, current.pna, sizeof(current.pna));
+            ++device_revision;
+        }
+        portEXIT_CRITICAL(&identity_mux);
+        identity_failed_tag = identity_failure = nullptr;
+    }
+}
 
 static void poll_device_uptime() {
     char response[48] = {};
@@ -34,14 +104,13 @@ static void poll_device_uptime() {
         !device_uptime.observe(ticks, millis())) return;
 
     Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
-    Config::invalidate_device_info();
+    invalidate_identity();
     Air10Clock::invalidate();
     CustomSettings::invalidate("STK reset");
     LiveStream::reattach();
     Air10Clock::request_sync();
     cached_mhr = -1;
     cached_mop = -1;
-    EdfRecorder::device_restarted();
     if (Arbiter::get_state() == SYS_THERAPY) {
         Arbiter::set_state(SYS_IDLE);
     }
@@ -91,7 +160,7 @@ static void poll_therapy_state() {
         if (airsense_present) {
             airsense_seen_ms = millis();
             poll_device_uptime();
-            Config::refresh_device_info();
+            refresh_identity();
             poll_therapy_mode();
             int new_rop = (int)strtoul(rv, nullptr, 16);
             int prev_rop = cached_rop.load();
@@ -126,7 +195,7 @@ static void poll_therapy_state() {
             system_state_t current = Arbiter::get_state();
             if (current != SYS_ERROR && current != SYS_TRANSPARENT &&
                 current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
-                if (current == SYS_THERAPY) EdfRecorder::request_stop();
+                invalidate_identity();
                 Arbiter::set_state(SYS_ERROR);
                 Log::logf(CAT_HEALTH, LOG_WARN, "AirSense unavailable: UART unresponsive\n");
             }
@@ -148,7 +217,6 @@ static void attempt_recovery() {
         Log::logf(CAT_HEALTH, LOG_INFO, "Device responded, clearing error\n");
         consecutive_timeouts = 0;
         Arbiter::set_state(SYS_IDLE);
-        Config::invalidate_device_info();
         CustomSettings::invalidate("UART recovery");
         // AirSense may have rebooted; force re-subscribe regardless of
         // the broker's stale subscribed flags.
@@ -159,6 +227,33 @@ static void attempt_recovery() {
 }  // namespace
 
 void request_refresh() { refresh_requested = true; }
+
+bool identity(Identity &out) {
+    portENTER_CRITICAL(&identity_mux);
+    out = device_identity;
+    portEXIT_CRITICAL(&identity_mux);
+    return out.valid;
+}
+
+uint32_t identity_generation() {
+    portENTER_CRITICAL(&identity_mux);
+    const uint32_t generation = device_identity.generation;
+    portEXIT_CRITICAL(&identity_mux);
+    return generation;
+}
+
+uint32_t identity_revision() { return device_revision.load(); }
+
+void invalidate_identity() {
+    portENTER_CRITICAL(&identity_mux);
+    const uint32_t generation = device_identity.generation + 1;
+    device_identity = {};
+    device_identity.generation = generation;
+    ++device_revision;
+    portEXIT_CRITICAL(&identity_mux);
+    request_refresh();
+    EdfRecorder::request_stop();
+}
 
 int rop() { return cached_rop.load(); }
 int mhr() { return cached_mhr.load(); }

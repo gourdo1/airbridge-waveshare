@@ -151,7 +151,6 @@ static uint32_t next_pending_ms = 0;
 static bool pending_scanned = false;
 static bool clock_write_active = false;
 static const char *pending_scan_error = nullptr;
-static uint32_t device_generation = 0;
 static uint32_t synced_device_generation = 0;
 static uint32_t synced_str_generation = 0;
 static uint16_t synced_saved_day = 0;
@@ -181,14 +180,10 @@ static char recording_id[81] = {};
 static char start_date[9] = {};
 static char start_time[9] = {};
 static char session_directory[40] = {};
-static uint16_t session_mid = 0;
-static uint16_t session_vid = 0;
-static char session_srn[24] = {};
+static AirSenseState::Identity recording_identity;
 static bool identification_verified = false;
 static uint32_t identification_device = 0;
 static uint32_t identification_crc = 0;
-static uint16_t identification_mid = 0, identification_vid = 0;
-static char identification_srn[24] = {};
 
 static WaveClock wave_clock = {};
 static TimedFrame pbt_samples[PBT_SAMPLE_COUNT];
@@ -275,12 +270,6 @@ static bool command_value(const char *command, char *out, size_t capacity,
     strncpy(out, value, capacity - 1);
     out[capacity - 1] = 0;
     return true;
-}
-
-static bool read_variable(const char *name, char *out, size_t capacity,
-                          uint16_t timeout_ms = POLL_TIMEOUT_MS) {
-    return Arbiter::get_var(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                            out, capacity, timeout_ms);
 }
 
 static bool read_stored_value(const char *tag, uint16_t epoch_day,
@@ -432,11 +421,12 @@ static bool write_pending(const EdfPending::Record &record) {
     return publish_single_file(part, path, backup);
 }
 
-static bool save_pending(const char *prefix = nullptr, const char *day = nullptr) {
+static bool save_pending(const AirSenseState::Identity &identity,
+                          const char *prefix = nullptr, const char *day = nullptr) {
     EdfPending::Record pending;
     pending.native_day = session_native_day;
-    pending.mid = session_mid; pending.vid = session_vid;
-    memcpy(pending.srn, session_srn, sizeof(pending.srn));
+    pending.mid = identity.mid; pending.vid = identity.vid;
+    memcpy(pending.srn, identity.srn, sizeof(pending.srn));
     memcpy(pending.prefix, prefix ? prefix : status.file_prefix, sizeof(pending.prefix));
     memcpy(pending.day, day ? day : status.therapy_day, sizeof(pending.day));
     if (!write_pending(pending)) {
@@ -571,11 +561,13 @@ static bool publish_identification_pair() {
     return true;
 }
 
-static bool collect_identification(uint8_t *&content, size_t &content_len) {
+static bool collect_identification(const AirSenseState::Identity &identity,
+                                   uint8_t *&content, size_t &content_len) {
     static const char *const tags[] = {
         "IMF", "VIR", "RIR", "PVR", "PVD", "CID", "RID", "VID",
         "SRN", "SID", "PNA", "PCD", "PCB", "MID", "FGT", "BID",
     };
+    if (!identity.valid || !identity.pna[0]) return false;
     content = static_cast<uint8_t *>(
         aircannect::Memory::alloc_large(IDENTIFICATION_BUFFER_SIZE));
     if (!content) {
@@ -587,18 +579,32 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
     bool built = true;
     bool cancelled = false;
     const char *failed_tag = "";
+    Arbiter::VarReadTrace trace;
     for (const char *tag : tags) {
         failed_tag = tag;
+        trace = {};
         if (post_processing_cancelled()) {
             cancelled = true;
             built = false;
             break;
         }
-        char value[128] = {};
-        if (!read_variable(tag, value, sizeof(value), 1000) ||
-            strchr(value, '\r') || strchr(value, '\n')) {
-            Log::logf(CAT_EDF, LOG_DEBUG,
-                      "Identification read failed for %s\n", tag);
+        char response[128] = {};
+        const char *value = nullptr;
+        if (!strcmp(tag, "SRN")) value = identity.srn;
+        else if (!strcmp(tag, "MID")) value = identity.mid_text;
+        else if (!strcmp(tag, "VID")) value = identity.vid_text;
+        else if (!strcmp(tag, "PNA")) value = identity.pna;
+        else {
+            value = response;
+            if (Arbiter::read_var(tag, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                                  response, sizeof(response), 1000, &trace) !=
+                Arbiter::VarResult::Ok) {
+                built = false;
+                break;
+            }
+        }
+        if (strchr(value, '\r') || strchr(value, '\n')) {
+            trace.outcome = "invalid_text";
             built = false;
             break;
         }
@@ -609,6 +615,7 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
         if (line_len <= 0 ||
             static_cast<size_t>(line_len) >=
                 IDENTIFICATION_BUFFER_SIZE - content_len) {
+            trace.outcome = "buffer_full";
             built = false;
             break;
         }
@@ -616,8 +623,11 @@ static bool collect_identification(uint8_t *&content, size_t &content_len) {
     }
     if (!built) {
         if (!cancelled) {
-            char error[96];
-            snprintf(error, sizeof(error), "Identification collection failed: tag=%s", failed_tag);
+            char error[160];
+            snprintf(error, sizeof(error),
+                     "Identification #%s result=%s queue=%lums sent=%u wait=%lums",
+                     failed_tag, trace.outcome, (unsigned long)trace.queue_ms,
+                     unsigned(trace.sent), (unsigned long)trace.wait_ms);
             post_error(error);
         }
         return false;
@@ -675,29 +685,24 @@ static bool write_identification(const uint8_t *content, size_t content_len) {
     return true;
 }
 
-static bool ensure_identification(uint32_t device) {
+static bool ensure_identification(const AirSenseState::Identity &identity) {
     if (!SdStorage::try_acquire()) return false;
-    const bool current = identification_verified && identification_device == device &&
-        identification_mid == session_mid && identification_vid == session_vid &&
-        !strcmp(identification_srn, session_srn) &&
+    const bool current = identification_verified && identification_device == identity.generation &&
         storage->exists("/Identification.tgt") && storage->exists("/Identification.crc");
     SdStorage::release();
     if (current) return true;
 
     uint8_t *content = nullptr;
     size_t size = 0;
-    bool success = collect_identification(content, size) &&
+    bool success = collect_identification(identity, content, size) &&
         !post_processing_cancelled() &&
-        device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
+        identity.generation == AirSenseState::identity_generation();
     if (success && SdStorage::try_acquire()) {
         success = write_identification(content, size);
         SdStorage::release();
         if (success) {
-            identification_device = device;
+            identification_device = identity.generation;
             identification_crc = crc32_ieee(content, size);
-            identification_mid = session_mid;
-            identification_vid = session_vid;
-            memcpy(identification_srn, session_srn, sizeof(identification_srn));
             identification_verified = true;
         }
     } else {
@@ -805,7 +810,8 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
 }
 
 static bool render_str_header(uint16_t first_day, uint32_t records,
-                              uint8_t *header, size_t capacity) {
+                              uint8_t *header, size_t capacity,
+                              const AirSenseState::Identity &identity) {
     int year = 0;
     unsigned month = 0;
     unsigned day = 0;
@@ -816,8 +822,8 @@ static bool render_str_header(uint16_t first_day, uint32_t records,
     char str_date[9];
     snprintf(str_recording, sizeof(str_recording),
              "Startdate %02u-%s-%04d X X X SRN=%s  MID=%u  VID=%u",
-             day, MONTH_NAMES[month - 1], year, session_srn,
-             session_mid, session_vid);
+             day, MONTH_NAMES[month - 1], year, identity.srn,
+             identity.mid, identity.vid);
     snprintf(str_date, sizeof(str_date), "%02u.%02u.%02u",
              day, month, year % 100);
     Air10Edf::HeaderInfo info = {
@@ -945,7 +951,8 @@ static bool render_empty_str_record(uint16_t epoch_day, uint8_t *record,
 }
 
 static bool update_str_file(const uint8_t *incoming_record,
-                            const EdfCatalog::Entry &latest) {
+                            const EdfCatalog::Entry &latest,
+                            const AirSenseState::Identity &identity) {
     constexpr const char *FINAL = "/STR.edf";
     constexpr const char *PART = "/STR.edf.part";
     constexpr const char *BACKUP = "/STR.edf.bak";
@@ -991,7 +998,7 @@ static bool update_str_file(const uint8_t *incoming_record,
             input.size() != header_size + existing_records * record_size ||
             !Air10StrTimeline::begin(header_start_day, existing_records,
                                      scan) ||
-            !render_str_header(header_start_day, existing_records, header, header_size)) {
+            !render_str_header(header_start_day, existing_records, header, header_size, identity)) {
             valid = false;
         }
         if (valid) same_header = memcmp(fixed, header, sizeof(fixed)) == 0;
@@ -1045,7 +1052,7 @@ static bool update_str_file(const uint8_t *incoming_record,
     Air10StrTimeline::Plan plan;
     if (!Air10StrTimeline::make_plan(scan, session_native_day, plan) ||
         !render_str_header(plan.start_day, plan.record_count,
-                           header, header_size)) {
+                           header, header_size, identity)) {
         if (input) input.close();
         aircannect::Memory::free(header);
         aircannect::Memory::free(work);
@@ -1149,7 +1156,7 @@ static bool update_str_file(const uint8_t *incoming_record,
     char pending[80];
     pending_path(latest.file_prefix, pending, sizeof(pending));
     if (valid && !storage->exists(pending))
-        valid = save_pending(latest.file_prefix, latest.therapy_day);
+        valid = save_pending(identity, latest.file_prefix, latest.therapy_day);
     if (!valid || !publish_single_file(PART, FINAL, BACKUP)) {
         storage->remove(PART);
         aircannect::Memory::free(timeline);
@@ -2273,6 +2280,11 @@ static bool anchor_session_clock(const ControlEvent &event) {
 static bool make_paths_and_metadata(const ControlEvent &event,
                                     uint16_t &mid, uint16_t &vid,
                                     bool rollover = false) {
+    if (!rollover && !AirSenseState::identity(recording_identity)) {
+        AirSenseState::request_refresh();
+        status_error("device identity not ready");
+        return false;
+    }
     if (!rollover && !anchor_session_clock(event)) return false;
     const time_t civil = static_cast<time_t>(session_clock.native_start);
     struct tm start_tm;
@@ -2312,34 +2324,12 @@ static bool make_paths_and_metadata(const ControlEvent &event,
     strncpy(status.file_prefix, prefix, sizeof(status.file_prefix));
     portEXIT_CRITICAL(&status_mux);
 
-    char srn[24] = "0";
-    char mid_text[16] = "0";
-    char vid_text[16] = "0";
-    if (rollover) {
-        memcpy(srn, session_srn, sizeof(srn));
-        mid = session_mid;
-        vid = session_vid;
-    } else {
-        if (!read_variable("SRN", srn, sizeof(srn)) ||
-            !read_variable("MID", mid_text, sizeof(mid_text)) ||
-            !read_variable("VID", vid_text, sizeof(vid_text))) {
-            status_error("device identity unavailable");
-            return false;
-        }
-        uint32_t parsed = 0;
-        mid = parse_hex_value(mid_text, strlen(mid_text), parsed)
-                  ? static_cast<uint16_t>(parsed) : 0;
-        vid = parse_hex_value(vid_text, strlen(vid_text), parsed)
-                  ? static_cast<uint16_t>(parsed) : 0;
-    }
-    session_mid = mid;
-    session_vid = vid;
-    strncpy(session_srn, srn, sizeof(session_srn) - 1);
-    session_srn[sizeof(session_srn) - 1] = 0;
+    mid = recording_identity.mid;
+    vid = recording_identity.vid;
     snprintf(recording_id, sizeof(recording_id),
              "Startdate %02d-%s-%04d X X X SRN=%s  MID=%u  VID=%u",
              start_tm.tm_mday, MONTH_NAMES[start_tm.tm_mon],
-             start_tm.tm_year + 1900, srn, mid, vid);
+             start_tm.tm_year + 1900, recording_identity.srn, mid, vid);
     return true;
 }
 
@@ -2393,7 +2383,7 @@ static bool begin_segment_files(const Air10Edf::Schema &brp_schema,
     if (storage->exists(path) || storage->exists(part) || storage->exists(backup))
         return false;
     // Persist intent before any EDF can be recovered and catalogued after reset.
-    if (!save_pending()) {
+    if (!save_pending(recording_identity)) {
         discard_pending();
         return false;
     }
@@ -2551,7 +2541,7 @@ static bool advance_segment(uint32_t captured_ms) {
     session_clock.captured_ms = boundary;
     session_native_day = Air10Clock::therapy_day(session_clock.native_start);
     ControlEvent event = {ControlKind::Start, boundary};
-    uint16_t mid = session_mid, vid = session_vid;
+    uint16_t mid = recording_identity.mid, vid = recording_identity.vid;
     const StreamSchema *schema = find_schema("TCE");
     const bool tcv = schema && schema_has_field(*schema, "TCV");
     const bool opened = make_paths_and_metadata(event, mid, vid, true) &&
@@ -2603,7 +2593,8 @@ static void stop_session(const ControlEvent &event) {
     next_start_ms = 0;
 }
 
-static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
+static bool refresh_str_day(uint16_t day, uint32_t generation,
+                             const AirSenseState::Identity &identity,
                              bool required) {
     const time_t civil = int64_t(day) * 86400;
     struct tm date;
@@ -2629,22 +2620,22 @@ static bool refresh_str_day(uint16_t day, uint32_t generation, uint32_t device,
 
     session_native_day = day;
     uint8_t *record = nullptr;
-    bool success = ensure_identification(device);
+    bool success = ensure_identification(identity);
     bool summary_ready = success && collect_str_summary(record, generation);
     success = success && !post_processing_cancelled() &&
-        device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
+        identity.generation == AirSenseState::identity_generation();
     if (success && SdStorage::try_acquire()) {
         uint32_t revision = 0;
         bool catalog_changed = false;
         if (summary_ready && record) {
-            summary_ready = update_str_file(record, latest);
+            summary_ready = update_str_file(record, latest, identity);
             // A content token survives retries after STR was published but the
             // catalog was not. Consumers compare revisions, never order them.
-            uint8_t identity[4];
-            SdStorage::put_le32(identity, identification_crc);
+            uint8_t identification[4];
+            SdStorage::put_le32(identification, identification_crc);
             uint32_t crc = crc32_ieee_update(crc32_ieee_initial(), record,
                 Air10Edf::record_size(Air10Edf::str_schema()));
-            revision = crc32_ieee_finish(crc32_ieee_update(crc, identity, sizeof(identity)));
+            revision = crc32_ieee_finish(crc32_ieee_update(crc, identification, sizeof(identification)));
         }
         for (uint32_t i = 0; success && i < count; i++) {
             success = !post_processing_cancelled();
@@ -2767,7 +2758,9 @@ static void sync_pending() {
         SdStorage::release();
         if (!scanned) return;
     }
-    const uint32_t device = __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE);
+    AirSenseState::Identity identity;
+    if (!AirSenseState::identity(identity)) return;
+    const uint32_t device = identity.generation;
     uint32_t generation = 0, saved_day = 0, after = 0;
     if (!read_u32_variable("ZEN", generation)) return;
     const bool changed = !have_synced_generation || device != synced_device_generation ||
@@ -2779,19 +2772,17 @@ static void sync_pending() {
     if (!read_u32_variable("SSD", saved_day) ||
         !read_u32_variable("ZEN", after) || after != generation) return;
 
-    uint32_t mid = 0, vid = 0;
-    bool success = read_variable("SRN", session_srn, sizeof(session_srn)) &&
-                   read_u32_variable("MID", mid) && mid <= UINT16_MAX &&
-                   read_u32_variable("VID", vid) && vid <= UINT16_MAX;
-    session_mid = mid;
-    session_vid = vid;
+    bool success = true;
     if (selected.prefix[0]) {
         memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
-        if (!success || strcmp(session_srn, selected.srn)) {
-            post_error("STR pending device unavailable or different");
+        if (strcmp(identity.srn, selected.srn)) {
+            char error[128];
+            snprintf(error, sizeof(error), "STR pending %s SRN mismatch: recorded=%s current=%s",
+                     selected.prefix, selected.srn, identity.srn);
+            post_error(error);
             success = false;
         } else {
-            success = refresh_str_day(selected.native_day, generation, device, true);
+            success = refresh_str_day(selected.native_day, generation, identity, true);
         }
     } else if (status.pending_str) {
         pending_cursor[0] = 0;
@@ -2805,14 +2796,14 @@ static void sync_pending() {
         for (unsigned i = 0; i < (catch_up ? 2u : 1u); i++) {
             const uint16_t day = days[i];
             if (selected.prefix[0] && day == selected.native_day) continue;
-            if (!refresh_str_day(day, generation, device, false)) {
+            if (!refresh_str_day(day, generation, identity, false)) {
                 success = false;
                 break;
             }
         }
     }
     success = success && read_u32_variable("ZEN", after) && after == generation &&
-              device == __atomic_load_n(&device_generation, __ATOMIC_ACQUIRE) &&
+              device == AirSenseState::identity_generation() &&
               !post_processing_cancelled();
     if (success) {
         synced_str_generation = generation;
@@ -3036,11 +3027,6 @@ void request_stop() {
         status_error("control queue full at therapy stop");
 }
 
-void device_restarted() {
-    __atomic_add_fetch(&device_generation, 1, __ATOMIC_RELEASE);
-    request_stop();
-}
-
 bool begin_clock_write(const char **reason) {
     const bool mounted = SdStorage::mounted();
     portENTER_CRITICAL(&status_mux);
@@ -3077,7 +3063,6 @@ namespace EdfRecorder {
 void init() {}
 void therapy_started() {}
 void request_stop() {}
-void device_restarted() {}
 bool begin_clock_write(const char **reason) {
     if (reason) *reason = nullptr;
     return true;

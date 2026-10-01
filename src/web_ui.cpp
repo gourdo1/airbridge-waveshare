@@ -355,10 +355,12 @@ enum StatusFields : uint8_t {
 
 template<class Output>
 static void appendStatusIdentity(Output &json, bool comma = true) {
+    AirSenseState::Identity identity;
+    AirSenseState::identity(identity);
     jsonAddString(json, "version", airbridge_version(), comma);
     jsonAddString(json, "built", airbridge_build_date());
-    jsonAddString(json, "pna", Config::get().device_pna.c_str());
-    jsonAddString(json, "srn", Config::get().device_srn.c_str());
+    jsonAddString(json, "pna", identity.pna);
+    jsonAddString(json, "srn", identity.srn);
 }
 
 template<class Output>
@@ -2184,13 +2186,13 @@ static void publishStatus() {
         health_at = now;
     }
     if (Config::revision() != config_revision) fields |= STATUS_CONFIG;
-    if (Config::device_info_revision() != device_revision) fields |= STATUS_IDENTITY;
+    if (AirSenseState::identity_revision() != device_revision) fields |= STATUS_IDENTITY;
     status_requested = false;
     if (fields) {
         last_published = status;
         ble_revision = OxiBle::revision();
         config_revision = Config::revision();
-        device_revision = Config::device_info_revision();
+        device_revision = AirSenseState::identity_revision();
         memcpy(source_id, current_source, sizeof(source_id));
         pending_fields = fields;
         if (!++revision) ++revision;
