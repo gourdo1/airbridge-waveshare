@@ -107,6 +107,7 @@ namespace Arbiter {
     bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                  char *out, uint16_t capacity, uint16_t timeout_ms = 0);
 
+    // Queue a no-reply frame; the worker retains UART through its RX-cycle guard.
     bool send_frame(const uint8_t *frame, uint16_t frame_len,
                     cmd_source_t src, cmd_priority_t prio);
 

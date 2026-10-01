@@ -78,6 +78,8 @@ static uint32_t stat_error = 0;
 
 static uint32_t next_ticket_id = 1;
 
+static constexpr uint32_t SILENT_FRAME_GUARD_MS = 40;
+
 static constexpr size_t LCD_COMMAND_SIZE = 32;
 static constexpr size_t LCD_FRAME_SIZE = 9 + 2 * (LCD_COMMAND_SIZE - 1);
 
@@ -842,6 +844,9 @@ static void arbiter_task(void *param) {
         }
 
         if (!t->policy.accepted_types) {
+            // L frames have no reply. Leave one Air10 RX service cycle after
+            // wire TX; the extra tick avoids rounding the wait below 40 ms.
+            vTaskDelay(pdMS_TO_TICKS(SILENT_FRAME_GUARD_MS) + 1);
             t->result.success = true;
         } else {
             uint32_t started_ms = millis();
