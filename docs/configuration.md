@@ -110,7 +110,6 @@ only while therapy is inactive.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `oxi_enabled` | true | Enable BLE oximeter support |
-| `oxi_require_known` | false | Only auto-connect to known devices |
 | `oxi_auto_start` | true | Start feeding data automatically on connect |
 | `oxi_feed_therapy_only` | false | Only inject readings during active therapy |
 | `oxi_interval_ms` | 500 | Injection interval in milliseconds |
@@ -121,6 +120,7 @@ BLE oximeters are managed from the **Oximetry** tab. For UDP oximetry, see [udp_
 
 Each **Known Device** has an **Auto-connect** setting, enabled by default.
 Turning it off keeps the device saved and available for manual connection.
+Automatic connections are limited to these saved devices.
 
 Only one source feeds at a time. First to deliver data wins, 10 seconds of silence releases.
 

@@ -1339,7 +1339,7 @@ static void handleBleAction(AsyncWebServerRequest *request) {
         ok = true;
     } else if (action == "autoconnect") {
         if (enabled != "true" && enabled != "false") {
-            request->send(400, "application/json", "{\"error\":\"enabled must be boolean\"}");
+            request->send(400, "application/json", "{\"error\":\"enabled must be true or false\"}");
             return;
         }
         ok = OxiBle::set_autoconnect(addr.c_str(), enabled == "true");

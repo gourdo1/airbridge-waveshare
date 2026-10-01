@@ -1,4 +1,5 @@
 #include "oxi_ble.h"
+#include "oxi_ble_policy.h"
 #include "oxi_arbiter.h"
 #include "wifi_setup.h"
 #include "uart_arbiter.h"
@@ -18,7 +19,6 @@
 #define OXI_TASK_STACK      4096
 #define OXI_TASK_PRIO       4
 #define SCAN_DURATION_MS    10000
-#define RECONNECT_DELAY_MS  3000
 
 static const NimBLEUUID PLX_SERVICE_UUID((uint16_t)0x1822);
 static const NimBLEUUID PLX_CONTINUOUS_UUID((uint16_t)0x2A5F);
@@ -83,7 +83,9 @@ static bool take_connect_request(ConnectRequest &request) {
 }
 
 static volatile bool disconnect_requested = false;  // drop connection, stay enabled
+static std::atomic<bool> charging_requested{false};
 static volatile bool disable_requested = false;     // drop connection, disable scanning
+static std::atomic<bool> enable_requested{false};
 static volatile bool del_one_requested = false;
 static volatile bool del_all_requested = false;
 static char del_one_addr[18] = "";
@@ -109,11 +111,35 @@ static bool device_needs_encryption = false;  // Nonin needs it, Viatom/O2Ring d
 
 // Known devices list
 // For devices that don't use BLE bonding (O2Ring, CheckMe, etc.)
-static oxi_known_device_t known_devices[MAX_KNOWN_DEVICES];
+struct KnownDevice : oxi_known_device_t {
+    uint8_t addr_type = 1;
+    OxiBlePolicy::Holdoff holdoff;
+};
+static KnownDevice known_devices[MAX_KNOWN_DEVICES];
 static int known_count = 0;
 static portMUX_TYPE known_mux = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t known_store_mutex = nullptr;
 static std::atomic<bool> known_ready{false};
+static OxiBlePolicy::Retry auto_retry;
+static bool observing = false;
+static uint32_t observing_since = 0;
+static bool observed_pending = false;
+struct ObservedDevice {
+    char addr[18] = {};
+    char name[32] = {};
+    uint8_t addr_type = 0;
+};
+static ObservedDevice observed_device;
+
+static portMUX_TYPE sample_mux = portMUX_INITIALIZER_UNLOCKED;
+static OxiBlePolicy::Samples ble_samples;
+
+static void feed_ble_sample(int8_t spo2, int16_t pulse, bool valid) {
+    portENTER_CRITICAL(&sample_mux);
+    ble_samples.received(valid, millis());
+    portEXIT_CRITICAL(&sample_mux);
+    OxiArbiter::feed(OXI_SRC_BLE, spo2, pulse, valid);
+}
 
 static int known_index(const char *addr) {
     for (int i = 0; i < known_count; i++)
@@ -146,9 +172,11 @@ static void known_load() {
         String a = p.getString(key, "");
         char auto_key[15];
         if (!autoconnect_key(a.c_str(), auto_key) || known_index(a.c_str()) >= 0) continue;
-        oxi_known_device_t device;
+        KnownDevice device;
         strlcpy(device.addr, a.c_str(), sizeof(device.addr));
         device.autoconnect = p.getBool(auto_key, true);
+        auto_key[0] = 't';
+        device.addr_type = p.getUChar(auto_key, 1);
         portENTER_CRITICAL(&known_mux);
         known_devices[known_count++] = device;
         portEXIT_CRITICAL(&known_mux);
@@ -183,13 +211,26 @@ static bool known_contains(const char *addr) {
     return found;
 }
 
-static bool known_add(const char *addr, bool legacy = false) {
+static bool known_add(const char *addr, uint8_t addr_type, bool legacy = false) {
     if (!known_store_mutex) return false;
     xSemaphoreTake(known_store_mutex, portMAX_DELAY);
     portENTER_CRITICAL(&known_mux);
     bool exists = known_index(addr) >= 0;
     bool room = known_count < (legacy ? MAX_KNOWN_DEVICES : KNOWN_DEVICE_LIMIT);
     portEXIT_CRITICAL(&known_mux);
+    char type_key[15];
+    Preferences type_prefs;
+    if ((exists || room) && autoconnect_key(addr, type_key) && type_prefs.begin("oxi_known", false)) {
+        type_key[0] = 't';
+        if (type_prefs.getUChar(type_key, 0xFF) != addr_type)
+            type_prefs.putUChar(type_key, addr_type);
+        type_prefs.end();
+    }
+    if (exists) {
+        portENTER_CRITICAL(&known_mux);
+        known_devices[known_index(addr)].addr_type = addr_type;
+        portEXIT_CRITICAL(&known_mux);
+    }
     if (exists || !room) {
         xSemaphoreGive(known_store_mutex);
         return exists;
@@ -206,6 +247,7 @@ static bool known_add(const char *addr, bool legacy = false) {
     auto &device = known_devices[known_count++];
     strlcpy(device.addr, addr, sizeof(device.addr));
     device.autoconnect = autoconnect;
+    device.addr_type = addr_type;
     portEXIT_CRITICAL(&known_mux);
     bool saved = known_save();
     xSemaphoreGive(known_store_mutex);
@@ -227,6 +269,8 @@ static bool known_remove(const char *addr) {
         Preferences p;
         char key[15];
         if (autoconnect_key(addr, key) && p.begin("oxi_known", false)) {
+            p.remove(key);
+            key[0] = 't';
             p.remove(key);
             p.end();
         }
@@ -252,10 +296,25 @@ static void known_clear() {
     Log::logf(CAT_OXI, LOG_INFO, "Cleared all known devices\n");
 }
 
-// Check if a device is "known" (either NimBLE-bonded or in our known list)
-static bool is_device_known(const char *addr, const NimBLEAddress &address) {
-    if (NimBLEDevice::isBonded(address)) return true;
-    return known_contains(addr);
+static void update_observer(bool active) {
+    portENTER_CRITICAL(&known_mux);
+    uint32_t now = millis();
+    if (active && !observing) observing_since = now;
+    observing = active;
+    if (!active) observed_pending = false;
+    for (int i = 0; i < known_count; i++)
+        known_devices[i].holdoff.update(now, observing, observing_since);
+    portEXIT_CRITICAL(&known_mux);
+}
+
+static void hold_autoconnect(const char *addr, bool charging) {
+    portENTER_CRITICAL(&known_mux);
+    int index = known_index(addr);
+    if (index >= 0) known_devices[index].holdoff.start(millis(), charging);
+    portEXIT_CRITICAL(&known_mux);
+    Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect holdoff addr=%s duration=%lus\n",
+              addr, (unsigned long)((charging ? OxiBlePolicy::CHARGING_HOLDOFF_MS :
+                                       OxiBlePolicy::RECONNECT_HOLDOFF_MS) / 1000));
 }
 
 
@@ -266,9 +325,9 @@ static void plx_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t
     int16_t spo2 = parse_sfloat(spo2_raw);
     int16_t pr = parse_sfloat(pr_raw);
     if (spo2 > 0 && spo2 <= 100 && pr > 0 && pr < 500) {
-        OxiArbiter::feed(OXI_SRC_BLE, spo2, pr, true);
+        feed_ble_sample(spo2, pr, true);
     } else {
-        OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+        feed_ble_sample(-1, -1, false);
     }
 }
 
@@ -286,7 +345,7 @@ static void hr_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t 
     oxi_reading_t r;
     OxiArbiter::snapshot(r);
     if (hr > 0 && hr < 500) {
-        OxiArbiter::feed(OXI_SRC_BLE, r.spo2, (int16_t)hr, r.valid);
+        feed_ble_sample(r.spo2, (int16_t)hr, r.valid);
     }
 }
 
@@ -295,9 +354,9 @@ static void nonin_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size
         uint8_t spo2 = data[2];
         uint16_t pr = data[3] | (data[4] << 8);
         if (spo2 > 0 && spo2 <= 100 && pr > 0 && pr < 500) {
-            OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)pr, true);
+            feed_ble_sample((int8_t)spo2, (int16_t)pr, true);
         } else {
-            OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+            feed_ble_sample(-1, -1, false);
         }
     }
 }
@@ -370,9 +429,9 @@ static void ws20a_process_frame(const uint8_t *frame, size_t frame_len) {
               spo2, pulse, pi, battery, seq);
 
     if (spo2 >= 50 && spo2 <= 100 && pulse >= 25 && pulse <= 250) {
-        OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)pulse, true);
+        feed_ble_sample((int8_t)spo2, (int16_t)pulse, true);
     } else {
-        OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+        feed_ble_sample(-1, -1, false);
     }
 }
 
@@ -445,8 +504,8 @@ static void ws20a_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, size
 // Viatom/Wellue: response packet header is 7 bytes (0x55, cmd, ~cmd, blk_lo, blk_hi, len_lo, len_hi)
 // CMD_READ_SENSORS response: payload byte 0 = SpO2, byte 1 = HR
 static NimBLERemoteCharacteristic *viatom_write_chr = nullptr;
-static uint8_t viatom_invalid_count = 0;
-#define VIATOM_MAX_INVALID  15  // disconnect after 15 invalid readings (~30s)
+static std::atomic<bool> viatom_initial_probe{false};
+static std::atomic<bool> viatom_time_pending{false};
 #define VIATOM_WRITE_CHUNK_LEN 20
 #define VIATOM_WRITE_CHUNK_DELAY_MS 50
 
@@ -460,20 +519,21 @@ static void viatom_notify_cb(NimBLERemoteCharacteristic *chr, uint8_t *data, siz
 
     // Response: 55 CMD ~CMD BLK_LO BLK_HI LEN_LO LEN_HI [payload...]
     // Byte 7 = SpO2, Byte 8 = HR, 0xFF = no finger, 0x00 = no reading
-    if (len >= 9 && data[0] == 0x55) {
+    // Read replies contain at least 12 payload bytes. A SetTIME ACK does not.
+    if (len >= 19 && data[0] == 0x55 && data[1] == 0 && data[2] == 0xFF &&
+        (data[5] | ((uint16_t)data[6] << 8)) >= 12) {
+        if (data[15] == 1 || data[15] == 2) {
+            charging_requested.store(true);
+            return;
+        }
+        if (!viatom_initial_probe.exchange(true)) viatom_time_pending.store(true);
         uint8_t spo2 = data[7];
-        uint8_t hr = data[8];
+        uint16_t hr = data[8] | ((uint16_t)data[9] << 8);
         bool no_finger = (spo2 == 0 || spo2 == 0xFF || hr == 0 || hr == 0xFF);
         if (!no_finger && spo2 <= 100 && hr < 250) {
-            OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)hr, true);
-            viatom_invalid_count = 0;
+            feed_ble_sample((int8_t)spo2, (int16_t)hr, true);
         } else {
-            OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
-            if (++viatom_invalid_count >= VIATOM_MAX_INVALID) {
-                Log::logf(CAT_OXI, LOG_WARN, "Viatom: no valid data for %d readings, disconnecting\n",
-                          VIATOM_MAX_INVALID);
-                disconnect_requested = true;
-            }
+            feed_ble_sample(-1, -1, false);
         }
     }
 }
@@ -599,9 +659,9 @@ static void oxyii_process_frame(const uint8_t *frame, size_t frame_len) {
     Log::logf(CAT_OXI, LOG_DEBUG, "OxyII: SpO2=%d HR=%d valid=%d\n",
               spo2, pulse, valid);
     if (valid) {
-        OxiArbiter::feed(OXI_SRC_BLE, (int8_t)spo2, (int16_t)pulse, true);
+        feed_ble_sample((int8_t)spo2, (int16_t)pulse, true);
     } else {
-        OxiArbiter::feed(OXI_SRC_BLE, -1, -1, false);
+        feed_ble_sample(-1, -1, false);
     }
 }
 
@@ -796,8 +856,27 @@ class OxiScanCB : public NimBLEScanCallbacks {
         char addr[18];
         snprintf(addr, sizeof(addr), "%02x:%02x:%02x:%02x:%02x:%02x",
                  bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0]);
+
+        portENTER_CRITICAL(&known_mux);
+        bool background = observing;
+        int index = known_index(addr);
+        if (background && index >= 0) {
+            uint32_t now = millis();
+            auto &device = known_devices[index];
+            device.holdoff.update(now, true, observing_since);
+            device.holdoff.last_seen = now;
+            if (device.autoconnect && !device.holdoff.active &&
+                auto_retry.ready(now) && !observed_pending) {
+                strlcpy(observed_device.addr, addr, sizeof(observed_device.addr));
+                strlcpy(observed_device.name, name.c_str(), sizeof(observed_device.name));
+                observed_device.addr_type = address.getType();
+                observed_pending = true;
+            }
+        }
+        portEXIT_CRITICAL(&known_mux);
+        if (background) return;
         // Passive advertisements need not contain a name or service UUID.
-        bool known = is_device_known(addr, address);
+        bool known = known_contains(addr);
         bool is_oxi = has_oxyii_manufacturer(dev) ||
                        known ||
                        dev->isAdvertisingService(PLX_SERVICE_UUID) ||
@@ -808,7 +887,10 @@ class OxiScanCB : public NimBLEScanCallbacks {
                        has_oximeter_name(name.c_str());
 
         if (is_oxi && scan_mutex && xSemaphoreTake(scan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (scan_result_count < MAX_SCAN_RESULTS) {
+            bool duplicate = false;
+            for (int i = 0; i < scan_result_count; i++)
+                if (strcasecmp(scan_results[i].addr, addr) == 0) duplicate = true;
+            if (!duplicate && scan_result_count < MAX_SCAN_RESULTS) {
                 snprintf(scan_results[scan_result_count].addr,
                          sizeof(scan_results[scan_result_count].addr), "%s", addr);
                 scan_results[scan_result_count].name = name.c_str();
@@ -937,7 +1019,8 @@ static bool subscribe_services(NimBLEClient *cl) {
             NimBLERemoteCharacteristic *viatomRead = viatomSvc->getCharacteristic(VIATOM_READ_UUID);
             if (viatomRead && viatomRead->canNotify() && viatomRead->subscribe(true, viatom_notify_cb)) {
                 Log::logf(CAT_OXI, LOG_DEBUG, "Subscribed Viatom read\n");
-                viatom_invalid_count = 0;
+                viatom_initial_probe.store(false);
+                viatom_time_pending.store(false);
                 viatom_write_chr = viatomSvc->getCharacteristic(VIATOM_WRITE_UUID);
                 if (viatom_write_chr) Log::logf(CAT_OXI, LOG_DEBUG, "Viatom write chr found\n");
                 got_spo2 = got_hr = true;
@@ -1100,6 +1183,7 @@ static bool handle_memory_pause() {
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             NimBLEDevice::getScan()->stop();
+            update_observer(false);
             xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
             released = NimBLEDevice::deinit(false);
             xSemaphoreGive(lifecycle_mutex);
@@ -1143,8 +1227,10 @@ void OxiBle::task(void *param) {
     init_stack();
 
     // Import legacy bonded-only sensors without removing any NimBLE bond.
-    for (int i = 0; i < NimBLEDevice::getNumBonds(); i++)
-        known_add(NimBLEDevice::getBondedAddress(i).toString().c_str(), true);
+    for (int i = 0; i < NimBLEDevice::getNumBonds(); i++) {
+        auto address = NimBLEDevice::getBondedAddress(i);
+        known_add(address.toString().c_str(), address.getType(), true);
+    }
     known_ready = true;
 
     pClient = NimBLEDevice::createClient();
@@ -1155,10 +1241,11 @@ void OxiBle::task(void *param) {
     auto &cfg = Config::get();
     if (cfg.oxi_enabled) {
         set_state(OXI_DISCONNECTED);
-        scan_requested = true;
     }
 
-    uint32_t last_reconnect = 0;
+    bool enabled = cfg.oxi_enabled;
+    bool config_enabled = enabled;
+    uint32_t scan_retry_at = 0;
     bool manual_scan = false;
     char failed_addr[18] = {};
     const char *last_failure = nullptr;
@@ -1170,25 +1257,57 @@ void OxiBle::task(void *param) {
             continue;
         }
 
+        if (config_enabled != cfg.oxi_enabled) {
+            config_enabled = cfg.oxi_enabled;
+            if (config_enabled) enable_requested.store(true);
+            else disable_requested = true;
+        }
+        if (enable_requested.exchange(false)) {
+            enabled = true;
+            if (state == OXI_DISABLED) set_state(OXI_DISCONNECTED);
+        }
+
         if (stop_scan_requested.exchange(false)) {
             manual_scan = true;
+            scan_requested = active_scan_requested = false;
+            update_observer(false);
             NimBLEDevice::getScan()->stop();
         }
 
         if (disable_requested) {
             disable_requested = false;
+            enabled = false;
             disconnect_requested = false;
+            charging_requested.store(false);
             request_connect(CONN_NONE, nullptr);
             Log::logf(CAT_OXI, LOG_DEBUG, "Disable requested\n");
+            update_observer(false);
+            NimBLEDevice::getScan()->stop();
+            scan_requested = active_scan_requested = false;
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
             set_state(OXI_DISABLED);
         }
 
-        if (disconnect_requested) {
+        bool charging = charging_requested.exchange(false);
+        OxiBlePolicy::Disconnect data_problem = OxiBlePolicy::Disconnect::None;
+        if (state == OXI_STREAMING) {
+            portENTER_CRITICAL(&sample_mux);
+            data_problem = ble_samples.check(millis());
+            portEXIT_CRITICAL(&sample_mux);
+        }
+        if (disconnect_requested || charging || data_problem != OxiBlePolicy::Disconnect::None) {
             disconnect_requested = false;
             request_connect(CONN_NONE, nullptr);
-            Log::logf(CAT_OXI, LOG_DEBUG, "Disconnect requested\n");
+            const char *reason = charging ? "charging" :
+                data_problem == OxiBlePolicy::Disconnect::Silent ? "no samples for 10s" :
+                data_problem == OxiBlePolicy::Disconnect::Invalid ? "invalid samples for 30s" : "requested";
+            Log::logf(CAT_OXI, data_problem == OxiBlePolicy::Disconnect::Silent ? LOG_WARN : LOG_INFO,
+                      "Sensor disconnect: %s\n", reason);
+            if (pClient->isConnected())
+                hold_autoconnect(pClient->getPeerAddress().toString().c_str(), charging);
+            update_observer(false);
+            NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
             set_state(OXI_DISCONNECTED);
@@ -1198,6 +1317,7 @@ void OxiBle::task(void *param) {
             suspend_enter_requested = false;
             Log::logf(CAT_OXI, LOG_DEBUG, "Suspend: stopping scan and dropping connection\n");
             NimBLEDevice::getScan()->stop();
+            update_observer(false);
             if (pClient->isConnected()) pClient->disconnect();
             OxiArbiter::stop_feed(OXI_SRC_BLE);
             scan_requested = false;
@@ -1211,6 +1331,7 @@ void OxiBle::task(void *param) {
             strncpy(addr, del_one_addr, sizeof(addr));
             Log::logf(CAT_OXI, LOG_DEBUG, "Remove-known requested: %s\n", addr);
             NimBLEDevice::getScan()->stop();
+            update_observer(false);
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             bool ok = do_remove_known(addr);
@@ -1223,6 +1344,7 @@ void OxiBle::task(void *param) {
             del_all_requested = false;
             Log::logf(CAT_OXI, LOG_DEBUG, "Clear-all-known requested\n");
             NimBLEDevice::getScan()->stop();
+            update_observer(false);
             if (pClient->isConnected()) pClient->disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
             do_clear_all_known();
@@ -1230,41 +1352,23 @@ void OxiBle::task(void *param) {
 
         if (scan_complete) {
             scan_complete = false;
-            status_revision.fetch_add(1);
-            last_reconnect = millis();
             if (state == OXI_SCANNING) {
+                status_revision.fetch_add(1);
                 Log::logf(CAT_OXI, manual_scan ? LOG_INFO : LOG_DEBUG,
                           "%s scan ended candidates=%d reason=%d\n",
                           manual_scan ? "Manual" : "Background",
                           scan_result_count, scan_end_reason);
-                set_state(OXI_DISCONNECTED);
-                if (scan_result_count > 0 && !manual_scan && !active_scan_requested) {
-                    for (int i = 0; i < scan_result_count; i++) {
-                        NimBLEAddress address(std::string(scan_results[i].addr),
-                                              scan_results[i].addr_type);
-                        bool known = is_device_known(scan_results[i].addr, address);
-                        portENTER_CRITICAL(&known_mux);
-                        int index = known_index(scan_results[i].addr);
-                        bool auto_enabled = index < 0 || known_devices[index].autoconnect;
-                        portEXIT_CRITICAL(&known_mux);
-                        if (!auto_enabled) continue;
-                        Log::logf(CAT_OXI, LOG_DEBUG, "%s %s known=%d\n",
-                                  scan_results[i].name.c_str(), scan_results[i].addr, known);
-                        bool requires_known = cfg.oxi_require_known ||
-                            strncasecmp(scan_results[i].name.c_str(), "Nonin", 5) == 0;
-                        if (requires_known && !known) continue;
-
-                        request_connect(CONN_AUTO, scan_results[i].addr);
-                        Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect triggered\n");
-                        break;
-                    }
-                }
+                set_state(enabled ? OXI_DISCONNECTED : OXI_DISABLED);
+            } else if (state == OXI_OBSERVING) {
+                update_observer(false);
+                set_state(enabled ? OXI_DISCONNECTED : OXI_DISABLED);
             }
         }
 
         if (scan_requested && !ble_suspended) {
             scan_requested = false;
             NimBLEScan *pScan = NimBLEDevice::getScan();
+            update_observer(false);
             if (pScan->isScanning()) {
                 if (active_scan_requested) {
                     pScan->stop();
@@ -1273,6 +1377,7 @@ void OxiBle::task(void *param) {
                     Log::logf(CAT_OXI, LOG_DEBUG, "scan_requested ignored, scan already in progress\n");
                 }
             } else {
+                if (pClient->isConnected()) pClient->disconnect();
                 if (scan_mutex) xSemaphoreTake(scan_mutex, portMAX_DELAY);
                 for (auto &result : scan_results) {
                     result.~oxi_scan_result_t();
@@ -1285,24 +1390,42 @@ void OxiBle::task(void *param) {
                 set_state(OXI_SCANNING);
                 Log::logf(CAT_OXI, LOG_DEBUG, "Starting scan (%dms)\n", SCAN_DURATION_MS);
                 pScan->setScanCallbacks(&scanCB);
+                pScan->setDuplicateFilter(true);
                 pScan->setMaxResults(0);  // callbacks own the bounded oximeter list
                 bool active = active_scan_requested;
                 active_scan_requested = false;
                 manual_scan = active;
-                // AirCANnect observer timing; active discovery is user-requested.
+                // Manual discovery is separate from passive observation.
                 pScan->setActiveScan(active);
                 pScan->setInterval(active ? 100 : 1000);
                 pScan->setWindow(active ? 99 : 20);
                 if (!pScan->start(SCAN_DURATION_MS)) {
-                    last_reconnect = millis();
-                    set_state(OXI_DISCONNECTED);
+                    set_state(enabled ? OXI_DISCONNECTED : OXI_DISABLED);
                 }
             }
         }
 
+        bool auto_allowed = enabled && !ble_suspended &&
+                            OxiArbiter::active_source() != OXI_SRC_UDP;
+        ObservedDevice automatic;
+        bool have_automatic = false;
+        portENTER_CRITICAL(&known_mux);
+        if (observed_pending && auto_allowed && observing) {
+            int index = known_index(observed_device.addr);
+            if (index >= 0 && known_devices[index].autoconnect &&
+                !known_devices[index].holdoff.active && auto_retry.ready(millis())) {
+                automatic = observed_device;
+                have_automatic = true;
+            }
+        }
+        observed_pending = false;
+        portEXIT_CRITICAL(&known_mux);
+        if (have_automatic) request_connect(CONN_AUTO, automatic.addr);
+
         ConnectRequest connection;
         if (!ble_suspended && take_connect_request(connection)) {
             connect_mode_t mode = connection.mode;
+            update_observer(false);
             NimBLEDevice::getScan()->stop();
             // Wait for scan to actually stop before connecting
             for (int i = 0; i < 20 && NimBLEDevice::getScan()->isScanning(); i++)
@@ -1320,12 +1443,20 @@ void OxiBle::task(void *param) {
 
                 uint8_t atype = 1;
                 String dev_name = "";
+                portENTER_CRITICAL(&known_mux);
+                int known = known_index(addr.c_str());
+                if (known >= 0) atype = known_devices[known].addr_type;
+                portEXIT_CRITICAL(&known_mux);
                 for (int i = 0; i < scan_result_count; i++) {
                     if (strcasecmp(scan_results[i].addr, addr.c_str()) == 0) {
                         atype = scan_results[i].addr_type;
                         dev_name = scan_results[i].name;
                         break;
                     }
+                }
+                if (mode == CONN_AUTO && have_automatic) {
+                    atype = automatic.addr_type;
+                    dev_name = automatic.name;
                 }
 
                 NimBLEAddress bleAddr(std::string(addr.c_str()), atype);
@@ -1353,6 +1484,7 @@ void OxiBle::task(void *param) {
                     }
                     pClient->cancelConnect();
                     vTaskDelay(pdMS_TO_TICKS(500));
+                    if (disconnect_requested || disable_requested || ble_suspended) break;
 
                     failure = "connect";
                     connect_error = 0;
@@ -1424,6 +1556,10 @@ void OxiBle::task(void *param) {
                     // subscribe
                     failure = "subscription";
                     connect_error = 0;
+                    charging_requested.store(false);
+                    portENTER_CRITICAL(&sample_mux);
+                    ble_samples.start(millis());
+                    portEXIT_CRITICAL(&sample_mux);
                     if (!subscribe_services(pClient)) {
                         Log::logf(CAT_OXI, LOG_DEBUG, "No suitable services, disconnecting\n");
                         pClient->disconnect();
@@ -1437,14 +1573,18 @@ void OxiBle::task(void *param) {
                     }
 
                     set_nonin_datetime(pClient);
-                    set_viatom_datetime();
+                    // Probe Viatom first: charging devices must not be kept awake
+                    // by configuration writes before their charging state is known.
                     OxiArbiter::set_source_id(pClient->getPeerAddress().toString().c_str());
+                    portENTER_CRITICAL(&sample_mux);
+                    ble_samples.subscribed(millis());
+                    portEXIT_CRITICAL(&sample_mux);
                     set_state(OXI_STREAMING);
                     Log::logf(CAT_OXI, LOG_INFO, "Sensor subscribed addr=%s name=\"%s\"%s\n",
                               addr.c_str(), dev_name.c_str(),
                               oxyii_write_chr ? "; initializing OxyII" : "");
 
-                    if (mode == CONN_USER && !known_add(addr.c_str())) {
+                    if (mode == CONN_USER && !known_add(addr.c_str(), atype)) {
                         Log::logf(CAT_OXI, LOG_WARN, "Sensor connected but not saved: known list full or NVS write failed\n");
                     }
                     failed_addr[0] = 0;
@@ -1454,7 +1594,7 @@ void OxiBle::task(void *param) {
                 }
 
                 if (!connected) {
-                    bool cancelled = disconnect_requested || disable_requested;
+                    bool cancelled = disconnect_requested || disable_requested || ble_suspended;
                     bool repeated = strcmp(failed_addr, addr.c_str()) == 0 &&
                                     last_failure && strcmp(last_failure, failure) == 0 &&
                                     last_connect_error == connect_error;
@@ -1469,24 +1609,59 @@ void OxiBle::task(void *param) {
                     }
                     if (pClient->isConnected()) pClient->disconnect();
                     set_state(OXI_DISCONNECTED);
-                    last_reconnect = millis();
+                }
+                if (mode == CONN_AUTO && !disconnect_requested && !disable_requested && !ble_suspended) {
+                    portENTER_CRITICAL(&known_mux);
+                    auto_retry.result(connected, millis());
+                    uint32_t wait_ms = connected ? 0 : auto_retry.deadline - millis();
+                    portEXIT_CRITICAL(&known_mux);
+                    if (!connected) Log::logf(CAT_OXI, LOG_DEBUG, "Auto-connect retry in %lums\n", (unsigned long)wait_ms);
                 }
             }
         }
 
-        // Auto-reconnect: scan periodically when disconnected and no other source active
-        if (state == OXI_DISCONNECTED && cfg.oxi_enabled && !ble_suspended &&
-            OxiArbiter::active_source() == OXI_SRC_NONE &&
-            millis() - last_reconnect > RECONNECT_DELAY_MS) {
-            last_reconnect = millis();
-            Log::logf(CAT_OXI, LOG_DEBUG, "Auto-reconnect: starting scan\n");
-            scan_requested = true;
+        NimBLEScan *scanner = NimBLEDevice::getScan();
+        bool has_auto = false;
+        portENTER_CRITICAL(&known_mux);
+        for (int i = 0; i < known_count; i++) has_auto |= known_devices[i].autoconnect;
+        portEXIT_CRITICAL(&known_mux);
+        auto_allowed = enabled && !ble_suspended && has_auto &&
+                       OxiArbiter::active_source() != OXI_SRC_UDP;
+        if (state == OXI_OBSERVING && !auto_allowed) {
+            update_observer(false);
+            scanner->stop();
+            set_state(enabled ? OXI_DISCONNECTED : OXI_DISABLED);
         }
+        if (state == OXI_DISCONNECTED && auto_allowed && !scan_requested &&
+            (!scan_retry_at || static_cast<int32_t>(millis() - scan_retry_at) >= 0) &&
+            !scanner->isScanning()) {
+            scan_complete = false;
+            scanner->clearResults();
+            scanner->setScanCallbacks(&scanCB, true);
+            scanner->setDuplicateFilter(false);
+            scanner->setMaxResults(0);
+            scanner->setActiveScan(false);
+            scanner->setInterval(1000);
+            scanner->setWindow(20);
+            update_observer(true);
+            if (scanner->start(0)) {
+                scan_retry_at = 0;
+                set_state(OXI_OBSERVING);
+                Log::logf(CAT_OXI, LOG_DEBUG, "Known sensor observation started\n");
+            } else {
+                update_observer(false);
+                scan_retry_at = millis() + 1000;
+            }
+        }
+        update_observer(state == OXI_OBSERVING && scanner->isScanning());
 
         // Viatom: poll sensor readings every 2s while streaming
         if (state == OXI_STREAMING && viatom_write_chr && pClient->isConnected()) {
             static uint32_t last_viatom_poll = 0;
-            if (millis() - last_viatom_poll >= 2000) {
+            if (viatom_time_pending.exchange(false) && !charging_requested.load()) {
+                set_viatom_datetime();
+                last_viatom_poll = millis();
+            } else if (millis() - last_viatom_poll >= 2000) {
                 last_viatom_poll = millis();
                 // CMD_READ_SENSORS packet: AA 17 E8 00 00 00 00 CRC
                 uint8_t cmd[] = {0xAA, 0x17, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -1522,10 +1697,7 @@ void OxiBle::connect(const char *addr) {
 void OxiBle::disconnect()  { disconnect_requested = true; }
 void OxiBle::disable()     { disable_requested = true; }
 void OxiBle::enable() {
-    if (state == OXI_DISABLED) {
-        set_state(OXI_DISCONNECTED);
-        scan_requested = true;
-    }
+    enable_requested.store(true);
 }
 void OxiBle::suspend() {
     if (!ble_suspended) {
@@ -1610,6 +1782,7 @@ bool OxiBle::set_autoconnect(const char *addr, bool enabled) {
         if (ok) {
             portENTER_CRITICAL(&known_mux);
             known_devices[index].autoconnect = enabled;
+            if (!enabled) known_devices[index].holdoff = {};
             portEXIT_CRITICAL(&known_mux);
             status_revision.fetch_add(1);
         }

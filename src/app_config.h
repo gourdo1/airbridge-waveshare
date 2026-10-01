@@ -32,7 +32,6 @@ struct AirBridgeConfig {
     bool        oxi_feed_therapy_only;
     uint16_t    oxi_interval_ms;
     bool        oxi_lframe_continuous; // send L-frames even when no valid reading
-    bool        oxi_require_known;     // only auto-connect to bonded/known devices
 
     uint16_t    uart_cmd_timeout_ms;
     uint8_t     uart_max_retries;
