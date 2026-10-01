@@ -38,6 +38,11 @@ int16_t parse_sfloat(uint16_t raw) {
 }
 
 static oxi_reading_t reading = { -1, -1, false, 0 };
+// Eight updates cover four 2 s measurements plus interleaved invalidations.
+// Faster sources can evict history; consumers must leave unavailable slots empty.
+constexpr uint8_t READING_HISTORY_SIZE = 8;
+static oxi_reading_t reading_history[READING_HISTORY_SIZE];
+static uint8_t history_count = 0, history_next = 0;
 static bool feeding = false;
 static oxi_source_t src_active = OXI_SRC_NONE;
 static uint32_t src_last_time = 0;
@@ -117,6 +122,7 @@ static void inject_lframe() {
 
 void OxiArbiter::init() {
     reading = { -1, -1, false, 0 };
+    history_count = history_next = 0;
     feeding = false;
     src_active = OXI_SRC_NONE;
     src_last_time = 0;
@@ -159,7 +165,10 @@ void OxiArbiter::feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool val
     reading.spo2 = spo2;
     reading.pulse_bpm = pulse_bpm;
     reading.valid = valid;
-    reading.timestamp_ms = millis();
+    reading.timestamp_ms = src_last_time;
+    reading_history[history_next] = reading;
+    history_next = (history_next + 1) % READING_HISTORY_SIZE;
+    if (history_count < READING_HISTORY_SIZE) history_count++;
     portEXIT_CRITICAL(&reading_mux);
 
     if (source_claimed) {
@@ -201,6 +210,21 @@ void OxiArbiter::snapshot(oxi_reading_t &out, oxi_source_t *source) {
     out = reading;
     if (source) *source = src_active;
     portEXIT_CRITICAL(&reading_mux);
+}
+
+bool OxiArbiter::snapshot_at(uint32_t time_ms, oxi_reading_t &out) {
+    bool found = false;
+    portENTER_CRITICAL(&reading_mux);
+    for (uint8_t i = 0; i < history_count; i++) {
+        const auto &sample = reading_history[
+            (history_next + READING_HISTORY_SIZE - 1 - i) % READING_HISTORY_SIZE];
+        if (int32_t(time_ms - sample.timestamp_ms) < 0) continue;
+        out = sample;
+        found = true;
+        break;
+    }
+    portEXIT_CRITICAL(&reading_mux);
+    return found;
 }
 
 oxi_source_t OxiArbiter::active_source() {

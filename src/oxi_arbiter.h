@@ -25,6 +25,9 @@ namespace OxiArbiter {
     bool is_feeding();
 
     void snapshot(oxi_reading_t &reading, oxi_source_t *source = nullptr);
+    // Latest accepted reading no later than time_ms, including invalid updates.
+    // False when that point has no predecessor in the bounded history.
+    bool snapshot_at(uint32_t time_ms, oxi_reading_t &reading);
     oxi_source_t active_source();
 
     void poll();
