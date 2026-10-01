@@ -8,11 +8,12 @@ typedef enum {
     OXI_BONDING,
     OXI_STREAMING,
     OXI_DISCONNECTED,
+    OXI_OBSERVING,
 } oxi_state_t;
 
 inline const char *oxi_state_name(oxi_state_t s) {
     static const char *names[] = {
-        "DISABLED","SCANNING","CONNECTING","BONDING","STREAMING","DISCONNECTED"
+        "DISABLED","SCANNING","CONNECTING","BONDING","STREAMING","DISCONNECTED","OBSERVING"
     };
     return (s < sizeof(names)/sizeof(names[0])) ? names[s] : "?";
 }
@@ -25,6 +26,15 @@ typedef struct {
 } oxi_reading_t;
 
 #define MAX_SCAN_RESULTS 8
+
+// Four new devices; retain the legacy union of three bonds and three knowns.
+constexpr int MAX_KNOWN_DEVICES = 6;
+constexpr int KNOWN_DEVICE_LIMIT = 4;
+
+struct oxi_known_device_t {
+    char addr[18] = {};
+    bool autoconnect = true;
+};
 
 struct oxi_scan_result_t {
     char addr[18];
@@ -57,7 +67,8 @@ namespace OxiBle {
 
     int get_scan_results(oxi_scan_result_t *out, int max);
 
-    int get_all_known(char addrs[][18], int max);
+    int get_known_devices(oxi_known_device_t *out, int max);
+    bool set_autoconnect(const char *addr, bool enabled);
 
     // Async: enqueue a deletion request. Actual stop-scan / disconnect /
     // unpair happens in the BLE task. Safe to call from any context.

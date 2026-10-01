@@ -1286,14 +1286,15 @@ static void handleBleStatus(AsyncWebServerRequest *request) {
         jsonAddInt(json, "rssi", devs[i].rssi);
         json += "}";
     }
-    json += "],\"bonds\":[";
-    char known_addrs[6][18];
-    int nk = OxiBle::get_all_known(known_addrs, 6);
+    json += "],\"known\":[";
+    oxi_known_device_t known[MAX_KNOWN_DEVICES];
+    int nk = OxiBle::get_known_devices(known, MAX_KNOWN_DEVICES);
     for (int i = 0; i < nk; i++) {
         if (i > 0) json += ',';
-        json += '"';
-        json += known_addrs[i];
-        json += '"';
+        json += '{';
+        jsonAddString(json, "addr", known[i].addr, false);
+        jsonAddBool(json, "autoconnect", known[i].autoconnect);
+        json += '}';
     }
     json += "]}";
     request->send(200, "application/json", json);
@@ -1305,12 +1306,13 @@ static void handleBleAction(AsyncWebServerRequest *request) {
 
     String body;
     if (!getBody(request, body)) return;
-    String action, addr;
-    struct { String *action; String *addr; } ctx = {&action, &addr};
+    String action, addr, enabled;
+    struct { String *action; String *addr; String *enabled; } ctx = {&action, &addr, &enabled};
     if (!json_foreach_kv(body, [](const char *key, const char *val, void *p) {
         auto *c = (decltype(ctx)*)p;
         if (strcmp(key, "action") == 0) *c->action = val;
         else if (strcmp(key, "addr") == 0) *c->addr = val;
+        else if (strcmp(key, "enabled") == 0) *c->enabled = val;
     }, &ctx)) {
         request->send(400, "application/json", "{\"error\":\"bad_json\"}");
         return;
@@ -1335,6 +1337,13 @@ static void handleBleAction(AsyncWebServerRequest *request) {
         }
         result = "connecting";
         ok = true;
+    } else if (action == "autoconnect") {
+        if (enabled != "true" && enabled != "false") {
+            request->send(400, "application/json", "{\"error\":\"enabled must be boolean\"}");
+            return;
+        }
+        ok = OxiBle::set_autoconnect(addr.c_str(), enabled == "true");
+        result = ok ? "autoconnect saved" : "unknown sensor or settings write failed";
     } else if (action == "disconnect") {
         OxiBle::disconnect();
         result = "disconnected";
@@ -1371,7 +1380,7 @@ static void handleBleAction(AsyncWebServerRequest *request) {
     }
 
     String json = "{";
-    jsonAddString(json, "ok", ok ? "true" : "false", false);
+    jsonAddBool(json, "ok", ok, false);
     jsonAddString(json, "result", result.c_str());
     json += '}';
     request->send(200, "application/json", json);

@@ -5,6 +5,7 @@
 #include "debug_log.h"
 #include "app_config.h"
 #include "crc.h"
+#include "hex_util.h"
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -108,76 +109,146 @@ static bool device_needs_encryption = false;  // Nonin needs it, Viatom/O2Ring d
 
 // Known devices list
 // For devices that don't use BLE bonding (O2Ring, CheckMe, etc.)
-#define KNOWN_MAX CONFIG_BT_NIMBLE_MAX_BONDS
-static char known_addrs[KNOWN_MAX][18] = {};
+static oxi_known_device_t known_devices[MAX_KNOWN_DEVICES];
 static int known_count = 0;
+static portMUX_TYPE known_mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t known_store_mutex = nullptr;
+static std::atomic<bool> known_ready{false};
+
+static int known_index(const char *addr) {
+    for (int i = 0; i < known_count; i++)
+        if (strcasecmp(known_devices[i].addr, addr) == 0) return i;
+    return -1;
+}
+
+static bool autoconnect_key(const char *addr, char key[15]) {
+    if (!addr || strlen(addr) != 17) return false;
+    key[0] = 'a';
+    key[1] = 'c';
+    for (int i = 0; i < 6; i++) {
+        int high = aircannect::hex_nibble(addr[i * 3]);
+        int low = aircannect::hex_nibble(addr[i * 3 + 1]);
+        if (high < 0 || low < 0 || (i < 5 && addr[i * 3 + 2] != ':')) return false;
+        key[2 + i * 2] = "0123456789abcdef"[high];
+        key[3 + i * 2] = "0123456789abcdef"[low];
+    }
+    key[14] = 0;
+    return true;
+}
 
 static void known_load() {
     Preferences p;
     if (!open_optional_preferences(p, "oxi_known")) return;
-    known_count = p.getUChar("count", 0);
-    if (known_count > KNOWN_MAX) known_count = KNOWN_MAX;
-    for (int i = 0; i < known_count; i++) {
+    int count = p.getUChar("count", 0);
+    for (int i = 0; i < count && i < MAX_KNOWN_DEVICES; i++) {
         char key[4];
         snprintf(key, sizeof(key), "a%d", i);
         String a = p.getString(key, "");
-        strncpy(known_addrs[i], a.c_str(), 17);
-        known_addrs[i][17] = '\0';
+        char auto_key[15];
+        if (!autoconnect_key(a.c_str(), auto_key) || known_index(a.c_str()) >= 0) continue;
+        oxi_known_device_t device;
+        strlcpy(device.addr, a.c_str(), sizeof(device.addr));
+        device.autoconnect = p.getBool(auto_key, true);
+        portENTER_CRITICAL(&known_mux);
+        known_devices[known_count++] = device;
+        portEXIT_CRITICAL(&known_mux);
     }
     p.end();
     Log::logf(CAT_OXI, LOG_DEBUG, "Loaded %d known devices\n", known_count);
 }
 
-static void known_save() {
+// Caller serializes NVS operations; callbacks only use the short snapshot lock.
+static bool known_save() {
+    oxi_known_device_t devices[MAX_KNOWN_DEVICES];
+    int count = OxiBle::get_known_devices(devices, MAX_KNOWN_DEVICES);
     Preferences p;
-    p.begin("oxi_known", false);
-    p.putUChar("count", known_count);
-    for (int i = 0; i < KNOWN_MAX; i++) {
+    if (!p.begin("oxi_known", false)) return false;
+    bool ok = true;
+    for (int i = 0; i < count; i++) {
         char key[4];
         snprintf(key, sizeof(key), "a%d", i);
-        if (i < known_count) p.putString(key, known_addrs[i]);
-        else p.remove(key);
+        ok = p.putString(key, devices[i].addr) > 0 && ok;
     }
+    if (ok) ok = p.putUChar("count", count) > 0;
     p.end();
     status_revision.fetch_add(1);
+    if (!ok) Log::logf(CAT_OXI, LOG_ERROR, "Cannot save known sensors\n");
+    return ok;
 }
 
 static bool known_contains(const char *addr) {
-    for (int i = 0; i < known_count; i++) {
-        if (strcasecmp(known_addrs[i], addr) == 0) return true;
-    }
-    return false;
+    portENTER_CRITICAL(&known_mux);
+    bool found = known_index(addr) >= 0;
+    portEXIT_CRITICAL(&known_mux);
+    return found;
 }
 
-static bool known_add(const char *addr) {
-    if (known_contains(addr)) return true;
-    if (known_count >= KNOWN_MAX) return false;
-    strncpy(known_addrs[known_count], addr, 17);
-    known_addrs[known_count][17] = '\0';
-    known_count++;
-    known_save();
+static bool known_add(const char *addr, bool legacy = false) {
+    if (!known_store_mutex) return false;
+    xSemaphoreTake(known_store_mutex, portMAX_DELAY);
+    portENTER_CRITICAL(&known_mux);
+    bool exists = known_index(addr) >= 0;
+    bool room = known_count < (legacy ? MAX_KNOWN_DEVICES : KNOWN_DEVICE_LIMIT);
+    portEXIT_CRITICAL(&known_mux);
+    if (exists || !room) {
+        xSemaphoreGive(known_store_mutex);
+        return exists;
+    }
+
+    bool autoconnect = true;
+    char key[15];
+    Preferences p;
+    if (autoconnect_key(addr, key) && open_optional_preferences(p, "oxi_known")) {
+        autoconnect = p.getBool(key, true);
+        p.end();
+    }
+    portENTER_CRITICAL(&known_mux);
+    auto &device = known_devices[known_count++];
+    strlcpy(device.addr, addr, sizeof(device.addr));
+    device.autoconnect = autoconnect;
+    portEXIT_CRITICAL(&known_mux);
+    bool saved = known_save();
+    xSemaphoreGive(known_store_mutex);
     Log::logf(CAT_OXI, LOG_INFO, "Added known device: %s\n", addr);
-    return true;
+    return saved;
 }
 
 static bool known_remove(const char *addr) {
-    for (int i = 0; i < known_count; i++) {
-        if (strcasecmp(known_addrs[i], addr) == 0) {
-            // Shift remaining entries
-            for (int j = i; j < known_count - 1; j++)
-                memcpy(known_addrs[j], known_addrs[j+1], 18);
-            known_count--;
-            known_save();
-            Log::logf(CAT_OXI, LOG_INFO, "Removed known device: %s\n", addr);
-            return true;
-        }
+    xSemaphoreTake(known_store_mutex, portMAX_DELAY);
+    portENTER_CRITICAL(&known_mux);
+    int index = known_index(addr);
+    if (index >= 0) {
+        for (int i = index; i + 1 < known_count; i++) known_devices[i] = known_devices[i + 1];
+        known_devices[--known_count] = {};
     }
-    return false;
+    portEXIT_CRITICAL(&known_mux);
+    if (index >= 0) {
+        known_save();
+        Preferences p;
+        char key[15];
+        if (autoconnect_key(addr, key) && p.begin("oxi_known", false)) {
+            p.remove(key);
+            p.end();
+        }
+        Log::logf(CAT_OXI, LOG_INFO, "Removed known device: %s\n", addr);
+    }
+    xSemaphoreGive(known_store_mutex);
+    return index >= 0;
 }
 
 static void known_clear() {
+    xSemaphoreTake(known_store_mutex, portMAX_DELAY);
+    Preferences p;
+    if (p.begin("oxi_known", false)) {
+        p.clear();
+        p.end();
+    }
+    portENTER_CRITICAL(&known_mux);
     known_count = 0;
-    known_save();
+    for (auto &device : known_devices) device = {};
+    portEXIT_CRITICAL(&known_mux);
+    xSemaphoreGive(known_store_mutex);
+    status_revision.fetch_add(1);
     Log::logf(CAT_OXI, LOG_INFO, "Cleared all known devices\n");
 }
 
@@ -1071,6 +1142,11 @@ void OxiBle::task(void *param) {
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     init_stack();
 
+    // Import legacy bonded-only sensors without removing any NimBLE bond.
+    for (int i = 0; i < NimBLEDevice::getNumBonds(); i++)
+        known_add(NimBLEDevice::getBondedAddress(i).toString().c_str(), true);
+    known_ready = true;
+
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(&clientCB);
     pClient->setConnectionParams(12, 12, 0, 400);
@@ -1167,6 +1243,11 @@ void OxiBle::task(void *param) {
                         NimBLEAddress address(std::string(scan_results[i].addr),
                                               scan_results[i].addr_type);
                         bool known = is_device_known(scan_results[i].addr, address);
+                        portENTER_CRITICAL(&known_mux);
+                        int index = known_index(scan_results[i].addr);
+                        bool auto_enabled = index < 0 || known_devices[index].autoconnect;
+                        portEXIT_CRITICAL(&known_mux);
+                        if (!auto_enabled) continue;
                         Log::logf(CAT_OXI, LOG_DEBUG, "%s %s known=%d\n",
                                   scan_results[i].name.c_str(), scan_results[i].addr, known);
                         bool requires_known = cfg.oxi_require_known ||
@@ -1363,8 +1444,8 @@ void OxiBle::task(void *param) {
                               addr.c_str(), dev_name.c_str(),
                               oxyii_write_chr ? "; initializing OxyII" : "");
 
-                    if (mode == CONN_USER && !device_needs_encryption) {
-                        known_add(addr.c_str());
+                    if (mode == CONN_USER && !known_add(addr.c_str())) {
+                        Log::logf(CAT_OXI, LOG_WARN, "Sensor connected but not saved: known list full or NVS write failed\n");
                     }
                     failed_addr[0] = 0;
                     last_failure = nullptr;
@@ -1425,7 +1506,8 @@ void OxiBle::task(void *param) {
 
 void OxiBle::init() {
     lifecycle_mutex = xSemaphoreCreateMutex();
-    if (!lifecycle_mutex) return;
+    known_store_mutex = xSemaphoreCreateMutex();
+    if (!lifecycle_mutex || !known_store_mutex) return;
     xTaskCreatePinnedToCore(OxiBle::task, "ble_oxi", OXI_TASK_STACK,
                             nullptr, OXI_TASK_PRIO, &oxi_task_handle, 0);
 }
@@ -1501,31 +1583,39 @@ int OxiBle::get_scan_results(oxi_scan_result_t *out, int max) {
     return n;
 }
 
-int OxiBle::get_all_known(char addrs[][18], int max) {
-    int n = 0;
-    // NimBLE bonds
-    if (!lifecycle_mutex || xSemaphoreTake(lifecycle_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return 0;
-    int nb = NimBLEDevice::isInitialized() ? NimBLEDevice::getNumBonds() : 0;
-    for (int i = 0; i < nb && n < max; i++) {
-        NimBLEAddress ba = NimBLEDevice::getBondedAddress(i);
-        strncpy(addrs[n], ba.toString().c_str(), 17);
-        addrs[n][17] = '\0';
-        n++;
-    }
-    xSemaphoreGive(lifecycle_mutex);
-    // Known list (skip duplicates with bonds)
-    for (int i = 0; i < known_count && n < max; i++) {
-        bool dup = false;
-        for (int j = 0; j < n; j++) {
-            if (strcasecmp(addrs[j], known_addrs[i]) == 0) { dup = true; break; }
-        }
-        if (!dup) {
-            strncpy(addrs[n], known_addrs[i], 17);
-            addrs[n][17] = '\0';
-            n++;
-        }
-    }
+int OxiBle::get_known_devices(oxi_known_device_t *out, int max) {
+    if (!out || max <= 0) return 0;
+    portENTER_CRITICAL(&known_mux);
+    int n = known_count < max ? known_count : max;
+    for (int i = 0; i < n; i++) out[i] = known_devices[i];
+    portEXIT_CRITICAL(&known_mux);
     return n;
+}
+
+bool OxiBle::set_autoconnect(const char *addr, bool enabled) {
+    char key[15];
+    if (!autoconnect_key(addr, key) || !known_store_mutex || !known_ready) return false;
+    xSemaphoreTake(known_store_mutex, portMAX_DELAY);
+    portENTER_CRITICAL(&known_mux);
+    int index = known_index(addr);
+    bool unchanged = index >= 0 && known_devices[index].autoconnect == enabled;
+    portEXIT_CRITICAL(&known_mux);
+    bool ok = unchanged;
+    if (index >= 0 && !unchanged) {
+        Preferences p;
+        if (p.begin("oxi_known", false)) {
+            ok = p.putBool(key, enabled) > 0;
+            p.end();
+        }
+        if (ok) {
+            portENTER_CRITICAL(&known_mux);
+            known_devices[index].autoconnect = enabled;
+            portEXIT_CRITICAL(&known_mux);
+            status_revision.fetch_add(1);
+        }
+    }
+    xSemaphoreGive(known_store_mutex);
+    return ok;
 }
 
 // Internal: must run on the BLE task (touches NimBLE + NVS).

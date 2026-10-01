@@ -444,9 +444,9 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
           <div class="msg" id="bleMsg"></div>
         </div>
         <div class="card">
-          <h3>Bonded Devices</h3>
+          <h3>Known Devices</h3>
           <div id="bleBonds"></div>
-          <div class="btn-row"><button class="btn btn-danger" onclick="bleAction('delete_all_bonds')">Delete All Bonds</button></div>
+          <div class="btn-row"><button class="btn btn-danger" onclick="bleAction('delete_all_bonds')">Forget All</button></div>
         </div>
       </div>
 
@@ -2236,16 +2236,29 @@ function loadBle() {
       oa.style.display = '';
     }
     const bl = document.getElementById('bleBonds'); bl.innerHTML = '';
-    if (d.bonds && d.bonds.length) {
-      d.bonds.forEach(addr => {
+    if (d.known && d.known.length) {
+      d.known.forEach(device => {
+        const addr = device.addr;
         const row = document.createElement('div'); row.className = 'row';
-        row.innerHTML = '<label style="font-family:monospace"></label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px">Delete</button>';
+        row.innerHTML = '<label style="font-family:monospace"></label>' +
+          '<label><input type="checkbox"> Auto-connect</label>' +
+          '<button class="btn">Connect</button><button class="btn btn-danger">Forget</button>';
         row.querySelector('label').textContent = addr;
-        row.querySelector('button').onclick = () => bleAction('delete_bond', addr);
+        const toggle = row.querySelector('input');
+        toggle.checked = device.autoconnect;
+        toggle.onchange = async () => {
+          toggle.disabled = true;
+          const ok = await bleAction('autoconnect', addr, {enabled:toggle.checked});
+          if (!ok) toggle.checked = device.autoconnect;
+          toggle.disabled = false;
+        };
+        const buttons = row.querySelectorAll('button');
+        buttons[0].onclick = () => bleConnect(addr);
+        buttons[1].onclick = () => bleAction('delete_bond', addr);
         bl.appendChild(row);
       });
     } else {
-      bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No bonded devices</div>';
+      bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No known devices</div>';
     }
     bleLoadedRevision = revision;
     return d;
@@ -2266,15 +2279,18 @@ async function bleConnect(addr) {
   await bleAction('connect', addr);
 }
 
-async function bleAction(action, addr) {
+async function bleAction(action, addr, settings = {}) {
   try {
-    const body = addr ? {action,addr} : {action};
+    const body = {action, ...settings};
+    if (addr) body.addr = addr;
     const r = await api('/api/ble', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || d.result || 'Oximetry action failed');
     if (action !== 'scan') showMsg(document.getElementById('bleMsg'), d.result, 'ok');
     loadBle();
-  } catch(e) { showMsg(document.getElementById('bleMsg'), 'Error: ' + e.message, 'err'); }
+    return true;
+  } catch(e) { showMsg(document.getElementById('bleMsg'), 'Error: ' + e.message, 'err'); return false; }
 }
 
 // Console

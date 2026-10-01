@@ -171,6 +171,28 @@ void dispatch_command(const char *line, String &response) {
                     response += '\n';
                 }
             }
+        } else if (sub == "KNOWN") {
+            oxi_known_device_t devices[MAX_KNOWN_DEVICES];
+            int count = OxiBle::get_known_devices(devices, MAX_KNOWN_DEVICES);
+            if (!count) response = "(no known sensors)\n";
+            for (int i = 0; i < count; i++) {
+                response += String(devices[i].addr) + " autoconnect=" +
+                            (devices[i].autoconnect ? "on\n" : "off\n");
+            }
+        } else if (sub.startsWith("AUTOCONNECT ")) {
+            String args = cmd.substring(16);
+            args.trim();
+            int space = args.indexOf(' ');
+            String addr = space > 0 ? args.substring(0, space) : "";
+            String value = space > 0 ? args.substring(space + 1) : "";
+            value.trim();
+            value.toUpperCase();
+            if (value != "ON" && value != "OFF") {
+                response = "ERR: OXI AUTOCONNECT <addr> ON|OFF\n";
+            } else {
+                response = OxiBle::set_autoconnect(addr.c_str(), value == "ON")
+                    ? "OK: autoconnect saved\n" : "ERR: unknown sensor or settings write failed\n";
+            }
         } else if (sub.startsWith("CONNECT")) {
             String addr = cmd.substring(12);  // "OXI CONNECT <addr>"
             addr.trim();
@@ -575,6 +597,8 @@ void dispatch_command(const char *line, String &response) {
                    "  OXI STATUS          Oximeter connection info\n"
                    "  OXI SCAN            Scan for BLE oximeters\n"
                    "  OXI RESULTS         Show scan results\n"
+                   "  OXI KNOWN           List known sensors and autoconnect\n"
+                   "  OXI AUTOCONNECT <addr> ON|OFF\n"
                    "  OXI CONNECT [addr]  Connect to oximeter\n"
                    "  OXI DISCONNECT      Disconnect oximeter\n"
                    "  OXI ENABLE|DISABLE  Enable/disable oximetry\n"
