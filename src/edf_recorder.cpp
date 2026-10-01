@@ -1930,11 +1930,11 @@ static void sample_pld() {
         {"Press.2s", "MKI"},
         {"EprPress.2s", "MKE"},  {"Leak.2s", "LKF", true},
         {"RespRate.2s", "RRR", true}, {"TidVol.2s", "TDD"},
-        {"MinVent.2s", "MV5", true}, {"TgtVent.2s", "TGT", true},
-        {"IERatio.2s", "IER"},   {"Snore.2s", "SNI"},
-        {"FlowLim.2s", "FFL"},   {"B5ITime.2s", "IN5"},
-        {"B5ETime.2s", "EX5"},
+        {"IERatio.2s", "IER"},  {"B5ITime.2s", "IN5"},
+        {"B5ETime.2s", "EX5"},  {"MinVent.2s", "MV5", true},
+        {"TgtVent.2s", "TGT", true},
         {"AlvMinVent.2s", "AAV", true},
+        {"Snore.2s", "SNI"},    {"FlowLim.2s", "FFL"},
     };
 
     const uint32_t started_ms = millis();
@@ -1954,6 +1954,7 @@ static void sample_pld() {
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     TimedFrame selected_pbt = {};
     const TimedFrame *pbt = nullptr;
+    bool pbt_after_target = false;
     auto collect_frames = [&](TickType_t wait = 0) {
         drain_raw_frames(wait);
         if (!status.active || segment_start != session_clock.captured_ms ||
@@ -1964,6 +1965,11 @@ static void sample_pld() {
             return false;
         }
         sample_oximetry();
+        for (uint8_t i = 0; pbt_schema && i < pbt_sample_count; i++) {
+            const int32_t offset = int32_t(pbt_samples[i].received_ms - target_ms);
+            if (offset >= 0 && offset <= PBT_SAMPLE_WINDOW_MS)
+                pbt_after_target = true;
+        }
         const TimedFrame *candidate = pbt_schema ? nearest_pbt(target_ms) : nullptr;
         if (candidate && (!pbt || abs(int32_t(candidate->received_ms - target_ms)) <
                                  abs(int32_t(pbt->received_ms - target_ms)))) {
@@ -1975,7 +1981,8 @@ static void sample_pld() {
 
     constexpr size_t count = sizeof(sources) / sizeof(sources[0]);
     int16_t values[count];
-    uint32_t deferred = 0;
+    uint32_t deferred = 0, polled = 0;
+    uint8_t poll_count = 0;
     uint8_t queries = 0, streamed = 0;
     if (!collect_frames()) return;
     for (size_t i = 0; i < count; i++) {
@@ -1986,12 +1993,31 @@ static void sample_pld() {
             deferred |= uint32_t(1) << i;
             continue;
         }
+        polled |= uint32_t(1) << i;
+        poll_count++;
+    }
+
+    // Two observed 40 ms UART turns per planned read, not the last burst's RTT.
+    // Missing stream fields share the same fixed window; late reads never extend it.
+    const uint32_t spacing_ms = poll_count
+        ? min(uint32_t(80), uint32_t(2 * PLD_SAMPLE_WINDOW_MS) / poll_count) : 0;
+    uint32_t not_before = target_ms - poll_count * spacing_ms / 2;
+    for (size_t i = 0; i < count; i++) {
+        if (!(polled & (uint32_t(1) << i))) continue;
+        while (int32_t(millis() - not_before) < 0) {
+            if (!collect_frames(pdMS_TO_TICKS(10))) return;
+        }
+        not_before += spacing_ms;
+        const auto &source = sources[i];
         (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
         if (!collect_frames()) return;
     }
 
-    // Stream-derived values need data through the target; never flush a minute early.
-    while (int32_t(millis() - target_ms) < 0) {
+    // Bracket the PBT target before choosing nearest, even after a fast burst.
+    // A stalled stream cannot hold the worker beyond its freshness window.
+    while (int32_t(millis() - target_ms) < 0 ||
+           (deferred && !pbt_after_target &&
+            int32_t(millis() - target_ms) < PBT_SAMPLE_WINDOW_MS)) {
         if (!collect_frames(pdMS_TO_TICKS(20))) return;
     }
 
