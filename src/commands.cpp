@@ -76,6 +76,7 @@ void dispatch_command(const char *line, String &response) {
                     String(LiveStream::is_stream_active(LiveTce::TAG) ? "subscribed" : "idle") +
                     "\n";
         response += "heap: " + String(ESP.getFreeHeap()) + "\n";
+        response += "heap_largest: " + String(ESP.getMaxAllocHeap()) + "\n";
         return;
     }
 
