@@ -39,7 +39,8 @@ bool read_raw(const char *cmd, int &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout) return false;
     uint32_t raw;
-    if (Arbiter::read_var_hex(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL, raw, timeout) !=
+    if (Arbiter::read_var_hex(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL, raw,
+                             timeout, nullptr, timeout) !=
         Arbiter::VarResult::Ok || raw > INT_MAX) return false;
     value = static_cast<int>(raw);
     return true;

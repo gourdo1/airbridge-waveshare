@@ -43,7 +43,8 @@ static_assert(sizeof(PERIOD_FIELDS) / sizeof(Field) <= MAX_FIELDS);
 using Scalar = Arbiter::VarResult;
 Scalar read_scalar(const char *tag, uint32_t &value, uint16_t timeout) {
     if (!timeout) return Scalar::Failed;
-    return Arbiter::read_var_hex(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value, timeout);
+    return Arbiter::read_var_hex(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value,
+                                 timeout, nullptr, timeout);
 }
 
 bool select_period(uint16_t selection, uint16_t timeout) {

@@ -98,12 +98,15 @@ namespace Arbiter {
                     VarReadTrace *trace = nullptr);
 
     // Return only the scalar value; a truncated value is a failed read.
+    // timeout_ms is a transport budget (at least 320 ms, including queue wait).
+    // A nonzero hard_timeout_ms caps the whole transaction, including that floor.
+    // Use it for caller-owned acquisition windows or remaining job deadlines.
     VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                        char *out, uint16_t capacity, uint16_t timeout_ms = 0,
-                       VarReadTrace *trace = nullptr);
+                       VarReadTrace *trace = nullptr, uint16_t hard_timeout_ms = 0);
     VarResult read_var_hex(const char *name, cmd_source_t src, cmd_priority_t prio,
                            uint32_t &out, uint16_t timeout_ms = 0,
-                           VarReadTrace *trace = nullptr);
+                           VarReadTrace *trace = nullptr, uint16_t hard_timeout_ms = 0);
     bool get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                  char *out, uint16_t capacity, uint16_t timeout_ms = 0);
 

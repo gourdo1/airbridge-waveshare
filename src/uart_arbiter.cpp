@@ -79,6 +79,10 @@ static uint32_t stat_error = 0;
 static uint32_t next_ticket_id = 1;
 
 static constexpr uint32_t SILENT_FRAME_GUARD_MS = 80;
+// Bench captures: guard/queue plus delayed G S replies need up to 320 ms.
+// Reserve before enqueue so caller and worker use the same deadline even if
+// OXH enters the queue concurrently; this is not a mandatory waiting period.
+static constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
 
 static constexpr size_t LCD_COMMAND_SIZE = 32;
 static constexpr size_t LCD_FRAME_SIZE = 9 + 2 * (LCD_COMMAND_SIZE - 1);
@@ -1365,7 +1369,7 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
 Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
                                     cmd_priority_t prio, char *out,
                                     uint16_t capacity, uint16_t timeout_ms,
-                                    VarReadTrace *trace) {
+                                    VarReadTrace *trace, uint16_t hard_timeout_ms) {
     if (trace) { *trace = {}; trace->outcome = "invalid_request"; }
     if (out && capacity) out[0] = 0;
     if (!name || strlen(name) != 3 || !out || capacity < 2) return VarResult::Failed;
@@ -1373,6 +1377,9 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
     snprintf(command, sizeof(command), "G S #%s", name);
     uint16_t length = capacity;
     bool missing;
+    if (!timeout_ms) timeout_ms = Config::get().uart_cmd_timeout_ms;
+    timeout_ms = max(timeout_ms, SCALAR_TIMEOUT_MIN_MS);
+    if (hard_timeout_ms) timeout_ms = min(timeout_ms, hard_timeout_ms);
     bool ok = read_command(command, src, prio, out, &length, timeout_ms,
                             capture_variable, &missing, trace);
     if (missing) {
@@ -1389,9 +1396,11 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
 
 Arbiter::VarResult Arbiter::read_var_hex(const char *name, cmd_source_t src,
                                         cmd_priority_t prio, uint32_t &out,
-                                        uint16_t timeout_ms, VarReadTrace *trace) {
+                                        uint16_t timeout_ms, VarReadTrace *trace,
+                                        uint16_t hard_timeout_ms) {
     char text[9];
-    VarResult result = read_var(name, src, prio, text, sizeof(text), timeout_ms, trace);
+    VarResult result = read_var(name, src, prio, text, sizeof(text), timeout_ms,
+                                trace, hard_timeout_ms);
     if (result != VarResult::Ok) return result;
     if (aircannect::parse_hex(text, strlen(text), out)) return VarResult::Ok;
     if (trace) trace->outcome = "invalid_hex";

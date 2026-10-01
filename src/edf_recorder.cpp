@@ -49,8 +49,6 @@ constexpr uint8_t PBT_SAMPLE_COUNT = 4;
 constexpr uint8_t BRH_SAMPLE_COUNT = 4;
 constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
-// Measured OXH guard plus delayed scalar reply can exceed 280 ms in total.
-constexpr uint16_t PLD_QUERY_TIMEOUT_MS = 320;
 constexpr uint16_t MKP_WINDOW_MS = 10000;
 // Ten seconds at 25 Hz, plus one PLD collection window and boundary samples.
 constexpr uint16_t MKP_HISTORY_COUNT = (MKP_WINDOW_MS + 2 * PLD_SAMPLE_WINDOW_MS) / 40 + 2;
@@ -301,10 +299,9 @@ static bool read_numeric_variable(const char *name, int16_t &value,
     uint32_t parsed = 0;
     Arbiter::VarReadTrace trace;
     queries++;
-    const uint16_t timeout_ms = min(uint32_t(PLD_QUERY_TIMEOUT_MS),
-                                   uint32_t(PLD_SAMPLE_WINDOW_MS - offset));
+    const uint16_t remaining_ms = PLD_SAMPLE_WINDOW_MS - offset;
     const auto result = Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                                             parsed, timeout_ms, &trace);
+                                             parsed, POLL_TIMEOUT_MS, &trace, remaining_ms);
     if (result != Arbiter::VarResult::Ok || parsed > INT16_MAX) {
         // Temporary capture of PLD failures, without logging live UART frames.
         Log::logf(CAT_EDF, LOG_WARN,

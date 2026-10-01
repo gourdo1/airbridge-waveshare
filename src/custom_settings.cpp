@@ -175,7 +175,8 @@ bool error_is(const char *value, const char *code) {
 bool read_raw_locked(const char *name, uint32_t &value) {
     uint16_t timeout = ClinicalJobs::timeout_ms();
     if (!timeout || loaded_generation != generation()) return false;
-    return Arbiter::read_var_hex(name, CMD_SRC_TCP, CMD_PRIO_NORMAL, value, timeout) ==
+    return Arbiter::read_var_hex(name, CMD_SRC_TCP, CMD_PRIO_NORMAL, value,
+                                 timeout, nullptr, timeout) ==
            Arbiter::VarResult::Ok;
 }
 
