@@ -51,6 +51,9 @@ constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
 // Measured OXH guard plus delayed scalar reply can exceed 280 ms in total.
 constexpr uint16_t PLD_QUERY_TIMEOUT_MS = 320;
+constexpr uint16_t MKP_WINDOW_MS = 10000;
+// Ten seconds at 25 Hz, plus one PLD collection window and boundary samples.
+constexpr uint16_t MKP_HISTORY_COUNT = (MKP_WINDOW_MS + 2 * PLD_SAMPLE_WINDOW_MS) / 40 + 2;
 constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
@@ -90,6 +93,11 @@ using Air10Stream::decoded_value32;
 struct TimedFrame {
     uint32_t received_ms;
     DecodedFrame frame;
+};
+
+struct PressureSample {
+    uint32_t received_ms;
+    int16_t value;
 };
 
 struct OutputFile {
@@ -189,6 +197,8 @@ static uint8_t pbt_next_sample = 0;
 static TimedFrame brh_samples[BRH_SAMPLE_COUNT];
 static uint8_t brh_sample_count = 0;
 static uint8_t brh_next_sample = 0;
+static PressureSample *mkp_history = nullptr;
+static uint16_t mkp_count = 0, mkp_next = 0;
 static uint32_t last_pld_slot = UINT32_MAX;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
@@ -291,7 +301,7 @@ static bool read_stored_value(const char *tag, uint16_t epoch_day,
 
 static bool read_numeric_variable(const char *name, int16_t &value,
                                   uint32_t slot, uint32_t target_ms,
-                                  uint8_t &queries) {
+                                  uint8_t &queries, Arbiter::VarReadTrace *timing = nullptr) {
     const int32_t offset = static_cast<int32_t>(millis() - target_ms);
     if (offset >= PLD_SAMPLE_WINDOW_MS) {
         Log::logf(CAT_EDF, LOG_DEBUG,
@@ -325,6 +335,7 @@ static bool read_numeric_variable(const char *name, int16_t &value,
         return false;
     }
     value = static_cast<int16_t>(parsed);
+    if (timing) *timing = trace;
     Log::logf(CAT_EDF, LOG_DEBUG,
               "PLD #%s slot=%lu raw=%d tx=%lu rx=%lu\n", name,
               (unsigned long)slot, int(value),
@@ -1781,6 +1792,42 @@ static bool advance_segment(uint32_t captured_ms);
 static void drain_raw_frames(TickType_t wait);
 static void sample_oximetry();
 
+static bool mean_mkp(uint32_t target_ms, int16_t &value) {
+    if (!mkp_history) return false;
+    uint32_t end = target_ms;
+    int64_t weighted = 0;
+    for (uint16_t i = 0; i < mkp_count; i++) {
+        const auto &sample = mkp_history[(mkp_next + MKP_HISTORY_COUNT - 1 - i) %
+                                          MKP_HISTORY_COUNT];
+        const int32_t age = int32_t(target_ms - sample.received_ms);
+        if (age < 0) continue;
+        // Bound sample-and-hold to two nominal periods; never bridge a stall.
+        if (end - sample.received_ms > 80) return false;
+        const uint32_t begin = age >= MKP_WINDOW_MS
+            ? target_ms - MKP_WINDOW_MS : sample.received_ms;
+        weighted += int64_t(sample.value) * (end - begin);
+        if (age >= MKP_WINDOW_MS) {
+            value = weighted / MKP_WINDOW_MS;
+            return true;
+        }
+        end = begin;
+    }
+    return false;
+}
+
+static void compare_mask_pressure(int16_t actual, const Arbiter::VarReadTrace &trace) {
+    if (!mkp_history) return;
+    int16_t at_tx = EDF_MISSING, at_rx = EDF_MISSING;
+    int16_t at_mid = EDF_MISSING;
+    (void)mean_mkp(trace.sent_ms, at_tx);
+    (void)mean_mkp(trace.received_ms, at_rx);
+    (void)mean_mkp(trace.sent_ms + (trace.received_ms - trace.sent_ms) / 2, at_mid);
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "MKF compare raw=%d mean_tx=%d mean_mid=%d mean_rx=%d tx=%lu rx=%lu\n",
+              int(actual), int(at_tx), int(at_mid), int(at_rx),
+              (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms);
+}
+
 static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                          const DecodedFrame &decoded) {
     uint32_t sample_ms = relative_ms(raw.captured_ms);
@@ -1818,6 +1865,11 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
         store_sample(brp, "Flow.40ms", record, slot, value);
     if (decoded_value(schema, decoded, "MKP", value)) {
         store_sample(brp, "Press.40ms", record, slot, value);
+        if (mkp_history && value >= 0) {
+            mkp_history[mkp_next] = {raw.captured_ms, value};
+            mkp_next = (mkp_next + 1) % MKP_HISTORY_COUNT;
+            if (mkp_count < MKP_HISTORY_COUNT) mkp_count++;
+        }
     }
     if (decoded_value(schema, decoded, "TCV", value))
         store_sample(brp, "TrigCycEvt.40ms", record, slot, value);
@@ -1927,8 +1979,12 @@ static void sample_pld() {
             deferred |= uint32_t(1) << i;
             continue;
         }
-        (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
+        Arbiter::VarReadTrace trace;
+        const bool have_value = read_numeric_variable(source.tag, values[i], absolute_slot,
+                                                       target_ms, queries, &trace);
         if (!collect_frames()) return;
+        if (have_value && strcmp(source.tag, "MKF") == 0)
+            compare_mask_pressure(values[i], trace);
     }
 
     // A next-minute slot may be collected early, but advancing its accumulator
@@ -2169,6 +2225,9 @@ static void clear_session_memory(bool remove_partial) {
     aircannect::Memory::free(header_buffer);
     header_buffer = nullptr;
     header_capacity = 0;
+    aircannect::Memory::free(mkp_history);
+    mkp_history = nullptr;
+    mkp_count = mkp_next = 0;
 }
 
 static bool anchor_session_clock(const ControlEvent &event) {
@@ -2293,6 +2352,13 @@ static bool allocate_session_buffers(const Air10Edf::Schema &brp_schema,
 
     if (!header_buffer) return false;
 
+    // Optional shadow comparison only; a failed allocation cannot stop EDF.
+    if (Log::get_cat_level(CAT_EDF) == LOG_DEBUG) {
+        mkp_history = static_cast<PressureSample *>(aircannect::Memory::alloc_large(
+            MKP_HISTORY_COUNT * sizeof(PressureSample)));
+        if (!mkp_history) Log::logf(CAT_EDF, LOG_DEBUG, "MKF comparison unavailable: memory\n");
+    }
+
     if (!initialize_accumulator(brp, brp_schema) ||
         !initialize_accumulator(pld, pld_schema) ||
         !initialize_accumulator(sad, Air10Edf::sad_schema()) ||
@@ -2344,6 +2410,7 @@ static void reset_session_state(bool rollover = false) {
     pbt_next_sample = 0;
     brh_sample_count = 0;
     brh_next_sample = 0;
+    mkp_count = mkp_next = 0;
     last_pld_slot = UINT32_MAX;
     last_oxi_slot = UINT32_MAX;
     if (!rollover) xQueueReset(raw_queue);
