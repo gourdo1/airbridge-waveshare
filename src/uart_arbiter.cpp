@@ -674,6 +674,8 @@ static void rx_task(void *param) {
                         LiveStream::on_l_frame(f->payload, f->payload_len);
                     } else {
                         stat_rx++;
+                        Log::logf(CAT_ARB, LOG_DEBUG, "RX-%c arrived %.32s t=%lu\n",
+                                  char(f->type), f->payload, millis());
                         rx_push_result_t push_result = rx_queue_push(f);
                         if (push_result == RX_PUSH_STORED ||
                             push_result == RX_PUSH_STORED_DROPPED_OLD) {
@@ -1511,7 +1513,11 @@ void Arbiter::write_raw(const uint8_t *data, size_t len) {
         if (transparent_active) transparent_sniff_tx(data, len);
         uart->write(data, len);
         uart->flush();
-        if (transparent_active) transparent_last_activity = millis();
+        if (transparent_active) {
+            transparent_last_activity = millis();
+            Log::logf(CAT_ARB, LOG_DEBUG, "TRANSP TX %u bytes t=%lu\n",
+                      unsigned(len), millis());
+        }
     }
 }
 
