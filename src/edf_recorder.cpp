@@ -44,7 +44,8 @@ constexpr uint16_t RAW_PAYLOAD_MAX = 64;
 constexpr uint8_t STREAM_FIELD_MAX = 8;
 constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
-constexpr uint16_t POLL_TIMEOUT_MS = 120;
+// Includes waiting behind an OXH guard plus an ordinary 40/80 ms response.
+constexpr uint16_t POLL_TIMEOUT_MS = 200;
 constexpr uint8_t PBT_SAMPLE_COUNT = 4;
 constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
