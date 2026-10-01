@@ -44,11 +44,12 @@ constexpr uint16_t RAW_PAYLOAD_MAX = 64;
 constexpr uint8_t STREAM_FIELD_MAX = 8;
 constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
-// Includes waiting behind an OXH guard plus an ordinary 40/80 ms response.
 constexpr uint16_t POLL_TIMEOUT_MS = 200;
 constexpr uint8_t PBT_SAMPLE_COUNT = 4;
 constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
+// Measured OXH guard plus delayed scalar reply can exceed 280 ms in total.
+constexpr uint16_t PLD_QUERY_TIMEOUT_MS = 320;
 constexpr uint16_t RECORDING_STATE_POLL_MS = 1000;
 constexpr uint16_t STORED_TIMEOUT_MS = 2000;
 constexpr uint8_t STORED_TRANSFER_ATTEMPTS = 3;
@@ -297,7 +298,7 @@ static bool read_numeric_variable(const char *name, int16_t &value,
                                   uint32_t slot, uint32_t target_ms,
                                   uint8_t &queries) {
     const int32_t offset = static_cast<int32_t>(millis() - target_ms);
-    if (offset > PLD_SAMPLE_WINDOW_MS) {
+    if (offset >= PLD_SAMPLE_WINDOW_MS) {
         Log::logf(CAT_EDF, LOG_DEBUG,
                   "PLD #%s slot=%lu skipped offset=%ldms\n",
                   name, (unsigned long)slot, (long)offset);
@@ -306,8 +307,10 @@ static bool read_numeric_variable(const char *name, int16_t &value,
     uint32_t parsed = 0;
     Arbiter::VarReadTrace trace;
     queries++;
+    const uint16_t timeout_ms = min(uint32_t(PLD_QUERY_TIMEOUT_MS),
+                                   uint32_t(PLD_SAMPLE_WINDOW_MS - offset));
     const auto result = Arbiter::read_var_hex(name, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                                             parsed, POLL_TIMEOUT_MS, &trace);
+                                             parsed, timeout_ms, &trace);
     if (result != Arbiter::VarResult::Ok || parsed > INT16_MAX) {
         // Temporary capture of PLD failures, without logging live UART frames.
         Log::logf(CAT_EDF, LOG_WARN,
