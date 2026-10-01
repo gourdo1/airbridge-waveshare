@@ -14,6 +14,7 @@
 #include "qframe.h"
 #include "network_hints.h"
 #include "live_stream.h"
+#include "live_tce.h"
 #include "live_web_consumer.h"
 #include "sd_storage.h"
 #include "edf_recorder.h"
@@ -102,6 +103,8 @@ void setup() {
 
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX);
     Log::logf(CAT_ARB, LOG_DEBUG, "Initialization returned\n");
+    LiveStream::init();
+    LiveTce::register_parser();
 
     bool wifi_ok = WiFiSetup::init();
 
@@ -125,8 +128,6 @@ void setup() {
     OxiBle::init();
     OxiUdp::init();
 
-    LiveStream::init();
-    LiveWebConsumer::init();
     EdfRecorder::init();
 
     Log::logf(CAT_GENERAL, LOG_DEBUG, "Startup initialization complete\n");

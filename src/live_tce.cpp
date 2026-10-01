@@ -18,10 +18,7 @@ static bool prepare() {
         Arbiter::read_var_hex("VID", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, vid) !=
             Arbiter::VarResult::Ok || vid > UINT16_MAX) return false;
     Air10Stream::Schema resolved = {};
-    if (!Air10Stream::resolve_schema(resolved, TAG, mid, vid) ||
-        !Air10Stream::schema_has_field(resolved, "MKP") ||
-        !Air10Stream::schema_has_field(resolved, "RFL") ||
-        !Air10Stream::schema_has_field(resolved, "LYK")) return false;
+    if (!Air10Stream::resolve_schema(resolved, TAG, mid, vid)) return false;
     portENTER_CRITICAL(&schema_mux);
     schema = resolved;
     portEXIT_CRITICAL(&schema_mux);

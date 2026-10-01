@@ -91,11 +91,6 @@ static void do_unsubscribe() {
     Log::logf(CAT_STREAM, LOG_DEBUG, "web: unsubscribed (idle)\n");
 }
 
-void init() {
-    LiveTce::register_parser();
-    // No device subscription here. acquire() handles that on first client.
-}
-
 void shutdown() {
     do_unsubscribe();
     portENTER_CRITICAL(&ring_mux);

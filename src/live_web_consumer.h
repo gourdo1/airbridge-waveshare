@@ -20,7 +20,6 @@ struct Sample {
 // subscription is held only while at least one live-chart client is connected.
 // The RX callback only stores samples; tick() publishes from the main task.
 
-void init();
 void shutdown();
 
 void acquire();
