@@ -30,8 +30,7 @@ const SignalSpec BRP_TCV_SIGNALS[] = {
     {"Crc16", "", "-32768", "32767", "-32768", "32767", 1},
 };
 
-// Airbreak SX567 superset. Unsupported model-specific signals are recorded as
-// EDF missing values rather than changing the file schema between devices.
+// RCR/RTR are deliberately omitted. Breath timing is selected per BRH schema.
 const SignalSpec PLD_SIGNALS[] = {
     {"MaskPress.2s", "cmH2O", "0.00", "40.00", "0", "2000", 30},
     {"Press.2s", "cmH2O", "0.00", "30.00", "0", "1500", 30},
@@ -48,8 +47,6 @@ const SignalSpec PLD_SIGNALS[] = {
     {"B5ETime.2s", "seconds", "0.00", "10.00", "0", "500", 30},
     {"Ti.2s", "seconds", "0.00", "10.00", "0", "500", 30},
     {"AlvMinVent.2s", "L/min", "0.00", "30.00", "0", "240", 30},
-    {"CLRatio.2s", "%", "0.00", "100.00", "0", "100", 30},
-    {"TRRatio.2s", "%", "0.00", "100.00", "0", "100", 30},
     {"Crc16", "", "-32768", "32767", "-32768", "32767", 1},
 };
 
@@ -290,6 +287,21 @@ const Schema &brp_schema(bool include_tcv) {
 }
 
 const Schema &pld_schema() { return PLD; }
+
+Schema pld_schema(bool include_int, bool include_ext,
+                  SignalSpec (&signals)[PLD_MAX_SIGNALS]) {
+    static_assert(sizeof(PLD_SIGNALS) / sizeof(PLD_SIGNALS[0]) == PLD_MAX_SIGNALS);
+    Schema selected = PLD;
+    selected.signals = signals;
+    selected.signal_count = 0;
+    for (const SignalSpec &signal : PLD_SIGNALS) {
+        if (!include_int && (!strcmp(signal.label, "Ti.2s") ||
+                             !strcmp(signal.label, "B5ITime.2s"))) continue;
+        if (!include_ext && !strcmp(signal.label, "B5ETime.2s")) continue;
+        signals[selected.signal_count++] = signal;
+    }
+    return selected;
+}
 
 const Schema &sad_schema() { return SAD; }
 const Schema &eve_schema() { return EVE; }

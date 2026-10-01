@@ -46,6 +46,7 @@ constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 200;
 constexpr uint8_t PBT_SAMPLE_COUNT = 4;
+constexpr uint8_t BRH_SAMPLE_COUNT = 4;
 constexpr uint16_t PBT_SAMPLE_WINDOW_MS = 200;
 constexpr uint16_t PLD_SAMPLE_WINDOW_MS = 500;
 // Measured OXH guard plus delayed scalar reply can exceed 280 ms in total.
@@ -86,7 +87,7 @@ using Air10Stream::schema_has_field;
 using Air10Stream::decoded_value;
 using Air10Stream::decoded_value32;
 
-struct PbtSample {
+struct TimedFrame {
     uint32_t received_ms;
     DecodedFrame frame;
 };
@@ -157,6 +158,8 @@ static constexpr char wave_tag[] = "TCE";
 static Accumulator brp;
 static Accumulator pld;
 static Accumulator sad;
+static Air10Edf::SignalSpec pld_signals[Air10Edf::PLD_MAX_SIGNALS];
+static Air10Edf::Schema pld_layout;
 static OutputFile eve;
 static OutputFile csl;
 static uint8_t *header_buffer = nullptr;
@@ -180,9 +183,12 @@ static uint16_t identification_mid = 0, identification_vid = 0;
 static char identification_srn[24] = {};
 
 static WaveClock wave_clock = {};
-static PbtSample pbt_samples[PBT_SAMPLE_COUNT];
+static TimedFrame pbt_samples[PBT_SAMPLE_COUNT];
 static uint8_t pbt_sample_count = 0;
 static uint8_t pbt_next_sample = 0;
+static TimedFrame brh_samples[BRH_SAMPLE_COUNT];
+static uint8_t brh_sample_count = 0;
+static uint8_t brh_next_sample = 0;
 static uint32_t last_pld_slot = UINT32_MAX;
 static uint32_t last_oxi_slot = UINT32_MAX;
 
@@ -1817,8 +1823,8 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
         store_sample(brp, "TrigCycEvt.40ms", record, slot, value);
 }
 
-static const PbtSample *nearest_pbt(uint32_t target_ms) {
-    const PbtSample *nearest = nullptr;
+static const TimedFrame *nearest_pbt(uint32_t target_ms) {
+    const TimedFrame *nearest = nullptr;
     uint32_t distance = PBT_SAMPLE_WINDOW_MS + 1;
     for (uint8_t i = 0; i < pbt_sample_count; i++) {
         const int32_t offset = static_cast<int32_t>(pbt_samples[i].received_ms - target_ms);
@@ -1831,6 +1837,28 @@ static const PbtSample *nearest_pbt(uint32_t target_ms) {
         }
     }
     return nearest;
+}
+
+static bool brh_inspiration(uint32_t target_ms, int16_t &value) {
+    const StreamSchema *schema = stream_leases[4] >= 0 ? find_schema("BRH") : nullptr;
+    if (!schema) return false;
+    const TimedFrame *latest = nullptr;
+    for (uint8_t i = 0; i < brh_sample_count; i++) {
+        const auto &sample = brh_samples[i];
+        if (int32_t(target_ms - sample.received_ms) < 0) continue;
+        if (!latest || int32_t(sample.received_ms - latest->received_ms) > 0)
+            latest = &sample;
+    }
+    if (!latest) return false;
+    int16_t inspiration;
+    if (!decoded_value(*schema, latest->frame, "INT", inspiration) || inspiration < 0)
+        return false;
+    // BRH is event-driven: a longer next breath does not invalidate the last INT.
+    value = inspiration;
+    Log::logf(CAT_EDF, LOG_DEBUG, "PLD #INT target=%lu raw=%d brh_rx=%lu age=%lu\n",
+              (unsigned long)target_ms, int(value), (unsigned long)latest->received_ms,
+              (unsigned long)(target_ms - latest->received_ms));
+    return true;
 }
 
 static void sample_pld() {
@@ -1846,9 +1874,8 @@ static void sample_pld() {
         {"MinVent.2s", "MV5", true}, {"TgtVent.2s", "TGT", true},
         {"IERatio.2s", "IER"},   {"Snore.2s", "SNI"},
         {"FlowLim.2s", "FFL"},   {"B5ITime.2s", "IN5"},
-        {"B5ETime.2s", "EX5"},   {"Ti.2s", "INT"},
-        {"AlvMinVent.2s", "AAV", true}, {"CLRatio.2s", "RCR"},
-        {"TRRatio.2s", "RTR"},
+        {"B5ETime.2s", "EX5"},
+        {"AlvMinVent.2s", "AAV", true},
     };
 
     const uint32_t started_ms = millis();
@@ -1866,8 +1893,8 @@ static void sample_pld() {
     const uint32_t segment_start = session_clock.captured_ms;
     const uint32_t target_ms = segment_start + absolute_slot * 2000;
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
-    PbtSample selected_pbt = {};
-    const PbtSample *pbt = nullptr;
+    TimedFrame selected_pbt = {};
+    const TimedFrame *pbt = nullptr;
     auto collect_frames = [&](TickType_t wait = 0) {
         drain_raw_frames(wait);
         if (!status.active || segment_start != session_clock.captured_ms ||
@@ -1878,7 +1905,7 @@ static void sample_pld() {
             return false;
         }
         sample_oximetry();
-        const PbtSample *candidate = pbt_schema ? nearest_pbt(target_ms) : nullptr;
+        const TimedFrame *candidate = pbt_schema ? nearest_pbt(target_ms) : nullptr;
         if (candidate && (!pbt || abs(int32_t(candidate->received_ms - target_ms)) <
                                  abs(int32_t(pbt->received_ms - target_ms)))) {
             selected_pbt = *candidate;
@@ -1895,6 +1922,7 @@ static void sample_pld() {
     for (size_t i = 0; i < count; i++) {
         values[i] = EDF_MISSING;
         const auto &source = sources[i];
+        if (signal_index(*pld.output.schema, source.label) < 0) continue;
         if (source.pbt && pbt_schema && schema_has_field(*pbt_schema, source.tag)) {
             deferred |= uint32_t(1) << i;
             continue;
@@ -1938,6 +1966,9 @@ static void sample_pld() {
     if (int32_t(finished_ms - target_ms) >= 2000) return;
     for (size_t i = 0; i < count; i++)
         store_sample(pld, sources[i].label, record, slot, values[i]);
+    int16_t inspiration = EDF_MISSING;
+    (void)brh_inspiration(target_ms, inspiration);
+    store_sample(pld, "Ti.2s", record, slot, inspiration);
 }
 
 static bool append_annotation(OutputFile &output, uint32_t onset,
@@ -2032,6 +2063,10 @@ static void process_raw_frame(const RawFrame &raw) {
         if (pbt_sample_count < PBT_SAMPLE_COUNT) pbt_sample_count++;
         Log::logf(CAT_EDF, LOG_DEBUG, "PBT seq=%u rx=%lu\n",
                   unsigned(decoded.sequence), (unsigned long)raw.captured_ms);
+    } else if (strcmp(tag, "BRH") == 0) {
+        brh_samples[brh_next_sample] = {raw.captured_ms, decoded};
+        brh_next_sample = (brh_next_sample + 1) % BRH_SAMPLE_COUNT;
+        if (brh_sample_count < BRH_SAMPLE_COUNT) brh_sample_count++;
     }
 }
 
@@ -2083,7 +2118,8 @@ static bool frame_sink(const qframe_t *frame, void *) {
     const bool wanted = memcmp(wave_tag, frame->payload, 3) == 0 ||
                         memcmp("APN", frame->payload, 3) == 0 ||
                         memcmp("CSN", frame->payload, 3) == 0 ||
-                        memcmp("PBT", frame->payload, 3) == 0;
+                        memcmp("PBT", frame->payload, 3) == 0 ||
+                        memcmp("BRH", frame->payload, 3) == 0;
     if (!wanted) return true;
 
     RawFrame raw = {};
@@ -2120,6 +2156,7 @@ static bool acquire_streams() {
     acquire_stream(1, "APN");
     acquire_stream(2, "CSN");
     acquire_stream(3, "PBT");
+    acquire_stream(4, "BRH");
     return true;
 }
 
@@ -2305,6 +2342,8 @@ static void reset_session_state(bool rollover = false) {
     wave_clock = {};
     pbt_sample_count = 0;
     pbt_next_sample = 0;
+    brh_sample_count = 0;
+    brh_next_sample = 0;
     last_pld_slot = UINT32_MAX;
     last_oxi_slot = UINT32_MAX;
     if (!rollover) xQueueReset(raw_queue);
@@ -2339,7 +2378,10 @@ static void start_session(const ControlEvent &event) {
     const StreamSchema *tce_schema = find_schema("TCE");
     const bool tcv = tce_schema && schema_has_field(*tce_schema, "TCV");
     const Air10Edf::Schema &brp_layout = Air10Edf::brp_schema(tcv);
-    const Air10Edf::Schema &pld_layout = Air10Edf::pld_schema();
+    const StreamSchema *brh_schema = find_schema("BRH");
+    pld_layout = Air10Edf::pld_schema(
+        brh_schema && schema_has_field(*brh_schema, "INT"),
+        brh_schema && schema_has_field(*brh_schema, "EXT"), pld_signals);
 
     reset_session_state();
     if (!acquire_streams()) {
@@ -2351,6 +2393,7 @@ static void start_session(const ControlEvent &event) {
     }
     if (!begin_segment_files(brp_layout, pld_layout)) {
         status_error("session buffer or file initialization failed");
+        release_streams();
         clear_session_memory(true);
         recording_storage_owned = false;
         SdStorage::release();
@@ -2362,6 +2405,7 @@ static void start_session(const ControlEvent &event) {
     portEXIT_CRITICAL(&status_mux);
     if (!same_therapy || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
         Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1) {
+        release_streams();
         clear_session_memory(true);
         discard_pending();
         recording_storage_owned = false;
@@ -2444,7 +2488,7 @@ static bool advance_segment(uint32_t captured_ms) {
     const StreamSchema *schema = find_schema("TCE");
     const bool tcv = schema && schema_has_field(*schema, "TCV");
     const bool opened = make_paths_and_metadata(event, mid, vid, true) &&
-        begin_segment_files(Air10Edf::brp_schema(tcv), Air10Edf::pld_schema());
+        begin_segment_files(Air10Edf::brp_schema(tcv), pld_layout);
     if (!opened) {
         capture_active = false;
         release_streams();

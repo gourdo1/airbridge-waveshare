@@ -43,6 +43,10 @@ struct HeaderInfo {
 
 const Schema &brp_schema(bool include_tcv);
 const Schema &pld_schema();
+constexpr size_t PLD_MAX_SIGNALS = 16;  // 15 data channels and CRC.
+// The caller owns the filtered signal array for the lifetime of the schema.
+Schema pld_schema(bool include_int, bool include_ext,
+                  SignalSpec (&signals)[PLD_MAX_SIGNALS]);
 const Schema &sad_schema();
 const Schema &eve_schema();
 const Schema &csl_schema();
