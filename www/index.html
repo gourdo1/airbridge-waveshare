@@ -136,6 +136,15 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .oxi-metric .big{font-size:42px;font-weight:700;line-height:1}
 .oxi-metric .unit{font-size:16px;font-weight:400;color:var(--text-dim);margin-left:2px}
 .oxi-badges{display:flex;gap:8px;margin-left:auto}
+.ble-device{display:flex;align-items:center;justify-content:space-between;gap:12px 20px;padding:12px 0;border-bottom:1px solid var(--border)}
+.ble-device:last-child{border-bottom:none}
+.ble-device-info{flex:1;min-width:0}
+.ble-device-name{display:block;font-size:14px;font-weight:500;overflow-wrap:anywhere}
+.ble-device-address{display:block;margin-top:4px;color:var(--text-dim);font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
+.ble-device-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ble-device-actions .btn{padding:8px 14px;white-space:nowrap}
+.ble-device-actions .ble-auto{min-width:144px}
+.ble-empty{color:var(--text-dim);font-size:13px;padding:8px 0}
 
 /* Charts */
 .chart-card{background:#0a0a16;border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px;overflow:hidden}
@@ -213,6 +222,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
   .topbar{padding:10px 16px}
   .topbar .page-title{font-size:14px}
   .oxi-metric .big{font-size:32px}
+  .ble-device{flex-direction:column;align-items:stretch}
+  .ble-device-actions{justify-content:flex-end}
+  .ble-device-actions .btn{flex:1}
+  .ble-device-actions .ble-auto{flex-basis:100%}
   .status-grid{grid-template-columns:1fr}
   #storagePath{flex-basis:100%}
   .storage-actions .btn{width:100%}
@@ -446,7 +459,8 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         <div class="card">
           <h3>Known Devices</h3>
           <div id="bleBonds"></div>
-          <div class="btn-row"><button class="btn btn-danger" onclick="bleAction('delete_all_bonds')">Forget All</button></div>
+          <div class="btn-row" id="bleForgetAll" hidden><button class="btn btn-danger" onclick="if(confirm('Forget all known devices?')) bleAction('delete_all_bonds', undefined, {}, 'bleKnownMsg')">Forget All</button></div>
+          <div class="msg" id="bleKnownMsg"></div>
         </div>
       </div>
 
@@ -806,15 +820,7 @@ function updateBleFromPush(d) {
     feed.onclick = () => bleAction(lastStatus.feeding === 'yes' ? 'stop_feed' : 'start_feed');
   }
   if (st) document.getElementById('btnOxiToggle').textContent = st === 'DISABLED' ? 'Enable' : 'Disable';
-  if (st || d.oxi_addr !== undefined) {
-    const connected = ['STREAMING', 'BONDING'].includes(lastStatus.oxi);
-    const address = (lastStatus.oxi_addr || '').toLowerCase();
-    document.querySelectorAll('#bleDevices [data-addr]').forEach(row => {
-      const active = connected && row.dataset.addr === address;
-      row.querySelector('button').hidden = active;
-      row.querySelector('.badge').hidden = !active;
-    });
-  }
+  if (st || d.oxi_addr !== undefined) updateBleConnections();
 }
 
 function appendLiveSamples(d, reset = false) {
@@ -2171,6 +2177,70 @@ function showMsg(el, text, type, timeout) {
 
 // BLE
 let bleRead = null, bleRevision = null, bleLoadedRevision = null;
+
+function updateBleConnections() {
+  const state = lastStatus.oxi;
+  const address = (lastStatus.oxi_addr || '').toLowerCase();
+  document.querySelectorAll('#bleDevices [data-addr], #bleBonds [data-addr]').forEach(row => {
+    const active = state === 'STREAMING' && row.dataset.addr === address;
+    const button = row.querySelector('.ble-connect');
+    button.textContent = active ? 'Connected' : 'Connect';
+    button.disabled = active || ['DISABLED', 'CONNECTING', 'BONDING'].includes(state);
+  });
+}
+
+function renderBleDevices(id, devices, known) {
+  const list = document.getElementById(id);
+  list.innerHTML = '';
+  if (!devices.length) {
+    const empty = document.createElement('div');
+    empty.className = 'ble-empty';
+    empty.textContent = known ? 'No known devices' : 'No devices found. Click Scan to search.';
+    list.appendChild(empty);
+    return;
+  }
+  devices.forEach(device => {
+    const row = document.createElement('div'); row.className = 'ble-device';
+    row.dataset.addr = device.addr.toLowerCase();
+    row.innerHTML = '<div class="ble-device-info"><strong class="ble-device-name"></strong>' +
+      '<small class="ble-device-address"></small></div><div class="ble-device-actions"></div>';
+    const name = device.name || device.addr;
+    row.querySelector('strong').textContent = name;
+    const address = row.querySelector('small');
+    address.textContent = device.addr + (known ? '' : ' (' + device.rssi + ' dBm)');
+    address.hidden = known && !device.name;
+    const actions = row.querySelector('.ble-device-actions');
+    const message = known ? 'bleKnownMsg' : 'bleMsg';
+    if (known) {
+      const auto = document.createElement('button');
+      auto.className = 'btn ble-auto' + (device.autoconnect ? ' btn-accent' : '');
+      auto.textContent = device.autoconnect ? 'Auto-connect On' : 'Auto-connect Off';
+      auto.setAttribute('aria-pressed', String(device.autoconnect));
+      auto.onclick = async () => {
+        auto.disabled = true;
+        await bleAction('autoconnect', device.addr, {enabled:String(!device.autoconnect)}, message);
+        auto.disabled = false;
+      };
+      actions.appendChild(auto);
+    }
+    const connect = document.createElement('button');
+    connect.className = 'btn btn-accent ble-connect';
+    connect.textContent = 'Connect';
+    connect.onclick = () => bleConnect(device.addr, message);
+    actions.appendChild(connect);
+    if (known) {
+      const forget = document.createElement('button');
+      forget.className = 'btn btn-danger';
+      forget.textContent = 'Forget';
+      forget.onclick = () => {
+        if (confirm('Forget ' + name + '?')) bleAction('delete_bond', device.addr, {}, message);
+      };
+      actions.appendChild(forget);
+    }
+    list.appendChild(row);
+  });
+}
+
 function toggleOxi() {
   var st = document.getElementById('bleStatusGrid');
   var isDisabled = st && st.querySelector('[data-field="state"]') &&
@@ -2208,58 +2278,16 @@ function loadBle() {
     if (ot) ot.textContent = d.state === 'DISABLED' ? 'Enable' : 'Disable';
     const sp = document.getElementById('bleScanSpinner');
     sp.style.display = d.state === 'SCANNING' ? 'inline-block' : 'none';
-    const dl = document.getElementById('bleDevices'); dl.innerHTML = '';
-    if (d.devices && d.devices.length) {
-      var connAddr = (lastStatus.oxi_addr || '').toLowerCase();
-      var isConn = connAddr && (d.state === 'STREAMING' || d.state === 'BONDING');
-      d.devices.forEach(dev => {
-        const row = document.createElement('div'); row.className = 'row';
-        row.dataset.addr = dev.addr.toLowerCase();
-        var active = isConn && dev.addr.toLowerCase() === connAddr;
-        row.innerHTML = '<label><strong></strong><br><small style="color:var(--text-dim)"></small></label>' +
-          '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>' +
-          '<button class="btn btn-accent">Connect</button>';
-        row.querySelector('strong').textContent = dev.name || 'Unknown';
-        row.querySelector('small').textContent = dev.addr + ' (' + dev.rssi + ' dBm)';
-        row.querySelector('button').hidden = active;
-        row.querySelector('.badge').hidden = !active;
-        row.querySelector('button').onclick = () => bleConnect(dev.addr);
-        dl.appendChild(row);
-      });
-    } else {
-      dl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No devices found. Click Scan to search.</div>';
-    }
+    renderBleDevices('bleDevices', d.devices || [], false);
     // Update dashboard oxi address
     var oa = document.getElementById('dashOxiAddr');
     if (oa && lastStatus.oxi_addr) {
       oa.textContent = lastStatus.oxi_addr;
       oa.style.display = '';
     }
-    const bl = document.getElementById('bleBonds'); bl.innerHTML = '';
-    if (d.known && d.known.length) {
-      d.known.forEach(device => {
-        const addr = device.addr;
-        const row = document.createElement('div'); row.className = 'row';
-        row.innerHTML = '<label style="font-family:monospace"></label>' +
-          '<label><input type="checkbox"> Auto-connect</label>' +
-          '<button class="btn">Connect</button><button class="btn btn-danger">Forget</button>';
-        row.querySelector('label').textContent = addr;
-        const toggle = row.querySelector('input');
-        toggle.checked = device.autoconnect;
-        toggle.onchange = async () => {
-          toggle.disabled = true;
-          const ok = await bleAction('autoconnect', addr, {enabled:String(toggle.checked)});
-          if (!ok) toggle.checked = device.autoconnect;
-          toggle.disabled = false;
-        };
-        const buttons = row.querySelectorAll('button');
-        buttons[0].onclick = () => bleConnect(addr);
-        buttons[1].onclick = () => bleAction('delete_bond', addr);
-        bl.appendChild(row);
-      });
-    } else {
-      bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No known devices</div>';
-    }
+    renderBleDevices('bleBonds', d.known || [], true);
+    document.getElementById('bleForgetAll').hidden = !d.known || d.known.length < 2;
+    updateBleConnections();
     bleLoadedRevision = revision;
     return d;
   } catch(e) { console.error(e); }
@@ -2275,11 +2303,11 @@ async function bleScan() {
   await bleAction('scan');
 }
 
-async function bleConnect(addr) {
-  await bleAction('connect', addr);
+async function bleConnect(addr, message = 'bleMsg') {
+  await bleAction('connect', addr, {}, message);
 }
 
-async function bleAction(action, addr, settings = {}) {
+async function bleAction(action, addr, settings = {}, message = 'bleMsg') {
   try {
     const body = {action, ...settings};
     if (addr) body.addr = addr;
@@ -2287,10 +2315,10 @@ async function bleAction(action, addr, settings = {}) {
     if (!r) return;
     const d = await r.json();
     if (!r.ok || !d.ok) throw new Error(d.error || d.result || 'Oximetry action failed');
-    if (action !== 'scan') showMsg(document.getElementById('bleMsg'), d.result, 'ok');
-    loadBle();
+    if (action !== 'scan') showMsg(document.getElementById(message), d.result, 'ok');
+    await loadBle();
     return true;
-  } catch(e) { showMsg(document.getElementById('bleMsg'), 'Error: ' + e.message, 'err'); return false; }
+  } catch(e) { showMsg(document.getElementById(message), 'Error: ' + e.message, 'err'); return false; }
 }
 
 // Console
