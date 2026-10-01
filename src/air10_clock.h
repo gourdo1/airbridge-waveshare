@@ -35,7 +35,7 @@ void invalidate();
 bool phase_anchor(PhaseAnchor &out);
 bool phase_unchanged(const PhaseAnchor &anchor);
 
-// Called from the main loop; applies NTP time after therapy and pending STR.
+// Main-loop maintenance: idle phase measurement/retry and deferred NTP writes.
 void handle();
 // Manual requests bypass the autosync setting, not standby/STR safety gates.
 void request_sync(bool manual = false);

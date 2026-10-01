@@ -18,6 +18,7 @@ static constexpr uint16_t CLOCK_TIMEOUT_MS = 500;
 static constexpr int64_t CLOCK_SEND_WINDOW_US = 10000;
 static constexpr uint32_t PHASE_PROBE_BUDGET_MS = 1500;
 static constexpr uint32_t PHASE_MAX_BRACKET_MS = 200;
+static constexpr uint32_t PHASE_RETRY_INTERVAL_MS = 5000;
 
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
@@ -40,7 +41,7 @@ struct ClockObservation {
     uint32_t received_ms = 0;
 };
 
-// Shared clock observations; only handle()/poll_status() own probe tickets.
+// Shared clock observations; only handle() owns probe tickets.
 static Air10Clock::PhaseAnchor device_phase;
 static uint32_t phase_generation = 1;
 static ClockObservation last_clock_read;
@@ -48,6 +49,8 @@ static ClockObservation phase_previous;
 static char phase_date[9];
 static uint32_t phase_started_ms = 0, phase_probe_generation = 0;
 static bool phase_measuring = false;
+static uint32_t phase_attempt_ms = 0;
+static bool phase_attempted = false;
 static uart_transaction_t *phase_ticket = nullptr;
 
 void Air10Clock::status_time(char (&out)[20]) {
@@ -140,34 +143,54 @@ void Air10Clock::poll_status() {
     if (Air10Clock::read(t, CLOCK_TIMEOUT_MS)) {
         snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
                  t.year, t.month, t.day, t.hour, t.minute);
-        if (AB_STORAGE_HAS_SDCARD && AirSenseState::device_standby() &&
-            !clock_sync_ticket && !phase_measuring) {
-            portENTER_CRITICAL(&device_time_mux);
-            phase_previous = last_clock_read;
-            phase_probe_generation = phase_generation;
-            portEXIT_CRITICAL(&device_time_mux);
-            snprintf(phase_date, sizeof(phase_date), "%02d%02d%04d", t.day, t.month, t.year);
-            phase_started_ms = millis();
-            phase_measuring = true;
-        }
     }
     publish_device_time(text);
 }
 
-static void stop_phase_measurement() {
+static void stop_phase_measurement(const char *reason = nullptr) {
+    if (phase_measuring && reason)
+        Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase stopped: %s\n", reason);
     if (phase_ticket) Arbiter::cancel_transaction(phase_ticket);
     phase_ticket = nullptr;
     phase_measuring = false;
 }
 
 static void handle_phase_measurement() {
-    if (!phase_measuring) return;
+    if (!phase_measuring) {
+        if (!AB_STORAGE_HAS_SDCARD || !AirSenseState::device_standby() ||
+            !AirSenseState::present_recently() || clock_sync_ticket) return;
+        const uint32_t now = millis();
+        portENTER_CRITICAL(&device_time_mux);
+        const bool due = !device_phase.generation ||
+            uint32_t(now - device_phase.captured_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
+        portEXIT_CRITICAL(&device_time_mux);
+        if (!due || (phase_attempted && now - phase_attempt_ms < PHASE_RETRY_INTERVAL_MS)) return;
+        phase_attempted = true;
+        phase_attempt_ms = now;
+        phase_started_ms = now;
+
+        Air10Clock::Calendar value;
+        if (!Air10Clock::read(value, CLOCK_TIMEOUT_MS)) {
+            Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase failed: calendar read\n");
+            return;
+        }
+        portENTER_CRITICAL(&device_time_mux);
+        phase_previous = last_clock_read;
+        phase_probe_generation = phase_generation;
+        portEXIT_CRITICAL(&device_time_mux);
+        snprintf(phase_date, sizeof(phase_date), "%02d%02d%04d",
+                 value.day, value.month, value.year);
+        phase_measuring = true;
+    }
     portENTER_CRITICAL(&device_time_mux);
     const bool unchanged = phase_probe_generation == phase_generation;
     portEXIT_CRITICAL(&device_time_mux);
-    if (!unchanged || !AirSenseState::device_standby() || clock_sync_ticket ||
-        uint32_t(millis() - phase_started_ms) >= PHASE_PROBE_BUDGET_MS) {
-        stop_phase_measurement();
+    const char *blocked = !unchanged ? "clock invalidated" :
+        !AirSenseState::device_standby() || !AirSenseState::present_recently() ? "not in standby" :
+        clock_sync_ticket ? "clock write" :
+        uint32_t(millis() - phase_started_ms) >= PHASE_PROBE_BUDGET_MS ? "probe deadline" : nullptr;
+    if (blocked) {
+        stop_phase_measurement(blocked);
         return;
     }
 
@@ -182,7 +205,7 @@ static void handle_phase_measurement() {
         const char *tic = qframe_response_value(response);
         if (!ok || !trace.sent || length >= sizeof(response) ||
             !Air10Clock::parse_calendar(phase_date, tic, value)) {
-            stop_phase_measurement();
+            stop_phase_measurement("TIC read failed");
             return;
         }
         int64_t civil = Air10Clock::civil_seconds(value);
@@ -205,7 +228,11 @@ static void handle_phase_measurement() {
                           (long long)civil, (unsigned long)measured.captured_ms,
                           unsigned(measured.uncertainty_ms));
             } else if (civil != phase_previous.civil + 1) {
+                Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase rejected: clock discontinuity\n");
                 Air10Clock::invalidate();
+            } else {
+                Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase rejected: bracket=%lums\n",
+                          (unsigned long)width);
             }
             stop_phase_measurement();
             return;
@@ -216,7 +243,7 @@ static void handle_phase_measurement() {
     const uart_send_window_t idle_only = {0, 0, true};
     phase_ticket = Arbiter::begin_cmd("G S #TIC", CMD_SRC_INTERNAL,
         CMD_PRIO_NORMAL, 32, CLOCK_TIMEOUT_MS, idle_only);
-    if (!phase_ticket) stop_phase_measurement();
+    if (!phase_ticket) stop_phase_measurement("UART queue unavailable");
 }
 
 void Air10Clock::request_sync(bool manual) {
@@ -245,7 +272,7 @@ static bool write_clock_value(const char *command) {
 }
 
 static void push_time_to_resmed() {
-    stop_phase_measurement();
+    stop_phase_measurement("clock write");
     Air10Clock::invalidate();
     struct tm t;
     time_t now = time(nullptr);
