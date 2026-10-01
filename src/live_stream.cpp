@@ -11,6 +11,7 @@ namespace LiveStream {
 struct Stream {
     char        tag[LIVE_STREAM_TAG_LEN + 1];
     decode_fn_t decode_fn;
+    prepare_fn_t prepare_fn;
     uint16_t    sample_size;
     uint8_t     ref_count;
     bool        subscribed;
@@ -49,12 +50,13 @@ static int find_stream_idx(const char *tag) {
 }
 
 static int create_stream(const char *tag, decode_fn_t decode_fn,
-                         uint16_t sample_size) {
+                         uint16_t sample_size, prepare_fn_t prepare_fn = nullptr) {
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (streams[i].in_use) continue;
         memcpy(streams[i].tag, tag, LIVE_STREAM_TAG_LEN);
         streams[i].tag[LIVE_STREAM_TAG_LEN] = 0;
         streams[i].decode_fn = decode_fn;
+        streams[i].prepare_fn = prepare_fn;
         streams[i].sample_size = sample_size;
         portENTER_CRITICAL(&data_mux);
         streams[i].in_use = true;
@@ -71,6 +73,7 @@ static int create_stream(const char *tag, decode_fn_t decode_fn,
 }
 
 static bool device_subscribe(int sidx, bool on, cmd_source_t src = CMD_SRC_INTERNAL) {
+    if (on && streams[sidx].prepare_fn && !streams[sidx].prepare_fn()) return false;
     char cmd[16];
     snprintf(cmd, sizeof(cmd), "P S &%s %d", streams[sidx].tag, on ? 1 : 0);
     char resp[32] = {};
@@ -96,7 +99,8 @@ void init() {
     Log::logf(CAT_STREAM, LOG_DEBUG, "broker init\n");
 }
 
-bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_size) {
+bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_size,
+                     prepare_fn_t prepare_fn) {
     if (!initialized) init();
     if (!initialized) return false;
     ControlGuard guard;
@@ -107,13 +111,14 @@ bool register_stream(const char *tag, decode_fn_t decode_fn, uint16_t sample_siz
         if (streams[sidx].decode_fn) return false;
         portENTER_CRITICAL(&data_mux);
         streams[sidx].decode_fn = decode_fn;
+        streams[sidx].prepare_fn = prepare_fn;
         streams[sidx].sample_size = sample_size;
         portEXIT_CRITICAL(&data_mux);
         Log::logf(CAT_STREAM, LOG_DEBUG,
                   "stream '%s' decoder attached\n", streams[sidx].tag);
         return true;
     }
-    return create_stream(tag, decode_fn, sample_size) >= 0;
+    return create_stream(tag, decode_fn, sample_size, prepare_fn) >= 0;
 }
 
 consumer_handle_t subscribe(const char *tag, consumer_cb_t cb, void *ctx) {

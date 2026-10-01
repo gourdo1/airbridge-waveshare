@@ -1,6 +1,6 @@
 #include "live_web_consumer.h"
 #include "live_stream.h"
-#include "live_pmd.h"
+#include "live_tce.h"
 #include "web_ui.h"
 #include "debug_log.h"
 
@@ -50,10 +50,10 @@ static void flush_batch() {
     WebUI::push_event("live", json);
 }
 
-static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
+static void on_tce(const void *sample, uint16_t sample_size, void *ctx) {
     (void)ctx;
-    if (sample_size < sizeof(LivePmd::Sample)) return;
-    const LivePmd::Sample *s = (const LivePmd::Sample *)sample;
+    if (sample_size < sizeof(LiveTce::Sample)) return;
+    const LiveTce::Sample *s = (const LiveTce::Sample *)sample;
 
     // Always store every frame (25 Hz) into the ring; the GET /api/live
     // backfill endpoint walks since_seq -> head at full resolution.
@@ -68,9 +68,9 @@ static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
 
 static void do_subscribe() {
     if (handle >= 0) return;
-    handle = LiveStream::subscribe(LivePmd::TAG, on_pmd, nullptr);
+    handle = LiveStream::subscribe(LiveTce::TAG, on_tce, nullptr);
     if (handle < 0) {
-        Log::logf(CAT_STREAM, LOG_WARN, "web: subscribe to PMD failed\n");
+        Log::logf(CAT_STREAM, LOG_WARN, "web: subscribe to TCE failed\n");
     } else {
         portENTER_CRITICAL(&ring_mux);
         int clients = client_count;
@@ -92,7 +92,7 @@ static void do_unsubscribe() {
 }
 
 void init() {
-    LivePmd::register_parser();
+    LiveTce::register_parser();
     // No device subscription here. acquire() handles that on first client.
 }
 
@@ -153,7 +153,7 @@ int get_samples(Sample *out, int max,
 }
 
 bool is_active() {
-    return LiveStream::is_stream_active(LivePmd::TAG);
+    return LiveStream::is_stream_active(LiveTce::TAG);
 }
 
 }

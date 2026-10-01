@@ -1,4 +1,5 @@
 #include "edf_recorder.h"
+#include "air10_stream.h"
 #include "hex_util.h"
 
 #include "board.h"
@@ -41,7 +42,6 @@ namespace {
 constexpr uint16_t RAW_QUEUE_CAPACITY_PSRAM = 128;
 constexpr uint16_t RAW_QUEUE_CAPACITY_FALLBACK = 48;
 constexpr uint16_t RAW_PAYLOAD_MAX = 64;
-constexpr uint8_t STREAM_FIELD_MAX = 8;
 constexpr uint8_t STREAM_COUNT = 5;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 200;
@@ -80,22 +80,11 @@ struct ControlEvent {
     uint32_t captured_ms;
 };
 
-struct StreamField {
-    char name[4];
-    uint8_t width;
-};
-
-struct StreamSchema {
-    char tag[4];
-    StreamField fields[STREAM_FIELD_MAX];
-    uint8_t field_count;
-    bool from_firmware;
-};
-
-struct DecodedFrame {
-    uint8_t sequence;
-    int32_t values[STREAM_FIELD_MAX];
-};
+using StreamSchema = Air10Stream::Schema;
+using DecodedFrame = Air10Stream::Frame;
+using Air10Stream::schema_has_field;
+using Air10Stream::decoded_value;
+using Air10Stream::decoded_value32;
 
 struct PbtSample {
     uint32_t received_ms;
@@ -163,7 +152,7 @@ static EdfCatalog::Entry summary_export_entry = {};
 static char pending_cursor[16] = {};
 static StreamSchema stream_schemas[STREAM_COUNT];
 static LiveStream::internal_handle_t stream_leases[STREAM_COUNT];
-static char wave_tag[4] = "TCE";
+static constexpr char wave_tag[] = "TCE";
 
 static Accumulator brp;
 static Accumulator pld;
@@ -342,140 +331,6 @@ static bool read_u32_variable(const char *name, uint32_t &value) {
                                  value, POLL_TIMEOUT_MS) == Arbiter::VarResult::Ok;
 }
 
-static void reset_schema(StreamSchema &schema, const char *tag) {
-    memset(&schema, 0, sizeof(schema));
-    memcpy(schema.tag, tag, 3);
-}
-
-static bool add_schema_field(StreamSchema &schema, const char *name,
-                             uint8_t width) {
-    if (!name || strlen(name) != 3 || width == 0 ||
-        schema.field_count >= STREAM_FIELD_MAX) {
-        return false;
-    }
-    StreamField &field = schema.fields[schema.field_count++];
-    memcpy(field.name, name, 3);
-    field.name[3] = 0;
-    field.width = width;
-    return true;
-}
-
-static bool set_schema(StreamSchema &schema, const char *tag,
-                       const char *definition) {
-    reset_schema(schema, tag);
-    if (!definition || !definition[0]) return false;
-
-    char copy[96];
-    strncpy(copy, definition, sizeof(copy) - 1);
-    char *save = nullptr;
-    for (char *token = strtok_r(copy, " ", &save); token;
-         token = strtok_r(nullptr, " ", &save)) {
-        char *colon = strchr(token, ':');
-        if (!colon || colon - token != 3) return false;
-        *colon = 0;
-        uint32_t width = 0;
-        if (!parse_hex_value(colon + 1, strlen(colon + 1), width) ||
-            width == 0 || width > 8 ||
-            !add_schema_field(schema, token, static_cast<uint8_t>(width))) {
-            return false;
-        }
-    }
-    return schema.field_count > 0;
-}
-
-static bool query_schema(StreamSchema &schema, const char *tag) {
-    char command[16];
-    char value[120] = {};
-    snprintf(command, sizeof(command), "G C &%s", tag);
-    if (!command_value(command, value, sizeof(value), 300)) return false;
-
-    char *save = nullptr;
-    char *count_text = strtok_r(value, " ", &save);
-    uint32_t count = 0;
-    if (!count_text || !parse_hex_value(count_text, strlen(count_text), count) ||
-        count == 0 || count > STREAM_FIELD_MAX) {
-        return false;
-    }
-
-    reset_schema(schema, tag);
-    for (uint32_t i = 0; i < count; i++) {
-        char *token = strtok_r(nullptr, " ", &save);
-        if (!token) return false;
-        char *colon = strchr(token, ':');
-        uint32_t width = 0;
-        if (!colon || colon - token != 3) return false;
-        *colon = 0;
-        if (!parse_hex_value(colon + 1, strlen(colon + 1), width) ||
-            width == 0 || width > 8 ||
-            !add_schema_field(schema, token, static_cast<uint8_t>(width))) {
-            return false;
-        }
-    }
-    schema.from_firmware = true;
-    return strtok_r(nullptr, " ", &save) == nullptr;
-}
-
-static int stream_profile(uint16_t mid, uint16_t vid) {
-    if (mid == 0x24) {
-        switch (vid) {
-            case 1: case 25: case 26: case 34: case 37: case 39: return 1;
-            case 2: case 38: return 2;
-            case 5: return 3;
-            case 7: case 11: case 12: case 28: return 4;
-            case 19: return 5;
-            case 9: case 27: return 6;
-            case 3: case 35: return 7;
-            case 36: return 8;
-            default: return 0;
-        }
-    }
-    if (mid == 0x28) {
-        switch (vid) {
-            case 41: case 43: case 45: return 4;
-            case 50: case 51: return 5;
-            case 44: case 46: case 48: case 49: return 9;
-            default: return 0;
-        }
-    }
-    return 0;
-}
-
-static void fallback_schemas(uint16_t mid, uint16_t vid) {
-    const int profile = stream_profile(mid, vid);
-    set_schema(stream_schemas[0], "PMD", "MKP:03 RFL:03 LYK:02");
-    set_schema(stream_schemas[1], "TCE",
-               profile == 4 || profile == 6 || profile == 9
-                   ? "TCV:04 MKP:03 RFL:03 LYK:02"
-                   : "MKP:03 RFL:03 LYK:02");
-    set_schema(stream_schemas[2], "APN", "AET:04 DUR:02");
-    if (profile == 3) {
-        reset_schema(stream_schemas[3], "CSN");
-    } else {
-        set_schema(stream_schemas[3], "CSN",
-                   profile == 4 || profile == 5 || profile == 6 || profile == 9
-                       ? "CSR:04" : "CET:05 CSR:04");
-    }
-
-    const char *pbt = nullptr;
-    if (profile == 7 || profile == 8)
-        pbt = "LKF:02 TIP:03 TEP:03";
-    else if (profile == 5)
-        pbt = "MV5:02 TGT:02 RRR:02 LKF:02 TIP:03 TEP:03";
-    else if (profile == 9)
-        pbt = "MV5:02 RRR:02 LKF:02 TIP:03 TEP:03 AAV:02";
-    else if (profile)
-        pbt = "MV5:02 RRR:02 LKF:02 TIP:03 TEP:03";
-
-    if (pbt) set_schema(stream_schemas[4], "PBT", pbt);
-    else reset_schema(stream_schemas[4], "PBT");
-
-    if (!profile) {
-        Log::logf(CAT_EDF, LOG_WARN,
-                  "unknown MID=%04X VID=%04X, using common AirSense schema\n",
-                  mid, vid);
-    }
-}
-
 static StreamSchema *find_schema(const char *tag) {
     for (StreamSchema &schema : stream_schemas) {
         if (schema.field_count && memcmp(schema.tag, tag, 3) == 0)
@@ -484,85 +339,10 @@ static StreamSchema *find_schema(const char *tag) {
     return nullptr;
 }
 
-static bool schema_has_field(const StreamSchema &schema, const char *name) {
-    for (uint8_t i = 0; i < schema.field_count; i++)
-        if (strcmp(schema.fields[i].name, name) == 0) return true;
-    return false;
-}
-
 static void resolve_schemas(uint16_t mid, uint16_t vid) {
-    fallback_schemas(mid, vid);
-    static const char *tags[STREAM_COUNT] = {
-        "PMD", "TCE", "APN", "CSN", "PBT",
-    };
-    for (uint8_t i = 0; i < STREAM_COUNT; i++) {
-        StreamSchema queried;
-        if (query_schema(queried, tags[i])) {
-            stream_schemas[i] = queried;
-            Log::logf(CAT_EDF, LOG_DEBUG,
-                      "%s schema from firmware (%u fields)\n",
-                      tags[i], queried.field_count);
-        }
-    }
-}
-
-static bool decode_frame(const RawFrame &raw, const StreamSchema &schema,
-                         DecodedFrame &decoded) {
-    size_t expected = 5;
-    for (uint8_t i = 0; i < schema.field_count; i++)
-        expected += schema.fields[i].width;
-    if (raw.len != expected || memcmp(raw.payload, schema.tag, 3) != 0)
-        return false;
-
-    uint32_t sequence = 0;
-    if (!parse_hex_value(reinterpret_cast<const char *>(raw.payload + 3),
-                         2, sequence)) {
-        return false;
-    }
-    decoded.sequence = static_cast<uint8_t>(sequence);
-
-    size_t offset = 5;
-    for (uint8_t i = 0; i < schema.field_count; i++) {
-        const StreamField &field = schema.fields[i];
-        uint32_t value = 0;
-        if (!parse_hex_value(
-                reinterpret_cast<const char *>(raw.payload + offset),
-                field.width, value)) {
-            return false;
-        }
-        if (strcmp(field.name, "RFL") == 0) {
-            const uint8_t bits = field.width * 4;
-            if (bits < 32 && (value & (1UL << (bits - 1))))
-                value |= ~((1UL << bits) - 1);
-        }
-        decoded.values[i] = static_cast<int32_t>(value);
-        offset += field.width;
-    }
-    return true;
-}
-
-static bool decoded_value(const StreamSchema &schema,
-                          const DecodedFrame &decoded,
-                          const char *name, int16_t &value) {
-    for (uint8_t i = 0; i < schema.field_count; i++) {
-        if (strcmp(schema.fields[i].name, name) != 0) continue;
-        if (decoded.values[i] < INT16_MIN || decoded.values[i] > INT16_MAX)
-            return false;
-        value = static_cast<int16_t>(decoded.values[i]);
-        return true;
-    }
-    return false;
-}
-
-static bool decoded_value32(const StreamSchema &schema,
-                            const DecodedFrame &decoded,
-                            const char *name, int32_t &value) {
-    for (uint8_t i = 0; i < schema.field_count; i++) {
-        if (strcmp(schema.fields[i].name, name) != 0) continue;
-        value = decoded.values[i];
-        return true;
-    }
-    return false;
+    static const char *tags[STREAM_COUNT] = {"TCE", "APN", "CSN", "PBT", "BRH"};
+    for (uint8_t i = 0; i < STREAM_COUNT; i++)
+        Air10Stream::resolve_schema(stream_schemas[i], tags[i], mid, vid);
 }
 
 static void epoch_day_to_civil(uint16_t epoch_day, int &year,
@@ -2238,7 +2018,7 @@ static void process_raw_frame(const RawFrame &raw) {
     };
     StreamSchema *schema = find_schema(tag);
     DecodedFrame decoded = {};
-    if (!schema || !decode_frame(raw, *schema, decoded)) return;
+    if (!schema || !Air10Stream::decode_frame(raw.payload, raw.len, *schema, decoded)) return;
 
     portENTER_CRITICAL(&status_mux);
     portEXIT_CRITICAL(&status_mux);
@@ -2333,16 +2113,14 @@ static void acquire_stream(uint8_t slot, const char *tag) {
         Log::logf(CAT_EDF, LOG_WARN, "%s subscribe failed\n", tag);
 }
 
-static void acquire_streams() {
+static bool acquire_streams() {
     for (LiveStream::internal_handle_t &lease : stream_leases) lease = -1;
     acquire_stream(0, "TCE");
-    if (stream_leases[0] < 0) {
-        strcpy(wave_tag, "PMD");
-        acquire_stream(0, "PMD");
-    }
+    if (stream_leases[0] < 0) return false;
     acquire_stream(1, "APN");
     acquire_stream(2, "CSN");
     acquire_stream(3, "PBT");
+    return true;
 }
 
 static void clear_session_memory(bool remove_partial) {
@@ -2564,6 +2342,13 @@ static void start_session(const ControlEvent &event) {
     const Air10Edf::Schema &pld_layout = Air10Edf::pld_schema();
 
     reset_session_state();
+    if (!acquire_streams()) {
+        release_streams();
+        status_error("TCE subscription failed");
+        recording_storage_owned = false;
+        SdStorage::release();
+        return;
+    }
     if (!begin_segment_files(brp_layout, pld_layout)) {
         status_error("session buffer or file initialization failed");
         clear_session_memory(true);
@@ -2598,9 +2383,7 @@ static void start_session(const ControlEvent &event) {
     status.csl_records = 1;
     portEXIT_CRITICAL(&status_mux);
 
-    strcpy(wave_tag, "TCE");
     capture_active = true;
-    acquire_streams();
     Log::logf(CAT_EDF, LOG_INFO,
               "recording %s/%s MID=%u VID=%u\n",
               status.therapy_day, status.file_prefix, mid, vid);

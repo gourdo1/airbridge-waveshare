@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-// Web UI consumer for the PMD live stream. Owns the per-frame ring buffer
+// Web UI consumer for the TCE live stream. Owns the per-frame ring buffer
 // served by /api/live, and pushes throttled SSE "live" events for clients
 // that prefer event-source pull.
 
@@ -16,7 +16,7 @@ struct Sample {
 };
 
 // Lifecycle is driven by /events/live presence: web_ui calls acquire() on
-// AsyncEventSource onConnect and release() on onDisconnect. The PMD device
+// AsyncEventSource onConnect and release() on onDisconnect. The TCE device
 // subscription is held only while at least one live-chart client is connected.
 // The RX callback only stores samples; tick() publishes from the main task.
 

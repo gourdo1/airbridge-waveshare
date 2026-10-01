@@ -15,7 +15,7 @@
 #include "air10_clock.h"
 #include "network_hints.h"
 #include "live_stream.h"
-#include "live_pmd.h"
+#include "live_tce.h"
 #include "export_sync.h"
 #include "board.h"
 #include "storage_browser.h"
@@ -72,8 +72,8 @@ void dispatch_command(const char *line, String &response) {
         response += "uart_l_rx: " + String(Arbiter::get_l_rx_count()) + "\n";
         response += "uart_timeout: " + String(Arbiter::get_timeout_count()) + "\n";
         response += "uart_error: " + String(Arbiter::get_error_count()) + "\n";
-        response += "live_pmd: " +
-                    String(LiveStream::is_stream_active(LivePmd::TAG) ? "subscribed" : "idle") +
+        response += "live_tce: " +
+                    String(LiveStream::is_stream_active(LiveTce::TAG) ? "subscribed" : "idle") +
                     "\n";
         response += "heap: " + String(ESP.getFreeHeap()) + "\n";
         return;

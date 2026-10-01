@@ -30,6 +30,8 @@ typedef int8_t internal_handle_t;
 // Return false to drop the frame.
 typedef bool (*decode_fn_t)(const uint8_t *payload, uint16_t len,
                             void *out, uint16_t out_size);
+// Optional schema preparation on the control task before enabling a stream.
+typedef bool (*prepare_fn_t)();
 
 // Consumer callback. `sample` is decode_fn output; cast to your stream's
 // sample struct. `ctx` is whatever you passed to subscribe(). Decoders and
@@ -43,7 +45,7 @@ void init();
 // tag is already registered or the table is full. `tag` must be exactly 3
 // ASCII chars (no NUL); only the first 3 are used.
 bool register_stream(const char *tag, decode_fn_t decode_fn,
-                     uint16_t sample_size);
+                     uint16_t sample_size, prepare_fn_t prepare_fn = nullptr);
 
 // Subscribe to a registered stream. Refcount-managed: first subscribe sends
 // `P S &<TAG> 1`; last unsubscribe sends `P S &<TAG> 0`. Returns a handle
