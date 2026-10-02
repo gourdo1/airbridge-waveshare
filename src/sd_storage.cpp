@@ -24,6 +24,7 @@ static Status status = {
     false,
     0,
     0,
+    0,
     "",
 };
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -216,9 +217,11 @@ void init() {
     }
 
     const uint64_t card_bytes = SD_MMC.cardSize();
+    const uint64_t total_bytes = SD_MMC.totalBytes();
     const uint64_t used_bytes = SD_MMC.usedBytes();
     portENTER_CRITICAL(&status_mux);
     status.card_bytes = card_bytes;
+    status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
@@ -245,8 +248,10 @@ fs::FS *filesystem() {
 void refresh_usage() {
 #if AB_STORAGE_HAS_SDCARD
     if (!mounted()) return;
+    const uint64_t total_bytes = SD_MMC.totalBytes();
     const uint64_t used_bytes = SD_MMC.usedBytes();
     portENTER_CRITICAL(&status_mux);
+    status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     portEXIT_CRITICAL(&status_mux);
 #endif

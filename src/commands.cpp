@@ -19,6 +19,8 @@
 #include "export_sync.h"
 #include "board.h"
 #include "storage_browser.h"
+#include "sd_storage.h"
+#include "memory_manager.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -76,13 +78,21 @@ void dispatch_command(const char *line, String &response) {
         response += "live_tce: " +
                     String(LiveStream::is_stream_active(LiveTce::TAG) ? "subscribed" : "idle") +
                     "\n";
-        response += "heap: " + String(ESP.getFreeHeap()) + "\n";
-        response += "heap_largest: " + String(ESP.getMaxAllocHeap()) + "\n";
+
+        const auto memory = aircannect::Memory::status();
+        response += "heap: " + String(memory.heap_free) + "\n";
+        response += "heap_largest: " + String(memory.heap_max_alloc) + "\n";
+        if (memory.psram_available) {
+            response += "psram: " + String(memory.psram_free) + " bytes free / " +
+                        String(memory.psram_total) + " bytes total\n";
+            response += "psram_largest: " + String(memory.psram_max_alloc) + " bytes\n";
+        } else {
+            response += "psram: unavailable\n";
+        }
         return;
     }
 
     if (upper == "STORAGE" || upper.startsWith("STORAGE ")) {
-#if AB_STORAGE_HAS_SDCARD
         bool quoted = false;
         for (unsigned i = 0; i < cmd.length(); i++) if (cmd[i] == '"') quoted = !quoted;
         if (quoted) { response = "ERR: unmatched quote\n"; return; }
@@ -91,15 +101,37 @@ void dispatch_command(const char *line, String &response) {
         action.toUpperCase();
         const String path = parse_quoted_token(cmd, &position);
         if ((action.isEmpty() || action == "STATUS") && path.isEmpty()) {
+            SdStorage::Status sd;
+            SdStorage::get_status(sd);
+            response = "state: ";
+            response += !sd.supported ? "unsupported" : sd.mounted ? "mounted" : "unavailable";
+            response += '\n';
+            if (sd.mounted) {
+                if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
+                    response += "capacity: " +
+                                String(static_cast<double>(sd.total_bytes) / 1048576, 1) + " MiB\n";
+                    response += "used: " +
+                                String(static_cast<double>(sd.used_bytes) / 1048576, 1) + " MiB\n";
+                    response += "free: " +
+                                String(static_cast<double>(sd.total_bytes - sd.used_bytes) / 1048576, 1) + " MiB\n";
+                } else {
+                    response += "space: unavailable\n";
+                }
+            }
+            if (sd.error[0]) response += "error: " + String(sd.error) + "\n";
+#if AB_STORAGE_HAS_SDCARD
             StorageBrowser::MutationStatus status;
             StorageBrowser::mutation_status(status);
-            response = "state: ";
-            response += status.active ? "working" : status.succeeded ? "done" :
-                status.error[0] ? "failed" : "idle";
-            response += "\nchanged: " + String(status.changed) + "\n";
-            if (status.error[0]) response += "error: " + String(status.error) + "\n";
+            if (status.active || status.succeeded || status.error[0]) {
+                response += "operation: ";
+                response += status.active ? "working" : status.succeeded ? "done" : "failed";
+                response += "\nchanged: " + String(status.changed) + " entries\n";
+                if (status.error[0]) response += "operation_error: " + String(status.error) + "\n";
+            }
+#endif
             return;
         }
+#if AB_STORAGE_HAS_SDCARD
         const String name = parse_quoted_token(cmd, &position);
         const String extra = parse_quoted_token(cmd, &position);
         StorageBrowser::Request request = {};
@@ -613,8 +645,8 @@ void dispatch_command(const char *line, String &response) {
 #if AB_STORAGE_HAS_SDCARD
                    "  STORAGE RENAME path name  Rename a file or folder\n"
                    "  STORAGE RM path     Delete a file or folder recursively\n"
-                   "  STORAGE STATUS      Last rename/delete result\n"
 #endif
+                   "  STORAGE STATUS      SD state, space and last file operation\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
                    "  LOG                 Show all category log levels\n"

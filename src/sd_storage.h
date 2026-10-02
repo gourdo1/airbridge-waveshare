@@ -17,6 +17,7 @@ struct Status {
     bool supported;
     bool mounted;
     uint64_t card_bytes;
+    uint64_t total_bytes;
     uint64_t used_bytes;
     char error[48];
 };
