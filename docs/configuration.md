@@ -118,10 +118,6 @@ only while therapy is inactive.
 
 BLE oximeters are managed from the **Oximetry** tab. For UDP oximetry, see [udp_oximetry.md](udp_oximetry.md).
 
-Each **Known Device** has an **Auto-connect** setting, enabled by default.
-Turning it off keeps the device saved and available for manual connection.
-Automatic connections are limited to these saved devices.
-
 Only one source feeds at a time. First to deliver data wins, 10 seconds of silence releases.
 
 ### UART
