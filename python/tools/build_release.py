@@ -103,6 +103,7 @@ def package_firmware(
     ))
     output_path = output_dir / f"{stem}.bin"
     shutil.copyfile(firmware_path, output_path)
+    shutil.copyfile(firmware_path.with_suffix(".elf"), output_dir / f"{stem}.elf")
     return {
         "raw": {
             "url": output_path.name,

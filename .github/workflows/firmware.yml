@@ -63,6 +63,7 @@ jobs:
         run: |
           assets=(
             dist/airbridge-*.bin
+            dist/airbridge-*.elf
             dist/airbridge-release.json
             dist/RELEASE_NOTES.md
             dist/SHA256SUMS
