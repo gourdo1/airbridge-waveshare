@@ -1499,7 +1499,7 @@ static SemaphoreHandle_t command_mutex = nullptr;
 
 static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
     if (!command_mutex || xSemaphoreTake(command_mutex, 0) != pdTRUE) {
-        request->send(503, "application/json", "{\"ok\":\"false\",\"error\":\"command_busy\"}");
+        request->send(503, "application/json", "{\"ok\":false,\"error\":\"command_busy\"}");
         return;
     }
     WebCommand *slot = nullptr;
@@ -1513,7 +1513,7 @@ static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
     }
     xSemaphoreGive(command_mutex);
     if (!transaction)
-        request->send(503, "application/json", "{\"ok\":\"false\",\"error\":\"command_unavailable\"}");
+        request->send(503, "application/json", "{\"ok\":false,\"error\":\"command_unavailable\"}");
 }
 
 static void serviceWebCommands() {
@@ -1534,15 +1534,22 @@ static void serviceWebCommands() {
         char response[128] = {};
         uint16_t length = sizeof(response);
         bool ok = false;
-        if (request && Arbiter::transaction_done(pending.transaction))
-            ok = Arbiter::finish_cmd(pending.transaction, response, &length);
-        else Arbiter::cancel_transaction(pending.transaction);
+        Arbiter::VarReadTrace trace;
+        if (request && Arbiter::transaction_done(pending.transaction)) {
+            ok = Arbiter::finish_cmd(pending.transaction, response, &length, nullptr, &trace);
+        } else {
+            Arbiter::cancel_transaction(pending.transaction);
+            length = 0;
+            trace.outcome = "deadline";
+        }
         if (!request) continue;
 
         if (ok && pending.refresh_therapy) AirSenseState::request_refresh();
         String json = "{";
-        jsonAddString(json, "ok", ok ? "true" : "false", false);
-        if (ok && length) jsonAddString(json, "response", response);
+        jsonAddBool(json, "ok", ok, false);
+        if (!ok)
+            jsonAddString(json, "error", strcmp(trace.outcome, "ok") ? trace.outcome : "command_failed");
+        if (length) jsonAddString(json, "response", response);
         json += '}';
         request->send(200, "application/json", json);
     }
@@ -1569,7 +1576,7 @@ static void handleCmd(AsyncWebServerRequest *request) {
     String response;
     dispatch_command(cmd.c_str() + 1, response);
     response.trim();
-    jsonAddString(json, "ok", "true", false);
+    jsonAddBool(json, "ok", true, false);
     jsonAddString(json, "response", response.c_str());
     json += '}';
     request->send(200, "application/json", json);

@@ -2373,9 +2373,9 @@ async function sendCmd() {
     const r = await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});
     if (!r) return;
     const d = await r.json();
-    if (d.error) cmdLog(d.error, 'var(--red)');
-    else if (d.response) cmdLog(d.response, 'var(--green)');
-    else cmdLog('OK', 'var(--green)');
+    if (d.error || (d.ok !== true && d.ok !== 'true'))
+      cmdLog('Error: ' + (d.error || 'Command failed') + (d.response ? '\n' + d.response : ''), 'var(--red)');
+    else cmdLog(d.response || 'OK', 'var(--green)');
   } catch(e) { cmdLog('Error: ' + e.message, 'var(--red)'); }
 }
 function clearConsole() { document.getElementById('cmdOutput').innerHTML = ''; }
