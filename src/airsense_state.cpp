@@ -14,11 +14,12 @@
 
 namespace AirSenseState {
 namespace {
+constexpr uint32_t ROP_POLL_INTERVAL_MS = 5000;
 constexpr uint32_t HEALTH_POLL_INTERVAL_MS = 10000;
 constexpr uint16_t HEALTH_TIMEOUT_MS = 500;
 constexpr uint32_t MHR_POLL_INTERVAL_MS = 30UL * 60 * 1000;
 
-uint32_t last_health_poll = 0, last_mhr_poll = 0;
+uint32_t last_rop_poll = 0, last_health_poll = 0, last_mhr_poll = 0;
 uint32_t consecutive_timeouts = 0, airsense_seen_ms = 0;
 bool airsense_present = false;
 std::atomic<int> cached_rop{-1}, cached_mhr{-1}, cached_mop{-1};
@@ -34,7 +35,7 @@ ReadStep read_step = ReadStep::None;
 uart_transaction_t *read_ticket = nullptr;
 uint32_t read_generation = 0;
 Identity identity_read;
-bool mhr_requested = false;
+bool health_requested = false, mhr_requested = false;
 
 static const char *read_tag() {
     static const char *tags[] = {"", "ROP", "STK", "SRN", "MID", "VID", "PNA", "MOP", "MHR", "BLS"};
@@ -95,7 +96,9 @@ static void accept_rop(const char *text, Arbiter::VarResult result,
             mhr_requested = true;
         }
         if (new_rop != prev_rop) WebUI::push_status_event();
-        read_step = ReadStep::Stk;
+        health_requested |= new_rop != prev_rop;
+        if (health_requested) last_health_poll = last_rop_poll;
+        read_step = health_requested ? ReadStep::Stk : ReadStep::None;
         return;
     }
 
@@ -260,9 +263,12 @@ void poll() {
     }
 
     if (read_step == ReadStep::None) {
-        if (millis() - last_health_poll < HEALTH_POLL_INTERVAL_MS && !refresh_requested.load()) return;
-        refresh_requested.exchange(false);
-        last_health_poll = millis();
+        const uint32_t now = millis();
+        const uint32_t interval = state == SYS_ERROR ? HEALTH_POLL_INTERVAL_MS : ROP_POLL_INTERVAL_MS;
+        if (now - last_rop_poll < interval && !refresh_requested.load()) return;
+        const bool refresh = refresh_requested.exchange(false);
+        health_requested = refresh || now - last_health_poll >= HEALTH_POLL_INTERVAL_MS;
+        last_rop_poll = now;
         read_generation = identity_generation();
         read_step = state == SYS_ERROR ? ReadStep::Bls : ReadStep::Rop;
     }
@@ -291,7 +297,7 @@ void poll() {
         return;
     }
     accept_read(response, result, trace);
-    if (read_step == ReadStep::None && airsense_present) {
+    if (read_step == ReadStep::None && airsense_present && health_requested) {
         Air10Clock::poll_status();
         LiveStream::resync();
     }
