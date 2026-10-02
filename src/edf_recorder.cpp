@@ -1995,10 +1995,10 @@ static void sample_pld() {
         poll_count++;
     }
 
-    // Two observed 40 ms UART turns per planned read, not the last burst's RTT.
+    // One nominal UART turn per planned read; slower replies consume the slack.
     // Missing stream fields share the same fixed window; late reads never extend it.
     const uint32_t spacing_ms = poll_count
-        ? min(uint32_t(80), uint32_t(2 * PLD_SAMPLE_WINDOW_MS) / poll_count) : 0;
+        ? min(uint32_t(40), uint32_t(2 * PLD_SAMPLE_WINDOW_MS) / poll_count) : 0;
     uint32_t not_before = target_ms - poll_count * spacing_ms / 2;
     for (size_t i = 0; i < count; i++) {
         if (!(polled & (uint32_t(1) << i))) continue;
