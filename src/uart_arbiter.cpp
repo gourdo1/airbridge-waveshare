@@ -79,9 +79,8 @@ static uint32_t stat_error = 0;
 static uint32_t next_ticket_id = 1;
 
 static constexpr uint32_t SILENT_FRAME_GUARD_MS = 80;
-// Bench captures: guard/queue plus delayed G S replies need up to 320 ms.
-// Reserve before enqueue so caller and worker use the same deadline even if
-// OXH enters the queue concurrently; this is not a mandatory waiting period.
+// Delayed G S replies after OXH need a response allowance separate from queue
+// wait. The caller's hard deadline still bounds both phases together.
 static constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
 
 static constexpr size_t LCD_COMMAND_SIZE = 32;
@@ -1227,7 +1226,8 @@ static bool capture_variable(const qframe_t *frame, void *context) {
 static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
                          cmd_priority_t prio, uint16_t output_capacity,
                          uint16_t timeout_ms, uart_frame_sink_t sink,
-                         const uart_send_window_t &window = {})
+                         const uart_send_window_t &window = {},
+                         uint32_t overall_timeout_ms = 0)
 {
     if (timeout_ms == 0) timeout_ms = Config::get().uart_cmd_timeout_ms;
     const int64_t delay_us = max(int64_t(0), window.not_before_us - esp_timer_get_time());
@@ -1241,7 +1241,8 @@ static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
     policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = timeout_ms;
-    policy.overall_timeout_ms = timeout_ms + uint32_t((delay_us + 999) / 1000);
+    policy.overall_timeout_ms = overall_timeout_ms ? overall_timeout_ms
+        : timeout_ms + uint32_t((delay_us + 999) / 1000);
 
     bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
     uint16_t capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
@@ -1324,12 +1325,14 @@ uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
 static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                        char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
                          uart_frame_sink_t sink, bool *missing = nullptr,
-                         Arbiter::VarReadTrace *trace = nullptr) {
+                         Arbiter::VarReadTrace *trace = nullptr,
+                         uint32_t overall_timeout_ms = 0) {
     if (trace) *trace = {};
     if (missing) *missing = false;
     uint16_t capacity = resp_buf ? QFRAME_MAX_PAYLOAD : 0;
     if (resp_buf && resp_len) capacity = *resp_len ? min(capacity, uint16_t(*resp_len - 1)) : 0;
-    auto *t = begin_read_command(cmd, src, prio, capacity, timeout_ms, sink);
+    auto *t = begin_read_command(cmd, src, prio, capacity, timeout_ms, sink,
+                                 {}, overall_timeout_ms);
     if (!t) { if (resp_len) *resp_len = 0; return false; }
     uint32_t elapsed = millis() - t->queued_ms;
     uint32_t remaining = elapsed < t->policy.overall_timeout_ms
@@ -1379,9 +1382,10 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
     bool missing;
     if (!timeout_ms) timeout_ms = Config::get().uart_cmd_timeout_ms;
     timeout_ms = max(timeout_ms, SCALAR_TIMEOUT_MIN_MS);
-    if (hard_timeout_ms) timeout_ms = min(timeout_ms, hard_timeout_ms);
+    const uint32_t overall_timeout_ms = hard_timeout_ms ? hard_timeout_ms
+        : 2u * timeout_ms;
     bool ok = read_command(command, src, prio, out, &length, timeout_ms,
-                            capture_variable, &missing, trace);
+                            capture_variable, &missing, trace, overall_timeout_ms);
     if (missing) {
         if (trace) trace->outcome = "missing";
         return VarResult::Missing;
