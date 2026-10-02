@@ -669,12 +669,6 @@ static void rx_task(void *param) {
                         // Unsolicited live stream sample. Route to LiveStream
                         stat_rx++;
                         stat_l_rx++;
-                        Log::logf(CAT_ARB, LOG_DEBUG,
-                                  "RX-L tag=%c%c%c len=%u t=%lu\n",
-                                  f->payload_len > 0 ? (char)f->payload[0] : '?',
-                                  f->payload_len > 1 ? (char)f->payload[1] : '?',
-                                  f->payload_len > 2 ? (char)f->payload[2] : '?',
-                                  f->payload_len, millis());
                         LiveStream::on_l_frame(f->payload, f->payload_len);
                     } else {
                         stat_rx++;
@@ -855,8 +849,10 @@ static void arbiter_task(void *param) {
             char snip[33] = {};
             int plen = t->frame_len > 5 ? t->frame_len - 9 : 0;  // minus header(5)+crc(4)
             if (plen > 0) memcpy(snip, t->frame + 5, min(plen, 32));
-            Log::logf(CAT_ARB, LOG_DEBUG, "TX %s src=%d prio=%d t=%lu\n",
-                      snip, t->source, t->priority, millis());
+            Log::logf(CAT_ARB, LOG_DEBUG,
+                      "TX %s src=%d prio=%d t=%lu ticket=%lu queue=%lums\n",
+                      snip, t->source, t->priority, millis(),
+                      (unsigned long)t->ticket_id, (unsigned long)t->sent_after_ms);
         }
 
         if (!t->policy.accepted_types) {
@@ -928,18 +924,6 @@ static void arbiter_task(void *param) {
                 if (rx.type == QFRAME_TYPE_E) {
                     t->result.protocol_error = true;
                     stat_error++;
-                }
-
-                if (Log::get_cat_level(CAT_ARB) >= LOG_DEBUG) {
-                    char snip[33] = {};
-                    if (rx.payload_len > 0) {
-                        memcpy(snip, rx.payload,
-                               min((int)rx.payload_len, (int)sizeof(snip) - 1));
-                    }
-                    Log::logf(CAT_ARB, LOG_DEBUG,
-                              "RX-%c %s ticket=%lu t=%lu\n",
-                              (char)rx.type, snip,
-                              (unsigned long)t->ticket_id, millis());
                 }
 
                 qframe_type_mask_t terminal = t->policy.terminal_types |

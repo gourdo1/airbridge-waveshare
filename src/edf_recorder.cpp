@@ -2026,10 +2026,6 @@ static void sample_pld() {
         if (pbt && decoded_value(*pbt_schema, pbt->frame, source.tag, values[i]) &&
             values[i] >= 0) {
             streamed++;
-            Log::logf(CAT_EDF, LOG_DEBUG,
-                      "PLD #%s slot=%lu raw=%d pbt_rx=%lu\n", source.tag,
-                      (unsigned long)absolute_slot, int(values[i]),
-                      (unsigned long)pbt->received_ms);
         } else {
             values[i] = EDF_MISSING;
             (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
@@ -2040,10 +2036,11 @@ static void sample_pld() {
     }
     const uint32_t finished_ms = millis();
     Log::logf(CAT_EDF, LOG_DEBUG,
-              "PLD series slot=%lu target=%lu start=%lu end=%lu queries=%u pbt=%u\n",
+              "PLD series slot=%lu target=%lu start=%lu end=%lu queries=%u pbt=%u pbt_rx=%lu\n",
               (unsigned long)absolute_slot, (unsigned long)target_ms,
               (unsigned long)started_ms, (unsigned long)finished_ms,
-              unsigned(queries), unsigned(streamed));
+              unsigned(queries), unsigned(streamed),
+              (unsigned long)(streamed ? pbt->received_ms : 0));
     // Do not publish an obsolete burst into a previous slot after a long stall.
     if (int32_t(finished_ms - target_ms) >= 2000) return;
     for (size_t i = 0; i < count; i++)
@@ -2146,8 +2143,6 @@ static void process_raw_frame(const RawFrame &raw) {
         pbt_samples[pbt_next_sample] = {raw.captured_ms, decoded};
         pbt_next_sample = (pbt_next_sample + 1) % PBT_SAMPLE_COUNT;
         if (pbt_sample_count < PBT_SAMPLE_COUNT) pbt_sample_count++;
-        Log::logf(CAT_EDF, LOG_DEBUG, "PBT seq=%u rx=%lu\n",
-                  unsigned(decoded.sequence), (unsigned long)raw.captured_ms);
     } else if (strcmp(tag, "BRH") == 0) {
         brh_samples[brh_next_sample] = {raw.captured_ms, decoded};
         brh_next_sample = (brh_next_sample + 1) % BRH_SAMPLE_COUNT;
