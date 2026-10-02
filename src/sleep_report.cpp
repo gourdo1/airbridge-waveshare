@@ -1,5 +1,6 @@
 #include "sleep_report.h"
 #include "air10_stored.h"
+#include "airsense_state.h"
 #include "app_config.h"
 #include "hex_util.h"
 #include "uart_arbiter.h"
@@ -40,6 +41,16 @@ const Field PERIOD_FIELDS[] = {
 static_assert(sizeof(DAY_FIELDS) / sizeof(Field) <= MAX_FIELDS);
 static_assert(sizeof(PERIOD_FIELDS) / sizeof(Field) <= MAX_FIELDS);
 
+struct ReadBudget {
+    Budget remaining;
+    bool interrupted = false;
+
+    uint16_t operator()(uint32_t reserve_ms) {
+        interrupted |= !AirSenseState::device_standby();
+        return interrupted ? 0 : remaining(reserve_ms);
+    }
+};
+
 using Scalar = Arbiter::VarResult;
 Scalar read_scalar(const char *tag, uint32_t &value, uint16_t timeout) {
     if (!timeout) return Scalar::Failed;
@@ -64,7 +75,7 @@ int fail(Snapshot &out, const char *error, int code = 503) {
     return code;
 }
 
-int collect_day(Snapshot &out, Budget budget) {
+int collect_day(Snapshot &out, ReadBudget &budget) {
     uint32_t before, after, day = out.request.selection, current;
     if (read_scalar("ZEN", before, budget(0)) != Scalar::Ok ||
         read_scalar("DSD", current, budget(0)) != Scalar::Ok || current >= 0xFFFF)
@@ -116,7 +127,7 @@ int collect_day(Snapshot &out, Budget budget) {
     return 200;
 }
 
-int collect_period(Snapshot &out, Budget budget) {
+int collect_period(Snapshot &out, ReadBudget &budget) {
     uint32_t original, current, noticed;
     // Reserve cleanup inside the existing job deadline, not after it expires.
     uint32_t reserve = 3u * Config::get().uart_cmd_timeout_ms;
@@ -145,15 +156,16 @@ int collect_period(Snapshot &out, Budget budget) {
         }
         out.present = out.values[0] != 0;  // Missing DRD does not prove no therapy.
     }
-    if (read_scalar("SEP", current, budget(0)) != Scalar::Ok)
+    // Undo our temporary GUI setting even if therapy interrupted collection.
+    if (read_scalar("SEP", current, changed ? budget.remaining(0) : budget(0)) != Scalar::Ok)
         return fail(out, changed ? "report_restore_failed" : "report_read_failed");
     if (current != out.request.selection) {
         // Do not overwrite an observed concurrent GUI/TCP selection.
         if (code != 200 && current == original) return code;
         return fail(out, "report_period_changed", 409);
     }
-    if (changed && (!select_period(original, budget(0)) ||
-        read_scalar("SEP", current, budget(0)) != Scalar::Ok || current != original))
+    if (changed && (!select_period(original, budget.remaining(0)) ||
+        read_scalar("SEP", current, budget.remaining(0)) != Scalar::Ok || current != original))
         return fail(out, "report_restore_failed");
     return code;
 }
@@ -182,7 +194,13 @@ int collect(Snapshot &out, Request request, Budget budget) {
     for (auto &value : out.on) value = 0xFFFF;
     for (auto &value : out.off) value = 0xFFFF;
     if (!valid(request)) return fail(out, "report_invalid_selection", 400);
-    return request.view == View::Day ? collect_day(out, budget) : collect_period(out, budget);
+    if (!AirSenseState::device_standby()) return fail(out, "report_not_idle", 409);
+    ReadBudget reads{budget};
+    int code = request.view == View::Day ? collect_day(out, reads) : collect_period(out, reads);
+    if ((reads.interrupted || !AirSenseState::device_standby()) &&
+        (!out.error || strcmp(out.error, "report_restore_failed") != 0))
+        return fail(out, "report_not_idle", 409);
+    return code;
 }
 
 }  // namespace SleepReport

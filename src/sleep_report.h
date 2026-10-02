@@ -53,7 +53,8 @@ using Budget = uint16_t (*)(uint32_t reserve_ms);
 bool valid(const Request &request);
 const Field *fields(View view, size_t &count);
 uint16_t period_days(uint16_t selection);
-// Caller serializes report jobs. No SD, JSON, task creation or persistent cache.
+// Caller serializes report jobs. Standby only; therapy stops collection,
+// except cleanup of a temporarily changed SEP. No persistent report cache.
 int collect(Snapshot &snapshot, Request request, Budget budget);
 
 }  // namespace SleepReport

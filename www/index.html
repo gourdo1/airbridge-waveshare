@@ -410,6 +410,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
           <div class="row" id="reportPeriodRow" hidden><label for="reportPeriod">Period</label><select id="reportPeriod" onchange="loadReport()"><option value="0">1 day</option><option value="1">7 days</option><option value="2">30 days</option><option value="3">90 days</option><option value="4">180 days</option><option value="5">365 days</option></select></div>
           <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)">Last saved day</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
           <div class="msg" id="reportMsg" role="status"></div>
+          <p class="report-note" id="reportAvailability" role="status"></p>
         </div>
         <div class="card" aria-busy="false" id="reportResult">
           <h3 id="reportTitle">Therapy day</h3>
@@ -1136,6 +1137,7 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
+  if (d.system !== undefined || d.rop !== undefined) renderReportAvailability();
   if (d.sd !== undefined) {
     configStorageSupported = d.sd !== 'unsupported';
     renderStorageStatus(d);
@@ -1231,6 +1233,16 @@ async function timeAction(action) {
 
 let reportGeneration = 0;
 
+function renderReportAvailability() {
+  const blocked = lastStatus.system !== 'IDLE' || lastStatus.rop !== 0;
+  const busy = document.getElementById('reportResult').getAttribute('aria-busy') === 'true';
+  for (const id of ['reportView', 'reportDay', 'reportPeriod', 'reportLatest', 'reportRefresh']) {
+    document.getElementById(id).disabled = blocked || (id === 'reportRefresh' && busy);
+  }
+  document.getElementById('reportAvailability').textContent = blocked ? 'Available in standby.' : '';
+  return blocked;
+}
+
 function reportDate(day) {
   return new Date(day * 86400000).toISOString().slice(0, 10);
 }
@@ -1278,6 +1290,7 @@ function renderReport(data) {
 }
 
 async function loadReport(latest = false) {
+  if (renderReportAvailability()) return;
   const generation = ++reportGeneration;
   const view = document.getElementById('reportView').value;
   const day = view === 'day';
@@ -1305,6 +1318,7 @@ async function loadReport(latest = false) {
   } catch(e) {
     if (generation !== reportGeneration) return;
     const errors = {
+      report_not_idle: 'Sleep Report is available in standby.',
       report_restore_failed: 'Could not restore the previous report period. Check Sleep Report on the AirSense.',
       report_period_changed: 'The report period changed on the device during this request. Refresh to read again.',
       report_period_not_selected: 'The device has not selected the requested period. Refresh to read again.',
@@ -1314,12 +1328,13 @@ async function loadReport(latest = false) {
       report_day_unavailable: 'This therapy date is not available.',
       report_deadline: 'The report request timed out.'
     };
-    showMsg(document.getElementById('reportMsg'), errors[e.message] || e.message, 'err');
+    if (e.message !== 'report_not_idle' || !renderReportAvailability())
+      showMsg(document.getElementById('reportMsg'), errors[e.message] || e.message, 'err');
   } finally {
     if (generation === reportGeneration) {
       document.getElementById('reportSpinner').style.display = 'none';
-      document.getElementById('reportRefresh').disabled = false;
       document.getElementById('reportResult').setAttribute('aria-busy', 'false');
+      renderReportAvailability();
     }
   }
 }
