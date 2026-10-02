@@ -696,6 +696,8 @@ void TcpBridge::task(void *param) {
                     }
                     line_pos = 0;
                 }
+            } else if (c == '\b' || c == '\x7f') {
+                if (line_pos > 0) --line_pos;
             } else if (line_pos < TCP_LINE_MAX - 1) {
                 line_buf[line_pos++] = c;
             }

@@ -69,6 +69,8 @@ static void serial_poll() {
                 }
                 serial_pos = 0;
             }
+        } else if (c == '\b' || c == '\x7f') {
+            if (serial_pos > 0) --serial_pos;
         } else if (serial_pos < SERIAL_LINE_MAX - 1) {
             serial_line[serial_pos++] = c;
         }
