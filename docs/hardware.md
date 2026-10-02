@@ -10,6 +10,7 @@ In order of preference:
 |---------|-----------|----|------|
 | PCB: interface board + XIAO main board | `xiao-esp32s3-plus-sdmmc4` | yes | [hardware_pcb.md](hardware_pcb.md) |
 | Hand-wired XIAO ESP32-S3 Plus + microSD | `xiao-esp32s3-plus-sdmmc4` | yes | [hardware_wiring.md](hardware_wiring.md#xiao-esp32-s3-plus--sd) |
+| Waveshare ESP32-S3-GEEK | `waveshare-esp32-s3-geek` | onboard | [below](#waveshare-esp32-s3-geek) |
 | Hand-wired XIAO ESP32-S3 Plus | `xiao-esp32s3-plus` | no | [hardware_wiring.md](hardware_wiring.md#xiao-esp32-s3-plus-without-sd) |
 | Hand-wired M5Stamp Pico (legacy) | `m5stamp-pico` | no | [hardware_wiring.md](hardware_wiring.md#m5stamp-pico-legacy) |
 
@@ -67,7 +68,27 @@ SD, 4-bit SDMMC (`xiao-esp32s3-plus-sdmmc4`):
 | GPIO13 | GPIO11 | GPIO12 | GPIO38 | GPIO39 | GPIO40 |
 
 Pins are set by build flags in `platformio.ini`; defaults are in
-`include/board.h`. The SD clock defaults to 40 MHz (`AB_SDMMC_FREQ_KHZ=40000`).
+`include/board.h`. The XIAO SD clock is 40 MHz (`AB_SDMMC_FREQ_KHZ=40000`).
+
+### Waveshare ESP32-S3-GEEK
+
+16 MB flash, 2 MB PSRAM, onboard microSD. The LCD is not used; its backlight
+is switched off.
+
+| UART connector | AirSense |
+|----------------|----------|
+| RX (GPIO44) | Tx |
+| TX (GPIO43) | Rx |
+| GND | GND |
+
+The onboard card uses 4-bit SDMMC at 40 MHz:
+
+| CLK | CMD | D0 | D1 | D2 | D3 |
+|-----|-----|----|----|----|----|
+| GPIO36 | GPIO35 | GPIO37 | GPIO33 | GPIO38 | GPIO34 |
+
+Power through the USB-A connector with 5 V, not the AirSense 24 V supply.
+Pinout: [Waveshare schematic](https://files.waveshare.com/wiki/ESP32-S3-GEEK/ESP32-S3-GEEK-Schematic1.pdf).
 
 ## Power
 

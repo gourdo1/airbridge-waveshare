@@ -76,6 +76,12 @@ static void serial_poll() {
 }
 
 void setup() {
+#ifdef AB_LCD_BACKLIGHT_GPIO
+    // Keep the unused local display dark, including boards with a BL pull-up.
+    pinMode(AB_LCD_BACKLIGHT_GPIO, OUTPUT);
+    digitalWrite(AB_LCD_BACKLIGHT_GPIO, LOW);
+#endif
+
     Serial.begin(115200);
 #if defined(AB_BOARD_WROOM_S3)
     pinMode(14, INPUT);

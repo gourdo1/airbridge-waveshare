@@ -18,6 +18,7 @@ DEFAULT_ENVIRONMENTS = (
     "m5stamp-pico",
     "xiao-esp32s3-plus",
     "xiao-esp32s3-plus-sdmmc4",
+    "waveshare-esp32-s3-geek",
 )
 MANIFEST_FILENAME = "airbridge-release.json"
 MANIFEST_SCHEMA = 1

@@ -68,7 +68,9 @@
 #define DEFAULT_HOSTNAME    "airbridge"
 
 #ifndef AB_OTA_RELEASE_TARGET
-#if defined(AB_BOARD_WROOM_S3)
+#if defined(AB_BOARD_WAVESHARE_ESP32_S3_GEEK)
+#define AB_OTA_RELEASE_TARGET "waveshare-esp32-s3-geek"
+#elif defined(AB_BOARD_WROOM_S3)
 #define AB_OTA_RELEASE_TARGET "wroom-s3-n16r8-sdmmc4"
 #elif defined(AB_BOARD_XIAO_ESP32S3_PLUS) && AB_STORAGE_SDMMC_ENABLED
 #define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus-sdmmc4"
