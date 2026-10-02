@@ -272,8 +272,9 @@ void poll() {
     auto result = Arbiter::VarResult::Failed;
     if (!read_ticket) {
         const bool urgent = read_step == ReadStep::Rop || read_step == ReadStep::Bls;
+        const uart_send_window_t window = {0, 0, false, !urgent};
         read_ticket = Arbiter::begin_var(read_tag(), CMD_SRC_INTERNAL,
-            urgent ? CMD_PRIO_HIGH : CMD_PRIO_NORMAL, sizeof(response), HEALTH_TIMEOUT_MS);
+            urgent ? CMD_PRIO_HIGH : CMD_PRIO_NORMAL, sizeof(response), HEALTH_TIMEOUT_MS, window);
         if (read_ticket) return;
     } else {
         if (!Arbiter::transaction_done(read_ticket)) {

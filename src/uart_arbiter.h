@@ -63,6 +63,7 @@ struct uart_send_window_t {
     int64_t not_before_us = 0;
     int64_t before_us = 0;
     bool idle_only = false;
+    bool outside_acquisition = false;
 };
 
 struct uart_transaction_t;
@@ -81,16 +82,17 @@ namespace Arbiter {
         const char *outcome = "not_queued";
     };
 
-    // Recorder-owned acquisition scope. Defers local OXH until destruction or
-    // until_ms, capped at one second. Already dispatched UART work is not cut off.
-    class OximetryDeferral {
+    // Recorder-owned query scope. Routine reads wait from entry; OXH waits
+    // from oxh_from_ms (zero = entry). Both gates end on destruction or until_ms,
+    // capped at one second. Already dispatched UART work is not cut off.
+    class AcquisitionWindow {
     public:
         // Wire time of an OXH already entering TX, its guard and tick rounding.
         static uint32_t lead_ms();
-        explicit OximetryDeferral(uint32_t until_ms);
-        ~OximetryDeferral();
-        OximetryDeferral(const OximetryDeferral &) = delete;
-        OximetryDeferral &operator=(const OximetryDeferral &) = delete;
+        explicit AcquisitionWindow(uint32_t until_ms, uint32_t oxh_from_ms = 0);
+        ~AcquisitionWindow();
+        AcquisitionWindow(const AcquisitionWindow &) = delete;
+        AcquisitionWindow &operator=(const AcquisitionWindow &) = delete;
     private:
         uint32_t until_ms_ = 0;
     };

@@ -2000,11 +2000,8 @@ static void sample_pld() {
         ? min(uint32_t(40), uint32_t(2 * PLD_SAMPLE_WINDOW_MS) / poll_count) : 0;
     uint32_t not_before = target_ms - poll_count * spacing_ms / 2;
     if (poll_count) {
-        const uint32_t defer_at = not_before - Arbiter::OximetryDeferral::lead_ms();
-        while (int32_t(millis() - defer_at) < 0) {
-            if (!collect_frames(pdMS_TO_TICKS(10))) return;
-        }
-        Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
+        const uint32_t defer_at = not_before - Arbiter::AcquisitionWindow::lead_ms();
+        Arbiter::AcquisitionWindow acquisition(target_ms + PLD_SAMPLE_WINDOW_MS, defer_at);
         for (size_t i = 0; i < count; i++) {
             if (!(polled & (uint32_t(1) << i))) continue;
             while (int32_t(millis() - not_before) < 0) {
@@ -2034,7 +2031,7 @@ static void sample_pld() {
             streamed++;
         } else {
             values[i] = EDF_MISSING;
-            Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
+            Arbiter::AcquisitionWindow acquisition(target_ms + PLD_SAMPLE_WINDOW_MS);
             (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
             drain_raw_frames(0);
             if (!status.active || segment_start != session_clock.captured_ms ||

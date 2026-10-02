@@ -192,7 +192,7 @@ static void handle_calendar_read() {
         }
     }
     if (!calendar_ticket) {
-        const uart_send_window_t window = {0, 0, calendar_for_phase};
+        const uart_send_window_t window = {0, 0, calendar_for_phase, true};
         calendar_ticket = Arbiter::begin_var(calendar_step == 2 ? "TIC" : "DAC",
             CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, 9, CLOCK_TIMEOUT_MS, window);
         if (calendar_ticket) return;

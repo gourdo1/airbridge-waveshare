@@ -82,7 +82,17 @@ static constexpr uint32_t SILENT_FRAME_GUARD_MS = 80;
 // Delayed G S replies after OXH need a response allowance separate from queue
 // wait. The caller's hard deadline still bounds both phases together.
 static constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
-static std::atomic<uint32_t> oximetry_defer_until{0};
+static std::atomic<uint32_t> acquisition_until{0};
+static std::atomic<uint32_t> acquisition_oxh_from{0};
+
+static uint32_t acquisition_remaining_ms() {
+    uint32_t until = acquisition_until.load(std::memory_order_acquire);
+    if (!until) return 0;
+    const int32_t remaining = int32_t(until - millis());
+    if (remaining > 0) return uint32_t(remaining);
+    acquisition_until.compare_exchange_strong(until, 0, std::memory_order_acq_rel);
+    return 0;
+}
 
 static constexpr size_t LCD_COMMAND_SIZE = 32;
 static constexpr size_t LCD_FRAME_SIZE = 9 + 2 * (LCD_COMMAND_SIZE - 1);
@@ -182,7 +192,9 @@ static uart_transaction_t* pq_pop(TickType_t wait) {
         int best = -1;
         for (int i = 0; i < pq.count; i++) {
             const auto *candidate = pq.tickets[i];
-            const int64_t delay_us = candidate->send_window.not_before_us - now_us;
+            int64_t delay_us = candidate->send_window.not_before_us - now_us;
+            if (candidate->send_window.outside_acquisition)
+                delay_us = max(delay_us, int64_t(acquisition_remaining_ms()) * 1000);
             if (delay_us > 0 && !__atomic_load_n(&candidate->cancelled, __ATOMIC_ACQUIRE) &&
                 uint32_t(millis() - candidate->queued_ms) < candidate->policy.overall_timeout_ms) {
                 const int64_t tick_us = int64_t(portTICK_PERIOD_MS) * 1000;
@@ -1444,38 +1456,38 @@ bool Arbiter::get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
 }
 
 bool Arbiter::oximetry_deferred() {
-    uint32_t until = oximetry_defer_until.load(std::memory_order_acquire);
-    if (!until) return false;
-    if (int32_t(until - millis()) > 0) return true;
-    oximetry_defer_until.compare_exchange_strong(until, 0, std::memory_order_acq_rel);
-    return false;
+    return acquisition_remaining_ms() &&
+        int32_t(millis() - acquisition_oxh_from.load(std::memory_order_acquire)) >= 0;
 }
 
-uint32_t Arbiter::OximetryDeferral::lead_ms() {
+uint32_t Arbiter::AcquisitionWindow::lead_ms() {
     const uint32_t baud = current_baud ? current_baud : 57600;
     constexpr uint32_t oxh_max_wire_bytes = 9 + 2 * 16;
     return SILENT_FRAME_GUARD_MS + 2 * portTICK_PERIOD_MS +
         (oxh_max_wire_bytes * 10 * 1000 + baud - 1) / baud;
 }
 
-Arbiter::OximetryDeferral::OximetryDeferral(uint32_t until_ms) {
+Arbiter::AcquisitionWindow::AcquisitionWindow(uint32_t until_ms, uint32_t oxh_from_ms) {
     const uint32_t now = millis();
     const int32_t remaining = int32_t(until_ms - now);
     if (remaining <= 0) return;
     uint32_t until = now + min(uint32_t(remaining), uint32_t(1000));
     // Zero is the inactive sentinel; shorten a wrapping window by one ms.
     if (!until) until = UINT32_MAX;
-    uint32_t previous = oximetry_defer_until.load(std::memory_order_acquire);
+    uint32_t previous = acquisition_until.load(std::memory_order_acquire);
     if (previous && int32_t(previous - now) > 0) return;
-    if (oximetry_defer_until.compare_exchange_strong(previous, until,
+    // Only the recorder creates windows; publish the OXH start before the gate.
+    acquisition_oxh_from.store(oxh_from_ms ? oxh_from_ms : now, std::memory_order_relaxed);
+    if (acquisition_until.compare_exchange_strong(previous, until,
                                                    std::memory_order_acq_rel))
         until_ms_ = until;
 }
 
-Arbiter::OximetryDeferral::~OximetryDeferral() {
+Arbiter::AcquisitionWindow::~AcquisitionWindow() {
     if (until_ms_)
-        oximetry_defer_until.compare_exchange_strong(until_ms_, 0,
+        acquisition_until.compare_exchange_strong(until_ms_, 0,
                                                     std::memory_order_acq_rel);
+    if (pq.available) xSemaphoreGive(pq.available);
 }
 
 bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,
