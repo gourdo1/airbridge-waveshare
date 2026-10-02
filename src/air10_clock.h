@@ -37,8 +37,10 @@ bool phase_unchanged(const PhaseAnchor &anchor);
 
 // Main-loop maintenance: idle phase measurement/retry and deferred NTP writes.
 void handle();
-// Manual requests bypass the autosync setting, not standby/STR safety gates.
+// Manual requests bypass autosync, not standby/STR or post-therapy deferral.
 void request_sync(bool manual = false);
+// Main-loop notification of confirmed therapy end; starts a 60-second hold.
+void request_post_therapy_sync();
 bool pull_time(bool force = false);
 
 inline bool parse_calendar(const char *dac, const char *tic, Calendar &out) {

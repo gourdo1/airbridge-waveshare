@@ -19,12 +19,15 @@ static constexpr int64_t CLOCK_SEND_WINDOW_US = 10000;
 static constexpr uint32_t PHASE_PROBE_BUDGET_MS = 1500;
 static constexpr uint32_t PHASE_MAX_BRACKET_MS = 200;
 static constexpr uint32_t PHASE_RETRY_INTERVAL_MS = 5000;
+static constexpr uint32_t CLOCK_POST_THERAPY_DELAY_MS = 60000;
 
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
 static std::atomic<uint8_t> clock_sync_requests{CLOCK_SYNC_AUTO};
 static bool clock_sync_pending = false;
 static bool clock_sync_manual = false;
+static bool clock_sync_settling = false;
+static uint32_t clock_sync_therapy_end_ms = 0;
 static uint32_t clock_sync_attempt_ms = 0;
 static bool clock_sync_attempted = false;
 static uart_transaction_t *clock_sync_ticket = nullptr;
@@ -319,6 +322,13 @@ void Air10Clock::request_sync(bool manual) {
     clock_sync_requests.fetch_or(manual ? CLOCK_SYNC_MANUAL : CLOCK_SYNC_AUTO);
 }
 
+void Air10Clock::request_post_therapy_sync() {
+    clock_sync_therapy_end_ms = millis();
+    clock_sync_settling = true;
+    request_sync();
+    Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock sync deferred: 60s after therapy\n");
+}
+
 static bool clock_write_applied(const char *command, bool ok, const char *response) {
     const char *value = qframe_response_value(response);
     // The device can refuse the change and return R with its unchanged value.
@@ -461,6 +471,10 @@ bool Air10Clock::pull_time(bool force) {
 void Air10Clock::handle() {
     handle_calendar_read();
     handle_phase_measurement();
+    if (clock_sync_settling &&
+        millis() - clock_sync_therapy_end_ms >= CLOCK_POST_THERAPY_DELAY_MS)
+        clock_sync_settling = false;
+
     const bool auto_enabled = Config::get().resmed_time;
     static bool was_auto_enabled = true;
     if (auto_enabled && !was_auto_enabled) request_sync();
@@ -490,6 +504,7 @@ void Air10Clock::handle() {
         if (disabled) clock_sync_pending = false;
         return;
     }
+    if (clock_sync_settling) return;
     if (clock_sync_ticket) {
         if (Arbiter::transaction_done(clock_sync_ticket)) {
             if (finish_clock_sync()) clock_sync_pending = false;

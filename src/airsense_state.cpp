@@ -92,7 +92,7 @@ static void accept_rop(const char *text, Arbiter::VarResult result,
             Arbiter::set_state(SYS_IDLE);
             Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
             EdfRecorder::request_stop();
-            Air10Clock::request_sync();
+            Air10Clock::request_post_therapy_sync();
             mhr_requested = true;
         }
         if (new_rop != prev_rop) WebUI::push_status_event();
