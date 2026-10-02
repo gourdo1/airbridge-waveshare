@@ -7,6 +7,7 @@
 #include "oxi_arbiter.h"
 #include "resmed_ota.h"
 #include "debug_log.h"
+#include "crash_diagnostics.h"
 #include "app_config.h"
 #include "build_info.h"
 #include "wifi_setup.h"
@@ -507,6 +508,54 @@ static void handleStatus(AsyncWebServerRequest *request) {
     request->send(200, "application/json", status_cache);
 }
 
+static void handleCrashStatus(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+
+    CrashDiagnostics::Snapshot crash;
+    if (!CrashDiagnostics::snapshot(crash)) {
+        request->send(503, "application/json", "{\"error\":\"busy\"}");
+        return;
+    }
+
+    char body[2048] = {};
+    FixedJson json{body, sizeof(body), 0, false};
+    fixedJsonPut(json, '{');
+    jsonAddString(json, "state", CrashDiagnostics::state_name(crash.state), false);
+    jsonAddUInt32(json, "size", crash.size);
+    jsonAddUInt32(json, "stored_size", crash.stored_size);
+    jsonAddString(json, "error", crash.error == ESP_OK ? "" : esp_err_to_name(crash.error));
+    fixedJsonPrintf(json, ",\"summary_available\":%s",
+                    crash.summary_available ? "true" : "false");
+    if (crash.summary_available) {
+        jsonAddString(json, "task", crash.task);
+        jsonAddString(json, "reason", crash.reason);
+        jsonAddString(json, "elf_sha", crash.elf_sha);
+        fixedJsonPrintf(json, ",\"pc\":\"0x%08lx\"", (unsigned long)crash.pc);
+        jsonAddUInt32(json, "cause", crash.cause);
+        fixedJsonPrintf(json, ",\"exception_address\":\"0x%08lx\"",
+                        (unsigned long)crash.exception_address);
+        fixedJsonPrintf(json, ",\"backtrace_corrupt\":%s,\"backtrace\":[",
+                        crash.backtrace_corrupt ? "true" : "false");
+        for (size_t i = 0; i < crash.backtrace_depth; ++i)
+            fixedJsonPrintf(json, "%s\"0x%08lx\"", i ? "," : "",
+                            (unsigned long)crash.backtrace[i]);
+        fixedJsonPut(json, ']');
+    }
+    fixedJsonPut(json, '}');
+    if (json.overflow) {
+        request->send(503, "application/json", "{\"error\":\"response_overflow\"}");
+        return;
+    }
+
+    auto *response = request->beginResponse(200, "application/json", body);
+    if (!response) {
+        request->send(503, "application/json", "{\"error\":\"allocation_failed\"}");
+        return;
+    }
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
 
 
 
@@ -581,11 +630,11 @@ static int saveSettings(const String &body, String &json) {
 }
 
 
-class BufferedJsonResponse : public AsyncWebServerResponse {
+class BufferedResponse : public AsyncWebServerResponse {
 public:
-    void begin(int code, size_t length) {
+    void begin(int code, size_t length, const char *type = "application/json") {
         _code = code;
-        _contentType = "application/json";
+        _contentType = type;
         _contentLength = length;
     }
 
@@ -644,12 +693,57 @@ private:
     size_t buffer_offset_ = 0, buffer_length_ = 0;
 };
 
-class ClinicalResponse : public BufferedJsonResponse {
+class CrashResponse : public BufferedResponse {
+public:
+    explicit CrashResponse(std::unique_ptr<CrashDiagnostics::Dump> dump)
+        : dump_(std::move(dump)) {
+        begin(200, dump_->size(), "application/octet-stream");
+    }
+
+    bool _sourceValid() const override { return bool(dump_); }
+
+protected:
+    size_t readBody(size_t offset, char *out, size_t capacity) override {
+        return dump_->read(offset, out, capacity);
+    }
+
+private:
+    std::unique_ptr<CrashDiagnostics::Dump> dump_;
+};
+
+static void handleCrashDump(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+
+    const char *error = nullptr;
+    auto dump = CrashDiagnostics::open_dump(error);
+    if (!dump) {
+        int code = 503;
+        if (!strcmp(error, "empty") || !strcmp(error, "unsupported")) code = 404;
+        if (!strcmp(error, "invalid") || !strcmp(error, "download_active")) code = 409;
+        String body = "{";
+        jsonAddString(body, "error", error, false);
+        body += '}';
+        request->send(code, "application/json", body);
+        return;
+    }
+
+    auto *response = new (std::nothrow) CrashResponse(std::move(dump));
+    if (!response) {
+        request->send(503, "application/json", "{\"error\":\"allocation_failed\"}");
+        return;
+    }
+    response->addHeader("Content-Disposition", "attachment; filename=\"airbridge-coredump.bin\"");
+    response->addHeader("Cache-Control", "no-store");
+    response->addHeader("Accept-Ranges", "none");
+    request->send(response);
+}
+
+class ClinicalResponse : public BufferedResponse {
 public:
     explicit ClinicalResponse(ClinicalJobs::Result &&ready) : result(std::move(ready)) {}
     ClinicalJobs::Result result;
 
-    void begin(int code) { BufferedJsonResponse::begin(code, result.length()); }
+    void begin(int code) { BufferedResponse::begin(code, result.length()); }
     bool _sourceValid() const override { return result.available(); }
 
 protected:
@@ -1182,7 +1276,7 @@ static void handleUploadDone(AsyncWebServerRequest *request) {
 }
 
 
-class LiveResponse : public BufferedJsonResponse {
+class LiveResponse : public BufferedResponse {
 public:
     ~LiveResponse() override { aircannect::Memory::free(samples_); }
 
@@ -1203,7 +1297,7 @@ public:
         size_t length = 0;
         for (uint16_t part = 0; part < count_ + 2; part++)
             length += formatPart(part, token, sizeof(token));
-        BufferedJsonResponse::begin(200, length);
+        BufferedResponse::begin(200, length);
         return true;
     }
 
@@ -2086,6 +2180,8 @@ void WebUI::init(uint16_t port) {
     http->on("/wizard", HTTP_GET, handleRoot);
     http->on("/api/onboarding", HTTP_POST, handleOnboardingComplete, NULL, handleJsonBody);
     http->on("/api/status", HTTP_GET, handleStatus);
+    http->on("/api/crash", HTTP_GET, handleCrashStatus);
+    http->on("/api/crash/dump", HTTP_GET, handleCrashDump);
     http->on("/api/settings", HTTP_GET, handleGetSettings);
     http->on("/api/settings", HTTP_POST, handlePostSettings, NULL, handleJsonBody);
     http->on("/api/config", HTTP_GET, handleGetConfig);

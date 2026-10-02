@@ -21,6 +21,7 @@
 #include "storage_browser.h"
 #include "sd_storage.h"
 #include "memory_manager.h"
+#include "crash_diagnostics.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -389,6 +390,49 @@ void dispatch_command(const char *line, String &response) {
         return;
     }
 
+    if (upper == "CRASH" || upper.startsWith("CRASH ")) {
+        String action = upper.substring(5);
+        action.trim();
+        if (action == "CLEAR") {
+            const char *error = CrashDiagnostics::clear();
+            response = error ? "ERR: " + String(error) + "\n"
+                             : "OK: crash dump cleared\n";
+            return;
+        }
+        if (!action.isEmpty() && action != "STATUS" && action != "SUMMARY") {
+            response = "ERR: CRASH [STATUS|SUMMARY|CLEAR]\n";
+            return;
+        }
+        CrashDiagnostics::Snapshot crash;
+        if (!CrashDiagnostics::snapshot(crash)) {
+            response = "ERR: crash diagnostics busy\n";
+            return;
+        }
+        response = "state: " + String(CrashDiagnostics::state_name(crash.state)) + "\n";
+        response += "size: " + String(crash.size) + " bytes\n";
+        if (crash.stored_size && !crash.size)
+            response += "stored_size: " + String(crash.stored_size) + " bytes\n";
+        if (crash.error != ESP_OK)
+            response += "error: " + String(esp_err_to_name(crash.error)) + "\n";
+        if (action != "SUMMARY") return;
+        if (!crash.summary_available) {
+            response += "summary: unavailable\n";
+            return;
+        }
+        response += "task: " + String(crash.task) + "\n";
+        response += "reason: " + String(crash.reason) + "\n";
+        response += "pc: 0x" + String(crash.pc, HEX) + "\n";
+        response += "cause: " + String(crash.cause) + "\n";
+        response += "exception_address: 0x" + String(crash.exception_address, HEX) + "\n";
+        response += "elf_sha: " + String(crash.elf_sha) + "\n";
+        response += "backtrace_corrupt: " + String(crash.backtrace_corrupt ? "yes" : "no") + "\n";
+        response += "backtrace:";
+        for (size_t i = 0; i < crash.backtrace_depth; ++i)
+            response += " 0x" + String(crash.backtrace[i], HEX);
+        response += '\n';
+        return;
+    }
+
     if (upper == "RESETREASON") {
         esp_reset_reason_t reason = esp_reset_reason();
         const char *name = Log::reset_reason_name();
@@ -660,6 +704,7 @@ void dispatch_command(const char *line, String &response) {
                    "  TRANSPARENT         Enter raw UART mode\n"
                    "  VERSION             Firmware version info\n"
                    "  RESETREASON         Last reset reason\n"
+                   "  CRASH STATUS|SUMMARY|CLEAR  Retained crash dump\n"
                    "  REBOOT              Restart ESP32\n"
                    "  HELP                This help\n"
                    "Anything without $ prefix is sent to AirSense.\n";

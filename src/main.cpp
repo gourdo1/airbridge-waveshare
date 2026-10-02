@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "build_info.h"
 #include "debug_log.h"
+#include "crash_diagnostics.h"
 #include "uart_arbiter.h"
 #include "tcp_bridge.h"
 #include "wifi_setup.h"
@@ -98,6 +99,7 @@ void setup() {
         Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
 
     Log::boot();
+    CrashDiagnostics::init();
     Log::logf(CAT_GENERAL, LOG_DEBUG, "Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();
