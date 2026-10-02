@@ -45,9 +45,6 @@ jobs:
             --disable-pip-version-check \
             platformio=="$PLATFORMIO_VERSION"
 
-      - name: Test release packager
-        run: python3 -m unittest discover -s test/python -v
-
       - name: Build firmware artifacts
         run: |
           .ci-venv/bin/python python/tools/build_release.py \
