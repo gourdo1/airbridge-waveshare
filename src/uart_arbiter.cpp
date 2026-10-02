@@ -1183,6 +1183,7 @@ typedef struct {
     bool received;
     bool bdd;
     bool missing;
+    uint8_t clock_probe;
     // The retained payload and its terminator follow this header.
 } single_response_capture_t;
 
@@ -1247,6 +1248,8 @@ static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
     capture->capacity = capacity;
     capture->bdd = bdd;
+    capture->clock_probe = strcmp(cmd, "G S #TIC") == 0 ? 1 :
+        strcmp(cmd, "G S #STK") == 0 ? 2 : 0;
     t->send_window = window;
     return publish_transaction(t);
 }
@@ -1277,6 +1280,16 @@ bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_l
     if (result) *result = t->result;
     if (trace) read_trace(t, true, *trace);
     auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
+    if (capture->clock_probe && Log::get_cat_level(CAT_TIME) >= LOG_DEBUG) {
+        const auto *payload = reinterpret_cast<const char *>(capture + 1);
+        const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
+        Log::logf(CAT_TIME, LOG_DEBUG,
+                  "probe %s tx=%lu rx=%lu value=%.*s\n",
+                  capture->clock_probe == 1 ? "TIC" : "STK",
+                  sent_after == UINT32_MAX ? 0UL : (unsigned long)(t->queued_ms + sent_after),
+                  (unsigned long)capture->received_ms,
+                  int(min(capture->length, capture->capacity)), payload);
+    }
     uint16_t output_capacity = resp_buf ? capture->capacity : 0;
     if (resp_buf && resp_len)
         output_capacity = *resp_len ? min(output_capacity, uint16_t(*resp_len - 1)) : 0;
@@ -1341,17 +1354,6 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     }
     if (missing)
         *missing = static_cast<single_response_capture_t *>(t->sink_context)->missing;
-    if (Log::get_cat_level(CAT_TIME) >= LOG_DEBUG &&
-        (strcmp(cmd, "G S #TIC") == 0 || strcmp(cmd, "G S #STK") == 0)) {
-        const auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
-        const auto *payload = reinterpret_cast<const char *>(capture + 1);
-        const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
-        Log::logf(CAT_TIME, LOG_DEBUG,
-                  "probe %s tx=%lu rx=%lu value=%.*s\n", cmd + 5,
-                  sent_after == UINT32_MAX ? 0UL : (unsigned long)(t->queued_ms + sent_after),
-                  (unsigned long)capture->received_ms,
-                  int(min(capture->length, capture->capacity)), payload);
-    }
     bool ok = Arbiter::finish_cmd(t, resp_buf, resp_len);
     if (trace && !ok && strcmp(trace->outcome, "ok") == 0)
         trace->outcome = "no_value";
@@ -1364,6 +1366,44 @@ bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                          capture_single_response);
 }
 
+uart_transaction_t *Arbiter::begin_var(const char *name, cmd_source_t src,
+                                     cmd_priority_t prio, uint16_t capacity,
+                                     uint16_t timeout_ms, const uart_send_window_t &window,
+                                     uint16_t hard_timeout_ms) {
+    if (!name || strlen(name) != 3 || capacity < 2) return nullptr;
+    char command[9];
+    snprintf(command, sizeof(command), "G S #%s", name);
+    if (!timeout_ms) timeout_ms = Config::get().uart_cmd_timeout_ms;
+    timeout_ms = max(timeout_ms, SCALAR_TIMEOUT_MIN_MS);
+    const uint32_t overall_timeout_ms = hard_timeout_ms ? hard_timeout_ms
+        : 2u * timeout_ms;
+    return begin_read_command(command, src, prio,
+        min(uint16_t(capacity - 1), uint16_t(QFRAME_MAX_PAYLOAD)), timeout_ms,
+        capture_variable, window, overall_timeout_ms);
+}
+
+Arbiter::VarResult Arbiter::finish_var(uart_transaction_t *t, char *out,
+                                      uint16_t capacity, VarReadTrace *trace) {
+    if (out && capacity) out[0] = 0;
+    if (!transaction_done(t)) return VarResult::Failed;
+    const auto *capture = static_cast<single_response_capture_t *>(t->sink_context);
+    const bool missing = capture->missing;
+    const bool truncated = capture->length > capture->capacity;
+    uint16_t length = capacity;
+    const bool ok = finish_cmd(t, out, &length, nullptr, trace);
+    if (missing) {
+        if (trace) trace->outcome = "missing";
+        return VarResult::Missing;
+    }
+    if (!ok || truncated || !out || capacity < 2 || length >= capacity) {
+        if (trace && (ok || strcmp(trace->outcome, "ok") == 0))
+            trace->outcome = ok ? "truncated" : "no_value";
+        if (out && capacity) out[0] = 0;
+        return VarResult::Failed;
+    }
+    return VarResult::Ok;
+}
+
 Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
                                     cmd_priority_t prio, char *out,
                                     uint16_t capacity, uint16_t timeout_ms,
@@ -1371,26 +1411,18 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
     if (trace) { *trace = {}; trace->outcome = "invalid_request"; }
     if (out && capacity) out[0] = 0;
     if (!name || strlen(name) != 3 || !out || capacity < 2) return VarResult::Failed;
-    char command[9];
-    snprintf(command, sizeof(command), "G S #%s", name);
-    uint16_t length = capacity;
-    bool missing;
-    if (!timeout_ms) timeout_ms = Config::get().uart_cmd_timeout_ms;
-    timeout_ms = max(timeout_ms, SCALAR_TIMEOUT_MIN_MS);
-    const uint32_t overall_timeout_ms = hard_timeout_ms ? hard_timeout_ms
-        : 2u * timeout_ms;
-    bool ok = read_command(command, src, prio, out, &length, timeout_ms,
-                            capture_variable, &missing, trace, overall_timeout_ms);
-    if (missing) {
-        if (trace) trace->outcome = "missing";
-        return VarResult::Missing;
-    }
-    if (!ok || length >= capacity) {
-        if (trace && ok) trace->outcome = "truncated";
-        out[0] = 0;
+    if (trace) *trace = {};
+    auto *t = begin_var(name, src, prio, capacity, timeout_ms, {}, hard_timeout_ms);
+    if (!t) return VarResult::Failed;
+    const uint32_t elapsed = millis() - t->queued_ms;
+    const uint32_t remaining = elapsed < t->policy.overall_timeout_ms
+        ? t->policy.overall_timeout_ms - elapsed : 0;
+    if (!await_transaction(t, remaining)) {
+        if (trace) read_trace(t, false, *trace);
+        cancel_transaction(t);
         return VarResult::Failed;
     }
-    return VarResult::Ok;
+    return finish_var(t, out, capacity, trace);
 }
 
 Arbiter::VarResult Arbiter::read_var_hex(const char *name, cmd_source_t src,

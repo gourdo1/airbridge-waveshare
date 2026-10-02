@@ -113,6 +113,13 @@ namespace Arbiter {
     // plus response time is capped by hard_timeout_ms, or twice that allowance
     // if no hard deadline is supplied. A hard deadline can shorten either phase.
     // Use it for caller-owned acquisition windows or remaining job deadlines.
+    uart_transaction_t *begin_var(const char *name, cmd_source_t src,
+                                  cmd_priority_t prio, uint16_t capacity,
+                                  uint16_t timeout_ms = 0,
+                                  const uart_send_window_t &window = {},
+                                  uint16_t hard_timeout_ms = 0);
+    VarResult finish_var(uart_transaction_t *transaction, char *out,
+                         uint16_t capacity, VarReadTrace *trace = nullptr);
     VarResult read_var(const char *name, cmd_source_t src, cmd_priority_t prio,
                        char *out, uint16_t capacity, uint16_t timeout_ms = 0,
                        VarReadTrace *trace = nullptr, uint16_t hard_timeout_ms = 0);

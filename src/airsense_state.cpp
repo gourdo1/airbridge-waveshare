@@ -29,17 +29,27 @@ portMUX_TYPE identity_mux = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<uint32_t> device_revision{0};
 const char *identity_failed_tag = nullptr, *identity_failure = nullptr;
 
-static bool read_identity_field(const char *tag, char *out, size_t capacity,
-                                 uint16_t *number = nullptr) {
-    Arbiter::VarReadTrace trace;
-    auto result = Arbiter::read_var(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                    out, capacity, HEALTH_TIMEOUT_MS, &trace);
+enum class ReadStep : uint8_t { None, Rop, Stk, Srn, Mid, Vid, Pna, Mop, Mhr, Bls };
+ReadStep read_step = ReadStep::None;
+uart_transaction_t *read_ticket = nullptr;
+uint32_t read_generation = 0;
+Identity identity_read;
+bool mhr_requested = false;
+
+static const char *read_tag() {
+    static const char *tags[] = {"", "ROP", "STK", "SRN", "MID", "VID", "PNA", "MOP", "MHR", "BLS"};
+    return tags[static_cast<unsigned>(read_step)];
+}
+
+static bool accept_identity_field(const char *tag, const char *text,
+                                   Arbiter::VarResult result, Arbiter::VarReadTrace &trace,
+                                   char *out, size_t capacity, uint16_t *number = nullptr) {
     uint32_t parsed = 0;
     if (result == Arbiter::VarResult::Ok) {
-        if (!out[0] || strchr(out, '\r') || strchr(out, '\n')) {
+        if (!text[0] || strlen(text) >= capacity || strchr(text, '\r') || strchr(text, '\n')) {
             result = Arbiter::VarResult::Failed;
             trace.outcome = "invalid_text";
-        } else if (number && !aircannect::parse_hex(out, strlen(out), parsed)) {
+        } else if (number && !aircannect::parse_hex(text, strlen(text), parsed)) {
             result = Arbiter::VarResult::Failed;
             trace.outcome = "invalid_hex";
         } else if (number && parsed > UINT16_MAX) {
@@ -55,172 +65,139 @@ static bool read_identity_field(const char *tag, char *out, size_t capacity,
         Log::logf(CAT_HEALTH, changed ? LOG_WARN : LOG_DEBUG,
                   "Identity #%s result=%s queue=%lums sent=%u wait=%lums value=%s\n",
                   tag, trace.outcome, (unsigned long)trace.queue_ms,
-                  unsigned(trace.sent), (unsigned long)trace.wait_ms, out);
+                  unsigned(trace.sent), (unsigned long)trace.wait_ms, text);
         return false;
     }
+    memcpy(out, text, strlen(text) + 1);
     if (number) *number = static_cast<uint16_t>(parsed);
     return true;
 }
 
-static void refresh_identity() {
-    Identity current;
-    identity(current);
-    if (!current.valid) {
-        if (!read_identity_field("SRN", current.srn, sizeof(current.srn)) ||
-            !read_identity_field("MID", current.mid_text, sizeof(current.mid_text), &current.mid) ||
-            !read_identity_field("VID", current.vid_text, sizeof(current.vid_text), &current.vid))
-            return;
-        portENTER_CRITICAL(&identity_mux);
-        const bool same_device = current.generation == device_identity.generation;
-        if (same_device) {
-            current.valid = true;
-            device_identity = current;
-            ++device_revision;
+static void accept_rop(const char *text, Arbiter::VarResult result,
+                        const Arbiter::VarReadTrace &trace) {
+    airsense_present = result == Arbiter::VarResult::Ok &&
+        (!strcmp(text, "0000") || !strcmp(text, "0001"));
+    if (airsense_present) {
+        consecutive_timeouts = 0;
+        airsense_seen_ms = millis();
+        const int new_rop = text[3] - '0';
+        const int prev_rop = cached_rop.exchange(new_rop);
+        const auto state = Arbiter::get_state();
+        if (new_rop == 1 && state == SYS_IDLE) {
+            Arbiter::set_state(SYS_THERAPY);
+            Log::logf(CAT_HEALTH, LOG_INFO, "Therapy started\n");
+            ExportSync::therapy_started();
+        } else if (new_rop == 0 && state == SYS_THERAPY) {
+            Arbiter::set_state(SYS_IDLE);
+            Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
+            EdfRecorder::request_stop();
+            Air10Clock::request_sync();
+            mhr_requested = true;
         }
-        portEXIT_CRITICAL(&identity_mux);
-        if (!same_device) {
-            Log::logf(CAT_HEALTH, LOG_DEBUG, "Identity invalidated during read\n");
-            return;
-        }
-        identity_failed_tag = identity_failure = nullptr;
-    }
-    if (!current.pna[0] && read_identity_field("PNA", current.pna, sizeof(current.pna))) {
-        portENTER_CRITICAL(&identity_mux);
-        if (current.generation == device_identity.generation) {
-            memcpy(device_identity.pna, current.pna, sizeof(current.pna));
-            ++device_revision;
-        }
-        portEXIT_CRITICAL(&identity_mux);
-        identity_failed_tag = identity_failure = nullptr;
-    }
-}
-
-static void poll_device_uptime() {
-    char response[48] = {};
-    if (!Arbiter::get_var("STK", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                          response, sizeof(response), HEALTH_TIMEOUT_MS)) return;
-    uint32_t ticks = 0;
-    if (!DeviceUptime::parse(response, ticks) ||
-        !device_uptime.observe(ticks, millis())) return;
-
-    Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
-    invalidate_identity();
-    Air10Clock::invalidate();
-    CustomSettings::invalidate("STK reset");
-    LiveStream::reattach();
-    Air10Clock::request_sync();
-    cached_mhr = -1;
-    cached_mop = -1;
-    if (Arbiter::get_state() == SYS_THERAPY) {
-        Arbiter::set_state(SYS_IDLE);
-    }
-}
-
-static void poll_mhr() {
-    uint32_t raw;
-    if (Arbiter::read_var_hex("MHR", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, raw) !=
-        Arbiter::VarResult::Ok || raw > INT_MAX) {
-        // UART unhappy; leave cache alone and retry next opportunity.
+        if (new_rop != prev_rop) WebUI::push_status_event();
+        read_step = ReadStep::Stk;
         return;
     }
-    int new_mhr = static_cast<int>(raw);
-    int prev_mhr = cached_mhr.load();
-    cached_mhr = new_mhr;
-    last_mhr_poll = millis();
-    if (new_mhr != prev_mhr) {
-        WebUI::push_status_event();
+
+    ++consecutive_timeouts;
+    Log::logf(CAT_HEALTH, LOG_DEBUG,
+              "ROP poll failed (%lu consecutive) result=%s queue=%lums sent=%u wait=%lums value=%s\n",
+              (unsigned long)consecutive_timeouts, trace.outcome,
+              (unsigned long)trace.queue_ms, unsigned(trace.sent),
+              (unsigned long)trace.wait_ms, text);
+    if (consecutive_timeouts >= 3) {
+        invalidate_identity();
+        Arbiter::set_state(SYS_ERROR);
+        Log::logf(CAT_HEALTH, LOG_WARN, "AirSense unavailable: UART unresponsive\n");
     }
+    Air10Clock::invalidate();
+    cached_mop = -1;
+    read_step = ReadStep::None;
 }
 
-static bool mhr_poll_due() {
-    if (cached_mhr.load() < 0) return true;
-    return millis() - last_mhr_poll >= MHR_POLL_INTERVAL_MS;
-}
-
-static void poll_therapy_mode() {
-    uint32_t raw;
-    const bool valid = Arbiter::read_var_hex("MOP", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                                            raw, HEALTH_TIMEOUT_MS) == Arbiter::VarResult::Ok &&
-        raw <= INT_MAX;
-    cached_mop = valid ? static_cast<int>(raw) : -1;
-}
-
-static void poll_therapy_state() {
-    char resp[64] = {};
-
-    uint32_t t0 = millis();
-    Log::logf(CAT_HEALTH, LOG_DEBUG, "ROP poll start t=%lu\n", t0);
-    bool ok = Arbiter::get_var("ROP", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, sizeof(resp), HEALTH_TIMEOUT_MS);
-    if (ok) {
-        consecutive_timeouts = 0;
-
-        const char *rv = resp;
-        airsense_present = rv && (strcmp(rv, "0000") == 0 || strcmp(rv, "0001") == 0);
-        if (airsense_present) {
-            airsense_seen_ms = millis();
-            poll_device_uptime();
-            refresh_identity();
-            poll_therapy_mode();
-            int new_rop = (int)strtoul(rv, nullptr, 16);
-            int prev_rop = cached_rop.load();
-            cached_rop = new_rop;
-
-            system_state_t current = Arbiter::get_state();
-            if (new_rop == 1 && current == SYS_IDLE) {
-                Arbiter::set_state(SYS_THERAPY);
-                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy started\n");
-                ExportSync::therapy_started();
-            } else if (new_rop == 0 && current == SYS_THERAPY) {
-                Arbiter::set_state(SYS_IDLE);
-                Log::logf(CAT_HEALTH, LOG_INFO, "Therapy ended\n");
-                EdfRecorder::request_stop();
-                Air10Clock::request_sync();
-                poll_mhr();
-            }
-
-            if (new_rop != prev_rop) {
-                WebUI::push_status_event();
-            }
-            Air10Clock::poll_status();
-        }
-    } else {
-        airsense_present = false;
-        consecutive_timeouts++;
-        Log::logf(CAT_HEALTH, LOG_DEBUG,
-                  "ROP poll timeout (%d consecutive) t=%lu dt=%lu\n",
-                  consecutive_timeouts, millis(), millis() - t0);
-
-        if (consecutive_timeouts >= 3) {
-            system_state_t current = Arbiter::get_state();
-            if (current != SYS_ERROR && current != SYS_TRANSPARENT &&
-                current != SYS_OTA_AIRSENSE && current != SYS_OTA_ESP) {
+static void accept_read(const char *text, Arbiter::VarResult result,
+                         Arbiter::VarReadTrace &trace) {
+    const bool ok = result == Arbiter::VarResult::Ok;
+    uint32_t raw = 0;
+    switch (read_step) {
+        case ReadStep::Rop:
+            accept_rop(text, result, trace);
+            break;
+        case ReadStep::Stk:
+            if (ok && DeviceUptime::parse(text, raw) && device_uptime.observe(raw, millis())) {
+                Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
                 invalidate_identity();
-                Arbiter::set_state(SYS_ERROR);
-                Log::logf(CAT_HEALTH, LOG_WARN, "AirSense unavailable: UART unresponsive\n");
+                Air10Clock::invalidate();
+                CustomSettings::invalidate("STK reset");
+                LiveStream::reattach();
+                Air10Clock::request_sync();
+                cached_mhr = cached_mop = -1;
+                if (Arbiter::get_state() == SYS_THERAPY) Arbiter::set_state(SYS_IDLE);
+                read_step = ReadStep::None;
+                break;
             }
+            identity(identity_read);
+            read_step = !identity_read.valid ? ReadStep::Srn :
+                !identity_read.pna[0] ? ReadStep::Pna : ReadStep::Mop;
+            break;
+        case ReadStep::Srn:
+            read_step = accept_identity_field("SRN", text, result, trace,
+                identity_read.srn, sizeof(identity_read.srn)) ? ReadStep::Mid : ReadStep::Mop;
+            break;
+        case ReadStep::Mid:
+            read_step = accept_identity_field("MID", text, result, trace,
+                identity_read.mid_text, sizeof(identity_read.mid_text), &identity_read.mid)
+                ? ReadStep::Vid : ReadStep::Mop;
+            break;
+        case ReadStep::Vid:
+        case ReadStep::Pna: {
+            const bool core = read_step == ReadStep::Vid;
+            const bool valid = core
+                ? accept_identity_field("VID", text, result, trace, identity_read.vid_text,
+                    sizeof(identity_read.vid_text), &identity_read.vid)
+                : accept_identity_field("PNA", text, result, trace, identity_read.pna,
+                    sizeof(identity_read.pna));
+            if (valid) {
+                portENTER_CRITICAL(&identity_mux);
+                if (identity_read.generation == device_identity.generation) {
+                    identity_read.valid = true;
+                    device_identity = identity_read;
+                    ++device_revision;
+                }
+                portEXIT_CRITICAL(&identity_mux);
+                identity_failed_tag = identity_failure = nullptr;
+            }
+            read_step = core && valid ? ReadStep::Pna : ReadStep::Mop;
+            break;
         }
-    }
-    if (!airsense_present) {
-        Air10Clock::invalidate();
-        cached_mop = -1;
-    }
-}
-
-static void attempt_recovery() {
-    if (Arbiter::get_state() != SYS_ERROR) return;
-
-    char resp[32] = {};
-    bool ok = Arbiter::get_var("BLS", CMD_SRC_INTERNAL, CMD_PRIO_HIGH,
-                               resp, sizeof(resp));
-    if (ok) {
-        Log::logf(CAT_HEALTH, LOG_INFO, "Device responded, clearing error\n");
-        consecutive_timeouts = 0;
-        Arbiter::set_state(SYS_IDLE);
-        CustomSettings::invalidate("UART recovery");
-        // AirSense may have rebooted; force re-subscribe regardless of
-        // the broker's stale subscribed flags.
-        LiveStream::reattach();
+        case ReadStep::Mop:
+            cached_mop = ok && aircannect::parse_hex(text, strlen(text), raw) && raw <= INT_MAX
+                ? static_cast<int>(raw) : -1;
+            read_step = mhr_requested || cached_mhr.load() < 0 ||
+                millis() - last_mhr_poll >= MHR_POLL_INTERVAL_MS ? ReadStep::Mhr : ReadStep::None;
+            break;
+        case ReadStep::Mhr:
+            if (ok && aircannect::parse_hex(text, strlen(text), raw) && raw <= INT_MAX) {
+                const int previous = cached_mhr.exchange(static_cast<int>(raw));
+                last_mhr_poll = millis();
+                mhr_requested = false;
+                if (previous != static_cast<int>(raw)) WebUI::push_status_event();
+            }
+            read_step = ReadStep::None;
+            break;
+        case ReadStep::Bls:
+            if (ok) {
+                Log::logf(CAT_HEALTH, LOG_INFO, "Device responded, clearing error\n");
+                consecutive_timeouts = 0;
+                Arbiter::set_state(SYS_IDLE);
+                CustomSettings::invalidate("UART recovery");
+                LiveStream::reattach();
+                request_refresh();
+            }
+            read_step = ReadStep::None;
+            break;
+        case ReadStep::None:
+            break;
     }
 }
 
@@ -265,9 +242,7 @@ bool present_recently() {
 
 bool system_idle() { return Arbiter::get_state() == SYS_IDLE; }
 
-bool device_standby() {
-    return system_idle() && rop() == 0;
-}
+bool device_standby() { return system_idle() && rop() == 0; }
 
 bool local_background_allowed() {
     const auto state = Arbiter::get_state();
@@ -275,19 +250,49 @@ bool local_background_allowed() {
 }
 
 void poll() {
-    const bool due = millis() - last_health_poll >= HEALTH_POLL_INTERVAL_MS;
-    if (!due && !refresh_requested.load()) return;
-
     const auto state = Arbiter::get_state();
-    if (state == SYS_IDLE || state == SYS_THERAPY) {
+    const bool allowed = state == SYS_IDLE || state == SYS_THERAPY || state == SYS_ERROR;
+    if (!allowed || (read_step != ReadStep::None && read_generation != identity_generation())) {
+        if (read_ticket) Arbiter::cancel_transaction(read_ticket);
+        read_ticket = nullptr;
+        read_step = ReadStep::None;
+        if (!allowed) return;
+    }
+
+    if (read_step == ReadStep::None) {
+        if (millis() - last_health_poll < HEALTH_POLL_INTERVAL_MS && !refresh_requested.load()) return;
         refresh_requested.exchange(false);
         last_health_poll = millis();
-        poll_therapy_state();
+        read_generation = identity_generation();
+        read_step = state == SYS_ERROR ? ReadStep::Bls : ReadStep::Rop;
+    }
+
+    char response[64] = {};
+    Arbiter::VarReadTrace trace;
+    auto result = Arbiter::VarResult::Failed;
+    if (!read_ticket) {
+        const bool urgent = read_step == ReadStep::Rop || read_step == ReadStep::Bls;
+        read_ticket = Arbiter::begin_var(read_tag(), CMD_SRC_INTERNAL,
+            urgent ? CMD_PRIO_HIGH : CMD_PRIO_NORMAL, sizeof(response), HEALTH_TIMEOUT_MS);
+        if (read_ticket) return;
+    } else {
+        if (!Arbiter::transaction_done(read_ticket)) {
+            if (!Arbiter::transaction_expired(read_ticket)) return;
+            Arbiter::cancel_transaction(read_ticket);
+            trace.outcome = "deadline";
+        } else {
+            result = Arbiter::finish_var(read_ticket, response, sizeof(response), &trace);
+        }
+        read_ticket = nullptr;
+    }
+    if (read_generation != identity_generation()) {
+        read_step = ReadStep::None;
+        return;
+    }
+    accept_read(response, result, trace);
+    if (read_step == ReadStep::None && airsense_present) {
+        Air10Clock::poll_status();
         LiveStream::resync();
-        if (mhr_poll_due()) poll_mhr();
-    } else if (due) {
-        last_health_poll = millis();
-        if (state == SYS_ERROR) attempt_recovery();
     }
 }
 

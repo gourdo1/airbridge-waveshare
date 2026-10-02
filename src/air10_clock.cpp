@@ -53,6 +53,14 @@ static uint32_t phase_attempt_ms = 0;
 static bool phase_attempted = false;
 static uart_transaction_t *phase_ticket = nullptr;
 
+// One main-loop calendar read serves the display and the phase baseline.
+static bool status_read_requested = false, calendar_for_phase = false;
+static uart_transaction_t *calendar_ticket = nullptr;
+static uint8_t calendar_step = 0, calendar_attempt = 0;
+static uint32_t calendar_generation = 0;
+static char calendar_date[9], calendar_tic[7];
+static Arbiter::VarReadTrace calendar_trace;
+
 void Air10Clock::status_time(char (&out)[20]) {
     system_state_t state = Arbiter::get_state();
     portENTER_CRITICAL(&device_time_mux);
@@ -136,15 +144,7 @@ void Air10Clock::poll_status() {
     bool due = device_time[0] == '-' ||
         uint32_t(millis() - device_time_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
     portEXIT_CRITICAL(&device_time_mux);
-    if (!due) return;
-
-    char text[20] = "--";
-    Air10Clock::Calendar t;
-    if (Air10Clock::read(t, CLOCK_TIMEOUT_MS)) {
-        snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
-                 t.year, t.month, t.day, t.hour, t.minute);
-    }
-    publish_device_time(text);
+    if (due) status_read_requested = true;
 }
 
 static void stop_phase_measurement(const char *reason = nullptr) {
@@ -155,33 +155,102 @@ static void stop_phase_measurement(const char *reason = nullptr) {
     phase_measuring = false;
 }
 
-static void handle_phase_measurement() {
-    if (!phase_measuring) {
-        if (!AB_STORAGE_HAS_SDCARD || !AirSenseState::device_standby() ||
-            !AirSenseState::present_recently() || clock_sync_ticket) return;
-        const uint32_t now = millis();
-        portENTER_CRITICAL(&device_time_mux);
-        const bool due = !device_phase.generation ||
-            uint32_t(now - device_phase.captured_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
-        portEXIT_CRITICAL(&device_time_mux);
-        if (!due || (phase_attempted && now - phase_attempt_ms < PHASE_RETRY_INTERVAL_MS)) return;
-        phase_attempted = true;
-        phase_attempt_ms = now;
-        phase_started_ms = now;
+static void stop_calendar_read() {
+    if (calendar_ticket) Arbiter::cancel_transaction(calendar_ticket);
+    calendar_ticket = nullptr;
+    calendar_step = 0;
+}
 
-        Air10Clock::Calendar value;
-        if (!Air10Clock::read(value, CLOCK_TIMEOUT_MS)) {
-            Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase failed: calendar read\n");
-            return;
-        }
-        portENTER_CRITICAL(&device_time_mux);
-        phase_previous = last_clock_read;
-        phase_probe_generation = phase_generation;
-        portEXIT_CRITICAL(&device_time_mux);
-        snprintf(phase_date, sizeof(phase_date), "%02d%02d%04d",
-                 value.day, value.month, value.year);
-        phase_measuring = true;
+static void handle_calendar_read() {
+    const auto state = Arbiter::get_state();
+    portENTER_CRITICAL(&device_time_mux);
+    const uint32_t generation = phase_generation;
+    const bool phase_due = !device_phase.generation ||
+        uint32_t(millis() - device_phase.captured_ms) >= DEVICE_TIME_POLL_INTERVAL_MS;
+    portEXIT_CRITICAL(&device_time_mux);
+    if ((state != SYS_IDLE && state != SYS_THERAPY) || clock_sync_ticket ||
+        !AirSenseState::present_recently() ||
+        (calendar_step && (calendar_generation != generation ||
+            (calendar_for_phase && (!AirSenseState::device_standby() ||
+                millis() - phase_started_ms >= PHASE_PROBE_BUDGET_MS))))) {
+        stop_calendar_read();
+        return;
     }
+    if (phase_measuring) return;
+    if (!calendar_step) {
+        calendar_for_phase = AB_STORAGE_HAS_SDCARD && phase_due &&
+            AirSenseState::device_standby() &&
+            (!phase_attempted || millis() - phase_attempt_ms >= PHASE_RETRY_INTERVAL_MS);
+        if (!status_read_requested && !calendar_for_phase) return;
+        status_read_requested = false;
+        calendar_generation = generation;
+        calendar_attempt = 0;
+        calendar_step = 1;
+        if (calendar_for_phase) {
+            phase_attempted = true;
+            phase_started_ms = phase_attempt_ms = millis();
+        }
+    }
+    if (!calendar_ticket) {
+        const uart_send_window_t window = {0, 0, calendar_for_phase};
+        calendar_ticket = Arbiter::begin_var(calendar_step == 2 ? "TIC" : "DAC",
+            CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, 9, CLOCK_TIMEOUT_MS, window);
+        if (calendar_ticket) return;
+    } else if (!Arbiter::transaction_done(calendar_ticket)) {
+        if (!Arbiter::transaction_expired(calendar_ticket)) return;
+        stop_calendar_read();
+    } else {
+        char response[9] = {};
+        Arbiter::VarReadTrace trace;
+        const auto result = Arbiter::finish_var(calendar_ticket, response, sizeof(response), &trace);
+        calendar_ticket = nullptr;
+        if (result == Arbiter::VarResult::Ok) {
+            if (calendar_step == 1) {
+                memcpy(calendar_date, response, sizeof(calendar_date));
+                calendar_step = 2;
+                return;
+            }
+            if (calendar_step == 2 && strlen(response) < sizeof(calendar_tic)) {
+                strcpy(calendar_tic, response);
+                calendar_trace = trace;
+                calendar_step = 3;
+                return;
+            }
+            if (calendar_step == 3) {
+                Air10Clock::Calendar value;
+                if (strcmp(calendar_date, response) && calendar_attempt++ == 0) {
+                    calendar_step = 1;
+                    return;
+                }
+                if (!strcmp(calendar_date, response) &&
+                    Air10Clock::parse_calendar(calendar_date, calendar_tic, value)) {
+                    observe_clock_read(value, calendar_trace);
+                    char text[20];
+                    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+                             value.year, value.month, value.day, value.hour, value.minute);
+                    publish_device_time(text);
+                    if (calendar_for_phase) {
+                        portENTER_CRITICAL(&device_time_mux);
+                        phase_previous = last_clock_read;
+                        phase_probe_generation = phase_generation;
+                        portEXIT_CRITICAL(&device_time_mux);
+                        memcpy(phase_date, calendar_date, sizeof(phase_date));
+                        phase_measuring = true;
+                    }
+                    calendar_step = 0;
+                    return;
+                }
+            }
+        }
+    }
+    calendar_step = 0;
+    publish_device_time("--");
+    if (calendar_for_phase)
+        Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase failed: calendar read\n");
+}
+
+static void handle_phase_measurement() {
+    if (!phase_measuring) return;
     portENTER_CRITICAL(&device_time_mux);
     const bool unchanged = phase_probe_generation == phase_generation;
     portEXIT_CRITICAL(&device_time_mux);
@@ -289,6 +358,7 @@ static bool write_clock_value(const char *command) {
 
 static void push_time_to_resmed() {
     stop_phase_measurement("clock write");
+    stop_calendar_read();
     Air10Clock::invalidate();
     struct tm t;
     time_t now = time(nullptr);
@@ -389,6 +459,7 @@ bool Air10Clock::pull_time(bool force) {
 }
 
 void Air10Clock::handle() {
+    handle_calendar_read();
     handle_phase_measurement();
     const bool auto_enabled = Config::get().resmed_time;
     static bool was_auto_enabled = true;
