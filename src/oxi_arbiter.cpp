@@ -64,16 +64,17 @@ static const char *src_name(oxi_source_t s) {
     }
 }
 
-static void inject_lframe() {
+static bool inject_lframe() {
     system_state_t st = Arbiter::get_state();
-    if (st == SYS_TRANSPARENT || st == SYS_OTA_AIRSENSE || st == SYS_OTA_ESP) return;
+    if (st == SYS_TRANSPARENT || st == SYS_OTA_AIRSENSE || st == SYS_OTA_ESP) return false;
+    if (Arbiter::oximetry_deferred()) return false;
 
     auto &cfg = Config::get();
-    if (cfg.oxi_feed_therapy_only && st != SYS_THERAPY) return;
+    if (cfg.oxi_feed_therapy_only && st != SYS_THERAPY) return false;
     oxi_reading_t current;
     oxi_source_t current_source;
     OxiArbiter::snapshot(current, &current_source);
-    if (!cfg.oxi_lframe_continuous && !current.valid) return;
+    if (!cfg.oxi_lframe_continuous && !current.valid) return false;
 
     if (current.valid != last_valid) {
         if (current.valid)
@@ -85,7 +86,6 @@ static void inject_lframe() {
     }
 
     uint8_t toggle = oxh_toggle ? 0x02 : 0x00;
-    oxh_toggle ^= 1;
 
     uint8_t oxs, sas;
     uint16_t hrr;
@@ -106,18 +106,20 @@ static void inject_lframe() {
     char payload[17];
     snprintf(payload, sizeof(payload), "OXH%02X%02X%03X%02X%02X10",
              oxh_seq, oxs, hrr, sas, sar);
-    oxh_seq = (oxh_seq + 1) & 0xFF;
-
-    Log::logf(CAT_OXI, LOG_DEBUG, "L-frame seq=%02X %s SpO2=%d HR=%d t=%lu\n",
-              (oxh_seq - 1) & 0xFF, current.valid ? "valid" : "no-finger",
-              current.spo2, current.pulse_bpm, millis());
-
     uint8_t frame_buf[32];
     int frame_len = qframe_build('L', (const uint8_t *)payload, 16,
                                  frame_buf, sizeof(frame_buf));
-    if (frame_len < 0) return;
+    if (frame_len < 0) return false;
 
-    Arbiter::send_frame(frame_buf, (uint16_t)frame_len, CMD_SRC_OXI, CMD_PRIO_LOW);
+    if (!Arbiter::send_frame(frame_buf, (uint16_t)frame_len, CMD_SRC_OXI, CMD_PRIO_LOW))
+        return false;
+
+    Log::logf(CAT_OXI, LOG_DEBUG, "L-frame queued seq=%02X %s SpO2=%d HR=%d t=%lu\n",
+              oxh_seq, current.valid ? "valid" : "no-finger",
+              current.spo2, current.pulse_bpm, millis());
+    oxh_seq++;
+    oxh_toggle ^= 1;
+    return true;
 }
 
 void OxiArbiter::init() {
@@ -273,7 +275,6 @@ void OxiArbiter::poll() {
     auto &cfg = Config::get();
     if (is_feeding() && active_source() != OXI_SRC_NONE &&
         millis() - last_inject >= cfg.oxi_interval_ms) {
-        last_inject = millis();
-        inject_lframe();
+        if (inject_lframe()) last_inject = millis();
     }
 }

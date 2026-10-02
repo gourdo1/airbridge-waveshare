@@ -81,6 +81,17 @@ namespace Arbiter {
         const char *outcome = "not_queued";
     };
 
+    // Recorder-owned acquisition scope. Defers local OXH until destruction or
+    // until_ms, capped at one second. Already dispatched UART work is not cut off.
+    class OximetryDeferral {
+    public:
+        explicit OximetryDeferral(uint32_t until_ms);
+        ~OximetryDeferral();
+        OximetryDeferral(const OximetryDeferral &) = delete;
+        OximetryDeferral &operator=(const OximetryDeferral &) = delete;
+    private:
+        uint32_t until_ms_ = 0;
+    };
     void init(HardwareSerial &serial, int rx_pin, int tx_pin);
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
@@ -114,6 +125,7 @@ namespace Arbiter {
     // Queue a no-reply frame; the worker retains UART through its RX-cycle guard.
     bool send_frame(const uint8_t *frame, uint16_t frame_len,
                     cmd_source_t src, cmd_priority_t prio);
+    bool oximetry_deferred();
 
     uart_transaction_t *begin_cmd(const char *cmd,
                                   cmd_source_t src,

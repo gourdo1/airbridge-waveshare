@@ -82,6 +82,7 @@ static constexpr uint32_t SILENT_FRAME_GUARD_MS = 80;
 // Delayed G S replies after OXH need a response allowance separate from queue
 // wait. The caller's hard deadline still bounds both phases together.
 static constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
+static std::atomic<uint32_t> oximetry_defer_until{0};
 
 static constexpr size_t LCD_COMMAND_SIZE = 32;
 static constexpr size_t LCD_FRAME_SIZE = 9 + 2 * (LCD_COMMAND_SIZE - 1);
@@ -821,6 +822,16 @@ static void arbiter_task(void *param) {
             t = nullptr;
             continue;
         }
+        if (t->source == CMD_SRC_OXI && Arbiter::oximetry_deferred()) {
+            // Do not replay an old reading after the acquisition window.
+            // OxiArbiter will submit the current reading when its feed is due.
+            current_ticket = nullptr;
+            Log::logf(CAT_ARB, LOG_DEBUG, "Queued OXH discarded during acquisition t=%lu\n",
+                      millis());
+            finish_ticket(t);
+            t = nullptr;
+            continue;
+        }
         if (t->lcd_step == LcdStep::Hide || t->lcd_step == LcdStep::Clear ||
             t->lcd_step == LcdStep::Expire) lcd_clear_at = 0;
         if (t->policy.accepted_types) Arbiter::clear_rx_frames();
@@ -1416,10 +1427,39 @@ bool Arbiter::get_var(const char *name, cmd_source_t src, cmd_priority_t prio,
     return read_var(name, src, prio, out, capacity, timeout_ms) == VarResult::Ok;
 }
 
+bool Arbiter::oximetry_deferred() {
+    uint32_t until = oximetry_defer_until.load(std::memory_order_acquire);
+    if (!until) return false;
+    if (int32_t(until - millis()) > 0) return true;
+    oximetry_defer_until.compare_exchange_strong(until, 0, std::memory_order_acq_rel);
+    return false;
+}
+
+Arbiter::OximetryDeferral::OximetryDeferral(uint32_t until_ms) {
+    const uint32_t now = millis();
+    const int32_t remaining = int32_t(until_ms - now);
+    if (remaining <= 0) return;
+    uint32_t until = now + min(uint32_t(remaining), uint32_t(1000));
+    // Zero is the inactive sentinel; shorten a wrapping window by one ms.
+    if (!until) until = UINT32_MAX;
+    uint32_t previous = oximetry_defer_until.load(std::memory_order_acquire);
+    if (previous && int32_t(previous - now) > 0) return;
+    if (oximetry_defer_until.compare_exchange_strong(previous, until,
+                                                   std::memory_order_acq_rel))
+        until_ms_ = until;
+}
+
+Arbiter::OximetryDeferral::~OximetryDeferral() {
+    if (until_ms_)
+        oximetry_defer_until.compare_exchange_strong(until_ms_, 0,
+                                                    std::memory_order_acq_rel);
+}
+
 bool Arbiter::send_frame(const uint8_t *frame, uint16_t frame_len,
                          cmd_source_t src, cmd_priority_t prio)
 {
     if (!uart_source_allowed(src)) return false;
+    if (src == CMD_SRC_OXI && oximetry_deferred()) return false;
     if (frame_len > QFRAME_MAX_RAW) return false;
 
     uart_response_policy_t no_response = {};

@@ -1948,6 +1948,7 @@ static void sample_pld() {
     const uint16_t slot = absolute_slot % 30;
     const uint32_t segment_start = session_clock.captured_ms;
     const uint32_t target_ms = segment_start + absolute_slot * 2000;
+    Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     TimedFrame selected_pbt = {};
     const TimedFrame *pbt = nullptr;
