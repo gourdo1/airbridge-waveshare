@@ -85,6 +85,8 @@ namespace Arbiter {
     // until_ms, capped at one second. Already dispatched UART work is not cut off.
     class OximetryDeferral {
     public:
+        // Wire time of an OXH already entering TX, its guard and tick rounding.
+        static uint32_t lead_ms();
         explicit OximetryDeferral(uint32_t until_ms);
         ~OximetryDeferral();
         OximetryDeferral(const OximetryDeferral &) = delete;

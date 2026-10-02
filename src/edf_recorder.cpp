@@ -1948,7 +1948,6 @@ static void sample_pld() {
     const uint16_t slot = absolute_slot % 30;
     const uint32_t segment_start = session_clock.captured_ms;
     const uint32_t target_ms = segment_start + absolute_slot * 2000;
-    Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
     const StreamSchema *pbt_schema = stream_leases[3] >= 0 ? find_schema("PBT") : nullptr;
     TimedFrame selected_pbt = {};
     const TimedFrame *pbt = nullptr;
@@ -2000,15 +1999,22 @@ static void sample_pld() {
     const uint32_t spacing_ms = poll_count
         ? min(uint32_t(40), uint32_t(2 * PLD_SAMPLE_WINDOW_MS) / poll_count) : 0;
     uint32_t not_before = target_ms - poll_count * spacing_ms / 2;
-    for (size_t i = 0; i < count; i++) {
-        if (!(polled & (uint32_t(1) << i))) continue;
-        while (int32_t(millis() - not_before) < 0) {
+    if (poll_count) {
+        const uint32_t defer_at = not_before - Arbiter::OximetryDeferral::lead_ms();
+        while (int32_t(millis() - defer_at) < 0) {
             if (!collect_frames(pdMS_TO_TICKS(10))) return;
         }
-        not_before += spacing_ms;
-        const auto &source = sources[i];
-        (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
-        if (!collect_frames()) return;
+        Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
+        for (size_t i = 0; i < count; i++) {
+            if (!(polled & (uint32_t(1) << i))) continue;
+            while (int32_t(millis() - not_before) < 0) {
+                if (!collect_frames(pdMS_TO_TICKS(10))) return;
+            }
+            not_before += spacing_ms;
+            const auto &source = sources[i];
+            (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
+            if (!collect_frames()) return;
+        }
     }
 
     // Bracket the PBT target before choosing nearest, even after a fast burst.
@@ -2028,6 +2034,7 @@ static void sample_pld() {
             streamed++;
         } else {
             values[i] = EDF_MISSING;
+            Arbiter::OximetryDeferral defer_oxh(target_ms + PLD_SAMPLE_WINDOW_MS);
             (void)read_numeric_variable(source.tag, values[i], absolute_slot, target_ms, queries);
             drain_raw_frames(0);
             if (!status.active || segment_start != session_clock.captured_ms ||

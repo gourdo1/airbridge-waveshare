@@ -1451,6 +1451,13 @@ bool Arbiter::oximetry_deferred() {
     return false;
 }
 
+uint32_t Arbiter::OximetryDeferral::lead_ms() {
+    const uint32_t baud = current_baud ? current_baud : 57600;
+    constexpr uint32_t oxh_max_wire_bytes = 9 + 2 * 16;
+    return SILENT_FRAME_GUARD_MS + 2 * portTICK_PERIOD_MS +
+        (oxh_max_wire_bytes * 10 * 1000 + baud - 1) / baud;
+}
+
 Arbiter::OximetryDeferral::OximetryDeferral(uint32_t until_ms) {
     const uint32_t now = millis();
     const int32_t remaining = int32_t(until_ms - now);
