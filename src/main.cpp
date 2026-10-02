@@ -14,6 +14,7 @@
 #include "qframe.h"
 #include "network_hints.h"
 #include "live_stream.h"
+#include "air10_stream.h"
 #include "live_tce.h"
 #include "live_web_consumer.h"
 #include "sd_storage.h"
@@ -180,6 +181,7 @@ void loop() {
     OxiArbiter::poll();
 
     AirSenseState::poll();
+    Air10Stream::poll();
 
     delay(10);
 }

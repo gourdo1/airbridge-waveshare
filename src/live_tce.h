@@ -22,7 +22,7 @@ extern const uint16_t SAMPLE_SIZE;     // sizeof(Sample)
 
 // Register the TCE parser with LiveStream. Idempotent: re-registration is
 // rejected by the broker but harmless. Call before any consumer subscribes
-// to "TCE". The broker prepares its schema before enabling the stream.
+// to "TCE". Enabling waits for the shared identity-bound schema cache.
 void register_parser();
 
 }

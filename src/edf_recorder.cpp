@@ -42,7 +42,7 @@ namespace {
 constexpr uint16_t RAW_QUEUE_CAPACITY_PSRAM = 128;
 constexpr uint16_t RAW_QUEUE_CAPACITY_FALLBACK = 48;
 constexpr uint16_t RAW_PAYLOAD_MAX = 64;
-constexpr uint8_t STREAM_COUNT = 5;
+constexpr uint8_t STREAM_COUNT = Air10Stream::SCHEMA_COUNT;
 constexpr uint16_t RECORDER_STACK = 8192;
 constexpr uint16_t POLL_TIMEOUT_MS = 200;
 constexpr uint8_t PBT_SAMPLE_COUNT = 4;
@@ -339,12 +339,6 @@ static StreamSchema *find_schema(const char *tag) {
             return &schema;
     }
     return nullptr;
-}
-
-static void resolve_schemas(uint16_t mid, uint16_t vid) {
-    static const char *tags[STREAM_COUNT] = {"TCE", "APN", "CSN", "PBT", "BRH"};
-    for (uint8_t i = 0; i < STREAM_COUNT; i++)
-        Air10Stream::resolve_schema(stream_schemas[i], tags[i], mid, vid);
 }
 
 static void epoch_day_to_civil(uint16_t epoch_day, int &year,
@@ -2303,6 +2297,10 @@ static bool make_paths_and_metadata(const ControlEvent &event,
         status_error("device identity not ready");
         return false;
     }
+    if (!rollover && !Air10Stream::snapshot(recording_identity.generation, stream_schemas)) {
+        status_error("stream schemas not ready");
+        return false;
+    }
     if (!rollover && !anchor_session_clock(event)) return false;
     const time_t civil = static_cast<time_t>(session_clock.native_start);
     struct tm start_tm;
@@ -2445,8 +2443,6 @@ static void start_session(const ControlEvent &event) {
         SdStorage::release();
         return;
     }
-    resolve_schemas(mid, vid);
-
     const StreamSchema *tce_schema = find_schema("TCE");
     const bool tcv = tce_schema && schema_has_field(*tce_schema, "TCV");
     const Air10Edf::Schema &brp_layout = Air10Edf::brp_schema(tcv);

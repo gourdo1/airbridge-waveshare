@@ -3,12 +3,27 @@
 #include <limits.h>
 #include <string.h>
 
+#include "airsense_state.h"
 #include "debug_log.h"
 #include "hex_util.h"
 #include "uart_arbiter.h"
 
 namespace Air10Stream {
 namespace {
+
+constexpr const char *SCHEMA_TAGS[SCHEMA_COUNT] = {"TCE", "APN", "CSN", "PBT", "BRH"};
+constexpr uint32_t RETRY_MS = 5000;
+constexpr uint16_t RESPONSE_SIZE = 160;
+
+// Five bounded layouts (230 bytes); readers only see a complete generation.
+Schema cached_schemas[SCHEMA_COUNT];
+portMUX_TYPE cache_mux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t cache_generation = 0;
+bool cache_ready = false;
+uint8_t next_schema = 0;
+uart_transaction_t *query_ticket = nullptr;
+uint32_t failed_at_ms = 0;
+bool query_failed = false;
 
 static void reset_schema(Schema &schema, const char *tag) {
     memset(&schema, 0, sizeof(schema));
@@ -51,14 +66,8 @@ static bool set_schema(Schema &schema, const char *tag,
     return schema.field_count > 0;
 }
 
-static bool query_schema(Schema &schema, const char *tag) {
-    char command[16];
+static bool parse_schema(Schema &schema, const char *tag, const char *response) {
     char value[120] = {};
-    snprintf(command, sizeof(command), "G C &%s", tag);
-    char response[160] = {};
-    uint16_t length = sizeof(response);
-    if (!Arbiter::send_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
-                           response, &length, 300)) return false;
     const char *result = qframe_response_value(response);
     if (!result || strlen(result) >= sizeof(value)) return false;
     strcpy(value, result);
@@ -142,15 +151,110 @@ bool fallback_schema(Schema &schema, const char *tag, uint16_t mid, uint16_t vid
     return set_schema(schema, tag, definition);
 }
 
-bool resolve_schema(Schema &schema, const char *tag, uint16_t mid, uint16_t vid) {
-    Schema queried = {};
-    if (query_schema(queried, tag)) {
-        schema = queried;
-        Log::logf(CAT_STREAM, LOG_DEBUG, "%s schema from firmware (%u fields)\n",
-                  tag, schema.field_count);
-        return true;
+void poll() {
+    const uint32_t generation = AirSenseState::identity_generation();
+    if (generation != cache_generation) {
+        if (query_ticket) Arbiter::cancel_transaction(query_ticket);
+        query_ticket = nullptr;
+        next_schema = 0;
+        query_failed = false;
+        portENTER_CRITICAL(&cache_mux);
+        memset(cached_schemas, 0, sizeof(cached_schemas));
+        cache_generation = generation;
+        cache_ready = false;
+        portEXIT_CRITICAL(&cache_mux);
     }
-    return fallback_schema(schema, tag, mid, vid);
+    if (cache_ready) return;
+
+    const auto state = Arbiter::get_state();
+    if (state != SYS_IDLE && state != SYS_THERAPY) {
+        if (query_ticket) Arbiter::cancel_transaction(query_ticket);
+        query_ticket = nullptr;
+        return;
+    }
+    AirSenseState::Identity identity;
+    if (!AirSenseState::identity(identity) || identity.generation != generation) return;
+    if (query_failed && millis() - failed_at_ms < RETRY_MS) return;
+
+    const char *tag = SCHEMA_TAGS[next_schema];
+    Arbiter::VarReadTrace trace;
+    uart_transaction_result_t result = {};
+    char response[RESPONSE_SIZE] = {};
+    uint16_t length = sizeof(response);
+    bool ok = false;
+    if (!query_ticket) {
+        char command[16];
+        snprintf(command, sizeof(command), "G C &%s", tag);
+        const uart_send_window_t window = {0, 0, false, true};
+        query_ticket = Arbiter::begin_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_LOW,
+                                          sizeof(response), 500, window);
+        if (query_ticket) return;
+    } else {
+        if (!Arbiter::transaction_done(query_ticket)) {
+            if (!Arbiter::transaction_expired(query_ticket)) return;
+            Arbiter::cancel_transaction(query_ticket);
+            trace.outcome = "deadline";
+        } else {
+            ok = Arbiter::finish_cmd(query_ticket, response, &length, &result, &trace);
+        }
+        query_ticket = nullptr;
+    }
+    if (generation != AirSenseState::identity_generation()) return;
+
+    Schema resolved = {};
+    const char *value = qframe_response_value(response);
+    const bool unsupported = result.terminal_type == QFRAME_TYPE_E &&
+        length < sizeof(response) && value && !strcmp(value, "6009");
+    if (unsupported) {
+        // An absent optional stock stream is resolved, not a discovery failure.
+        fallback_schema(resolved, tag, identity.mid, identity.vid);
+    } else if (!ok || length >= sizeof(response) || !parse_schema(resolved, tag, response)) {
+        Log::logf(CAT_STREAM, query_failed ? LOG_DEBUG : LOG_WARN,
+                  "%s schema failed result=%s queue=%lums sent=%u wait=%lums response=%s\n",
+                  tag, ok ? "invalid_schema" : trace.outcome,
+                  (unsigned long)trace.queue_ms, unsigned(trace.sent),
+                  (unsigned long)trace.wait_ms, response);
+        failed_at_ms = millis();
+        query_failed = true;
+        return;
+    }
+
+    query_failed = false;
+    portENTER_CRITICAL(&cache_mux);
+    cached_schemas[next_schema++] = resolved;
+    cache_ready = next_schema == SCHEMA_COUNT;
+    portEXIT_CRITICAL(&cache_mux);
+    Log::logf(CAT_STREAM, LOG_DEBUG, "%s schema from %s (%u fields)\n",
+              tag, resolved.from_firmware ? "firmware" : "stock", resolved.field_count);
+}
+
+bool snapshot(uint32_t generation, Schema (&out)[SCHEMA_COUNT]) {
+    portENTER_CRITICAL(&cache_mux);
+    const bool ready = cache_ready && cache_generation == generation;
+    if (ready) memcpy(out, cached_schemas, sizeof(cached_schemas));
+    portEXIT_CRITICAL(&cache_mux);
+    if (ready && generation == AirSenseState::identity_generation()) return true;
+    memset(out, 0, sizeof(out));
+    return false;
+}
+
+bool schema(const char *tag, Schema &out) {
+    const uint32_t generation = AirSenseState::identity_generation();
+    bool found = false;
+    portENTER_CRITICAL(&cache_mux);
+    if (cache_ready && cache_generation == generation) {
+        for (const Schema &entry : cached_schemas) {
+            if (entry.field_count && !strcmp(entry.tag, tag)) {
+                out = entry;
+                found = true;
+                break;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&cache_mux);
+    if (found && generation == AirSenseState::identity_generation()) return true;
+    out = {};
+    return false;
 }
 
 bool schema_has_field(const Schema &schema, const char *name) {
