@@ -390,7 +390,10 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "sd", "unsupported");
 #endif
         jsonAddInt(json, "heap", ESP.getFreeHeap());
-        jsonAddInt(json, "rssi", WiFi.RSSI());
+        jsonAddInt(json, "psram_free", aircannect::Memory::psram_available() ?
+                   static_cast<int>(ESP.getFreePsram()) : -1);
+        jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
+        jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
         jsonAddInt(json, "uptime", millis() / 1000);
     }
     if (fields & STATUS_OXI) {
