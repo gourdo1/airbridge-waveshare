@@ -11,6 +11,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import zipfile
 
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parents[2]
@@ -72,26 +73,32 @@ def validate_esp32_image(path: pathlib.Path) -> None:
 
 def build_firmware(
     pio: str, environment_name: str, source_date_epoch: int, version: str
-) -> pathlib.Path:
+) -> tuple[pathlib.Path, pathlib.Path]:
     build_env = os.environ.copy()
     build_env["AIRBRIDGE_VERSION"] = version
     build_env["SOURCE_DATE_EPOCH"] = str(source_date_epoch)
     subprocess.run(
-        [pio, "run", "-e", environment_name],
+        [pio, "run", "-e", environment_name, "-t", "initialbin"],
         cwd=PROJECT_DIR,
         env=build_env,
         check=True,
     )
 
-    firmware_path = (
-        PROJECT_DIR / ".pio" / "build" / environment_name / "firmware.bin"
-    )
+    build_dir = PROJECT_DIR / ".pio" / "build" / environment_name
+    firmware_path = build_dir / "firmware.bin"
+    initial_path = build_dir / "firmware.factory.bin"
     validate_esp32_image(firmware_path)
-    return firmware_path
+    # ESP32 initial images start with padding before the bootloader at 0x1000.
+    if initial_path.stat().st_size <= firmware_path.stat().st_size:
+        raise RuntimeError(
+            f"initial image does not contain the complete flash layout: {initial_path}"
+        )
+    return firmware_path, initial_path
 
 
 def package_firmware(
     firmware_path: pathlib.Path,
+    initial_image_path: pathlib.Path,
     output_dir: pathlib.Path,
     environment_name: str,
     version: str,
@@ -104,6 +111,12 @@ def package_firmware(
     output_path = output_dir / f"{stem}.bin"
     shutil.copyfile(firmware_path, output_path)
     shutil.copyfile(firmware_path.with_suffix(".elf"), output_dir / f"{stem}.elf")
+    with zipfile.ZipFile(
+        output_dir / f"{stem}-initial.zip", "w",
+        compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+    ) as archive:
+        archive.write(initial_image_path, arcname=f"{stem}-initial.bin")
+
     return {
         "raw": {
             "url": output_path.name,
@@ -165,11 +178,11 @@ def main() -> None:
 
     targets = {}
     for environment_name in environments:
-        firmware_path = build_firmware(
+        firmware_path, initial_image_path = build_firmware(
             args.pio, environment_name, source_date_epoch, version
         )
         targets[environment_name] = package_firmware(
-            firmware_path, output_dir, environment_name, version
+            firmware_path, initial_image_path, output_dir, environment_name, version
         )
 
     write_release_manifest(output_dir, version, targets)

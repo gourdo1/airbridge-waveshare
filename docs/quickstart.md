@@ -5,7 +5,7 @@
   without SD. See [hardware.md](hardware.md) for variants and which features
   need SD.
 - AirSense 10 with edge connector access
-- PlatformIO installed
+- A computer with Chrome or Edge and a USB data cable
 
 ## Wiring
 
@@ -13,6 +13,24 @@ PCB: [hardware_pcb.md](hardware_pcb.md).
 Hand-wired: [hardware_wiring.md](hardware_wiring.md).
 
 ## Flash firmware
+
+Download the `-initial.zip` matching your board from the
+[latest release](https://github.com/m-kozlowski/airbridge/releases/latest)
+and extract the `-initial.bin` image.
+
+Open [ESPWebTool](https://esptool.spacehuhn.com/) in Chrome or Edge:
+
+1. Connect the board over USB. M5Stamp Pico needs a 3.3 V USB-to-serial adapter.
+2. Select **Connect** and choose its serial port.
+3. Add the extracted `-initial.bin` at address `0x0`.
+4. Select **Program** and wait for flashing to finish.
+
+For later updates through the Web UI, use the matching application `.bin`,
+not the initial image.
+
+### Build from source instead
+
+Install PlatformIO and check out the matching release tag.
 
 XIAO with SD (PCB or hand-wired):
 
@@ -26,7 +44,7 @@ XIAO without SD:
 pio run -e xiao-esp32s3-plus -t upload
 ```
 
-M5Stamp Pico (legacy; needs a 3.3 V USB-to-serial adapter):
+M5Stamp Pico (legacy):
 
 ```bash
 pio run -e m5stamp-pico -t upload
@@ -42,9 +60,9 @@ you through your WiFi network, AirSense connection, time, optional sync
 destinations, and Web UI credentials. Use **Save & next**, then **Finish**.
 You can reopen the wizard from **Config > Initial setup**.
 
-Alternatively, copy `provision.env.example` to `provision.env` and fill in
-your WiFi credentials before flashing. Provisioning runs automatically after
-a serial upload.
+When flashing with PlatformIO, you can instead copy `provision.env.example`
+to `provision.env` and fill in your WiFi credentials before flashing. These
+settings are applied automatically after the USB upload.
 
 ## Verify it works
 
