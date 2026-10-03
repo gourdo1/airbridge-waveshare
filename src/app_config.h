@@ -34,7 +34,6 @@ struct AirBridgeConfig {
     bool        oxi_lframe_continuous; // send L-frames even when no valid reading
 
     uint16_t    uart_cmd_timeout_ms;
-    uint8_t     uart_max_retries;
 
     bool        allow_transparent_during_therapy;
 

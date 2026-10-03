@@ -127,7 +127,6 @@ Only one source feeds at a time. First to deliver data wins, 10 seconds of silen
 | `tcp_port` | 23 | TCP command port |
 | `allow_transparent_during_therapy` | false | Allow raw UART passthrough during therapy |
 | `uart_cmd_timeout_ms` | 500 | Command response timeout |
-| `uart_max_retries` | 3 | Retry count for failed commands |
 
 ### Logging
 

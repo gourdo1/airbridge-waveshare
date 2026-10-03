@@ -68,7 +68,6 @@ static const KVEntry kv_table[] = {
     KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
     KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
     KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500, Uart),
-    KV_U8("uart_max_retries", "uart_retries", uart_max_retries, 3, Uart),
     KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false, Uart),
     KV_U16("debug_port", "debug_port", debug_port, 8023, Logging),
     KV_BOOL("syslog_en", "syslog_en", syslog_enabled, false, Logging),
