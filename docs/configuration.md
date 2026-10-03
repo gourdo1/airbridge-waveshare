@@ -29,7 +29,7 @@ top-level WiFi-related config keys are:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hostname` | airbridge | Device hostname (mDNS + softAP SSID prefix) |
+| `hostname` | airbridge | DHCP hostname and AP SSID prefix |
 | `wifi_mode` | 1 | Operating mode, see table below |
 | `wifi_roam` | true | Roam automatically between saved networks |
 | `wifi_country` | 01 | ISO 3166 country code; "01" = worldwide |
