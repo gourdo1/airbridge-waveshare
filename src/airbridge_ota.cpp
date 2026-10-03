@@ -63,8 +63,7 @@ static const char *last_blocked = nullptr;
 static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
-static esp_ota_handle_t install_handle = 0;
-static const esp_partition_t *install_partition = nullptr;
+static OtaImage::Writer image_writer;
 
 bool lock(TickType_t timeout = portMAX_DELAY) {
     return !mutex || xSemaphoreTakeRecursive(mutex, timeout) == pdTRUE;
@@ -188,18 +187,14 @@ void check_task(void *) {
     }
 
     const esp_partition_t *partition = esp_ota_get_next_update_partition(nullptr);
-    bool installable = newer && partition && resolved.size <= partition->size;
+    bool installable = newer && partition && resolved.image_size <= partition->size;
     finish_check(&manifest, &resolved, newer,
                  newer && !installable ? "artifact_too_large" : nullptr);
     vTaskDelete(nullptr);
 }
 
 void abort_install(const char *error) {
-    if (install_handle) {
-        esp_ota_abort(install_handle);
-        install_handle = 0;
-    }
-    install_partition = nullptr;
+    abort_image();
 
     if (lock()) {
         runtime.operation = OP_NONE;
@@ -222,9 +217,6 @@ bool install_continue(void *) {
 }
 
 bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
-    if (!data || !len || !install_handle) return false;
-    if (offset == 0 && data[0] != 0xe9) return false;
-
     if (!lock(pdMS_TO_TICKS(100))) return false;
     bool expected = runtime.operation == OP_INSTALL && offset == runtime.bytes &&
                     runtime.bytes <= runtime.total_size &&
@@ -232,7 +224,7 @@ bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
     unlock();
     if (!expected) return false;
 
-    if (esp_ota_write(install_handle, data, len) != ESP_OK) return false;
+    if (!write_image(offset, data, len)) return false;
 
     if (lock()) {
         uint8_t before = progress_percent(runtime.bytes, runtime.total_size);
@@ -257,15 +249,9 @@ void install_task(void *) {
         return;
     }
 
-    install_partition = esp_ota_get_next_update_partition(nullptr);
-    if (!install_partition || artifact.size > install_partition->size) {
-        abort_install("artifact_too_large");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    if (esp_ota_begin(install_partition, artifact.size, &install_handle) != ESP_OK) {
-        abort_install("esp_ota_begin_failed");
+    if (!begin_image(artifact.size, artifact.image_size,
+                     artifact.zlib ? OtaImage::Encoding::Zlib : OtaImage::Encoding::Plain)) {
+        abort_install(image_status().error);
         vTaskDelete(nullptr);
         return;
     }
@@ -273,26 +259,22 @@ void install_task(void *) {
     OtaUrl::Error transport_error;
     if (!OtaUrl::stream(artifact.url, artifact.size, install_write,
                         install_continue, nullptr, transport_error)) {
-        abort_install(transport_error.code[0] ? transport_error.code
+        abort_install(image_status().error ? image_status().error :
+                      transport_error.code[0] ? transport_error.code
                                               : "firmware_fetch_failed");
         vTaskDelete(nullptr);
         return;
     }
 
-    esp_err_t result = esp_ota_end(install_handle);
-    install_handle = 0;
-    if (result != ESP_OK ||
-        esp_ota_set_boot_partition(install_partition) != ESP_OK) {
-        abort_install(result != ESP_OK ? "esp_ota_end_failed"
-                                      : "set_boot_partition_failed");
+    if (!finish_image()) {
+        abort_install(image_status().error);
         vTaskDelete(nullptr);
         return;
     }
 
     char partition_name[17] = {};
     snprintf(partition_name, sizeof(partition_name), "%s",
-             install_partition->label);
-    install_partition = nullptr;
+             image_status().partition);
     if (lock()) {
         runtime.operation = OP_NONE;
         runtime.reboot_pending = true;
@@ -566,6 +548,21 @@ void end_manual_upload(bool success, const char *error) {
     if (ended && !success)
         Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
 }
+
+bool begin_image(size_t wire_size, size_t image_size, OtaImage::Encoding encoding) {
+    if (!lock()) return false;
+    const bool owned = runtime.operation == OP_MANUAL || runtime.operation == OP_INSTALL;
+    unlock();
+    return owned && image_writer.begin(wire_size, image_size, encoding);
+}
+
+bool write_image(size_t index, const uint8_t *data, size_t len) {
+    return image_writer.write(index, data, len);
+}
+
+bool finish_image() { return image_writer.finish(); }
+void abort_image() { image_writer.abort(); }
+const OtaImage::Status &image_status() { return image_writer.status(); }
 
 bool begin_resmed_flash() {
     if (!lock()) return false;

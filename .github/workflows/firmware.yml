@@ -75,6 +75,7 @@ jobs:
         run: |
           assets=(
             dist/airbridge-*.bin
+            dist/airbridge-*.bin.zlib
             dist/airbridge-*-initial.zip
             dist/airbridge-*.elf
             dist/airbridge-release.json

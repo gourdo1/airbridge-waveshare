@@ -215,9 +215,12 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
     filter["schema"] = true;
     filter["product"] = true;
     filter["version"] = true;
-    JsonObject raw_filter = filter["targets"][target]["raw"].to<JsonObject>();
-    raw_filter["url"] = true;
-    raw_filter["size"] = true;
+    for (const char *encoding : {"raw", "zlib"}) {
+        JsonObject artifact_filter = filter["targets"][target][encoding].to<JsonObject>();
+        artifact_filter["url"] = true;
+        artifact_filter["size"] = true;
+        artifact_filter["decoded_size"] = true;
+    }
     if (filter.overflowed()) {
         set_error(error, "manifest_alloc_failed");
         return false;
@@ -253,16 +256,21 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
 
     JsonObjectConst targets = root["targets"].as<JsonObjectConst>();
     JsonObjectConst target_object = targets[target].as<JsonObjectConst>();
-    JsonObjectConst raw = target_object["raw"].as<JsonObjectConst>();
-    if (target_object.isNull() || raw.isNull()) {
+    JsonObjectConst artifact = target_object["zlib"].as<JsonObjectConst>();
+    const bool zlib = !artifact.isNull();
+    if (!zlib) artifact = target_object["raw"].as<JsonObjectConst>();
+    if (target_object.isNull() || artifact.isNull()) {
         set_error(error, "manifest_target_missing");
         return false;
     }
 
-    const char *url = raw["url"].as<const char *>();
-    uint64_t size = raw["size"].as<uint64_t>();
+    const char *url = artifact["url"].as<const char *>();
+    uint64_t size = artifact["size"].as<uint64_t>();
+    uint64_t image_size = zlib ? artifact["decoded_size"].as<uint64_t>() : size;
     if (!url || !*url || strlen(url) >= sizeof(manifest.artifact.url) ||
-        !raw["size"].is<uint64_t>() || size == 0 || size > SIZE_MAX) {
+        !artifact["size"].is<uint64_t>() || size == 0 || size > SIZE_MAX ||
+        (zlib && !artifact["decoded_size"].is<uint64_t>()) ||
+        image_size == 0 || image_size > SIZE_MAX) {
         set_error(error, "manifest_artifact_invalid");
         return false;
     }
@@ -270,6 +278,8 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
     snprintf(manifest.version, sizeof(manifest.version), "%s", version);
     snprintf(manifest.artifact.url, sizeof(manifest.artifact.url), "%s", url);
     manifest.artifact.size = (size_t)size;
+    manifest.artifact.image_size = (size_t)image_size;
+    manifest.artifact.zlib = zlib;
     return true;
 }
 

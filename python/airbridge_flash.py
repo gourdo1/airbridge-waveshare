@@ -22,6 +22,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 import uuid
+import zlib
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -235,16 +236,26 @@ def resolve_environment(explicit, metadata):
 
 def load_firmware(path):
     data = path.read_bytes()
+    if data and data[0] != 0xE9:
+        try:
+            decoder = zlib.decompressobj()
+            data = decoder.decompress(data) + decoder.flush()
+            if not decoder.eof or decoder.unused_data:
+                raise FlashError(f'{path}: incomplete zlib image or trailing data')
+        except zlib.error as error:
+            raise FlashError(f'{path}: invalid ESP or zlib image') from error
     if not data or data[0] != 0xE9:
         raise FlashError(f'{path}: empty file or invalid ESP image magic')
     return data
 
 
-def upload(target, data, auth, timeout, chunk_size):
+def upload(target, data, auth, timeout, chunk_size, *, image_size=None, encoding='plain'):
     started = time.monotonic()
+    image_size = len(data) if image_size is None else image_size
+    filename = 'firmware.bin.zlib' if encoding == 'zlib' else 'firmware.bin'
     boundary = '----airbridge-' + uuid.uuid4().hex
     prefix = (f'--{boundary}\r\n'
-              'Content-Disposition: form-data; name="firmware"; filename="firmware.bin"\r\n'
+              f'Content-Disposition: form-data; name="firmware"; filename="{filename}"\r\n'
               'Content-Type: application/octet-stream\r\n\r\n').encode()
     suffix = f'\r\n--{boundary}--\r\n'.encode()
     conn = connection(target, timeout)
@@ -269,8 +280,10 @@ def upload(target, data, auth, timeout, chunk_size):
         body = decode_response(conn.getresponse())
         if not is_ok(body):
             raise FlashError(f'upload rejected: {body.get("error") or body}')
-        if body.get('size') != len(data):
-            raise FlashError(f'upload size mismatch: expected {len(data)}, got {body.get("size")}')
+        if body.get('size') != image_size:
+            raise FlashError(f'upload size mismatch: expected {image_size}, got {body.get("size")}')
+        if encoding == 'zlib' and (body.get('wire_size') != len(data) or body.get('encoding') != 'zlib'):
+            raise FlashError('compressed upload confirmation mismatch')
         emit(target, f'upload confirmed, partition={body.get("partition", "unknown")} '
              f'(send {sent - started:.1f}s, confirmation {time.monotonic() - sent:.1f}s)')
     except (OSError, http.client.HTTPException) as error:
@@ -304,12 +317,14 @@ def wait_for_reboot(target, previous_uptime, started, auth, timeout, reboot_time
     raise FlashError('upload succeeded, but reboot could not be confirmed before timeout')
 
 
-def flash_target(target, data, args, auth):
+def flash_target(target, data, args, auth, encoding='plain'):
     OUTPUT_CONTEXT.value = OutputContext()
     if MULTI_OUTPUT is None:
         emit(target, f'target: {target.label}')
     try:
-        upload(target, data, auth, args.timeout, args.chunk_size)
+        wire_data = zlib.compress(data, level=6) if encoding == 'zlib' else data
+        upload(target, wire_data, auth, args.timeout, args.chunk_size,
+               image_size=len(data), encoding=encoding)
         if args.no_reboot:
             emit(target, 'firmware staged; reboot manually to activate it')
             return 0
@@ -343,7 +358,10 @@ def main(argv=None):
     parser.add_argument('targets', nargs='*', default=['airbridge'], metavar='TARGET',
                         help='host/IP or HTTP(S) URL; multiple devices upload in parallel')
     parser.add_argument('-e', '--env', help='PlatformIO environment (default: autodetect)')
-    parser.add_argument('-f', '--file', type=Path, help='ESP application firmware.bin')
+    parser.add_argument('-f', '--file', type=Path, help='ESP application .bin or .bin.zlib')
+    parser.add_argument('--compress', nargs='?', const='zlib', default='auto',
+                        choices=('auto', 'zlib', 'none'),
+                        help='transport compression: auto detects support, zlib forces compression, none sends plain')
     parser.add_argument('--build', action='store_true', help='build selected/detected environments first')
     parser.add_argument('-u', '--user', default=os.environ.get('AIRBRIDGE_HTTP_USER', 'admin'))
     parser.add_argument('-p', '--password', default=os.environ.get('AIRBRIDGE_HTTP_PASSWORD', 'airbridge'))
@@ -362,13 +380,20 @@ def main(argv=None):
         targets = list(dict.fromkeys(parse_target(value) for value in args.targets))
         auth = None if args.no_auth else auth_header(args.user, args.password)
         environments = {}
+        encodings = {}
         # Resolve all targets and validate all images before starting any upload.
         for target in targets:
             request_json(target, 'GET', '/api/status', auth, args.timeout)
             environment = None
+            metadata = None
+            if args.compress == 'auto' or (args.file is None and not args.env):
+                metadata = request_json(target, 'GET', '/api/ota', auth, args.timeout,
+                                        allow_missing=True)
+            supported = (metadata or {}).get('upload_encodings', [])
+            use_zlib = args.compress == 'zlib' or (
+                args.compress == 'auto' and isinstance(supported, list) and 'zlib' in supported)
+            encodings[target] = 'zlib' if use_zlib else 'plain'
             if args.file is None:
-                metadata = None if args.env else request_json(
-                    target, 'GET', '/api/ota', auth, args.timeout, allow_missing=True)
                 environment = resolve_environment(args.env, metadata)
                 emit(target, f'{target_label(target)}: environment {environment}')
             environments[target] = environment
@@ -390,7 +415,8 @@ def main(argv=None):
                 MULTI_OUTPUT.start()
         try:
             with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
-                results = list(pool.map(lambda target: flash_target(target, images[target], args, auth), targets))
+                results = list(pool.map(lambda target: flash_target(
+                    target, images[target], args, auth, encodings[target]), targets))
         finally:
             MULTI_OUTPUT = None
         if len(targets) > 1:

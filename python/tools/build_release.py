@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import zipfile
+import zlib
 
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parents[2]
@@ -63,6 +64,15 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def compress_zlib(source_path: pathlib.Path,
+                  destination_path: pathlib.Path) -> None:
+    compressor = zlib.compressobj(level=6)
+    with source_path.open("rb") as source, destination_path.open("wb") as destination:
+        while chunk := source.read(READ_CHUNK_BYTES):
+            destination.write(compressor.compress(chunk))
+        destination.write(compressor.flush())
+
+
 def validate_esp32_image(path: pathlib.Path) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"firmware image is missing or empty: {path}")
@@ -109,7 +119,9 @@ def package_firmware(
         filename_component(environment_name),
     ))
     output_path = output_dir / f"{stem}.bin"
+    compressed_path = output_dir / f"{stem}.bin.zlib"
     shutil.copyfile(firmware_path, output_path)
+    compress_zlib(firmware_path, compressed_path)
     shutil.copyfile(firmware_path.with_suffix(".elf"), output_dir / f"{stem}.elf")
     with zipfile.ZipFile(
         output_dir / f"{stem}-initial.zip", "w",
@@ -121,7 +133,12 @@ def package_firmware(
         "raw": {
             "url": output_path.name,
             "size": output_path.stat().st_size,
-        }
+        },
+        "zlib": {
+            "url": compressed_path.name,
+            "size": compressed_path.stat().st_size,
+            "decoded_size": output_path.stat().st_size,
+        },
     }
 
 

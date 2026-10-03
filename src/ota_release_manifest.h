@@ -11,6 +11,8 @@ static constexpr size_t URL_MAX = 512;
 struct Artifact {
     char url[URL_MAX] = {};
     size_t size = 0;
+    size_t image_size = 0;
+    bool zlib = false;
 };
 
 struct Manifest {

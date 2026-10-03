@@ -25,9 +25,6 @@ Open [ESPWebTool](https://esptool.spacehuhn.com/) in Chrome or Edge:
 3. Add the extracted `-initial.bin` at address `0x0`.
 4. Select **Program** and wait for flashing to finish.
 
-For later updates through the Web UI, use the matching application `.bin`,
-not the initial image.
-
 ### Build from source instead
 
 Install PlatformIO and check out the matching release tag.

@@ -30,7 +30,6 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <esp_partition.h>
-#include <esp_ota_ops.h>
 #include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <time.h>
@@ -1094,19 +1093,13 @@ static AsyncWebServerRequest *uploadOwner = nullptr;
 static size_t uploadNextIndex = 0;
 static bool uploadComplete = false;
 static bool uploadOwnsUart = false;
-static esp_ota_handle_t esp_ota_handle = 0;
-static const esp_partition_t *esp_ota_part = nullptr;
 static constexpr size_t UPLOAD_ERASE_BLOCK = 64 * 1024;
 static size_t uploadErased = 0;
 
 static void finishUpload(AsyncWebServerRequest *request, bool success,
                          const char *error) {
     if (uploadOwner != request) return;
-    if (esp_ota_handle) {
-        esp_ota_abort(esp_ota_handle);
-        esp_ota_handle = 0;
-    }
-    esp_ota_part = nullptr;
+    if (uploadKind == UPLOAD_ESP) OtaManager::abort_image();
     if (!success) {
         uploadOk = false;
         uploadComplete = false;
@@ -1164,7 +1157,7 @@ static bool hasValidResmedUpload() {
 }
 
 static bool eraseUploadThrough(const esp_partition_t *part, size_t end) {
-    // Both upload paths check capacity before erasing ahead of their next write.
+    // ResMed staging checks capacity before erasing ahead of its next write.
     while (uploadErased < end) {
         const size_t size = min(UPLOAD_ERASE_BLOCK, size_t(part->size - uploadErased));
         esp_err_t err = esp_partition_erase_range(part, uploadErased, size);
@@ -1666,12 +1659,8 @@ static void handleFlashCancel(AsyncWebServerRequest *request) {
 // ESP32 OTA
 static void abortEspOtaUpload(AsyncWebServerRequest *request) {
     if (uploadOwner != request) return;
-    if (esp_ota_handle) {
-        esp_ota_abort(esp_ota_handle);
-        esp_ota_handle = 0;
-    }
-    esp_ota_part = nullptr;
-    uploadKind = UPLOAD_NONE;
+    OtaManager::abort_image();
+    uploadOk = false;
     // Keep the request reservation until completion or disconnect.
 }
 
@@ -1688,63 +1677,18 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         uploadSize = 0;
         uploadOk = false;
 
-        esp_ota_part = esp_ota_get_next_update_partition(NULL);
-        if (!esp_ota_part) {
-            Log::logf(CAT_OTA, LOG_ERROR, "No OTA partition found\n");
-            uploadKind = UPLOAD_NONE;
-            finishUpload(request, false, "ota_partition_missing");
-            return;
-        }
-        Log::logf(CAT_OTA, LOG_DEBUG, "OTA target: '%s' (0x%X, %u bytes)\n",
-                  esp_ota_part->label, esp_ota_part->address, esp_ota_part->size);
-
-        // Keep block erase speed without blocking async_tcp on the whole slot.
-        uploadErased = min(UPLOAD_ERASE_BLOCK, size_t(esp_ota_part->size));
-        esp_err_t err = esp_ota_begin(esp_ota_part, uploadErased,
-                                      &esp_ota_handle);
-        if (err != ESP_OK) {
-            Log::logf(CAT_OTA, LOG_ERROR, "esp_ota_begin failed: %s\n", esp_err_to_name(err));
-            esp_ota_part = nullptr;
-            uploadKind = UPLOAD_NONE;
-            finishUpload(request, false, "esp_ota_begin_failed");
-            return;
-        }
-        uploadOk = true;
+        uploadOwnsUart = true;
+        Arbiter::set_state(SYS_OTA_ESP);
+        uploadOk = OtaManager::begin_image();
     }
 
     if (!acceptUploadChunk(request, index, len, final)) return;
-    if (uploadKind == UPLOAD_ESP && esp_ota_part && uploadOk && len > 0) {
-        // validate esp binary magic on first data
-        if (uploadSize == 0 && len > 0 && data[0] != 0xE9) {
-            Log::logf(CAT_OTA, LOG_WARN, "Not an ESP32 binary (magic=0x%02X)\n", data[0]);
-            uploadOk = false;
+    if (uploadKind == UPLOAD_ESP && uploadOk && len > 0) {
+        if (!OtaManager::write_image(index, data, len)) {
             abortEspOtaUpload(request);
             return;
         }
-        if (uploadSize == 0) {
-            uploadOwnsUart = true;
-            Arbiter::set_state(SYS_OTA_ESP);
-        }
-        if (len > esp_ota_part->size - uploadSize) {
-            Log::logf(CAT_OTA, LOG_WARN, "ESP OTA image exceeds partition\n");
-            uploadOk = false;
-            abortEspOtaUpload(request);
-            return;
-        }
-        if (!eraseUploadThrough(esp_ota_part, uploadSize + len)) {
-            uploadOk = false;
-            abortEspOtaUpload(request);
-            return;
-        }
-        esp_err_t err = esp_ota_write(esp_ota_handle, data, len);
-        if (err != ESP_OK) {
-            Log::logf(CAT_OTA, LOG_ERROR, "esp_ota_write failed at %u: %s\n",
-                      uploadSize, esp_err_to_name(err));
-            uploadOk = false;
-            abortEspOtaUpload(request);
-            return;
-        }
-        uploadSize += len;
+        uploadSize = OtaManager::image_status().bytes;
     }
 
     if (final && uploadOk) {
@@ -1760,37 +1704,22 @@ static void handleEspOtaDone(AsyncWebServerRequest *request) {
     if (!ownsUpload(request)) return;
 
     bool ok = false;
-    const char *error = "invalid firmware image";
-
-    if (uploadComplete && uploadKind == UPLOAD_ESP && uploadOk &&
-        uploadSize > 0 && esp_ota_part) {
-        esp_err_t err = esp_ota_end(esp_ota_handle);
-        esp_ota_handle = 0;
-        if (err == ESP_OK) {
-            err = esp_ota_set_boot_partition(esp_ota_part);
-            if (err == ESP_OK) {
-                ok = true;
-                Log::logf(CAT_OTA, LOG_INFO, "ESP OTA OK, boot set to '%s'\n",
-                          esp_ota_part->label);
-            } else {
-                error = esp_err_to_name(err);
-                Log::logf(CAT_OTA, LOG_ERROR, "set_boot_partition failed: %s\n",
-                          esp_err_to_name(err));
-            }
-        } else {
-            Log::logf(CAT_OTA, LOG_ERROR, "esp_ota_end failed: %s\n", esp_err_to_name(err));
-            error = esp_err_to_name(err);
-        }
-    }
+    if (uploadComplete && uploadKind == UPLOAD_ESP && uploadOk)
+        ok = OtaManager::finish_image();
+    const auto &image = OtaManager::image_status();
+    const char *error = image.error ? image.error : "invalid firmware image";
+    if (ok)
+        Log::logf(CAT_OTA, LOG_INFO, "ESP OTA OK, boot set to '%s'\n", image.partition);
 
     String json = "{";
     jsonAddString(json, "ok", ok ? "true" : "false", false);
     if (!ok) jsonAddString(json, "error", error);
-    jsonAddInt(json, "size", uploadSize);
-    if (esp_ota_part)
-        jsonAddString(json, "partition", esp_ota_part->label);
+    jsonAddInt(json, "size", image.bytes);
+    jsonAddInt(json, "wire_size", image.wire_bytes);
+    jsonAddString(json, "encoding", OtaImage::encoding_name(image.encoding));
+    if (image.partition[0]) jsonAddString(json, "partition", image.partition);
 
-    finishUpload(request, ok, ok ? nullptr : "esp_upload_failed");
+    finishUpload(request, ok, ok ? nullptr : error);
     uploadKind = UPLOAD_NONE;
 
     json += '}';
@@ -1813,6 +1742,7 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
         jsonAddString(json, "version", airbridge_version());
         jsonAddUInt32(json, "uptime", millis() / 1000);
         jsonAddString(json, "release_target", AB_OTA_RELEASE_TARGET);
+        json += ",\"upload_encodings\":[\"auto\",\"plain\",\"zlib\"]";
         jsonAddInt(json, "bytes", status.bytes);
         jsonAddInt(json, "total_size", status.total_size);
         jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
