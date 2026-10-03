@@ -96,6 +96,8 @@ namespace Arbiter {
     private:
         uint32_t until_ms_ = 0;
     };
+    // Boot only: drive TX idle before slow setup work, without starting UART.
+    void prepare_tx(int tx_pin);
     void init(HardwareSerial &serial, int rx_pin, int tx_pin);
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,

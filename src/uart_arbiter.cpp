@@ -4,6 +4,7 @@
 #include "live_stream.h"
 #include "custom_settings.h"
 #include "hex_util.h"
+#include <driver/gpio.h>
 #include <freertos/queue.h>
 #include <esp_timer.h>
 #include <atomic>
@@ -969,6 +970,12 @@ static void arbiter_task(void *param) {
     }
 }
 
+
+void Arbiter::prepare_tx(int tx_pin) {
+    // Preload idle before enabling output; digitalWrite requires pinMode first.
+    gpio_set_level(static_cast<gpio_num_t>(tx_pin), 1);
+    pinMode(tx_pin, OUTPUT);
+}
 
 void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin) {
     uart = &serial;

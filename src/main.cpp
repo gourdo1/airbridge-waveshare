@@ -79,6 +79,8 @@ static void serial_poll() {
 }
 
 void setup() {
+    Arbiter::prepare_tx(PIN_AS10_TX);
+
 #ifdef AB_LCD_BACKLIGHT_GPIO
     // Keep the unused local display dark, including boards with a BL pull-up.
     pinMode(AB_LCD_BACKLIGHT_GPIO, OUTPUT);
