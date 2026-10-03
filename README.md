@@ -30,9 +30,9 @@ Both support serial (`-p /dev/ttyUSB0`) and TCP (`-p tcp:hostname`) with `--tcp-
 
 ## Screenshots
 
-| Dashboard | Sleep Report |
-|---|---|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Report](docs/screenshots/report.png) |
+| Dashboard | Edf Sync | Sleep Report |
+|---|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Sync](docs/screenshots/sync.png) | ![Report](docs/screenshots/report.png) |
 
 | Clinical Settings | Oximetry | OTA Upload |
 |---|---|---|
