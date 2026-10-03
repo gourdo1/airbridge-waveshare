@@ -34,9 +34,21 @@ jobs:
             .pio/libdeps
           key: >-
             ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-deps-${{
-            hashFiles('platformio.ini') }}
+            hashFiles('platformio.ini', 'lib/libsmb2/**') }}
           restore-keys: |
             ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-deps-
+
+      - name: Cache PlatformIO build objects
+        continue-on-error: true
+        uses: actions/cache@v6
+        with:
+          path: .pio/build-cache
+          key: >-
+            ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-build-${{
+            hashFiles('platformio.ini', 'lib/libsmb2/**') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-build-${{ hashFiles('platformio.ini', 'lib/libsmb2/**') }}-
+            ${{ runner.os }}-pio-${{ env.PLATFORMIO_VERSION }}-build-
 
       - name: Create build environment
         run: |
