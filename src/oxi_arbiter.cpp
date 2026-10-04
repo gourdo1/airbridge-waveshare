@@ -47,6 +47,7 @@ static bool feeding = false;
 static oxi_source_t src_active = OXI_SRC_NONE;
 static uint32_t src_last_time = 0;
 static char source_id[32] = "";
+static char source_name[32] = "";
 static portMUX_TYPE reading_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #define SOURCE_TIMEOUT_MS 10000
@@ -129,6 +130,7 @@ void OxiArbiter::init() {
     src_active = OXI_SRC_NONE;
     src_last_time = 0;
     source_id[0] = '\0';
+    source_name[0] = '\0';
     oxh_seq = 0;
     oxh_toggle = 0;
     last_valid = false;
@@ -237,18 +239,17 @@ oxi_source_t OxiArbiter::active_source() {
     return source;
 }
 
-void OxiArbiter::set_source_id(const char *id) {
+void OxiArbiter::set_source(const char *id, const char *name) {
     portENTER_CRITICAL(&reading_mux);
-    strncpy(source_id, id ? id : "", sizeof(source_id) - 1);
-    source_id[sizeof(source_id) - 1] = '\0';
+    strlcpy(source_id, id ? id : "", sizeof(source_id));
+    strlcpy(source_name, name ? name : "", sizeof(source_name));
     portEXIT_CRITICAL(&reading_mux);
 }
 
-void OxiArbiter::get_source_id(char *out, size_t size) {
-    if (!out || !size) return;
+void OxiArbiter::get_source(char *id, size_t id_size, char *name, size_t name_size) {
     portENTER_CRITICAL(&reading_mux);
-    strncpy(out, source_id, size - 1);
-    out[size - 1] = '\0';
+    if (id && id_size) strlcpy(id, source_id, id_size);
+    if (name && name_size) strlcpy(name, source_name, name_size);
     portEXIT_CRITICAL(&reading_mux);
 }
 
@@ -262,6 +263,7 @@ void OxiArbiter::poll() {
         src_active = OXI_SRC_NONE;
         reading.valid = false;
         source_id[0] = '\0';
+        source_name[0] = '\0';
         feed_stopped = feeding;
         feeding = false;
     }

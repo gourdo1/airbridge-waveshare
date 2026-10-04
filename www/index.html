@@ -50,10 +50,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .content{flex:1;overflow-y:auto;padding:20px 24px}
 
 /* Panes */
-.pane{display:none;max-width:900px}.pane.active{display:block}
+.pane{display:none;max-width:1080px}.pane.active{display:block}
 
 /* Cards */
 .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:16px}
+.dashboard-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+.dashboard-grid>.card{min-width:0;margin-bottom:0}
+.dashboard-grid .time-row{gap:12px;flex-wrap:wrap}
+.dashboard-grid .time-row .value{font-size:12px;margin-left:auto}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:12px}
 .card h3{color:var(--accent);margin-bottom:12px;font-size:14px;text-transform:uppercase;letter-spacing:0.5px}
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
@@ -133,13 +137,15 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .time-row .value{font-size:14px;font-family:'SF Mono','Consolas',monospace;font-weight:500}
 
 /* Oximeter card */
-.oxi-header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-.oxi-icon{width:44px;height:44px;border-radius:12px;background:#064e3b;display:flex;align-items:center;justify-content:center;font-size:22px}
-.oxi-values{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.dashboard-grid .oxi-source-row{flex-wrap:nowrap;align-items:center}
+.oxi-source-value{min-width:0;text-align:right}
+.oxi-source-name{display:block;font-size:13px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.oxi-address{display:block;min-height:16px;font:11px/16px 'SF Mono',Consolas,monospace;color:var(--text-dim)}
+.oxi-values{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.oxi-metric{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px}
 .oxi-metric .label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px}
-.oxi-metric .big{font-size:42px;font-weight:700;line-height:1}
-.oxi-metric .unit{font-size:16px;font-weight:400;color:var(--text-dim);margin-left:2px}
-.oxi-badges{display:flex;gap:8px;margin-left:auto}
+.oxi-metric .big{font-size:32px;font-weight:700;line-height:1.2}
+.oxi-metric .unit{font-size:12px;font-weight:400;color:var(--text-dim);margin-left:2px}
 .ble-device{display:flex;align-items:center;justify-content:space-between;gap:12px 20px;padding:12px 0;border-bottom:1px solid var(--border)}
 .ble-device:last-child{border-bottom:none}
 .ble-device-info{flex:1;min-width:0}
@@ -225,7 +231,6 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
   .chart-row-2{grid-template-columns:1fr}
   .topbar{padding:10px 16px}
   .topbar .page-title{font-size:14px}
-  .oxi-metric .big{font-size:32px}
   .ble-device{flex-direction:column;align-items:stretch}
   .ble-device-actions{justify-content:flex-end}
   .ble-device-actions .btn{flex:1}
@@ -280,7 +285,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
       <!-- STATUS / DASHBOARD -->
       <div class="pane" id="p-status">
-        <div class="card-grid">
+        <div class="card-grid dashboard-grid">
           <div class="card">
             <div class="card-header">
               <span class="label">Device</span>
@@ -319,9 +324,9 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
               <span class="value" id="dashResmedTime">--</span>
             </div>
             <div class="btn-group">
-              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('ntp_sync')">Ntp Sync</button>
-              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')">Sync to Resmed</button>
-              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')">Sync from Resmed</button>
+              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('ntp_sync')">NTP</button>
+              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')">To ResMed</button>
+              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')">From ResMed</button>
             </div>
             <div class="time-row">
               <span class="label">SD card</span>
@@ -331,29 +336,32 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
               <div class="storage-meter-fill" id="dashStorageFill"></div>
             </div>
           </div>
-        </div>
 
-        <!-- Oximeter summary card -->
-        <div class="card">
-          <div class="oxi-header">
-            <div class="oxi-icon">&#9829;</div>
-            <div>
-              <div style="font-weight:600;font-size:15px">Oximetry</div>
-              <div style="font-size:12px;color:var(--text-dim);font-family:monospace;display:none" id="dashOxiAddr"></div>
-            </div>
-            <div class="oxi-badges">
+          <div class="card">
+            <div class="card-header">
+              <span class="label">Oximetry</span>
               <span class="badge badge-idle" id="dashOxiBadge">--</span>
+            </div>
+            <div class="oxi-values">
+              <div class="oxi-metric">
+                <div><span class="big" style="color:var(--green)" id="dashSpo2">--</span><span class="unit">%</span></div>
+                <div class="label">SpO2</div>
+              </div>
+              <div class="oxi-metric">
+                <div><span class="big" style="color:var(--cyan)" id="dashPulse">--</span><span class="unit">bpm</span></div>
+                <div class="label">Pulse Rate</div>
+              </div>
+            </div>
+            <div class="time-row oxi-source-row">
+              <span class="label">Source</span>
+              <div class="oxi-source-value">
+                <span class="oxi-source-name" id="dashOxiName">--</span>
+                <span class="oxi-address" id="dashOxiAddr"></span>
+              </div>
+            </div>
+            <div class="time-row">
+              <span class="label">AirSense</span>
               <span class="badge badge-idle" id="dashFeedBadge">Feed: --</span>
-            </div>
-          </div>
-          <div class="oxi-values">
-            <div class="oxi-metric">
-              <div class="label">SpO2 Level</div>
-              <div><span class="big" style="color:var(--green)" id="dashSpo2">--</span><span class="unit">%</span></div>
-            </div>
-            <div class="oxi-metric">
-              <div class="label">Pulse Rate</div>
-              <div><span class="big" style="color:var(--cyan)" id="dashPulse">--</span><span class="unit">bpm</span></div>
             </div>
           </div>
         </div>
@@ -781,12 +789,13 @@ function updateBleFromPush(d) {
       b.className = 'badge ' + (st === 'STREAMING' ? 'badge-streaming' : st === 'DISCONNECTED' ? 'badge-idle' : 'badge-idle');
     }
   }
-  if (d.oxi_addr !== undefined && dashboard) {
-    var oa = document.getElementById('dashOxiAddr');
-    if (oa) {
-      if (d.oxi_addr) { oa.textContent = d.oxi_addr; oa.style.display = ''; }
-      else { oa.style.display = 'none'; }
-    }
+  if (dashboard && (d.oxi_addr !== undefined || d.oxi_name !== undefined)) {
+    const address = d.oxi_addr !== undefined ? d.oxi_addr : lastStatus.oxi_addr;
+    const name = d.oxi_name !== undefined ? d.oxi_name : lastStatus.oxi_name;
+    const label = document.getElementById('dashOxiName');
+    label.textContent = name || address || '--';
+    label.title = name || address || '';
+    document.getElementById('dashOxiAddr').textContent = name ? address || '' : '';
   }
   if (d.feeding !== undefined && dashboard) {
     var fb = document.getElementById('dashFeedBadge');
@@ -2311,12 +2320,6 @@ function loadBle() {
     const sp = document.getElementById('bleScanSpinner');
     sp.style.display = d.state === 'SCANNING' ? 'inline-block' : 'none';
     renderBleDevices('bleDevices', d.devices || [], false);
-    // Update dashboard oxi address
-    var oa = document.getElementById('dashOxiAddr');
-    if (oa && lastStatus.oxi_addr) {
-      oa.textContent = lastStatus.oxi_addr;
-      oa.style.display = '';
-    }
     renderBleDevices('bleBonds', d.known || [], true);
     document.getElementById('bleForgetAll').hidden = !d.known || d.known.length < 2;
     updateBleConnections();

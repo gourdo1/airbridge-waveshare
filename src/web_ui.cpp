@@ -400,9 +400,8 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         const auto &r = status.reading;
         jsonAddString(json, "oxi", oxi_state_name(status.oxi));
         jsonAddUInt32(json, "ble_revision", OxiBle::revision());
-        char oxi_addr[32];
-        OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
-        jsonAddString(json, "oxi_addr", oxi_addr);
+        jsonAddString(json, "oxi_addr", status.oxi_source);
+        jsonAddString(json, "oxi_name", status.oxi_name);
         jsonAddString(json, "feeding", status.feeding ? "yes" : "no");
         jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
         jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
@@ -2174,6 +2173,7 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
+        strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||
         (a.reading.valid && (a.reading.spo2 != b.reading.spo2 ||
                             a.reading.pulse_bpm != b.reading.pulse_bpm)))
@@ -2203,16 +2203,12 @@ void WebUI::push_status_event() {
 static void publishStatus() {
     static uint32_t revision = 1, health_at = 0, oxi_at = 0;
     static uint32_t ble_revision = 0, config_revision = 0, device_revision = 0;
-    static char source_id[32] = {};
     static uint8_t pending_fields = STATUS_ALL;
     const auto status = DeviceStatus::snapshot();
     const uint32_t now = millis();
-    char current_source[sizeof(source_id)];
-    OxiArbiter::get_source_id(current_source, sizeof(current_source));
     uint8_t fields = statusChanges(status, last_published);
     if (status_requested) fields |= STATUS_THERAPY;
-    if ((fields & STATUS_OXI) || strcmp(source_id, current_source) ||
-        OxiBle::revision() != ble_revision ||
+    if ((fields & STATUS_OXI) || OxiBle::revision() != ble_revision ||
         (now - oxi_at >= 2000 && live_events && live_events->count())) {
         fields |= STATUS_OXI;
         oxi_at = now;
@@ -2229,7 +2225,6 @@ static void publishStatus() {
         ble_revision = OxiBle::revision();
         config_revision = Config::revision();
         device_revision = AirSenseState::identity_revision();
-        memcpy(source_id, current_source, sizeof(source_id));
         pending_fields = fields;
         if (!++revision) ++revision;
     }

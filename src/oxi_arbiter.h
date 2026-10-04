@@ -16,8 +16,9 @@ namespace OxiArbiter {
     void init();
 
     void feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool valid);
-    void set_source_id(const char *id);
-    void get_source_id(char *out, size_t size);
+    // The claiming transport publishes its address and display name together.
+    void set_source(const char *id, const char *name);
+    void get_source(char *id, size_t id_size, char *name, size_t name_size);
 
     void start_feed();
     // Transport cleanup stops only its own source; NONE is an explicit stop.

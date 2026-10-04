@@ -1530,9 +1530,14 @@ void OxiBle::task(void *param) {
 
                 uint8_t atype = 1;
                 String dev_name = "";
+                // Empty advertisements fall back to the name learned earlier.
+                char saved_name[sizeof(known_devices[0].name)] = {};
                 portENTER_CRITICAL(&known_mux);
                 int known = known_index(addr.c_str());
-                if (known >= 0) atype = known_devices[known].addr_type;
+                if (known >= 0) {
+                    atype = known_devices[known].addr_type;
+                    strlcpy(saved_name, known_devices[known].name, sizeof(saved_name));
+                }
                 portEXIT_CRITICAL(&known_mux);
                 for (int i = 0; i < scan_result_count; i++) {
                     if (strcasecmp(scan_results[i].addr, addr.c_str()) == 0) {
@@ -1667,7 +1672,8 @@ void OxiBle::task(void *param) {
                     set_nonin_datetime(pClient);
                     // Probe Viatom first: charging devices must not be kept awake
                     // by configuration writes before their charging state is known.
-                    OxiArbiter::set_source_id(pClient->getPeerAddress().toString().c_str());
+                    OxiArbiter::set_source(pClient->getPeerAddress().toString().c_str(),
+                                           dev_name.length() ? dev_name.c_str() : saved_name);
                     portENTER_CRITICAL(&sample_mux);
                     ble_samples.subscribed(millis());
                     portEXIT_CRITICAL(&sample_mux);
