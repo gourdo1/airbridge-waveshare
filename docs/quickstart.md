@@ -1,119 +1,87 @@
 # Quick Start
 
 ## What you need
-
-- One of the supported boards:
-  - Waveshare ESP32-S3-LCD-1.54 (with or without touch)
-  - M5Stamp Pico (ESP32-PICO-D4)
-  - XIAO ESP32S3 Plus
-- MP1584 buck converter (24V to 3.3V)
+- AirBridge hardware: the PCB, or a hand-wired XIAO ESP32-S3 Plus with or
+  without SD. See [hardware.md](hardware.md) for variants and which features
+  need SD.
 - AirSense 10 with edge connector access
-- USB-C cable (Waveshare, XIAO) or a 3.3V USB-to-serial adapter (M5Stamp Pico) for the initial flash
-- PlatformIO installed
+- A computer with Chrome or Edge and a USB data cable
 
 ## Wiring
 
-See [hardware.md](hardware.md) for the pinout, wiring diagram, and power notes.
+PCB: [hardware_pcb.md](hardware_pcb.md).
+Hand-wired: [hardware_wiring.md](hardware_wiring.md).
 
 ## Flash firmware
 
-For the Waveshare ESP32-S3-LCD-1.54:
+Download the `-initial.zip` matching your board from the
+[latest release](https://github.com/m-kozlowski/airbridge/releases/latest)
+and extract the `-initial.bin` image.
 
-```bash
-pio run -e waveshare-s3-lcd154 -t upload
-```
+Open [ESPWebTool](https://esptool.spacehuhn.com/) in Chrome or Edge:
 
-The board flashes over its USB-C port. If the upload can't connect, hold the
-**BOOT** button while plugging in the USB cable, then retry. The serial
-console for this board is the same USB-C port.
+1. Connect the board over USB. M5Stamp Pico needs a 3.3 V USB-to-serial adapter.
+2. Select **Connect** and choose its serial port.
+3. Add the extracted `-initial.bin` at address `0x0`.
+4. Select **Program** and wait for flashing to finish.
 
-For the M5Stamp Pico:
+### Build from source instead
 
-```bash
-pio run -e m5stamp-pico -t upload
-```
+Install PlatformIO and check out the matching release tag.
 
-For the XIAO ESP32S3 Plus SDMMC4 build:
+XIAO with SD (PCB or hand-wired):
 
 ```bash
 pio run -e xiao-esp32s3-plus-sdmmc4 -t upload
 ```
 
-## Configure WiFi
-
-Three options, pick whichever suits you:
-
-**SmartConfig (no cable needed):** On first boot the device waits 60 seconds for SmartConfig. Install the [EspTouch](https://github.com/EspressifApp/EsptouchForAndroid/releases) app on your phone. Connect your phone to the target WiFi network, select **EspTouch v1**, enter the WiFi password, and hit confirm. The device picks up the credentials and connects automatically. Credentials are saved.
-
-**Provisioning file:** Create `provision.env` from the example and flash:
+XIAO without SD:
 
 ```bash
-cp provision.env.example provision.env
-# Edit provision.env with your WiFi credentials
-python provision.py <serial port>
+pio run -e xiao-esp32s3-plus -t upload
 ```
 
-Provisioning also runs automatically after every serial flash (`pio run -t upload`).
-On boards with native USB (Waveshare, XIAO), the USB port briefly disappears
-while the board resets after flashing. If automatic provisioning reports that
-the device is not responding, run `python provision.py <serial port>` again by hand.
+M5Stamp Pico (legacy):
 
-**Manual via AP:** If SmartConfig times out, the device creates a WiFi access point (`airbridge_XXXXXX`, password `airbridge`). Connect to it, open `http://192.168.4.1/`, go to the **Device** tab, set your WiFi SSID and password, wifi_mode to `0`. Save and reboot.
+```bash
+pio run -e m5stamp-pico -t upload
+```
+
+Waveshare ESP32-S3-LCD-1.54, AirSense wired to the UART pads or to the
+SCL/SDA pads (see [hardware.md](hardware.md#waveshare-esp32-s3-lcd-154)).
+These boards are not in the release images, so always build from source:
+
+```bash
+pio run -e waveshare-s3-lcd154 -t upload
+pio run -e waveshare-s3-lcd154-i2cpads -t upload
+```
+
+If the upload can't connect, hold **BOOT** while plugging in the USB cable.
+The USB port briefly disappears while the board resets after flashing; if the
+automatic provisioning step misses it, run `python provision.py <serial port>`
+again by hand.
+
+## Configure WiFi
+
+On a fresh installation, connect to the `airbridge_...` WiFi access point
+(password `airbridge`) and open `http://192.168.4.1/`.
+
+Log in with username `admin` and password `airbridge`. The setup wizard guides
+you through your WiFi network, AirSense connection, time, optional sync
+destinations, and Web UI credentials. Use **Save & next**, then **Finish**.
+You can reopen the wizard from **Config > Initial setup**.
+
+When flashing with PlatformIO, you can instead copy `provision.env.example`
+to `provision.env` and fill in your WiFi credentials before flashing. These
+settings are applied automatically after the USB upload.
 
 ## Verify it works
 
-After reboot, the device connects to your WiFi. Open `http://airbridge/` in your browser.
+Once connected to your WiFi, open `http://airbridge/`. If the hostname does
+not resolve, use the device IP from your router's DHCP leases.
 
-If mDNS doesn't resolve, check your router's DHCP leases for the device IP.
+The **Dashboard** should show the AirSense name and serial number. With the
+AirSense powered on, connected, and not running therapy, its state is
+`IDLE`.
 
-Default credentials:
-- Username: `admin`
-- Password: `airbridge`
-
-The **Status** tab shows the system state. If the AirSense is powered on and connected, you should see `system: IDLE` along with the device name and serial number.
-
-## Ports
-
-| Port | Purpose |
-|------|---------|
-| 80   | Web UI |
-| 23   | TCP command port (telnet) |
-| 8023 | Debug log stream (read-only) |
-| 3232 | OTA firmware updates |
-
-## OTA updates
-
-After initial setup, you can update firmware over WiFi:
-
-```bash
-export AIRBRIDGE_OTA_PASS=airbridge
-pio run -e ota -t upload                    # M5Stamp Pico
-pio run -e waveshare-s3-lcd154-ota -t upload  # Waveshare ESP32-S3-LCD-1.54
-```
-
-## Oximetry
-
-The device scans for BLE pulse oximeters automatically. Supported devices:
-- Nonin 3230 (BLE)
-- Wellue/Viatom devices: O2Ring, Checkme O2, SleepU, O2M
-- OxyII devices, including O2Ring-S
-- ACCARE WS20A
-- Generic BLE PLX / Heart Rate sensors
-
-Go to the **Bluetooth** tab in the web UI to scan, connect, and manage oximeter devices. When connected, SpO2 and pulse data are injected into the AirSense data stream.
-
-## Command line
-
-Connect via telnet to port 23 for direct control:
-
-```bash
-telnet airbridge 23
-```
-
-Commands use `$` prefix. Type `$HELP` for the full list. Anything without `$` is sent directly to the AirSense as a UART command.
-
-Debug logs stream on port 8023:
-
-```bash
-nc airbridge 8023
-```
+See [Configuration](configuration.md) for available settings.

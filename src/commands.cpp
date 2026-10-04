@@ -6,12 +6,22 @@
 #include "resmed_ota.h"
 #include "debug_log.h"
 #include "app_config.h"
+#include "device_status.h"
+#include "build_info.h"
+#include "airbridge_ota.h"
 #include <esp_partition.h>
 #include <time.h>
 #include "wifi_setup.h"
+#include "air10_clock.h"
 #include "network_hints.h"
 #include "live_stream.h"
-#include "live_pmd.h"
+#include "live_tce.h"
+#include "export_sync.h"
+#include "board.h"
+#include "storage_browser.h"
+#include "sd_storage.h"
+#include "memory_manager.h"
+#include "crash_diagnostics.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -43,24 +53,22 @@ void dispatch_command(const char *line, String &response) {
     upper.toUpperCase();
 
     if (upper == "STATUS") {
-        system_state_t sys = Arbiter::get_state();
-        oxi_state_t oxi = OxiBle::get_state();
-        const oxi_reading_t &r = OxiArbiter::get_reading();
-
-        Config::refresh_device_info();
-        auto &cfg = Config::get();
+        const auto status = DeviceStatus::snapshot();
+        const auto &r = status.reading;
+        AirSenseState::Identity identity;
+        AirSenseState::identity(identity);
 
         response.reserve(512);
-        response = "system: " + String(system_state_name(sys)) + "\n";
-        if (!cfg.device_pna.isEmpty())
-            response += "device: " + cfg.device_pna + " (" + cfg.device_srn + ")\n";
-        response += "oxi: " + String(oxi_state_name(oxi)) + "\n";
+        response = "system: " + String(system_state_name(status.sys)) + "\n";
+        if (identity.valid)
+            response += "device: " + String(identity.pna) + " (" + identity.srn + ")\n";
+        response += "oxi: " + String(oxi_state_name(status.oxi)) + "\n";
         if (r.valid) {
             response += "spo2: " + String(r.spo2) + "%\n";
             response += "pulse: " + String(r.pulse_bpm) + " bpm\n";
             response += "age: " + String((millis() - r.timestamp_ms) / 1000) + "s\n";
         }
-        response += "feeding: " + String(OxiArbiter::is_feeding() ? "yes" : "no") + "\n";
+        response += "feeding: " + String(status.feeding ? "yes" : "no") + "\n";
         response += "log_level: " + String(Log::level_name(Log::get_level())) + "\n";
         response += "uart_baud: " + String(Arbiter::get_baud()) + "\n";
         response += "uart_tx: " + String(Arbiter::get_tx_count()) + "\n";
@@ -68,10 +76,93 @@ void dispatch_command(const char *line, String &response) {
         response += "uart_l_rx: " + String(Arbiter::get_l_rx_count()) + "\n";
         response += "uart_timeout: " + String(Arbiter::get_timeout_count()) + "\n";
         response += "uart_error: " + String(Arbiter::get_error_count()) + "\n";
-        response += "live_pmd: " +
-                    String(LiveStream::is_stream_active(LivePmd::TAG) ? "subscribed" : "idle") +
+        response += "live_tce: " +
+                    String(LiveStream::is_stream_active(LiveTce::TAG) ? "subscribed" : "idle") +
                     "\n";
-        response += "heap: " + String(ESP.getFreeHeap()) + "\n";
+
+        const auto memory = aircannect::Memory::status();
+        response += "heap: " + String(memory.heap_free) + "\n";
+        response += "heap_largest: " + String(memory.heap_max_alloc) + "\n";
+        if (memory.psram_available) {
+            response += "psram: " + String(memory.psram_free) + " bytes free / " +
+                        String(memory.psram_total) + " bytes total\n";
+            response += "psram_largest: " + String(memory.psram_max_alloc) + " bytes\n";
+        } else {
+            response += "psram: unavailable\n";
+        }
+        return;
+    }
+
+    if (upper == "STORAGE" || upper.startsWith("STORAGE ")) {
+        bool quoted = false;
+        for (unsigned i = 0; i < cmd.length(); i++) if (cmd[i] == '"') quoted = !quoted;
+        if (quoted) { response = "ERR: unmatched quote\n"; return; }
+        int position = 7;
+        String action = parse_quoted_token(cmd, &position);
+        action.toUpperCase();
+        const String path = parse_quoted_token(cmd, &position);
+        if ((action.isEmpty() || action == "STATUS") && path.isEmpty()) {
+            SdStorage::Status sd;
+            SdStorage::get_status(sd);
+            response = "state: ";
+            response += !sd.supported ? "unsupported" : sd.mounted ? "mounted" : "unavailable";
+            response += '\n';
+            if (sd.mounted) {
+                if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
+                    response += "capacity: " +
+                                String(static_cast<double>(sd.total_bytes) / 1048576, 1) + " MiB\n";
+                    response += "used: " +
+                                String(static_cast<double>(sd.used_bytes) / 1048576, 1) + " MiB\n";
+                    response += "free: " +
+                                String(static_cast<double>(sd.total_bytes - sd.used_bytes) / 1048576, 1) + " MiB\n";
+                } else {
+                    response += "space: unavailable\n";
+                }
+            }
+            if (sd.error[0]) response += "error: " + String(sd.error) + "\n";
+#if AB_STORAGE_HAS_SDCARD
+            StorageBrowser::MutationStatus status;
+            StorageBrowser::mutation_status(status);
+            if (status.active || status.succeeded || status.error[0]) {
+                response += "operation: ";
+                response += status.active ? "working" : status.succeeded ? "done" : "failed";
+                response += "\nchanged: " + String(status.changed) + " entries\n";
+                if (status.error[0]) response += "operation_error: " + String(status.error) + "\n";
+            }
+#endif
+            return;
+        }
+#if AB_STORAGE_HAS_SDCARD
+        const String name = parse_quoted_token(cmd, &position);
+        const String extra = parse_quoted_token(cmd, &position);
+        StorageBrowser::Request request = {};
+        const bool rename = action == "RENAME";
+        if ((!rename && action != "RM") || path.isEmpty() ||
+            path.length() >= sizeof(request.path) ||
+            (rename ? name.isEmpty() || name.length() >= 256 : !name.isEmpty()) ||
+            !extra.isEmpty()) {
+            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS\n";
+            return;
+        }
+        request.kind = rename ? StorageBrowser::Kind::Rename : StorageBrowser::Kind::Delete;
+        strcpy(request.path, path.c_str());
+        strcpy(request.selection, name.c_str());
+        std::weak_ptr<StorageBrowser::Transfer> active;
+        const auto result = StorageBrowser::start(request,
+            [](int, const char *, std::shared_ptr<StorageBrowser::Transfer>, uint64_t) {}, active);
+        switch (result) {
+        case StorageBrowser::StartResult::Started:
+            response = "OK: storage operation started; $STORAGE STATUS for result\n"; break;
+        case StorageBrowser::StartResult::BadRequest:
+            response = "ERR: invalid path or name\n"; break;
+        case StorageBrowser::StartResult::Busy:
+            response = "ERR: storage busy\n"; break;
+        default:
+            response = "ERR: storage unavailable\n"; break;
+        }
+#else
+        response = "ERR: storage unsupported\n";
+#endif
         return;
     }
 
@@ -87,7 +178,8 @@ void dispatch_command(const char *line, String &response) {
             response = "OK: oximetry feed stopped\n";
         } else if (sub == "STATUS") {
             oxi_state_t st = OxiBle::get_state();
-            const oxi_reading_t &r = OxiArbiter::get_reading();
+            oxi_reading_t r;
+            OxiArbiter::snapshot(r);
             response = "state: " + String(oxi_state_name(st)) + "\n";
             response += "feeding: " + String(OxiArbiter::is_feeding() ? "yes" : "no") + "\n";
             if (r.valid) {
@@ -105,9 +197,38 @@ void dispatch_command(const char *line, String &response) {
             if (count == 0) {
                 response = "(no oximeters found)\n";
             } else {
-                for (int i = 0; i < count; i++)
-                    response += devs[i].addr + " " + devs[i].name +
-                                " RSSI=" + String(devs[i].rssi) + "\n";
+                for (int i = 0; i < count; i++) {
+                    response += devs[i].addr;
+                    response += ' ';
+                    response += devs[i].name;
+                    response += " RSSI=";
+                    response += devs[i].rssi;
+                    response += '\n';
+                }
+            }
+        } else if (sub == "KNOWN") {
+            oxi_known_device_t devices[MAX_KNOWN_DEVICES];
+            int count = OxiBle::get_known_devices(devices, MAX_KNOWN_DEVICES);
+            if (!count) response = "(no known sensors)\n";
+            for (int i = 0; i < count; i++) {
+                response += String(devices[i].addr) + " autoconnect=" +
+                            (devices[i].autoconnect ? "on" : "off");
+                if (devices[i].name[0]) response += " name=" + String(devices[i].name);
+                response += '\n';
+            }
+        } else if (sub.startsWith("AUTOCONNECT ")) {
+            String args = cmd.substring(16);
+            args.trim();
+            int space = args.indexOf(' ');
+            String addr = space > 0 ? args.substring(0, space) : "";
+            String value = space > 0 ? args.substring(space + 1) : "";
+            value.trim();
+            value.toUpperCase();
+            if (value != "ON" && value != "OFF") {
+                response = "ERR: OXI AUTOCONNECT <addr> ON|OFF\n";
+            } else {
+                response = OxiBle::set_autoconnect(addr.c_str(), value == "ON")
+                    ? "OK: autoconnect saved\n" : "ERR: unknown sensor or settings write failed\n";
             }
         } else if (sub.startsWith("CONNECT")) {
             String addr = cmd.substring(12);  // "OXI CONNECT <addr>"
@@ -142,10 +263,11 @@ void dispatch_command(const char *line, String &response) {
         if (subUpper == "DUMP" || sub.length() == 0) {
             response = Config::dump();
         } else if (subUpper == "SAVE") {
-            Config::save();
-            response = "OK: config saved to NVS\n";
+            response = Config::save() ? "OK: config saved to NVS\n" :
+                                        "ERROR: NVS save failed\n";
         } else if (subUpper == "RESET") {
             Config::reset_defaults();
+            OtaManager::config_changed();
             response = "OK: config reset to defaults\n";
         } else {
             // "CONFIG key value" or "CONFIG key"
@@ -155,7 +277,11 @@ void dispatch_command(const char *line, String &response) {
                 String val = sub.substring(space + 1);
                 val.trim();
                 if (Config::set_value(key.c_str(), val.c_str())) {
-                    response = "OK: " + key + "=" + val + "\n";
+                    if (key.equalsIgnoreCase("update_url"))
+                        OtaManager::config_changed();
+                    response = "OK: " + key + "=" +
+                               (Config::is_sensitive(key.c_str()) && val.length()
+                                    ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + key + "'\n";
                 }
@@ -163,11 +289,65 @@ void dispatch_command(const char *line, String &response) {
                 // Get single key
                 String val;
                 if (Config::get_value(sub.c_str(), val)) {
-                    response = sub + "=" + val + "\n";
+                    response = sub + "=" +
+                               (Config::is_sensitive(sub.c_str()) && val.length()
+                                    ? "****" : val) + "\n";
                 } else {
                     response = "ERR: unknown key '" + sub + "'\n";
                 }
             }
+        }
+        return;
+    }
+
+    if (upper.startsWith("EXPORT")) {
+        String sub = cmd.substring(6);
+        sub.trim();
+        sub.toUpperCase();
+        if (sub.length() == 0 || sub == "STATUS") {
+            ExportSync::Status export_status;
+            ExportSync::get_status(export_status);
+            response = "smb state=" + String(ExportSync::state_name(
+                export_status.state));
+            response += " files=" + String(export_status.files_uploaded);
+            response += "/" + String(export_status.files_seen);
+            response += " skipped=" + String(export_status.files_skipped);
+            response += " bytes=" + String(
+                static_cast<unsigned long long>(export_status.bytes_uploaded));
+            if (export_status.current_day[0])
+                response += " day=" + String(export_status.current_day);
+            if (export_status.last_error[0])
+                response += " error=" + String(export_status.last_error);
+            response += "\n";
+            ExportSync::SleepHqStatus sleephq_status;
+            ExportSync::get_sleephq_status(sleephq_status);
+            response += "sleephq state=" + String(ExportSync::state_name(
+                sleephq_status.state));
+            response += " files=" + String(sleephq_status.files_uploaded);
+            response += "/" + String(sleephq_status.files_seen);
+            response += " skipped=" + String(sleephq_status.files_skipped);
+            response += " bytes=" + String(static_cast<unsigned long long>(
+                sleephq_status.bytes_uploaded));
+            if (sleephq_status.import_id)
+                response += " import=" + String(sleephq_status.import_id);
+            if (sleephq_status.import_status[0])
+                response += " import_status=" +
+                            String(sleephq_status.import_status);
+            if (sleephq_status.current_day[0])
+                response += " day=" + String(sleephq_status.current_day);
+            if (sleephq_status.last_error[0])
+                response += " error=" + String(sleephq_status.last_error);
+            response += "\n";
+        } else if (sub == "SMB" || sub == "SLEEPHQ") {
+            const char *error = nullptr;
+            const bool smb = sub == "SMB";
+            const bool queued = smb ? ExportSync::request_manual_smb(false, &error)
+                                    : ExportSync::request_manual_sleephq(false, &error);
+            response = queued ? (smb ? "OK: SMB sync queued\n" : "OK: SleepHQ sync queued\n")
+                              : String("ERR: ") + error + "\n";
+        } else {
+            response = "ERR: use EXPORT STATUS, EXPORT SMB, or "
+                       "EXPORT SLEEPHQ\n";
         }
         return;
     }
@@ -189,15 +369,14 @@ void dispatch_command(const char *line, String &response) {
     }
 
     if (upper == "TIMESYNC") {
-        extern void reset_resmed_time_sync();
-        reset_resmed_time_sync();
+        Air10Clock::request_sync(true);
         response = "OK: resmed clock sync will retry\n";
         return;
     }
 
     if (upper == "VERSION") {
-        response = "AirBridge " + String(AIRBRIDGE_VERSION) + "\n";
-        response += "Built: " + String(AIRBRIDGE_BUILD_DATE) + "\n";
+        response = "AirBridge " + String(airbridge_version()) + "\n";
+        response += "Built: " + String(airbridge_build_date()) + "\n";
         response += "ESP32 SDK: " + String(ESP.getSdkVersion()) + "\n";
         response += "Chip: " + String(ESP.getChipModel()) + " rev" + String(ESP.getChipRevision()) + "\n";
         response += "Flash: " + String(ESP.getFlashChipSize() / 1024) + "KB\n";
@@ -211,14 +390,52 @@ void dispatch_command(const char *line, String &response) {
         return;
     }
 
+    if (upper == "CRASH" || upper.startsWith("CRASH ")) {
+        String action = upper.substring(5);
+        action.trim();
+        if (action == "CLEAR") {
+            const char *error = CrashDiagnostics::clear();
+            response = error ? "ERR: " + String(error) + "\n"
+                             : "OK: crash dump cleared\n";
+            return;
+        }
+        if (!action.isEmpty() && action != "STATUS" && action != "SUMMARY") {
+            response = "ERR: CRASH [STATUS|SUMMARY|CLEAR]\n";
+            return;
+        }
+        CrashDiagnostics::Snapshot crash;
+        if (!CrashDiagnostics::snapshot(crash)) {
+            response = "ERR: crash diagnostics busy\n";
+            return;
+        }
+        response = "state: " + String(CrashDiagnostics::state_name(crash.state)) + "\n";
+        response += "size: " + String(crash.size) + " bytes\n";
+        if (crash.stored_size && !crash.size)
+            response += "stored_size: " + String(crash.stored_size) + " bytes\n";
+        if (crash.error != ESP_OK)
+            response += "error: " + String(esp_err_to_name(crash.error)) + "\n";
+        if (action != "SUMMARY") return;
+        if (!crash.summary_available) {
+            response += "summary: unavailable\n";
+            return;
+        }
+        response += "task: " + String(crash.task) + "\n";
+        response += "reason: " + String(crash.reason) + "\n";
+        response += "pc: 0x" + String(crash.pc, HEX) + "\n";
+        response += "cause: " + String(crash.cause) + "\n";
+        response += "exception_address: 0x" + String(crash.exception_address, HEX) + "\n";
+        response += "elf_sha: " + String(crash.elf_sha) + "\n";
+        response += "backtrace_corrupt: " + String(crash.backtrace_corrupt ? "yes" : "no") + "\n";
+        response += "backtrace:";
+        for (size_t i = 0; i < crash.backtrace_depth; ++i)
+            response += " 0x" + String(crash.backtrace[i], HEX);
+        response += '\n';
+        return;
+    }
+
     if (upper == "RESETREASON") {
         esp_reset_reason_t reason = esp_reset_reason();
-        const char *names[] = {
-            "UNKNOWN","POWERON","EXT","SW","PANIC",
-            "INT_WDT","TASK_WDT","WDT","DEEPSLEEP",
-            "BROWNOUT","SDIO","USB","JTAG","EFUSE","PWR_GLITCH","CPU_LOCKUP"
-        };
-        const char *name = (reason < sizeof(names)/sizeof(names[0])) ? names[reason] : "?";
+        const char *name = Log::reset_reason_name();
         response = "reset reason: " + String(name) + " (" + String(reason) + ")\n";
         return;
     }
@@ -335,13 +552,13 @@ void dispatch_command(const char *line, String &response) {
             else if (Config::add_network(ssid.c_str(), pass.c_str()))
                 response = "OK: added '" + ssid + "'\n";
             else
-                response = "ERR: list full\n";
+                response = "ERR: list full or NVS save failed\n";
         } else if (sub.startsWith("REMOVE ")) {
             int idx = sub.substring(7).toInt();
             if (Config::remove_network((uint8_t)idx))
                 response = "OK: removed slot " + String(idx) + "\n";
             else
-                response = "ERR: invalid index\n";
+                response = "ERR: invalid index or NVS save failed\n";
         } else {
             response = "ERR: WIFI [STATUS|LIST|ADD ssid pass|REMOVE N|HINTS|HINTS CLEAR]\n"
                        "     ADD: use \"quotes\" if SSID or password contains spaces\n";
@@ -460,16 +677,24 @@ void dispatch_command(const char *line, String &response) {
                    "  OXI STATUS          Oximeter connection info\n"
                    "  OXI SCAN            Scan for BLE oximeters\n"
                    "  OXI RESULTS         Show scan results\n"
+                   "  OXI KNOWN           List known sensors and autoconnect\n"
+                   "  OXI AUTOCONNECT <addr> ON|OFF\n"
                    "  OXI CONNECT [addr]  Connect to oximeter\n"
                    "  OXI DISCONNECT      Disconnect oximeter\n"
                    "  OXI ENABLE|DISABLE  Enable/disable oximetry\n"
                    "  CONFIG [key [val]]  Get/set config\n"
                    "  CONFIG SAVE|RESET   Save/reset config\n"
                    "  CONFIG DUMP         Show all config\n"
+                   "  EXPORT STATUS|SMB|SLEEPHQ  Export status/manual sync\n"
+#if AB_STORAGE_HAS_SDCARD
+                   "  STORAGE RENAME path name  Rename a file or folder\n"
+                   "  STORAGE RM path     Delete a file or folder recursively\n"
+#endif
+                   "  STORAGE STATUS      SD state, space and last file operation\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
                    "  LOG                 Show all category log levels\n"
-                   "  LOG [cat] level     Set log level (cats: GENERAL OXI TCP WIFI OTA WEB ARB HEALTH ALL)\n"
+                   "  LOG [cat] level     Set log level (use LOG to list categories, or ALL)\n"
                    "  WIFI                WiFi status/management\n"
                    "  WIFI LIST           List configured networks\n"
                    "  WIFI ADD ssid pass  Add network (use \"quotes\" if either has spaces)\n"
@@ -479,6 +704,7 @@ void dispatch_command(const char *line, String &response) {
                    "  TRANSPARENT         Enter raw UART mode\n"
                    "  VERSION             Firmware version info\n"
                    "  RESETREASON         Last reset reason\n"
+                   "  CRASH STATUS|SUMMARY|CLEAR  Retained crash dump\n"
                    "  REBOOT              Restart ESP32\n"
                    "  HELP                This help\n"
                    "Anything without $ prefix is sent to AirSense.\n";

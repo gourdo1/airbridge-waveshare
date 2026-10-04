@@ -6,7 +6,7 @@ namespace WebUI {
 
     void handle();
 
-    // event: event type name (e.g., "status", "ble", "flash", "live")
+    // Publish outside device callbacks; live uses the chart-only connection.
     void push_event(const char *event, const char *json);
     void push_event(const char *event, const String &json);
 

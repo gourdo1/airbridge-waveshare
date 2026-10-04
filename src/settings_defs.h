@@ -173,19 +173,14 @@ static const char * const COMFORT_LAYOUT[MODE_COUNT][COMFORT_MAX_VARS] = {
 
 static const char * const EPR_VARS[] = {"RMA", "RMT", "EPR", "EPA", "EPX", "EPT", NULL};
 
-static const char * const PATIENT_VARS[] = {
-    "RMA", "RMT", "ALR", "SST", "MSK", "TBT", "QFC", NULL
+static const char * const ACCESSORY_VARS[] = {
+    "MSK", "TBT", "CCO", "HMS", "HMX", "HTF", "HTS", "HTX", NULL
 };
 
-static const char * const CLIMATE_VARS[] = {
-    "CCO", "HMS", "HMX", "HTF", "HTS", "HTX", NULL
+static const char * const OPTION_VARS[] = {
+    "ALR", "SST", "QFC", "ALV", "HLE", "NMF", "SPX", "APX", "LMA", NULL
 };
 
-static const char * const SYSTEM_VARS[] = {
+static const char * const CONFIGURATION_VARS[] = {
     "LAN", "PRD", "TMU", "ACC", NULL
 };
-
-static const char * const ALARM_VARS[] = {
-    "ALV", "HLE", "NMF", "SPX", "APX", "LMA", NULL
-};
-

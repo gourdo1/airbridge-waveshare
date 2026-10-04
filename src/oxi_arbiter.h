@@ -17,13 +17,17 @@ namespace OxiArbiter {
 
     void feed(oxi_source_t src, int8_t spo2, int16_t pulse_bpm, bool valid);
     void set_source_id(const char *id);
-    const char *get_source_id();
+    void get_source_id(char *out, size_t size);
 
     void start_feed();
-    void stop_feed();
+    // Transport cleanup stops only its own source; NONE is an explicit stop.
+    void stop_feed(oxi_source_t source = OXI_SRC_NONE);
     bool is_feeding();
 
-    const oxi_reading_t& get_reading();
+    void snapshot(oxi_reading_t &reading, oxi_source_t *source = nullptr);
+    // Latest accepted reading no later than time_ms, including invalid updates.
+    // False when that point has no predecessor in the bounded history.
+    bool snapshot_at(uint32_t time_ms, oxi_reading_t &reading);
     oxi_source_t active_source();
 
     void poll();

@@ -1,5 +1,9 @@
 #include "crc.h"
 
+#ifdef ESP_PLATFORM
+#include <esp_rom_crc.h>
+#endif
+
 static const uint16_t crc16_table[256] = {
     0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
     0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
@@ -48,4 +52,30 @@ uint8_t crc8_ccitt(const uint8_t *data, size_t len, uint8_t crc) {
             crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1;
     }
     return crc;
+}
+
+uint32_t crc32_ieee_initial() {
+    return 0xFFFFFFFFu;
+}
+
+uint32_t crc32_ieee_update(uint32_t crc, const uint8_t *data, size_t len) {
+#ifdef ESP_PLATFORM
+    // ROM complements input and output; our incremental API keeps raw state.
+    return ~esp_rom_crc32_le(~crc, data, len);
+#else
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc & 1u) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+    }
+    return crc;
+#endif
+}
+
+uint32_t crc32_ieee_finish(uint32_t crc) {
+    return ~crc;
+}
+
+uint32_t crc32_ieee(const uint8_t *data, size_t len) {
+    return crc32_ieee_finish(crc32_ieee_update(crc32_ieee_initial(), data, len));
 }

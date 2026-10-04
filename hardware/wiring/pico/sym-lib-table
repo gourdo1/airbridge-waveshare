@@ -1,0 +1,3 @@
+(sym_lib_table (version 7)
+  (lib (name "airbridge") (type "KiCad") (uri "${KIPRJMOD}/libraries/airbridge.kicad_sym") (options "") (descr "Hand-wired modules; used terminals only"))
+)

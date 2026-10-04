@@ -1,7 +1,49 @@
 # Hardware
 
-## AirSense 10 edge connector
+AirBridge connects to the AirSense 10 edge connector: UART plus +24 V.
 
+## Variants
+
+In order of preference:
+
+| Variant | Build env | SD | Docs |
+|---------|-----------|----|------|
+| PCB: interface board + XIAO main board | `xiao-esp32s3-plus-sdmmc4` | yes | [hardware_pcb.md](hardware_pcb.md) |
+| Hand-wired XIAO ESP32-S3 Plus + microSD | `xiao-esp32s3-plus-sdmmc4` | yes | [hardware_wiring.md](hardware_wiring.md#xiao-esp32-s3-plus--sd) |
+| Waveshare ESP32-S3-GEEK | `waveshare-esp32-s3-geek` | onboard | [below](#waveshare-esp32-s3-geek) |
+| Waveshare ESP32-S3-LCD-1.54 (UART pads) | `waveshare-s3-lcd154` | onboard | [below](#waveshare-esp32-s3-lcd-154) |
+| Waveshare ESP32-S3-LCD-1.54 (SCL/SDA pads) | `waveshare-s3-lcd154-i2cpads` | onboard | [below](#alternate-wiring-sclsda-pads) |
+| Hand-wired XIAO ESP32-S3 Plus | `xiao-esp32s3-plus` | no | [hardware_wiring.md](hardware_wiring.md#xiao-esp32-s3-plus-without-sd) |
+| Hand-wired M5Stamp Pico (legacy) | `m5stamp-pico` | no | [hardware_wiring.md](hardware_wiring.md#m5stamp-pico-legacy) |
+
+The PCB and the hand-wired XIAO + SD use the same GPIOs and the same firmware.
+
+The M5Stamp Pico has no PSRAM and no SD support. It is kept building, but new
+features are not designed around it.
+
+## What needs SD
+
+Requires SD:
+
+- local therapy recording in AirSense EDF format (`DATALOG`, `STR.edf`,
+  `Identification`)
+- SMB export
+- SleepHQ export
+- Storage browser (list, download, ZIP, rename, delete)
+
+Works without SD:
+
+- UART/TCP bridge
+- live pressure/flow charts
+- oximetry (BLE, UDP)
+- clinical settings
+- Sleep Report
+- ResMed OTA and AirBridge OTA
+
+On builds without SD the Sync and Storage tabs are hidden and the SMB/SleepHQ
+setup steps are skipped.
+
+## AirSense 10 edge connector
 
 | Left | Right |
 |------|-------|
@@ -11,71 +53,69 @@
 | nc   | nc    |
 | nc   | **+24V**  |
 
-UART: 3.3V logic, 57600 8N1.
+UART: 3.3 V logic, 57600 8N1. AirSense Tx goes to AirBridge RX.
+
+## GPIO
+
+| Signal | XIAO ESP32-S3 Plus | M5Stamp Pico |
+|--------|--------------------|--------------|
+| UART RX (from AirSense Tx) | GPIO2 (D1) | G36 |
+| UART TX (to AirSense Rx) | GPIO1 (D0) | G26 |
+| LED | GPIO21 | G27 |
+
+SD, 4-bit SDMMC (`xiao-esp32s3-plus-sdmmc4`):
+
+| CLK | CMD | D0 | D1 | D2 | D3 |
+|-----|-----|----|----|----|----|
+| GPIO13 | GPIO11 | GPIO12 | GPIO38 | GPIO39 | GPIO40 |
+
+Pins are set by build flags in `platformio.ini`; defaults are in
+`include/board.h`. The XIAO SD clock is 40 MHz (`AB_SDMMC_FREQ_KHZ=40000`).
+
+### Waveshare ESP32-S3-GEEK
+
+16 MB flash, 2 MB PSRAM, onboard microSD. The LCD is not used; its backlight
+is switched off.
+
+| UART connector | AirSense |
+|----------------|----------|
+| RX (GPIO44) | Tx |
+| TX (GPIO43) | Rx |
+| GND | GND |
+
+The onboard card uses 4-bit SDMMC at 40 MHz:
+
+| CLK | CMD | D0 | D1 | D2 | D3 |
+|-----|-----|----|----|----|----|
+| GPIO36 | GPIO35 | GPIO37 | GPIO33 | GPIO38 | GPIO34 |
+
+Power through the USB-A connector with 5 V, not the AirSense 24 V supply.
+Pinout: [Waveshare schematic](https://files.waveshare.com/wiki/ESP32-S3-GEEK/ESP32-S3-GEEK-Schematic1.pdf).
 
 ## Power
 
-+24V rail from the edge connector. Use a buck converter (e.g. MP1584) to step down to 3.3V for the ESP32.
+### XIAO through BAT
 
-Hot-plugging the stepdown module may trip the AirSense overcurrent protection, causing it to shut down. A ~47 Ohm series resistor on the +24V input limits inrush current and prevents this.
+The XIAO is fed from a 5 V buck into its **BAT** pad, through a diode
+(Schottky when hand-wired, LM66100 ideal diode on the PCB). No battery is
+fitted.
 
-## Bare minimum hardware diagram
+- The **5V** pad is USB VBUS. Feeding it would push current into the USB host
+  whenever a cable is connected. BAT is the board's own supply input.
+- The diode keeps the XIAO charger and USB from backfeeding the buck.
+- With the buck powered, BAT is held above the charger's regulation voltage,
+  so the charger does not supply charging current.
+- USB stays usable for flashing and logs with the device installed.
 
-```
+### Series resistor on +24 V
 
-    AirSense 10                          M5Stamp Pico
-    Edge Connector                       +-----------+
-                                         |           |
-    Tx  -------------------------------- G36 (RX)    |  (pin definitions can be set
-    Rx  -------------------------------- G26 (TX)    |   in include/board.h)
-    GND ----------------+--------------- GND         |
-                        |                |           |
-    +24V ---[47R]--+    |    +--------> 3V3          |
-                   |    |    |           |           |
-                   |    |    |           +-----------+
-                   |    |    |
-                   |    |    |
-               +---+----+----+---+
-               |  IN+  GND  OUT+ |
-               |    MP1584EN     |
-               |   (3.3V out)    |
-               +-----------------+
+Hot-plugging a buck module into the AirSense charges its input capacitors hard
+enough to trip the AirSense overcurrent protection, which shuts it down.
+A ~47 Ω resistor in series with +24 V limits that inrush.
 
-
-    Notes:
-    - 47 ohm resistor in series with +24V prevents
-      overcurrent trip when hot-plugging the step-down module
-    - MP1584EN is a cheap ready-made module. Any 24V-to-3.3V
-      step-down will work as long as it can supply 300mA+
-    - TODO: design proper board closer to IEC 60601
-      for medical electrical equipment
-```
-
-## XIAO ESP32S3 Plus
-
-The `xiao-esp32s3-plus` and `xiao-esp32s3-plus-sdmmc4` build targets keep
-the same AirSense UART role, but move the pins to match the AirCANnect-style
-XIAO layout:
-
-| Signal | XIAO ESP32S3 Plus GPIO |
-|--------|-------------------------|
-| AirSense TX -> AirBridge RX | GPIO2 |
-| AirSense RX <- AirBridge TX | GPIO1 |
-
-The `xiao-esp32s3-plus-sdmmc4` target enables SDMMC4 as an optional
-compile-time capability:
-
-| SD signal | XIAO ESP32S3 Plus GPIO |
-|-----------|-------------------------|
-| CLK       | GPIO13 |
-| CMD       | GPIO11 |
-| D0        | GPIO12 |
-| D1        | GPIO38 |
-| D2        | GPIO39 |
-| D3        | GPIO40 |
-
-Use pull-ups on CMD and D0-D3. If early prototypes are wired with long leads,
-drop `AB_SDMMC_FREQ_KHZ` from `40000` to `20000` in the build flags.
+It works, but it is not an optimal solution: it drops voltage and dissipates
+power continuously, so it needs a 2 W part. The PCB replaces it with the
+eFuse soft-start; see [hardware_pcb.md](hardware_pcb.md#power).
 
 ## Waveshare ESP32-S3-LCD-1.54
 
@@ -177,8 +217,26 @@ Notes:
   noise and the firmware's health polling recovers. If it ever causes trouble,
   the ROM output can be disabled permanently by burning the
   `UART_PRINT_CONTROL` eFuse (irreversible).
-- The onboard TF card slot is not used by the firmware yet.
+- The onboard TF card slot is used for SD recording and export (see
+  [What needs SD](#what-needs-sd)). It is 4-bit SDMMC at 20 MHz:
+
+  | CLK | CMD | D0 | D1 | D2 | D3 |
+  |-----|-----|----|----|----|----|
+  | GPIO16 | GPIO15 | GPIO17 | GPIO18 | GPIO13 | GPIO14 |
+
+- Partition table: `partitions_s3_16mb.csv` (two 7.75 MB app slots plus a
+  crash-dump partition). A board still on the older 8 MB layout keeps working
+  after a WiFi update, but only gets the new layout (and crash dumps) after
+  one USB flash of the complete image: `pio run -e <env> -t upload`, or
+  `pio run -e <env> -t initialbin` and then `firmware.factory.bin` at
+  address `0x0` in a web flasher.
 
 ## Enclosure
 
-STL files for 3D-printed case in [`docs/stl/`](stl/).
+3D-printable enclosure for the PCB variant:
+[airbridge-xiao.stl](../hardware/enclosure/xiao/airbridge-xiao.stl).
+
+## Sources
+
+KiCad projects, PDFs, gerbers and assembly files are in
+[`hardware/`](../hardware/README.md).

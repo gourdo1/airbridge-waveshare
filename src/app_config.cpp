@@ -1,56 +1,118 @@
 #include "app_config.h"
-#include "uart_arbiter.h"
-#include "qframe.h"
 #include "network_hints.h"
+#include "debug_log.h"
 #include <Preferences.h>
+#include <nvs.h>
+#include <initializer_list>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
 
 #define CFG_DEFAULT_TCP_PORT    23
-#define CFG_DEFAULT_BAUD        57600
 
 static Preferences prefs;
 static AirBridgeConfig cfg;
+static uint32_t config_revision = 0;
+static uint32_t section_revisions[static_cast<size_t>(Config::Section::Logging) + 1] = {};
+static bool onboarding_done = false;
+static bool onboarding_stored = false;
+
+// Also consumed by generate_web_ui.py; field membership lives in kv_table.
+static const struct {
+    Config::Section section;
+    const char *name;
+    const char *label;
+} config_sections[] = {
+    {Config::Section::Network, "network", "Network"},
+    {Config::Section::Access, "access", "Web access"},
+    {Config::Section::Time, "time", "Time"},
+    {Config::Section::Oximetry, "oximetry", "Oximetry"},
+    {Config::Section::Uart, "uart", "UART"},
+    {Config::Section::Smb, "smb", "SMB"},
+    {Config::Section::SleepHq, "sleephq", "SleepHQ"},
+    {Config::Section::Updates, "updates", "Firmware updates"},
+    {Config::Section::Logging, "logging", "Logging"},
+};
+
+struct KVEntry {
+    const char *key;
+    const char *nvs_key;
+    enum { STR, U8, U16, BOOL } type;
+    void *ptr;
+    union Default {
+        const char *text;
+        uint32_t number;
+        constexpr Default(const char *value) : text(value) {}
+        constexpr Default(uint32_t value) : number(value) {}
+    } initial;
+    bool sensitive;
+    Config::Section section;
+};
+
+#define KV_STR(k, n, f, d, s) {k, n, KVEntry::STR, &cfg.f, {d}, false, Config::Section::s}
+#define KV_SECRET(k, n, f, d, s) {k, n, KVEntry::STR, &cfg.f, {d}, true, Config::Section::s}
+#define KV_U8(k, n, f, d, s) {k, n, KVEntry::U8, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+#define KV_U16(k, n, f, d, s) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+// Choice labels are used at build time, not retained in firmware RAM.
+#define KV_ENUM(k, n, f, d, s, ...) KV_U8(k, n, f, d, s)
+#define KV_BOOL(k, n, f, d, s, ...) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
+
+static const KVEntry kv_table[] = {
+    KV_STR("hostname", "hostname", hostname, DEFAULT_HOSTNAME, Network),
+    KV_ENUM("wifi_mode", "wifi_mode", wifi_mode, WIFI_MODE_AP_ONLY, Network, "0=Auto (STA + AP fallback)", "1=AP only", "2=Off", "3=STA only", "4=STA+AP always"),
+    KV_BOOL("wifi_roam", "wifi_roam", wifi_roam, true, Network),
+    KV_STR("wifi_country", "wifi_country", wifi_country, "01", Network),
+    KV_U16("tcp_port", "tcp_port", tcp_port, CFG_DEFAULT_TCP_PORT, Uart),
+    KV_BOOL("oxi_enabled", "oxi_enabled", oxi_enabled, true, Oximetry),
+    KV_BOOL("oxi_auto_start", "oxi_autostart", oxi_auto_start, true, Oximetry),
+    KV_BOOL("oxi_feed_therapy_only", "oxi_thronly", oxi_feed_therapy_only, false, Oximetry),
+    KV_U16("oxi_interval_ms", "oxi_interval", oxi_interval_ms, 500, Oximetry),
+    KV_BOOL("oxi_lframe_continuous", "oxi_lframe_cont", oxi_lframe_continuous, true, Oximetry),
+    KV_U16("uart_cmd_timeout_ms", "uart_timeout", uart_cmd_timeout_ms, 500, Uart),
+    KV_BOOL("allow_transparent_during_therapy", "allow_transp", allow_transparent_during_therapy, false, Uart),
+    KV_U16("debug_port", "debug_port", debug_port, 8023, Logging),
+    KV_BOOL("syslog_en", "syslog_en", syslog_enabled, false, Logging),
+    KV_STR("syslog_host", "syslog_host", syslog_host, "", Logging),
+    KV_U16("syslog_port", "syslog_port", syslog_port, 514, Logging),
+    KV_U16("http_port", "http_port", http_port, 80, Access),
+    KV_STR("http_user", "http_user", http_user, "admin", Access),
+    KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
+    KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
+    KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
+    KV_STR("tz", "tz", tz, "UTC0", Time),
+    KV_BOOL("resmed_time", "resmed_time", resmed_time, true, Time),
+    KV_U16("udp_oxi_port", "udp_oxi_port", udp_oxi_port, 8025, Oximetry),
+    KV_BOOL("smb_enabled", "smb_enable", smb_enabled, false, Smb),
+    KV_BOOL("smb_auto_after_therapy", "smb_auto", smb_auto_after_therapy, true, Smb, "0=Manual", "1=Automatic"),
+    KV_STR("smb_endpoint", "smb_ep", smb_endpoint, "", Smb),
+    KV_STR("smb_user", "smb_user", smb_user, "", Smb),
+    KV_SECRET("smb_password", "smb_pass", smb_password, "", Smb),
+    KV_BOOL("sleephq_enabled", "shq_enable", sleephq_enabled, false, SleepHq),
+    KV_BOOL("sleephq_auto_after_therapy", "shq_auto", sleephq_auto_after_therapy, true, SleepHq, "0=Manual", "1=Automatic"),
+    KV_STR("sleephq_client_id", "shq_id", sleephq_client_id, "", SleepHq),
+    KV_SECRET("sleephq_client_secret", "shq_secret", sleephq_client_secret, "", SleepHq),
+    KV_STR("sleephq_team_id", "shq_team", sleephq_team_id, "", SleepHq),
+    KV_STR("sleephq_device_id", "shq_device", sleephq_device_id, "", SleepHq),
+};
+
+
+static void reset_value(const KVEntry &entry) {
+    switch (entry.type) {
+        case KVEntry::STR:  *(String *)entry.ptr = entry.initial.text; break;
+        case KVEntry::U8:   *(uint8_t *)entry.ptr = entry.initial.number; break;
+        case KVEntry::U16:  *(uint16_t *)entry.ptr = entry.initial.number; break;
+        case KVEntry::BOOL: *(bool *)entry.ptr = entry.initial.number; break;
+    }
+}
 
 static void apply_defaults() {
-    cfg.hostname = DEFAULT_HOSTNAME;
+    for (const KVEntry &entry : kv_table) reset_value(entry);
+    for (auto &revision : section_revisions) __atomic_add_fetch(&revision, 1, __ATOMIC_RELEASE);
     cfg.wifi_net_count = 0;
     for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
         cfg.wifi_nets[i].ssid = "";
         cfg.wifi_nets[i].pass = "";
         cfg.wifi_nets[i].enabled = false;
     }
-    cfg.wifi_mode = WIFI_MODE_AP_ONLY;   // virgin device: AP up, user provisions
-    cfg.wifi_roam = true;
-    cfg.wifi_country = "01";             // worldwide / ESP-IDF default
-    cfg.tcp_port = CFG_DEFAULT_TCP_PORT;
-
-    cfg.oxi_enabled = true;
-    cfg.oxi_auto_start = true;
-    cfg.oxi_feed_therapy_only = false;
-    cfg.oxi_device_type = 0;
-    cfg.oxi_device_addr = "";
-    cfg.oxi_interval_ms = 500;
-    cfg.oxi_lframe_continuous = true;
-    cfg.oxi_require_known = false;
-
-    cfg.uart_baud = CFG_DEFAULT_BAUD;
-    cfg.uart_cmd_timeout_ms = 500;
-    cfg.uart_max_retries = 3;
-
-    cfg.allow_transparent_during_therapy = false;
-
-    cfg.debug_port = 8023;
-
-    cfg.http_port = 80;
-    cfg.http_user = "admin";
-    cfg.http_pass = "airbridge";
-
-    cfg.ota_password = "airbridge";
-
-    cfg.ntp_server = "";
-    cfg.tz = "UTC0";
-    cfg.udp_oxi_port = 8025;
-
-    cfg.mitm_mode = 0;
 }
 
 void Config::init() {
@@ -58,11 +120,46 @@ void Config::init() {
     prefs.begin("airbridge", false);
 }
 
-static void load_wifi_nets() {
+struct StoredNetworks {
+    uint8_t version, count;
+    struct Entry { uint8_t enabled; char ssid[33], pass[65]; } entries[WIFI_MAX_NETWORKS];
+};
+static_assert(sizeof(StoredNetworks) == 398, "WiFi profile layout");
+
+static bool decode_wifi_nets(const StoredNetworks &stored) {
+    if (stored.version != 1 || stored.count > WIFI_MAX_NETWORKS) return false;
+    for (uint8_t i = 0; i < stored.count; i++) {
+        const auto &entry = stored.entries[i];
+        if (entry.enabled > 1 || !entry.ssid[0] ||
+            !memchr(entry.ssid, 0, sizeof(entry.ssid)) ||
+            !memchr(entry.pass, 0, sizeof(entry.pass))) return false;
+    }
+    cfg.wifi_net_count = stored.count;
+    for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+        const bool present = i < stored.count;
+        cfg.wifi_nets[i].ssid = present ? stored.entries[i].ssid : "";
+        cfg.wifi_nets[i].pass = present ? stored.entries[i].pass : "";
+        cfg.wifi_nets[i].enabled = present && stored.entries[i].enabled;
+    }
+    return true;
+}
+
+static void load_wifi_nets(bool migrate = true) {
     Preferences wp;
     // writable: we may need to scrub legacy bssid_<i>/chan_<i> keys after
     // migrating them to NetworkHints.
     wp.begin("wnet", false);
+    if (wp.isKey("profiles")) {
+        StoredNetworks stored = {};
+        if (wp.getBytesLength("profiles") != sizeof(stored) ||
+            wp.getBytes("profiles", &stored, sizeof(stored)) != sizeof(stored) ||
+            !decode_wifi_nets(stored)) {
+            cfg.wifi_net_count = 0;
+            Log::logf(CAT_CONFIG, LOG_ERROR, "Invalid saved WiFi profiles\n");
+        }
+        wp.end();
+        return;
+    }
     cfg.wifi_net_count = wp.getUChar("count", 0);
     if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) cfg.wifi_net_count = WIFI_MAX_NETWORKS;
     for (int i = 0; i < cfg.wifi_net_count; i++) {
@@ -72,7 +169,7 @@ static void load_wifi_nets() {
         snprintf(key, sizeof(key), "pass_%d", i);
         cfg.wifi_nets[i].pass = wp.getString(key, "");
         snprintf(key, sizeof(key), "ena_%d", i);
-        cfg.wifi_nets[i].enabled = wp.getBool(key, true);
+        cfg.wifi_nets[i].enabled = wp.getBool(key, true) && cfg.wifi_nets[i].ssid.length() > 0;
 
         // Legacy hint keys: bssid_<i> + chan_<i> used to live here. Migrate
         // any populated values into NetworkHints, then nuke the old keys.
@@ -101,87 +198,147 @@ static void load_wifi_nets() {
             cfg.wifi_nets[0].pass = prefs.getString("wifi_pass", "");
             cfg.wifi_nets[0].enabled = true;
             cfg.wifi_net_count = 1;
-            Config::save_wifi_nets();
-            prefs.remove("wifi_ssid");
-            prefs.remove("wifi_pass");
+            if (migrate && Config::save_wifi_nets()) {
+                prefs.remove("wifi_ssid");
+                prefs.remove("wifi_pass");
+            }
         }
     }
 }
 
-void Config::load() {
-    cfg.hostname        = prefs.getString("hostname", cfg.hostname);
-    cfg.wifi_mode       = prefs.getUChar("wifi_mode", cfg.wifi_mode);
-    cfg.wifi_roam       = prefs.getBool("wifi_roam", cfg.wifi_roam);
-    cfg.wifi_country    = prefs.getString("wifi_country", cfg.wifi_country);
-    cfg.tcp_port        = prefs.getUShort("tcp_port", cfg.tcp_port);
-    load_wifi_nets();
-
-    cfg.oxi_enabled     = prefs.getBool("oxi_enabled", cfg.oxi_enabled);
-    cfg.oxi_auto_start  = prefs.getBool("oxi_autostart", cfg.oxi_auto_start);
-    cfg.oxi_feed_therapy_only = prefs.getBool("oxi_thronly", cfg.oxi_feed_therapy_only);
-    cfg.oxi_device_type = prefs.getUChar("oxi_devtype", cfg.oxi_device_type);
-    cfg.oxi_device_addr = prefs.getString("oxi_devaddr", cfg.oxi_device_addr);
-    cfg.oxi_interval_ms = prefs.getUShort("oxi_interval", cfg.oxi_interval_ms);
-    cfg.oxi_lframe_continuous = prefs.getBool("oxi_lframe_cont", cfg.oxi_lframe_continuous);
-    cfg.oxi_require_known = prefs.getBool("oxi_req_known", cfg.oxi_require_known);
-
-    cfg.uart_baud       = prefs.getULong("uart_baud", cfg.uart_baud);
-    cfg.uart_cmd_timeout_ms = prefs.getUShort("uart_timeout", cfg.uart_cmd_timeout_ms);
-    cfg.uart_max_retries = prefs.getUChar("uart_retries", cfg.uart_max_retries);
-
-    cfg.allow_transparent_during_therapy = prefs.getBool("allow_transp", cfg.allow_transparent_during_therapy);
-
-    cfg.debug_port      = prefs.getUShort("debug_port", cfg.debug_port);
-
-    cfg.http_port       = prefs.getUShort("http_port", cfg.http_port);
-    cfg.http_user       = prefs.getString("http_user", cfg.http_user);
-    cfg.http_pass       = prefs.getString("http_pass", cfg.http_pass);
-
-    cfg.ota_password    = prefs.getString("ota_pass", cfg.ota_password);
-    cfg.ntp_server      = prefs.getString("ntp_server", cfg.ntp_server);
-    cfg.tz              = prefs.getString("tz", cfg.tz);
-    cfg.udp_oxi_port    = prefs.getUShort("udp_oxi_port", cfg.udp_oxi_port);
-    cfg.mitm_mode       = prefs.getUChar("mitm_mode", cfg.mitm_mode);
+static void apply_syslog() {
+    if (!Log::configure_syslog(cfg.syslog_enabled, cfg.syslog_host.c_str(),
+                               cfg.syslog_port, cfg.hostname.c_str())) {
+        Log::logf(CAT_GENERAL, LOG_WARN, "[LOG] Cannot enable syslog\n");
+    }
 }
 
-void Config::save() {
-    prefs.putString("hostname", cfg.hostname);
-    prefs.putUChar("wifi_mode", cfg.wifi_mode);
-    prefs.putBool("wifi_roam", cfg.wifi_roam);
-    prefs.putString("wifi_country", cfg.wifi_country);
-    prefs.putUShort("tcp_port", cfg.tcp_port);
-    // wifi_nets saved separately via save_wifi_nets()
+static bool load_values() {
+    bool legacy = prefs.isKey("wifi_ssid");
+    for (const KVEntry &entry : kv_table) {
+        reset_value(entry);
+        if (!prefs.isKey(entry.nvs_key)) continue;
+        legacy = true;
+        switch (entry.type) {
+            case KVEntry::STR: {
+                auto &value = *(String *)entry.ptr;
+                value = prefs.getString(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U8: {
+                auto &value = *(uint8_t *)entry.ptr;
+                value = prefs.getUChar(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::U16: {
+                auto &value = *(uint16_t *)entry.ptr;
+                value = prefs.getUShort(entry.nvs_key, value);
+                break;
+            }
+            case KVEntry::BOOL: {
+                auto &value = *(bool *)entry.ptr;
+                value = prefs.getBool(entry.nvs_key, value);
+                break;
+            }
+        }
+    }
+    for (auto &revision : section_revisions) __atomic_add_fetch(&revision, 1, __ATOMIC_RELEASE);
+    return legacy;
+}
 
-    prefs.putBool("oxi_enabled", cfg.oxi_enabled);
-    prefs.putBool("oxi_autostart", cfg.oxi_auto_start);
-    prefs.putBool("oxi_thronly", cfg.oxi_feed_therapy_only);
-    prefs.putUChar("oxi_devtype", cfg.oxi_device_type);
-    prefs.putString("oxi_devaddr", cfg.oxi_device_addr);
-    prefs.putUShort("oxi_interval", cfg.oxi_interval_ms);
-    prefs.putBool("oxi_lframe_cont", cfg.oxi_lframe_continuous);
-    prefs.putBool("oxi_req_known", cfg.oxi_require_known);
+void Config::load() {
+    bool legacy = load_values();
+    // Classify old installations before migration or any new settings are saved.
+    nvs_handle_t networks;
+    if (nvs_open("wnet", NVS_READONLY, &networks) == ESP_OK) {
+        uint8_t count = 0;
+        if (nvs_get_u8(networks, "count", &count) == ESP_OK && count > 0)
+            legacy = true;
+        nvs_close(networks);
+    }
+    onboarding_stored = prefs.isKey("onboard");
+    onboarding_done = onboarding_stored ? prefs.getBool("onboard", false) : legacy;
+    if (!onboarding_stored)
+        onboarding_stored = prefs.putBool("onboard", onboarding_done) == 1;
+    load_wifi_nets();
+    apply_syslog();
+}
 
-    prefs.putULong("uart_baud", cfg.uart_baud);
-    prefs.putUShort("uart_timeout", cfg.uart_cmd_timeout_ms);
-    prefs.putUChar("uart_retries", cfg.uart_max_retries);
+static esp_err_t store_value(nvs_handle_t handle, const KVEntry &entry) {
+    switch (entry.type) {
+        case KVEntry::STR: return nvs_set_str(handle, entry.nvs_key, ((String *)entry.ptr)->c_str());
+        case KVEntry::U8: return nvs_set_u8(handle, entry.nvs_key, *(uint8_t *)entry.ptr);
+        case KVEntry::U16: return nvs_set_u16(handle, entry.nvs_key, *(uint16_t *)entry.ptr);
+        case KVEntry::BOOL: return nvs_set_u8(handle, entry.nvs_key, *(bool *)entry.ptr);
+    }
+    return ESP_ERR_INVALID_ARG;
+}
 
-    prefs.putBool("allow_transp", cfg.allow_transparent_during_therapy);
+static bool store_onboarding_marker() {
+    if (!onboarding_stored)
+        onboarding_stored = prefs.putBool("onboard", onboarding_done) == 1;
+    return onboarding_stored;
+}
 
-    prefs.putUShort("debug_port", cfg.debug_port);
+bool Config::save() {
+    if (!store_onboarding_marker()) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: onboarding marker\n");
+        load_values();
+        return false;
+    }
+    nvs_handle_t handle;
+    esp_err_t error = nvs_open("airbridge", NVS_READWRITE, &handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: NVS open: %s\n", esp_err_to_name(error));
+        load_values();
+        return false;
+    }
+    const char *stage = "commit";
+    for (const KVEntry &entry : kv_table) {
+        error = store_value(handle, entry);
+        if (error != ESP_OK) { stage = entry.nvs_key; break; }
+    }
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "Save failed: %s: %s\n", stage, esp_err_to_name(error));
+        load_values();
+    }
+    apply_syslog();
+    __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+    if (error == ESP_OK) Log::logf(CAT_CONFIG, LOG_INFO, "Configuration saved\n");
+    return error == ESP_OK;
+}
 
-    prefs.putUShort("http_port", cfg.http_port);
-    prefs.putString("http_user", cfg.http_user);
-    prefs.putString("http_pass", cfg.http_pass);
+bool Config::onboarding_complete() {
+    return __atomic_load_n(&onboarding_done, __ATOMIC_ACQUIRE);
+}
 
-    prefs.putString("ota_pass", cfg.ota_password);
-    prefs.putString("ntp_server", cfg.ntp_server);
-    prefs.putString("tz", cfg.tz);
-    prefs.putUShort("udp_oxi_port", cfg.udp_oxi_port);
-    prefs.putUChar("mitm_mode", cfg.mitm_mode);
+bool Config::complete_onboarding(const char *user, const char *password) {
+    const String previous_user = cfg.http_user;
+    const String previous_password = cfg.http_pass;
+    if (user) cfg.http_user = user;
+    if (password) cfg.http_pass = password;
+    if (((user || password) && !save()) || prefs.putBool("onboard", true) != 1) {
+        cfg.http_user = previous_user;
+        cfg.http_pass = previous_password;
+        return false;
+    }
+    __atomic_store_n(&onboarding_done, true, __ATOMIC_RELEASE);
+    onboarding_stored = true;
+    __atomic_add_fetch(&config_revision, 1, __ATOMIC_RELEASE);
+    return true;
+}
+
+uint32_t Config::revision(Section section) {
+    return __atomic_load_n(section == Section::All ? &config_revision :
+        &section_revisions[static_cast<size_t>(section)], __ATOMIC_ACQUIRE);
 }
 
 void Config::reset_defaults() {
     prefs.clear();
+    onboarding_done = false;
+    onboarding_stored = false;
     apply_defaults();
     save();
 }
@@ -191,116 +348,88 @@ AirBridgeConfig& Config::get() {
 }
 
 
-void Config::refresh_device_info() {
-    char resp[64] = {};
-    uint16_t len;
-
-    if (cfg.device_pna.isEmpty()) {
-        len = sizeof(resp);
-        memset(resp, 0, sizeof(resp));
-        if (Arbiter::send_cmd("G S #PNA", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                               resp, &len)) {
-            const char *v = qframe_response_value(resp);
-            if (v) cfg.device_pna = v;
-        }
-    }
-
-    if (cfg.device_srn.isEmpty()) {
-        len = sizeof(resp);
-        memset(resp, 0, sizeof(resp));
-        if (Arbiter::send_cmd("G S #SRN", CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                               resp, &len)) {
-            const char *v = qframe_response_value(resp);
-            if (v) cfg.device_srn = v;
-        }
+static void format_value(const KVEntry &entry, String &out) {
+    switch (entry.type) {
+        case KVEntry::STR:  out = *(String *)entry.ptr; break;
+        case KVEntry::U8:   out = String(*(uint8_t *)entry.ptr); break;
+        case KVEntry::U16:  out = String(*(uint16_t *)entry.ptr); break;
+        case KVEntry::BOOL: out = *(bool *)entry.ptr ? "1" : "0"; break;
     }
 }
-
-void Config::invalidate_device_info() {
-    cfg.device_pna = "";
-    cfg.device_srn = "";
-}
-
-struct KVEntry {
-    const char *key;
-    enum { STR, U8, U16, U32, BOOL } type;
-    void *ptr;
-};
-
-#define KV_STR(k, f)  { k, KVEntry::STR,  &cfg.f }
-#define KV_U8(k, f)   { k, KVEntry::U8,   &cfg.f }
-#define KV_U16(k, f)  { k, KVEntry::U16,  &cfg.f }
-#define KV_U32(k, f)  { k, KVEntry::U32,  &cfg.f }
-#define KV_BOOL(k, f) { k, KVEntry::BOOL, &cfg.f }
-
-static const KVEntry kv_table[] = {
-    KV_STR("hostname", hostname),
-    KV_U8("wifi_mode", wifi_mode),
-    KV_BOOL("wifi_roam", wifi_roam),
-    KV_STR("wifi_country", wifi_country),
-    KV_U16("tcp_port", tcp_port),
-    KV_BOOL("oxi_enabled", oxi_enabled),
-    KV_BOOL("oxi_auto_start", oxi_auto_start),
-    KV_BOOL("oxi_feed_therapy_only", oxi_feed_therapy_only),
-    KV_U8("oxi_device_type", oxi_device_type),
-    KV_STR("oxi_device_addr", oxi_device_addr),
-    KV_U16("oxi_interval_ms", oxi_interval_ms),
-    KV_BOOL("oxi_lframe_continuous", oxi_lframe_continuous),
-    KV_BOOL("oxi_require_known", oxi_require_known),
-    KV_U32("uart_baud", uart_baud),
-    KV_U16("uart_cmd_timeout_ms", uart_cmd_timeout_ms),
-    KV_U8("uart_max_retries", uart_max_retries),
-    KV_BOOL("allow_transparent_during_therapy", allow_transparent_during_therapy),
-    KV_U16("debug_port", debug_port),
-    KV_U16("http_port", http_port),
-    KV_STR("http_user", http_user),
-    KV_STR("http_pass", http_pass),
-    KV_STR("ota_password", ota_password),
-    KV_STR("ntp_server", ntp_server),
-    KV_STR("tz", tz),
-    KV_U16("udp_oxi_port", udp_oxi_port),
-    KV_U8("mitm_mode", mitm_mode),
-    { nullptr, KVEntry::U8, nullptr }
-};
 
 bool Config::get_value(const char *key, String &out) {
-    for (const KVEntry *e = kv_table; e->key; e++) {
-        if (strcasecmp(key, e->key) == 0) {
-            switch (e->type) {
-            case KVEntry::STR:  out = *(String*)e->ptr; break;
-            case KVEntry::U8:   out = String(*(uint8_t*)e->ptr); break;
-            case KVEntry::U16:  out = String(*(uint16_t*)e->ptr); break;
-            case KVEntry::U32:  out = String(*(uint32_t*)e->ptr); break;
-            case KVEntry::BOOL: out = (*(bool*)e->ptr) ? "1" : "0"; break;
-            }
+    for (const KVEntry &entry : kv_table) {
+        if (strcasecmp(key, entry.key) == 0) {
+            format_value(entry, out);
             return true;
         }
     }
+    return false;
+}
+
+bool Config::is_sensitive(const char *key) {
+    for (const KVEntry &entry : kv_table)
+        if (strcasecmp(key, entry.key) == 0) return entry.sensitive;
     return false;
 }
 
 bool Config::set_value(const char *key, const char *value) {
-    for (const KVEntry *e = kv_table; e->key; e++) {
-        if (strcasecmp(key, e->key) == 0) {
-            switch (e->type) {
-            case KVEntry::STR:  *(String*)e->ptr = value; break;
-            case KVEntry::U8:   *(uint8_t*)e->ptr = atoi(value); break;
-            case KVEntry::U16:  *(uint16_t*)e->ptr = atoi(value); break;
-            case KVEntry::U32:  *(uint32_t*)e->ptr = atol(value); break;
-            case KVEntry::BOOL: *(bool*)e->ptr = (atoi(value) != 0); break;
+    if (strcasecmp(key, "syslog_host") == 0 && *value) {
+        in_addr address;
+        if (inet_pton(AF_INET, value, &address) != 1) return false;
+    } else if (strcasecmp(key, "syslog_port") == 0) {
+        char *end;
+        unsigned long port = strtoul(value, &end, 10);
+        if (*value < '0' || *value > '9' || *end || port == 0 || port > 65535)
+            return false;
+    } else if (strcasecmp(key, "syslog_en") == 0) {
+        if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) return false;
+    }
+
+    for (const KVEntry &entry : kv_table) {
+        if (strcasecmp(key, entry.key) == 0) {
+            bool changed = false;
+            switch (entry.type) {
+            case KVEntry::STR:
+                changed = *(String*)entry.ptr != value;
+                *(String*)entry.ptr = value;
+                break;
+            case KVEntry::U8:
+                changed = *(uint8_t*)entry.ptr != static_cast<uint8_t>(atoi(value));
+                *(uint8_t*)entry.ptr = atoi(value);
+                break;
+            case KVEntry::U16:
+                changed = *(uint16_t*)entry.ptr != static_cast<uint16_t>(atoi(value));
+                *(uint16_t*)entry.ptr = atoi(value);
+                break;
+            case KVEntry::BOOL:
+                changed = *(bool*)entry.ptr != (atoi(value) != 0);
+                *(bool*)entry.ptr = (atoi(value) != 0);
+                break;
             }
+            if (changed) __atomic_add_fetch(&section_revisions[static_cast<size_t>(entry.section)],
+                                             1, __ATOMIC_RELEASE);
             return true;
         }
     }
     return false;
 }
 
-void Config::foreach_kv(kv_visitor_fn fn, void *ctx) {
+bool Config::parse_section(const char *name, Section &out) {
+    for (const auto &entry : config_sections) {
+        if (strcmp(name, entry.name) != 0) continue;
+        out = entry.section;
+        return true;
+    }
+    return false;
+}
+
+void Config::foreach_kv(kv_visitor_fn fn, void *ctx, Section section) {
     String val;
-    for (const KVEntry *e = kv_table; e->key; e++) {
-        val = "";
-        get_value(e->key, val);
-        fn(e->key, val, ctx);
+    for (const KVEntry &entry : kv_table) {
+        if (section != Section::All && entry.section != section) continue;
+        format_value(entry, val);
+        fn(entry.key, val, entry.sensitive, ctx);
     }
 }
 
@@ -313,38 +442,46 @@ String Config::dump() {
         out += "\n";
     }
     // KV table entries
-    foreach_kv([](const char *key, const String &val, void *p) {
+    foreach_kv([](const char *key, const String &val, bool sensitive, void *p) {
         String v = val;
-        if (strstr(key, "pass") && v.length() > 0) v = "****";
+        if (sensitive && v.length() > 0) v = "****";
         *(String*)p += String(key) + "=" + v + "\n";
     }, &out);
     return out;
 }
 
 
-void Config::save_wifi_nets() {
-    Preferences wp;
-    wp.begin("wnet", false);
-    wp.putUChar("count", cfg.wifi_net_count);
-    for (int i = 0; i < WIFI_MAX_NETWORKS; i++) {
-        char key[14];
-        if (i < cfg.wifi_net_count) {
-            snprintf(key, sizeof(key), "ssid_%d", i);
-            wp.putString(key, cfg.wifi_nets[i].ssid);
-            snprintf(key, sizeof(key), "pass_%d", i);
-            wp.putString(key, cfg.wifi_nets[i].pass);
-            snprintf(key, sizeof(key), "ena_%d", i);
-            wp.putBool(key, cfg.wifi_nets[i].enabled);
-        } else {
-            snprintf(key, sizeof(key), "ssid_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
-            snprintf(key, sizeof(key), "pass_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
-            snprintf(key, sizeof(key), "ena_%d", i);
-            if (wp.isKey(key)) wp.remove(key);
-        }
+bool Config::save_wifi_nets() {
+    const auto failed = []() { load_wifi_nets(false); return false; };
+    if (!store_onboarding_marker()) return failed();
+    if (cfg.wifi_net_count > WIFI_MAX_NETWORKS) return failed();
+    StoredNetworks stored = {};
+    stored.version = 1;
+    stored.count = cfg.wifi_net_count;
+    for (uint8_t i = 0; i < stored.count; i++) {
+        const auto &net = cfg.wifi_nets[i];
+        if (!net.ssid.length() || net.ssid.length() >= sizeof(stored.entries[i].ssid) ||
+            net.pass.length() >= sizeof(stored.entries[i].pass)) return failed();
+        stored.entries[i].enabled = net.enabled;
+        strcpy(stored.entries[i].ssid, net.ssid.c_str());
+        strcpy(stored.entries[i].pass, net.pass.c_str());
     }
-    wp.end();
+    nvs_handle_t handle;
+    esp_err_t error = nvs_open("wnet", NVS_READWRITE, &handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "WiFi profiles: NVS open failed: %s\n", esp_err_to_name(error));
+        return failed();
+    }
+    const char *stage = "write";
+    error = nvs_set_blob(handle, "profiles", &stored, sizeof(stored));
+    if (error == ESP_OK) { stage = "commit"; error = nvs_commit(handle); }
+    nvs_close(handle);
+    if (error != ESP_OK) {
+        Log::logf(CAT_CONFIG, LOG_ERROR, "WiFi profiles: %s failed: %s\n", stage, esp_err_to_name(error));
+        return failed();
+    }
+    Log::logf(CAT_CONFIG, LOG_INFO, "WiFi profiles saved count=%u\n", stored.count);
+    return true;
 }
 
 bool Config::add_network(const char *ssid, const char *pass) {
@@ -354,8 +491,7 @@ bool Config::add_network(const char *ssid, const char *pass) {
     cfg.wifi_nets[idx].pass = pass ? pass : "";
     cfg.wifi_nets[idx].enabled = true;
     cfg.wifi_net_count++;
-    save_wifi_nets();
-    return true;
+    return save_wifi_nets();
 }
 
 bool Config::remove_network(uint8_t idx) {
@@ -370,6 +506,5 @@ bool Config::remove_network(uint8_t idx) {
     cfg.wifi_nets[cfg.wifi_net_count].ssid = "";
     cfg.wifi_nets[cfg.wifi_net_count].pass = "";
     cfg.wifi_nets[cfg.wifi_net_count].enabled = false;
-    save_wifi_nets();
-    return true;
+    return save_wifi_nets();
 }

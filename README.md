@@ -6,28 +6,18 @@ ESP32 bridge for ResMed AirSense 10 CPAP.
 
 ## What it does
 
+- **Web UI** - configure therapy settings, view sleep reports, live pressure/flow waveforms, and manage oximeters.
+- **SD recording and export** - records therapy in Air10 EDF format and synchronizes files to SMB and SleepHQ on [SD-capable hardware](docs/hardware.md#what-needs-sd).
 - **Oximetry** - feeds SpO2/pulse into AirSense for native SAD.edf recording. BLE (Nonin 3150, O2Ring, O2Ring-S, Checkme O2, WS20A, generic PLX/HR sensors) and UDP for integrating unsupported devices.
-- **Web UI** - read/write all therapy settings, live pressure/flow waveforms, BLE device management, ResMed firmware upload
-- **TCP-UART bridge** - send commands to AirSense over WiFi. Single UART writer (arbiter) with priority queue prevents collisions between concurrent sources (TCP clients, BLE feeder, health monitor, web UI).
-- **ResMed OTA** - flash AirSense firmware (BLX/CMX/CDX) over UART from web UI or CLI. Handles baud negotiation, block chaining, bootloader re-entry.
-
-## Supported boards
-
-| Board | PlatformIO env |
-|-------|----------------|
-| Waveshare ESP32-S3-LCD-1.54 | `waveshare-s3-lcd154` (UART pads), `waveshare-s3-lcd154-i2cpads` (SCL/SDA pads) |
-| M5Stamp Pico | `m5stamp-pico` |
-| XIAO ESP32S3 Plus | `xiao-esp32s3-plus`, `xiao-esp32s3-plus-sdmmc4` |
-
-Wiring for each board is in [docs/hardware.md](docs/hardware.md).
+- **ResMed OTA** - upload and flash AirSense firmware over WiFi.
+- **TCP-UART bridge** - send commands to AirSense over WiFi.
 
 ## First setup
 
-1. Copy `provision.env.example` to `provision.env`, fill in your WiFi credentials
-2. Flash: `pio run -e <env> -t upload` (see the table above)
-3. Open `http://airbridge/` (default login: admin/airbridge)
-
-Without `provision.env`, the device tries SmartConfig for 60 seconds - use the [EspTouch](https://github.com/EspressifApp/EsptouchForAndroid/releases) app (v1 mode, phone must be on the target WiFi) to send credentials. If SmartConfig times out, it falls back to AP mode (`airbridge_XXXX`) where you can configure WiFi via web UI at `http://192.168.4.1/`.
+Follow the [Quick Start](docs/quickstart.md) to wire and flash your board.
+On a fresh installation, connect to its `airbridge_...` WiFi network
+(password `airbridge`), open `http://192.168.4.1/`, and complete the setup wizard.
+Default Web UI login: `admin` / `airbridge`.
 
 ## Related tools
 
@@ -40,9 +30,9 @@ Both support serial (`-p /dev/ttyUSB0`) and TCP (`-p tcp:hostname`) with `--tcp-
 
 ## Screenshots
 
-| Dashboard | Sleep Report |
-|---|---|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Report](docs/screenshots/report.png) |
+| Dashboard | Edf Sync | Sleep Report |
+|---|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Sync](docs/screenshots/sync.png) | ![Report](docs/screenshots/report.png) |
 
 | Clinical Settings | Oximetry | OTA Upload |
 |---|---|---|

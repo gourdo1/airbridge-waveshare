@@ -9,10 +9,11 @@
 #include "uart_arbiter.h"
 #include "oxi_arbiter.h"
 #include "live_stream.h"
-#include "live_pmd.h"
+#include "live_tce.h"
+#include "airsense_state.h"
 #include "debug_log.h"
 
-bool airsense_is_present();     // main.cpp
+
 
 namespace StatusScreen {
 
@@ -49,8 +50,8 @@ static float    pressure_cmh2o = 0;
 // Runs on the UART rx task: keep it tiny.
 static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
     (void)ctx;
-    if (sample_size < sizeof(LivePmd::Sample)) return;
-    const LivePmd::Sample *s = (const LivePmd::Sample *)sample;
+    if (sample_size < sizeof(LiveTce::Sample)) return;
+    const LiveTce::Sample *s = (const LiveTce::Sample *)sample;
     portENTER_CRITICAL(&pmd_mux);
     pmd_sum += s->mkp;
     pmd_count++;
@@ -61,11 +62,11 @@ static void on_pmd(const void *sample, uint16_t sample_size, void *ctx) {
 static void update_pmd_subscription(bool want) {
     if (want && pmd_handle < 0) {
         if (pmd_retry_ms && millis() - pmd_retry_ms < PMD_RETRY_MS) return;
-        pmd_handle = LiveStream::subscribe(LivePmd::TAG, on_pmd, nullptr);
+        pmd_handle = LiveStream::subscribe(LiveTce::TAG, on_pmd, nullptr);
         if (pmd_handle < 0) {
             pmd_retry_ms = millis();
             if (pmd_retry_ms == 0) pmd_retry_ms = 1;
-            Log::logf(CAT_GENERAL, LOG_WARN, "[LCD] PMD subscribe failed\n");
+            Log::logf(CAT_GENERAL, LOG_WARN, "[LCD] pressure stream (TCE) subscribe failed\n");
         } else {
             pmd_retry_ms = 0;
         }
@@ -164,7 +165,7 @@ static void draw_status() {
     if (therapy) {
         draw_line(L_STATE, "THERAPY", RGB565_GREEN);
     } else if (st == SYS_IDLE) {
-        if (airsense_is_present()) draw_line(L_STATE, "STANDBY", RGB565_WHITE);
+        if (AirSenseState::present_recently()) draw_line(L_STATE, "STANDBY", RGB565_WHITE);
         else                       draw_line(L_STATE, "NO AIRSENSE", RGB565_DARKGREY);
     } else if (st == SYS_ERROR) {
         draw_line(L_STATE, "UART ERROR", RGB565_RED);
@@ -183,7 +184,8 @@ static void draw_status() {
     }
 
     // SpO2 / pulse from whichever oximetry source is feeding
-    oxi_reading_t r = OxiArbiter::get_reading();
+    oxi_reading_t r;
+    OxiArbiter::snapshot(r);
     if (r.valid && r.spo2 > 0) {
         snprintf(buf, sizeof(buf), "SpO2 %d%%", r.spo2);
         draw_line(L_SPO2, buf, RGB565_WHITE);

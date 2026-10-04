@@ -137,4 +137,29 @@
 
 
 #define DEFAULT_HOSTNAME    "airbridge"
-#define DEFAULT_OTA_PORT    3232
+
+#ifndef AB_OTA_RELEASE_TARGET
+#if defined(AB_BOARD_WAVESHARE_S3_LCD154) && AB_AS10_TX_GPIO == 42
+// Separate target so a release can never swap the SCL/SDA wiring variant
+// for the UART-pad one (or vice versa).
+#define AB_OTA_RELEASE_TARGET "waveshare-s3-lcd154-i2cpads"
+#elif defined(AB_BOARD_WAVESHARE_S3_LCD154)
+#define AB_OTA_RELEASE_TARGET "waveshare-s3-lcd154"
+#elif defined(AB_BOARD_WAVESHARE_ESP32_S3_GEEK)
+#define AB_OTA_RELEASE_TARGET "waveshare-esp32-s3-geek"
+#elif defined(AB_BOARD_WROOM_S3)
+#define AB_OTA_RELEASE_TARGET "wroom-s3-n16r8-sdmmc4"
+#elif defined(AB_BOARD_XIAO_ESP32S3_PLUS) && AB_STORAGE_SDMMC_ENABLED
+#define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus-sdmmc4"
+#elif defined(AB_BOARD_XIAO_ESP32S3_PLUS)
+#define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus"
+#else
+#define AB_OTA_RELEASE_TARGET "m5stamp-pico"
+#endif
+#endif
+
+#ifndef AB_DEFAULT_UPDATE_URL
+#define AB_DEFAULT_UPDATE_URL                                                \
+    "https://github.com/m-kozlowski/airbridge/releases/latest/download/"   \
+    "airbridge-release.json"
+#endif

@@ -1,74 +1,132 @@
 """
-Pre-build script: minify + gzip www/index.html -> src/web_ui_html.h
+Pre-build script: minify JavaScript, compact HTML and gzip into a build header.
 """
 
-import gzip, os, re, sys
+import gzip
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
 
-Import("env")
+try:
+    Import("env")
+except NameError:
+    env = None
+
+# SCons executes extra scripts without defining __file__.
+PROJECT_DIR = (os.path.abspath(env.get("PROJECT_DIR", ".")) if env is not None
+               else os.path.dirname(os.path.abspath(__file__)))
+RJS_MIN_PATH = os.path.join(PROJECT_DIR, "third_party", "rjsmin", "rjsmin.py")
+
+
+def load_js_minifier():
+    spec = importlib.util.spec_from_file_location("airbridge_rjsmin", RJS_MIN_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load JavaScript minifier: {RJS_MIN_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if module.__version__ != "1.2.5":
+        raise RuntimeError(f"unsupported rjsmin version {module.__version__}; expected 1.2.5")
+    return module._make_jsmin(python_only=True)
+
+
+js_minify = load_js_minifier()
+
+
+def fill_config_sections(html, source):
+    # These two declarative C++ tables are shared with Config's HTTP filter.
+    sections = {}
+    rows = source.split('} config_sections[] = {', 1)[1].split('};', 1)[0]
+    for row in rows.splitlines():
+        if not row.strip():
+            continue
+        match = re.fullmatch(r'\s*\{Config::Section::(\w+), "([^"]+)", "([^"]+)"\},\s*', row)
+        if not match:
+            raise ValueError(f'unsupported config section: {row}')
+        symbol, name, label = match.groups()
+        sections[symbol] = {'id': name, 'label': label, 'keys': [], 'options': {}}
+
+    rows = source.split('static const KVEntry kv_table[] = {', 1)[1].split('};', 1)[0]
+    for row in rows.splitlines():
+        if not row.strip():
+            continue
+        match = re.fullmatch(
+            r'\s*KV_(\w+)\("([^"]+)", "[^"]+", \w+, '
+            r'(?:"(?:\\.|[^"\\])*"|[^,]+), (\w+)(.*?)\),\s*', row)
+        if not match:
+            raise ValueError(f'unsupported config field: {row}')
+        kind, key, section, choices = match.groups()
+        sections[section]['keys'].append(key)
+        if kind in ('BOOL', 'ENUM'):
+            labels = (json.loads('[' + choices.removeprefix(', ') + ']') if choices
+                      else ['0=Disabled', '1=Enabled'] if kind == 'BOOL' else [])
+            if not labels:
+                raise ValueError(f'missing enum choices: {key}')
+            sections[section]['options'][key] = [label.split('=', 1) for label in labels]
+
+    marker = '/* CONFIG_SECTIONS */ []'
+    if html.count(marker) != 1:
+        raise ValueError('expected one Config sections placeholder')
+    return html.replace(marker, json.dumps(list(sections.values()), separators=(',', ':')))
+
 
 def minify_html(html):
-    # remove comments
-    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+    # Regex minification corrupts JS strings, regex literals and line comments.
+    # Minify JS separately and exclude raw-text blocks from HTML whitespace edits.
+    blocks = re.split(
+        r'(<!--.*?-->|<(?:script|style|pre|textarea)\b[^>]*>.*?</(?:script|style|pre|textarea)\s*>)',
+        html, flags=re.DOTALL | re.IGNORECASE)
+    for i, block in enumerate(blocks):
+        if i % 2:
+            if block.startswith('<!--'):
+                blocks[i] = ''
+            elif re.match(r'<script\b', block, re.IGNORECASE):
+                opening = block.index('>') + 1
+                closing = block.lower().rindex('</script')
+                blocks[i] = block[:opening] + js_minify(block[opening:closing]) + block[closing:]
+        else:
+            block = re.sub(r'>\s+<', '><', block)
+            blocks[i] = re.sub(r'\s+', ' ', block)
+    return ''.join(blocks).strip()
 
-    # minify css
-    def minify_css(m):
-        css = m.group(1)
-        css = re.sub(r'/\*.*?\*/', '', css, flags=re.DOTALL)
-        css = re.sub(r'\s*([{}:;,>+~])\s*', r'\1', css)
-        css = re.sub(r';\}', '}', css)
-        css = re.sub(r'\s+', ' ', css).strip()
-        return '<style>' + css + '</style>'
-    html = re.sub(r'<style>(.*?)</style>', minify_css, html, flags=re.DOTALL)
 
-    # minify js
-    def minify_js(m):
-        js = m.group(1)
-        js = re.sub(r'//[^\n]*', '', js)
-        js = re.sub(r'/\*.*?\*/', '', js, flags=re.DOTALL)
-        lines = []
-        for line in js.split('\n'):
-            stripped = line.strip()
-            if stripped:
-                lines.append(stripped)
-        js = '\n'.join(lines)
-        js = re.sub(r'\s*([{}();,=<>+\-*/?:&|!])\s*', r'\1', js)
-        js = re.sub(r'\b(const|let|var|return|typeof|instanceof|new|delete|throw|in|of|async|await|function|else|void)\b(?=[^\s({;,])', r'\1 ', js)
-        js = re.sub(r'([^\s}])(?=\b(const|let|var|return|typeof|instanceof|new|delete|throw|in|of|async|await|function|else|void)\b)', r'\1 ', js)
-        return '<script>' + js + '</script>'
-    html = re.sub(r'<script>(.*?)</script>', minify_js, html, flags=re.DOTALL)
-
-    # whitespace
-    html = re.sub(r'>\s+<', '><', html)
-    html = re.sub(r'\s+', ' ', html).strip()
-
-    return html
-
-project_dir = env.get("PROJECT_DIR", ".")
-html_path = os.path.join(project_dir, "www", "index.html")
-header_path = os.path.join(project_dir, "src", "web_ui_html.h")
-
-if os.path.exists(html_path):
-    needs_update = not os.path.exists(header_path) or \
-                   os.path.getmtime(html_path) > os.path.getmtime(header_path)
-
-    if needs_update:
-        with open(html_path, "r") as f:
-            raw = f.read()
-
-        minified = minify_html(raw)
-        compressed = gzip.compress(minified.encode("utf-8"), compresslevel=9)
-
-        with open(header_path, "w") as f:
-            f.write("// Auto-generated from www/index.html, do not edit!\n")
-            f.write("#pragma once\n")
-            f.write("#include <stdint.h>\n\n")
-            f.write(f"#define HTML_PAGE_GZ_SIZE {len(compressed)}\n\n")
-            f.write("static const uint8_t HTML_PAGE_GZ[] PROGMEM = {\n")
-            for i in range(0, len(compressed), 16):
-                chunk = compressed[i:i+16]
-                f.write("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
-            f.write("};\n")
-
+def generate_header(project_dir, output_dir):
+    html_path = os.path.join(project_dir, "www", "index.html")
+    header_path = os.path.join(output_dir, "web_ui_generated.h")
+    if not os.path.exists(html_path):
+        print(f"[web_ui] WARNING: {html_path} not found")
+        return
+    raw = Path(html_path).read_text(encoding="utf-8")
+    raw = fill_config_sections(raw, Path(project_dir, 'src', 'app_config.cpp').read_text(encoding='utf-8'))
+    minified = minify_html(raw)
+    compressed = gzip.compress(minified.encode("utf-8"), compresslevel=9, mtime=0)
+    lines = [
+        "// Auto-generated from www/index.html, do not edit!\n",
+        "#pragma once\n",
+        "#include <stdint.h>\n\n",
+        f"#define HTML_PAGE_GZ_SIZE {len(compressed)}\n\n",
+        "static const uint8_t HTML_PAGE_GZ[] PROGMEM = {\n",
+    ]
+    for i in range(0, len(compressed), 16):
+        chunk = compressed[i:i+16]
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",\n")
+    lines.append("};\n")
+    content = "".join(lines)
+    header = Path(header_path)
+    if not header.exists() or header.read_text(encoding="utf-8") != content:
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text(content, encoding="utf-8")
         print(f"[web_ui] {html_path} ({len(raw)} -> {len(minified)} minified -> {len(compressed)} gzipped)")
-else:
-    print(f"[web_ui] WARNING: {html_path} not found")
+
+
+if env is not None:
+    output_dir = os.path.join(env.subst("$BUILD_DIR"), "generated")
+    generate_header(PROJECT_DIR, output_dir)
+    env.AppendUnique(CPPPATH=[output_dir])
+elif __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_dir", help="Directory for the generated header")
+    generate_header(PROJECT_DIR, parser.parse_args().output_dir)

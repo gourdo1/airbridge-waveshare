@@ -4,6 +4,8 @@
 namespace WiFiSetup {
     bool init();
     void check();
+    void request_reconfigure(bool network, bool clock);
+    void profiles_changed();
     bool is_connected();
     bool time_synced();
     bool set_fallback_time(int year, int month, int day, int hour, int min, int sec, bool force = false);
@@ -14,6 +16,7 @@ namespace WiFiSetup {
     void resume_roaming();
 
     const char *state_name();
+    uint32_t revision();
     int8_t current_rssi();
     const char *connected_ssid();
     uint8_t connected_net_idx();

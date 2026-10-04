@@ -11,6 +11,12 @@
   --text:#e0e0e0;--text-dim:#888;--accent:#00d4aa;--accent-dim:#00d4aa33;
   --red:#e94560;--green:#4ade80;--blue:#818cf8;--cyan:#22d3ee;--orange:#fb923c
 }
+[hidden]{display:none!important}
+.sync-value{overflow-wrap:anywhere;min-width:0;text-align:right}
+.sync-note,.sync-error{font-size:12px;margin:10px 0;color:var(--text-dim)}
+.sync-error{color:var(--red)}
+#p-setup .btn-row{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+#p-setup input,#p-setup select{max-width:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow:hidden}
 .app{display:grid;grid-template-columns:220px 1fr;height:100vh}
 
@@ -27,12 +33,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 
 /* Main */
 .main{display:flex;flex-direction:column;overflow:hidden}
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 24px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 24px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
 .topbar .left{display:flex;align-items:center;gap:12px}
 .topbar .page-title{font-size:16px;font-weight:600}
 .live-badge{background:var(--accent);color:#000;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:1px}
-.topbar .right{display:flex;align-items:center;gap:16px;font-size:12px;color:var(--text-dim)}
-.wifi-bars{display:inline-flex;align-items:flex-end;gap:2px;height:12px;vertical-align:middle}
+.topbar .right{display:flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:8px 16px;min-width:0;font-size:12px;color:var(--text-dim)}
+.topbar .wifi-status{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%}
+#topSsid{max-width:24ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wifi-bars{display:inline-flex;align-items:flex-end;flex-shrink:0;gap:2px;height:12px;vertical-align:middle}
 .wifi-bars span{width:3px;border-radius:1px;background:#475569}
 .wifi-bars span:nth-child(1){height:4px}
 .wifi-bars span:nth-child(2){height:6px}
@@ -51,6 +59,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
 .card-header .label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim)}
 .card-title{font-size:18px;font-weight:600;margin-bottom:4px}
+.storage-meter{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:4px}
+.storage-meter-fill{height:100%;background:var(--accent);width:0}
+#dashStorageSummary{font-size:12px;text-align:right}
 
 /* Badges */
 .badge{display:inline-block;font-size:10px;font-weight:700;padding:3px 10px;border-radius:12px;letter-spacing:0.5px;text-transform:uppercase}
@@ -63,13 +74,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 /* Rows, fields */
 .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #25254533}
 .row:last-child{border-bottom:none}
+.setting-group{margin-top:14px}
+.setting-group .setting-group{margin-left:12px}
+.setting-group h4{font-size:13px;color:var(--text);margin-bottom:4px}
 .row label{flex:1;font-size:14px}
-.row select,.row input[type=number]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
+.row select,.row input[type=number],.row input[type=date]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
+#p-report .row{gap:12px;flex-wrap:wrap}
+#p-report .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.report-note{font-size:12px;color:var(--text-dim);margin:12px 0;line-height:1.5}
+.report-note:empty{display:none}
+#reportGrid .stat{gap:12px;align-items:baseline}
+.report-interval{display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
+.report-interval:last-child{border-bottom:none}
+.interval-duration{font-size:12px;color:var(--text-dim);white-space:nowrap}
+.interval-range{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
 .row input[type=number]{width:100px}
 input[type=text],input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:200px;font-size:14px}
 
 /* Buttons */
 .btn{padding:8px 20px;border:1px solid var(--border-light);border-radius:8px;background:transparent;color:var(--text);font-size:12px;font-weight:600;cursor:pointer;letter-spacing:0.3px;transition:all 0.15s}
+a.btn{display:inline-block;text-decoration:none}
+a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .btn:hover{background:#ffffff0a;border-color:var(--text-dim)}
 .btn:disabled{opacity:0.4;cursor:not-allowed}
 .btn-accent{background:var(--accent);color:#000;border-color:var(--accent)}
@@ -85,6 +110,16 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .stat:last-child{border-bottom:none}
 .stat .k{color:var(--text-dim)}
 .stat .v{color:var(--text);font-weight:500;text-align:right;padding-right:8px}
+
+/* Configuration */
+#configCategories{margin:16px 0}
+#configFields .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+[data-config-form][data-loading="1"]::before{content:'Loading...';display:block;color:var(--text-dim);margin:12px 0}
+.config-section-title{color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.5px}
+[data-config-form] .row{gap:16px}
+[data-config-form] label{min-width:0;overflow-wrap:anywhere}
+[data-config-form] label small{display:block;color:var(--text-dim);font-weight:normal;margin-top:4px;line-height:1.4}
+#configWifi{padding:12px 0;border-bottom:1px solid var(--border);margin-bottom:8px}
 
 /* Device info */
 .device-info{display:grid;grid-template-columns:1fr 1fr;gap:4px}
@@ -105,6 +140,15 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .oxi-metric .big{font-size:42px;font-weight:700;line-height:1}
 .oxi-metric .unit{font-size:16px;font-weight:400;color:var(--text-dim);margin-left:2px}
 .oxi-badges{display:flex;gap:8px;margin-left:auto}
+.ble-device{display:flex;align-items:center;justify-content:space-between;gap:12px 20px;padding:12px 0;border-bottom:1px solid var(--border)}
+.ble-device:last-child{border-bottom:none}
+.ble-device-info{flex:1;min-width:0}
+.ble-device-name{display:block;font-size:14px;font-weight:500;overflow-wrap:anywhere}
+.ble-device-address{display:block;margin-top:4px;color:var(--text-dim);font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
+.ble-device-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ble-device-actions .btn{padding:8px 14px;white-space:nowrap}
+.ble-device-actions .ble-auto{min-width:144px}
+.ble-empty{color:var(--text-dim);font-size:13px;padding:8px 0}
 
 /* Charts */
 .chart-card{background:#0a0a16;border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px;overflow:hidden}
@@ -134,6 +178,28 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 .toast.err{background:#450a0a;color:var(--red);border:1px solid #7f1d1d}
 @keyframes slideIn{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:translateX(0)}}
 
+/* Storage */
+#p-storage .btn{font-family:inherit}
+#storageUsage{font-size:12px;color:var(--text-dim);margin-bottom:16px}
+.storage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+#storagePath{flex:1 1 200px;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font:12px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
+.storage-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+#storageEntries:not(:empty){border:1px solid var(--border-light);border-radius:8px;overflow:hidden;background:var(--surface)}
+.storage-row{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:12px;align-items:center;padding:11px 12px;border-bottom:1px solid var(--border)}
+.storage-row:last-child{border-bottom:none}
+.storage-row:hover{background:#ffffff04}
+.storage-row input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+.storage-row a{color:var(--text);font-size:14px;font-weight:600;text-decoration:none;overflow-wrap:anywhere;cursor:pointer}
+.storage-row a:hover{color:var(--accent)}
+.storage-row a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.storage-row small{display:block;color:var(--text-dim);margin-top:4px;font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere;line-height:1.5}
+.storage-row .storage-download{width:38px;height:34px;padding:0;font-size:20px;line-height:1}
+.storage-entry-actions{display:flex;gap:8px;align-items:center}
+#storageMessage{font-size:12px;color:var(--text-dim);line-height:1.5}
+#storageMessage:not(:empty){margin:10px 0}
+.storage-pagination{display:flex;align-items:center;gap:8px;margin-top:12px}
+#storagePage{font-size:12px;color:var(--text-dim);margin:0 4px}
+
 /* Spinner */
 .spinner{display:none;border:3px solid #333;border-top:3px solid var(--accent);border-radius:50%;width:20px;height:20px;animation:spin 0.8s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -146,6 +212,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
 /* Responsive */
 @media(max-width:768px){
+  [data-config-form] .row{flex-direction:column;align-items:stretch;gap:8px}
+  [data-config-form] .row input,[data-config-form] .row select{width:100%}
+  #p-setup .row{flex-direction:column;align-items:stretch;gap:8px}
+  #p-setup .row input{width:100%}
   body{display:flex;flex-direction:column;min-height:0;height:100vh;height:100dvh}
   .app{grid-template-columns:1fr;grid-template-rows:minmax(0,1fr);height:auto;flex:1;min-height:0}
   .sidebar{display:none}
@@ -156,7 +226,15 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
   .topbar{padding:10px 16px}
   .topbar .page-title{font-size:14px}
   .oxi-metric .big{font-size:32px}
+  .ble-device{flex-direction:column;align-items:stretch}
+  .ble-device-actions{justify-content:flex-end}
+  .ble-device-actions .btn{flex:1}
+  .ble-device-actions .ble-auto{flex-basis:100%}
   .status-grid{grid-template-columns:1fr}
+  #storagePath{flex-basis:100%}
+  .storage-actions .btn{width:100%}
+  .storage-row{gap:8px;padding:10px}
+  .storage-entry-actions{grid-column:2 / -1;justify-content:flex-end}
 }
 </style>
 </head>
@@ -172,11 +250,11 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
     <nav>
       <a class="nav-item active" data-tab="status"><span class="icon">&#9878;</span> Dashboard</a>
       <a class="nav-item" data-tab="report"><span class="icon">&#9776;</span> Sleep Report</a>
-      <a class="nav-item" data-tab="patient"><span class="icon">&#9883;</span> Patient</a>
+      <a class="nav-item" data-tab="sync" hidden><span class="icon">&#8644;</span> Sync</a>
       <a class="nav-item" data-tab="clinical"><span class="icon">&#9881;</span> Clinical</a>
-      <a class="nav-item" data-tab="climate"><span class="icon">&#9729;</span> Climate</a>
       <a class="nav-item" data-tab="bluetooth"><span class="icon">&#9829;</span> Oximetry</a>
       <a class="nav-item" data-tab="console"><span class="icon">&#9002;</span> Console</a>
+      <a class="nav-item" data-tab="storage" hidden><span class="icon">&#9635;</span> Storage</a>
       <a class="nav-item" data-tab="device"><span class="icon">&#9881;</span> Config</a>
       <a class="nav-item" data-tab="ota"><span class="icon">&#8679;</span> OTA Upload</a>
     </nav>
@@ -189,8 +267,11 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
       </div>
       <div class="right">
         <span id="topUptime">--</span>
-        <span id="topWifi" class="wifi-bars" title="--"><span></span><span></span><span></span><span></span></span>
-        <span id="topHeap">-- free</span>
+        <span class="wifi-status">
+          <span id="topWifi" class="wifi-bars" title="--"><span></span><span></span><span></span><span></span></span>
+          <span id="topSsid">WiFi: --</span>
+        </span>
+        <span title="Free memory"><span id="topHeap">-- heap</span><span id="topPsram" hidden></span></span>
         <button class="btn" onclick="loadStatus()" style="padding:4px 12px;font-size:11px">Refresh</button>
       </div>
     </div>
@@ -198,7 +279,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
     <div class="content">
 
       <!-- STATUS / DASHBOARD -->
-      <div class="pane active" id="p-status">
+      <div class="pane" id="p-status">
         <div class="card-grid">
           <div class="card">
             <div class="card-header">
@@ -209,6 +290,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div class="time-row">
               <span class="label">Serial</span>
               <span class="value" id="dashSrn">--</span>
+            </div>
+            <div class="time-row">
+              <span class="label">Therapy mode</span>
+              <span class="value" id="dashMode">--</span>
             </div>
             <div class="time-row">
               <span class="label">Motor Hours</span>
@@ -223,7 +308,7 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 
           <div class="card">
             <div class="card-header">
-              <span class="label">Clock</span>
+              <span class="label">System</span>
             </div>
             <div class="time-row">
               <span class="label">AirBridge Time</span>
@@ -237,6 +322,13 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('ntp_sync')">Ntp Sync</button>
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')">Sync to Resmed</button>
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')">Sync from Resmed</button>
+            </div>
+            <div class="time-row">
+              <span class="label">SD card</span>
+              <span class="value" id="dashStorageSummary">--</span>
+            </div>
+            <div class="storage-meter" id="dashStorageMeter" role="meter" aria-label="SD card usage" aria-valuemin="0" aria-valuemax="100" hidden>
+              <div class="storage-meter-fill" id="dashStorageFill"></div>
             </div>
           </div>
         </div>
@@ -267,7 +359,6 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         </div>
 
         <!-- Hidden status grid for renderStatus compatibility -->
-        <div id="statusGrid" class="status-grid" style="display:none"></div>
         <div class="spinner" id="statusSpinner"></div>
 
         <!-- Telemetry -->
@@ -320,47 +411,36 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
       <!-- SLEEP REPORT -->
       <div class="pane" id="p-report">
         <div class="card">
-          <h3>Last Session</h3>
+          <h3>Sleep Report</h3>
+          <div class="row"><label for="reportView">View</label><select id="reportView" onchange="loadReport()"><option value="day">Day</option><option value="period">Period</option></select></div>
+          <div class="row" id="reportDayRow"><label for="reportDay">Therapy date</label><input type="date" id="reportDay" onchange="loadReport()"></div>
+          <div class="row" id="reportPeriodRow" hidden><label for="reportPeriod">Period</label><select id="reportPeriod" onchange="loadReport()"><option value="0">1 day</option><option value="1">7 days</option><option value="2">30 days</option><option value="3">90 days</option><option value="4">180 days</option><option value="5">365 days</option></select></div>
+          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)">Last saved day</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
+          <div class="msg" id="reportMsg" role="status"></div>
+          <p class="report-note" id="reportAvailability" role="status"></p>
+        </div>
+        <div class="card" aria-busy="false" id="reportResult">
+          <h3 id="reportTitle">Therapy day</h3>
           <div class="spinner" id="reportSpinner"></div>
-          <div id="sessionGrid" class="status-grid"></div>
+          <p class="report-note" id="reportNote"></p>
+          <div id="reportGrid" class="status-grid"></div>
         </div>
-        <div class="card">
-          <h3>Summary</h3>
-          <div id="summaryGrid" class="status-grid"></div>
-        </div>
-        <div class="btn-row"><button class="btn btn-accent" onclick="loadReport()">Refresh</button></div>
-      </div>
-
-      <!-- PATIENT -->
-      <div class="pane" id="p-patient">
-        <div class="card">
-          <h3>Patient Settings</h3>
-          <div class="spinner" id="patientSpinner"></div>
-          <div id="patientFields"></div>
-          <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings('patient')">Save</button></div>
-          <div class="msg" id="patientMsg"></div>
+        <div class="card" id="reportMaskCard" hidden>
+          <h3>Mask intervals</h3>
+          <div id="reportIntervals"></div>
         </div>
       </div>
 
       <!-- CLINICAL -->
       <div class="pane" id="p-clinical">
-        <div class="card"><h3>Therapy Mode</h3><div id="modeField"></div></div>
-        <div class="card"><h3>Mode Settings</h3><div class="spinner" id="clinicalSpinner"></div><div id="modeFields"></div></div>
-        <div class="card"><h3>Comfort</h3><div id="comfortFields"></div><div id="clinicalFields"></div></div>
-        <div class="card"><h3>Alarms</h3><div id="alarmFields"></div></div>
-        <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings('clinical')">Save All</button></div>
+        <div class="spinner" id="clinicalSpinner"></div>
+        <div class="card"><h3>Therapy</h3><div id="therapyFields"></div></div>
+        <div class="card"><h3>Comfort</h3><div id="comfortFields"></div></div>
+        <div class="card"><h3>Accessories</h3><div id="accessoriesFields"></div></div>
+        <div class="card"><h3>Options</h3><div id="optionsFields"></div></div>
+        <div class="card"><h3>Configuration</h3><div id="configurationFields"></div></div>
+        <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings()">Save All</button></div>
         <div class="msg" id="clinicalMsg"></div>
-      </div>
-
-      <!-- CLIMATE -->
-      <div class="pane" id="p-climate">
-        <div class="card">
-          <h3>Climate Control</h3>
-          <div class="spinner" id="climateSpinner"></div>
-          <div id="climateFields"></div>
-          <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings('climate')">Save</button></div>
-          <div class="msg" id="climateMsg"></div>
-        </div>
       </div>
 
       <!-- BLUETOOTH / OXIMETRY -->
@@ -385,9 +465,10 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
           <div class="msg" id="bleMsg"></div>
         </div>
         <div class="card">
-          <h3>Bonded Devices</h3>
+          <h3>Known Devices</h3>
           <div id="bleBonds"></div>
-          <div class="btn-row"><button class="btn btn-danger" onclick="bleAction('delete_all_bonds')">Delete All Bonds</button></div>
+          <div class="btn-row" id="bleForgetAll" hidden><button class="btn btn-danger" onclick="if(confirm('Forget all known devices?')) bleAction('delete_all_bonds', undefined, {}, 'bleKnownMsg')">Forget All</button></div>
+          <div class="msg" id="bleKnownMsg"></div>
         </div>
       </div>
 
@@ -404,23 +485,81 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
         </div>
       </div>
 
+      <!-- INITIAL SETUP -->
+      <div class="pane" id="p-setup">
+        <div class="card">
+          <div class="card-header"><h3 id="setupTitle" tabindex="-1">Initial setup</h3><span id="setupProgress"></span></div>
+          <p id="setupNote" class="sync-note"></p>
+          <div id="setupNetwork" hidden>
+            <div class="sync-note" id="setupWifiStatus" aria-live="polite"></div>
+            <div class="row"><label for="setupSsid">Network name</label><input type="text" id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
+            <div class="row"><label for="setupPass">WiFi password</label><input id="setupPass" type="password" autocomplete="new-password"></div>
+            <div class="sync-note">Leave the network name empty to keep saved networks. Your current access point stays available while connecting.</div>
+            <a id="setupWifiLink" class="btn" hidden>Open on the local network</a>
+          </div>
+          <div id="setupDevice" class="sync-note" aria-live="polite" hidden></div>
+          <div id="setupForms"></div>
+          <div id="setupFinish" hidden>
+            <p>Setup saved. You can change these settings in Config and Sync.</p>
+            <div class="btn-row"><a class="btn btn-accent" href="/">Open dashboard</a><a class="btn" href="/#bluetooth">Set up oximetry</a></div>
+          </div>
+          <div class="msg" id="setupMsg" role="status"></div>
+          <div class="btn-row" id="setupActions">
+            <button class="btn" id="setupBack" onclick="setupMove(-1)">Back</button>
+            <button class="btn" id="setupSkip" onclick="setupMove(1, true)">Skip</button>
+            <button class="btn btn-accent" id="setupNext" onclick="setupMove(1)">Next</button>
+            <button class="btn" onclick="showTab('device')">Later</button>
+          </div>
+        </div>
+      </div>
+
       <!-- DEVICE CONFIG -->
       <div class="pane" id="p-device">
-        <div class="card" style="border-left:3px solid var(--accent)">
-          <h3>WiFi Networks</h3>
-          <div id="wifiNetList"></div>
-          <div class="btn-group" style="margin-top:12px">
-            <button class="btn btn-accent" onclick="wifiAddPrompt()">Add Network</button>
-          </div>
-          <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
-          <div class="msg" id="wifiMsg"></div>
-        </div>
         <div class="card">
           <h3>Device Configuration</h3>
-          <div class="spinner" id="configSpinner"></div>
+          <div class="btn-row"><button class="btn" onclick="startSetup()">Initial setup</button></div>
+          <div id="configWifi" hidden>
+            <h4 class="config-section-title">WiFi networks</h4>
+            <div id="wifiNetList"></div>
+            <div class="btn-group" style="margin-top:12px">
+              <button class="btn btn-accent" onclick="wifiAddPrompt()">Add Network</button>
+            </div>
+            <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
+            <div class="msg" id="wifiMsg"></div>
+          </div>
+          <div class="btn-group" id="configCategories" aria-label="Configuration categories"></div>
           <div id="configFields"></div>
-          <div class="btn-row"><button class="btn btn-accent" onclick="saveConfig()">Save & Persist</button></div>
-          <div class="msg" id="configMsg"></div>
+        </div>
+      </div>
+
+      <!-- SYNC -->
+      <div class="pane" id="p-sync">
+        <div class="msg" id="syncMsg"></div>
+        <div class="card" id="syncUnavailable">Sync requires a build with SD support.</div>
+        <div class="card-grid" id="syncCards" hidden></div>
+      </div>
+
+      <div class="pane" id="p-storage">
+        <div class="card">
+          <div class="card-header"><span class="label">SD card</span><span id="storageState" class="badge badge-idle">--</span></div>
+          <div id="storageUsage"></div>
+          <div class="storage-toolbar">
+            <div id="storagePath" aria-label="Current folder">/</div>
+            <button class="btn" id="storageUp" onclick="storageUp()">Up</button>
+            <button class="btn" id="storageRefresh" onclick="loadStorage()">Refresh</button>
+          </div>
+          <div class="storage-actions">
+            <button class="btn" id="storageZip" onclick="storageDownload('archive')">Download folder ZIP</button>
+            <button class="btn btn-accent" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
+            <button class="btn btn-danger" id="storageDelete" onclick="storageDelete()">Delete selected</button>
+          </div>
+          <div id="storageMessage" role="status" aria-live="polite"></div>
+          <div id="storageEntries"></div>
+          <div class="storage-pagination">
+            <button class="btn" id="storagePrev" onclick="loadStorage(storagePath, storageOffset - 32)">Previous</button>
+            <span id="storagePage"></span>
+            <button class="btn" id="storageNext" onclick="loadStorage(storagePath, storageOffset + 32)">Next</button>
+          </div>
         </div>
       </div>
 
@@ -433,14 +572,24 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
             <div style="font-size:24px">&#9881;</div>
             <div>
               <div style="font-weight:600;font-size:15px">AirBridge Firmware</div>
-              <div style="font-size:12px;color:var(--text-dim)">ESP32-PICO-D4 &middot; <span id="espFwVer">--</span></div>
+              <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwVer">--</span></div>
             </div>
           </div>
+          <div class="row">
+            <label>Latest release</label>
+            <span class="value" id="espFwLatest">--</span>
+          </div>
+          <div class="btn-row" style="margin-bottom:14px">
+            <button class="btn" id="btnOtaCheck" onclick="otaCheckRelease()">Check for updates</button>
+            <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none">Install update</button>
+          </div>
+          <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
+          <div class="msg" id="otaReleaseMsg"></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
             <div>
               <div class="upload-area" id="espDropZone" style="padding:24px;border-color:var(--accent)">
-                <p style="font-size:13px">Select firmware .bin<br><small style="color:var(--text-dim)">or drag and drop here</small></p>
-                <input type="file" id="espFileInput" style="display:none" accept=".bin">
+                <p style="font-size:13px">Select firmware .bin or .bin.zlib<br><small style="color:var(--text-dim)">or drag and drop here</small></p>
+                <input type="file" id="espFileInput" style="display:none" accept=".bin,.zlib">
               </div>
             </div>
             <div>
@@ -518,11 +667,11 @@ input[type=text],input[type=password]{background:var(--bg);color:var(--text);bor
 <nav class="bottom-nav">
   <a class="bnav-item active" data-tab="status"><span class="icon">&#9878;</span>Home</a>
   <a class="bnav-item" data-tab="report"><span class="icon">&#9776;</span>Report</a>
-  <a class="bnav-item" data-tab="patient"><span class="icon">&#9883;</span>Patient</a>
+  <a class="bnav-item" data-tab="sync" hidden><span class="icon">&#8644;</span>Sync</a>
   <a class="bnav-item" data-tab="clinical"><span class="icon">&#9881;</span>Clinical</a>
-  <a class="bnav-item" data-tab="climate"><span class="icon">&#9729;</span>Climate</a>
   <a class="bnav-item" data-tab="bluetooth"><span class="icon">&#9829;</span>Oxi</a>
   <a class="bnav-item" data-tab="console"><span class="icon">&#9002;</span>CLI</a>
+  <a class="bnav-item" data-tab="storage" hidden><span class="icon">&#9635;</span>Storage</a>
   <a class="bnav-item" data-tab="device"><span class="icon">&#9881;</span>Config</a>
   <a class="bnav-item" data-tab="ota"><span class="icon">&#8679;</span>OTA</a>
 </nav>
@@ -536,73 +685,121 @@ let settings = [], curMode = 0;
 
 // SSE
 let evtSrc = null;
+let liveEvtSrc = null;
+function updateLiveSubscription() {
+  const wanted = !document.hidden && document.getElementById('p-status').classList.contains('active');
+  if (!wanted) {
+    if (liveEvtSrc) liveEvtSrc.close();
+    liveEvtSrc = null;
+    return;
+  }
+  if (liveEvtSrc) return;
+  liveEvtSrc = new EventSource('/events/live');
+  liveEvtSrc.addEventListener('live', e => {
+    try { updateChartsFromPush(JSON.parse(e.data)); } catch(ex) {}
+  });
+  liveEvtSrc.onopen = () => backfillLive();
+}
+document.addEventListener('visibilitychange', updateLiveSubscription);
 function initSSE() {
   if (evtSrc) evtSrc.close();
   evtSrc = new EventSource('/events');
   evtSrc.addEventListener('status', e => {
     try { updateStatusFromPush(JSON.parse(e.data)); } catch(ex) {}
   });
-  evtSrc.addEventListener('live', e => {
-    try { updateChartsFromPush(JSON.parse(e.data)); } catch(ex) {}
+  evtSrc.addEventListener('exports', e => {
+    try {
+      const data = JSON.parse(e.data);
+      applyExports(data);
+    } catch(ex) { console.error(ex); }
   });
-  evtSrc.addEventListener('flash', e => {
-    try { updateFlashFromPush(JSON.parse(e.data)); } catch(ex) {}
+  evtSrc.addEventListener('ota', e => {
+    try { otaSerial++; applyOtaStatus(JSON.parse(e.data)); } catch(ex) { console.error(ex); }
   });
   evtSrc.addEventListener('wifi', e => {
+    const revision = JSON.parse(e.data).revision;
+    if (revision === wifiRevision) return;
+    wifiRevision = revision;
+    wifiSerial++;
     // Refresh WiFi list if Config tab is active
     var pane = document.getElementById('p-device');
-    if (pane && pane.classList.contains('active')) loadWifiNets();
+    if (pane && pane.classList.contains('active') && configSection === 'network') loadWifiNets();
+    if (setupActive() && setupStep === 'network') loadSetupWifi();
   });
   evtSrc.onerror = () => {
+    exportsFresh = false;
+    renderExports();
+    if (otaWatch) showMsg(document.getElementById('otaReleaseMsg'), 'Connection lost; waiting for device...', 'err', 0);
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '#555';
-    setTimeout(initSSE, 3000);
   };
   evtSrc.onopen = () => {
+    wifiRevision = null;
+    wifiSerial++;
+    otaSerial++;
+    otaStatus = null;
+    exportsSnapshot = null;
+    bleLoadedRevision = null;
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
-    // Reconnected: pull whatever we missed during the disconnect.
-    if (typeof backfillLive === 'function') backfillLive();
   };
 }
 
 let lastStatus = {};
+let statusRead = null, statusSerial = 0;
+const statusPush = {};
+let uiStarted = false;
+function applyConfigRevision(d) {
+  if (d.config_revision !== undefined && lastStatus.config_revision !== undefined &&
+      d.config_revision !== lastStatus.config_revision) {
+    document.querySelectorAll('[data-config-form]').forEach(root => { root.dataset.stale = '1'; });
+    bleLoadedRevision = null;
+  }
+}
 function updateStatusFromPush(d) {
+  statusSerial++;
+  applyConfigRevision(d);
+  Object.assign(statusPush, d);
   Object.assign(lastStatus, d);
-  renderStatus(lastStatus);
+  renderStatus(d);
+  if (setupActive()) renderSetupDevice();
   updateBleFromPush(d);
+  updateOxiChart(d);
+  finishOtaObservation();
+  if (!uiStarted && d.version) { uiStarted = true; startUI(); }
 }
 
-var lastBleState = '';
 function updateBleFromPush(d) {
+  if (d.ble_revision !== undefined) bleRevision = d.ble_revision;
   // Update dashboard oxi card from any push
   var st = d.oxi || d.state;
-  if (st) {
+  const dashboard = document.getElementById('p-status').classList.contains('active');
+  if (st && dashboard) {
     var b = document.getElementById('dashOxiBadge');
     if (b) {
       b.textContent = st;
       b.className = 'badge ' + (st === 'STREAMING' ? 'badge-streaming' : st === 'DISCONNECTED' ? 'badge-idle' : 'badge-idle');
     }
   }
-  if (d.oxi_addr !== undefined) {
+  if (d.oxi_addr !== undefined && dashboard) {
     var oa = document.getElementById('dashOxiAddr');
     if (oa) {
       if (d.oxi_addr) { oa.textContent = d.oxi_addr; oa.style.display = ''; }
       else { oa.style.display = 'none'; }
     }
   }
-  if (d.feeding !== undefined) {
+  if (d.feeding !== undefined && dashboard) {
     var fb = document.getElementById('dashFeedBadge');
     if (fb) {
       fb.textContent = 'Feed: ' + d.feeding;
       fb.className = 'badge ' + (d.feeding === 'yes' ? 'badge-feed' : 'badge-idle');
     }
   }
-  if (d.spo2 !== undefined) {
+  if (d.spo2 !== undefined && dashboard) {
     var s = document.getElementById('dashSpo2');
     if (s) s.textContent = d.spo2 >= 0 ? d.spo2 : '--';
   }
-  if (d.pulse !== undefined) {
+  if (d.pulse !== undefined && dashboard) {
     var p = document.getElementById('dashPulse');
     if (p) p.textContent = d.pulse >= 0 ? d.pulse : '--';
   }
@@ -612,81 +809,282 @@ function updateBleFromPush(d) {
   if (!pane || !pane.classList.contains('active')) return;
   var g = document.getElementById('bleStatusGrid');
   if (!g || !g.children.length) { loadBle(); return; }
+  if (bleRevision !== bleLoadedRevision) loadBle();
   var fields = {
     state: st, feeding: d.feeding,
-    spo2: d.spo2 >= 0 ? d.spo2 + '%' : '--',
-    pulse: d.pulse >= 0 ? d.pulse + ' bpm' : '--'
+    spo2: d.spo2 === undefined ? undefined : d.spo2 >= 0 ? d.spo2 + '%' : '--',
+    pulse: d.pulse === undefined ? undefined : d.pulse >= 0 ? d.pulse + ' bpm' : '--'
   };
   for (var k in fields) {
+    if (fields[k] === undefined) continue;
     var el = g.querySelector('[data-field="' + k + '"]');
     if (el) el.textContent = fields[k];
   }
   var sp = document.getElementById('bleScanSpinner');
-  if (sp) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
-  if (lastBleState === 'SCANNING' && st !== 'SCANNING') loadBle();
-  if (lastBleState !== 'STREAMING' && st === 'STREAMING') loadBle();
-  if (lastBleState === 'STREAMING' && st !== 'STREAMING') loadBle();
-  if (pendingConnect) {
-    var msgEl = document.getElementById('bleMsg');
-    if (st === 'STREAMING') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connected', 'ok');
-      loadBle();
-    } else if (st === 'DISABLED') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connection failed', 'err');
-      loadBle();
-    } else if (st === 'DISCONNECTED' && lastBleState !== 'CONNECTING' && lastBleState !== 'BONDING') {
-      pendingConnect = false;
-      showMsg(msgEl, 'Connection failed', 'err');
-      loadBle();
-    }
+  if (sp && st) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
+  if (d.feeding !== undefined) {
+    const feed = document.getElementById('btnFeed');
+    feed.textContent = d.feeding === 'yes' ? 'Stop Feed' : 'Start Feed';
+    feed.onclick = () => bleAction(lastStatus.feeding === 'yes' ? 'stop_feed' : 'start_feed');
   }
-  lastBleState = st;
+  if (st) document.getElementById('btnOxiToggle').textContent = st === 'DISABLED' ? 'Enable' : 'Disable';
+  if (st || d.oxi_addr !== undefined) updateBleConnections();
 }
 
-function updateFlashFromPush(d) {
-  if (d.active !== undefined) {
-    const phase = document.getElementById('flashPhase');
-    const bar = document.getElementById('flashBar');
-    const prog = document.getElementById('flashProgress');
-    if (phase) phase.textContent = d.phase || '';
-    if (d.total > 0 && bar) {
-      bar.style.width = (d.sent / d.total * 100) + '%';
-      prog.style.display = 'block';
-    }
-    if (!d.active && d.error) showMsg(document.getElementById('flashMsg'), d.error, 'err');
-    if (!d.active && !d.error) showMsg(document.getElementById('flashMsg'), 'Flash complete', 'ok');
-  }
-}
-
-function updateChartsFromPush(d) {
-  // SSE "live" event: { seq, samples:[[mkp,rfl,lyk],...], spo2, pulse }
-  if (d.samples && d.samples.length) {
-    d.samples.forEach(s => {
+function appendLiveSamples(d, reset = false) {
+  if (!Number.isInteger(d.seq)) return false;
+  const samples = d.samples || [];
+  const delta = liveSeq === null || reset ? samples.length : (d.seq - liveSeq) & 0xffff;
+  if (liveSeq !== null && !reset && (delta === 0 || delta >= 0x8000)) return false;
+  if (reset) for (const k in waveData) waveData[k].length = 0;
+  const count = Math.min(delta, samples.length);
+  if (count) {
+    samples.slice(-count).forEach(s => {
       waveData.press.push(s[0]);
       waveData.flow.push(s[1]);
       waveData.leak.push(s[2]);
     });
     for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
   }
-  // Slow charts: ~0.5 Hz (every 10 SSE events at 5 Hz fire rate).
-  slowTick++;
-  if (slowTick >= 10) {
-    slowData.spo2.push(d.spo2 >= 0 ? d.spo2 : -32768);
-    slowData.pulse.push(d.pulse >= 0 ? d.pulse : -32768);
-    while (slowData.spo2.length > SLOW_PTS) slowData.spo2.shift();
-    while (slowData.pulse.length > SLOW_PTS) slowData.pulse.shift();
-    slowTick = 0;
-  }
   liveSeq = d.seq;
-  updateCharts();
+  return true;
+}
+
+function updateChartsFromPush(d) {
+  // SSE and HTTP backfill can overlap. Append only samples newer than liveSeq.
+  if (!appendLiveSamples(d)) return;
+  updateCharts(false);
+}
+
+function updateOxiChart(d) {
+  if (d.spo2 === undefined || !Number.isFinite(d.sample_ms)) return;
+  const bucket = Math.floor(d.sample_ms / 2000);
+  if (bucket === slowBucket) return;
+  if (slowBucket !== null && bucket < slowBucket) {
+    slowData.spo2.length = slowData.pulse.length = 0;
+    slowBucket = null;
+  }
+  const gaps = slowBucket === null ? 0 : Math.min(SLOW_PTS - 1, bucket - slowBucket - 1);
+  for (const [key, value] of Object.entries({spo2:d.spo2, pulse:d.pulse})) {
+    for (let i = 0; i < gaps; i++) slowData[key].push(-32768);
+    slowData[key].push(value >= 0 ? value : -32768);
+    if (slowData[key].length > SLOW_PTS) slowData[key].splice(0, slowData[key].length - SLOW_PTS);
+  }
+  slowBucket = bucket;
+  if (!document.hidden && document.getElementById('p-status').classList.contains('active')) updateCharts(true);
+}
+
+// Initial setup shares Config forms and the existing status/WiFi events.
+let setupStep = 'network';
+let setupBusy = false;
+let setupWifiRead = null;
+const SETUP_STEPS = {
+  network: ['Network', 'Add a network or keep using the AirBridge access point.'],
+  airsense: ['AirSense', 'Connect the Air10 service cable. You can continue without the device.'],
+  time: ['Time', 'Choose your timezone. NTP uses the configured server when a network is available.'],
+  smb: ['SMB (optional)', 'Configure a shared folder, or skip this step.'],
+  sleephq: ['SleepHQ (optional)', 'Configure your SleepHQ endpoint, or skip this step.'],
+  access: ['Access', 'Changes to the Web UI login apply only when you finish. Leave the password untouched to keep it.']
+};
+
+function setupActive() {
+  return document.getElementById('p-setup').classList.contains('active');
+}
+
+function rememberSetup(step) {
+  try { sessionStorage.setItem('airbridge.setup', step); } catch(e) {}
+}
+
+function setupSteps() {
+  return Object.keys(SETUP_STEPS).filter(id => configStorageSupported || (id !== 'smb' && id !== 'sleephq'));
+}
+
+function setupLock(busy) {
+  setupBusy = busy;
+  document.querySelectorAll('#setupActions button, #setupForms input, #setupForms select, #setupForms button, #setupNetwork input').forEach(button => { button.disabled = busy; });
+  document.getElementById('setupBack').disabled = busy || setupSteps().indexOf(setupStep) === 0;
+}
+
+function renderSetupDevice() {
+  const el = document.getElementById('setupDevice');
+  const state = lastStatus.system;
+  const identity = [lastStatus.pna, lastStatus.srn].filter(Boolean).join(' | ');
+  el.textContent = (!state || state === 'ERROR' ? 'AirSense communication not confirmed yet.' :
+    'AirSense status: ' + state + '.') + (identity ? ' ' + identity : '');
+}
+
+function setupNetworkSelected() {
+  const mode = document.querySelector('#setup-network [data-key="wifi_mode"]');
+  if (mode && mode.value === '1' && document.getElementById('setupSsid').value) mode.value = '0';
+}
+
+async function loadSetupWifi() {
+  if (setupWifiRead) return setupWifiRead;
+  const serial = wifiSerial;
+  setupWifiRead = (async () => {
+    try {
+      const r = await api('/api/wifi', undefined, 5000);
+      if (!r || !r.ok) throw new Error('Cannot read WiFi status');
+      const d = await r.json();
+      if (serial !== wifiSerial) return null;
+      document.getElementById('setupWifiStatus').textContent =
+        'State: ' + d.state + (d.ssid ? ' | ' + d.ssid : '') +
+        ' | Saved: ' + (d.networks.map(n => n.ssid).join(', ') || 'none');
+      const link = document.getElementById('setupWifiLink');
+      link.hidden = !d.ip;
+      if (d.ip) { link.href = 'http://' + d.ip + '/wizard'; link.textContent = 'Continue at ' + d.ip; }
+      return d;
+    } catch(e) {
+      showMsg(document.getElementById('setupMsg'), e.message, 'err');
+      return null;
+    } finally {
+      setupWifiRead = null;
+      if (serial !== wifiSerial && setupActive() && setupStep === 'network') loadSetupWifi();
+    }
+  })();
+  return setupWifiRead;
+}
+
+async function renderSetup() {
+  setupLock(true);
+  try {
+    const steps = setupSteps();
+    const index = steps.indexOf(setupStep);
+    rememberSetup(setupStep);
+    document.getElementById('setupTitle').textContent = SETUP_STEPS[setupStep][0];
+    document.getElementById('setupProgress').textContent = (index + 1) + ' of ' + steps.length;
+    document.getElementById('setupNote').textContent = SETUP_STEPS[setupStep][1];
+    document.getElementById('setupNetwork').hidden = setupStep !== 'network';
+    document.getElementById('setupDevice').hidden = setupStep !== 'airsense';
+    document.getElementById('setupNext').textContent = setupStep === 'access' ? 'Finish' : 'Save & next';
+    document.getElementById('setupSkip').textContent = setupStep === 'access' ? 'Keep access & finish' : 'Skip';
+    document.getElementById('setupMsg').textContent = '';
+    document.getElementById('setupMsg').className = 'msg';
+    const forms = document.getElementById('setupForms');
+    Array.from(forms.children).forEach(root => { root.hidden = true; });
+    if (setupStep !== 'airsense') {
+      let root = document.getElementById('setup-' + setupStep);
+      if (!root) {
+        root = document.createElement('div');
+        root.id = 'setup-' + setupStep;
+        root.dataset.configForm = setupStep;
+        forms.appendChild(root);
+      }
+      root.hidden = false;
+      if (!root.children.length || root.dataset.stale === '1')
+        await loadConfigFields(root, setupStep, 'setupMsg');
+      if (setupStep === 'network') {
+        const mode = root.querySelector('[data-key="wifi_mode"]');
+        if (mode) {
+          // Unsafe modes remain available in Config, not in the AP setup flow.
+          Array.from(mode.options).forEach(option => { if (['2', '3'].includes(option.value)) option.remove(); });
+          if (!mode.value) mode.value = '0';
+        }
+        await loadSetupWifi();
+      }
+    } else renderSetupDevice();
+    document.getElementById('setupTitle').focus();
+  } finally { setupLock(false); }
+}
+
+async function startSetup() {
+  if (setupBusy) return;
+  showTab('setup');
+  document.getElementById('setupActions').hidden = false;
+  document.getElementById('setupFinish').hidden = true;
+  let stored;
+  try { stored = sessionStorage.getItem('airbridge.setup'); } catch(e) {}
+  if (!Object.hasOwn(lastStatus, 'onboarding_complete')) {
+    setupLock(true);
+    const status = await loadStatus();
+    setupLock(false);
+    if (!status) {
+      showMsg(document.getElementById('setupMsg'), 'Cannot read device status. Reload to retry.', 'err');
+      document.getElementById('setupNext').disabled = true;
+      document.getElementById('setupSkip').disabled = true;
+      return;
+    }
+  }
+  configStorageSupported = lastStatus.sd !== 'unsupported' && !!lastStatus.sd;
+  setupStep = setupSteps().includes(stored) ? stored : 'network';
+  await renderSetup();
+}
+
+async function setupMove(direction, skip = false) {
+  if (setupBusy) return;
+  setupLock(true);
+  try {
+    const root = document.getElementById('setup-' + setupStep);
+    if (direction > 0) {
+      if (!skip && setupStep !== 'airsense') {
+        if (!root || !root.children.length) {
+          await renderSetup();
+          return;
+        }
+        if (setupStep === 'network') {
+          const ssid = document.getElementById('setupSsid');
+          const pass = document.getElementById('setupPass');
+          const wifi = await loadSetupWifi();
+          if (!wifi) return;
+          const mode = root.querySelector('[data-key="wifi_mode"]');
+          if (mode.value !== '1' && !ssid.value && !wifi.networks.some(n => n.enabled === '1'))
+            throw new Error('Add a network or select AP only.');
+          if (ssid.value) {
+            const idx = wifi.networks.findIndex(n => n.ssid === ssid.value);
+            if (!await wifiAction(idx < 0 ? 'add' : 'update', ssid.value, pass.value,
+                idx < 0 ? undefined : idx, 'setupMsg')) return;
+            ssid.value = ''; pass.value = '';
+          }
+        }
+        if (setupStep !== 'access' && !await saveConfig(root.id, 'setupMsg')) return;
+      }
+      if (setupStep === 'access') {
+        const changes = skip ? {} : collectConfigChanges(root);
+        if (!confirmAccessChange(root, changes)) return;
+        // Do not issue authenticated background requests across a login change.
+        if (evtSrc) { evtSrc.close(); evtSrc = null; }
+        const r = await api('/api/onboarding', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
+        if (!r) { initSSE(); return; }
+        const d = await r.json();
+        if (!r.ok || d.ok !== true) throw new Error(d.error || 'Setup save failed');
+        lastStatus.onboarding_complete = 1;
+        rememberSetup('done');
+        document.getElementById('setupForms').innerHTML = '';
+        document.getElementById('setupActions').hidden = true;
+        document.getElementById('setupFinish').hidden = false;
+        document.getElementById('setupNote').textContent =
+          Object.keys(changes).length ? 'Use your new credentials when opening the dashboard.' : 'Initial setup is complete.';
+        return;
+      }
+      if (skip && root) root.innerHTML = '';
+      if (skip && setupStep === 'network') {
+        document.getElementById('setupSsid').value = '';
+        document.getElementById('setupPass').value = '';
+      }
+    }
+    const steps = setupSteps();
+    setupStep = steps[Math.max(0, steps.indexOf(setupStep) + direction)];
+  } catch(e) {
+    if (!evtSrc) initSSE();
+    showMsg(document.getElementById('setupMsg'), 'Save not confirmed: ' + e.message, 'err');
+    return;
+  } finally { setupLock(false); }
+  await renderSetup();
 }
 
 // Navigation
-const tabNames = ['status','report','patient','clinical','climate','bluetooth','console','device','ota'];
+const tabNames = ['status','report','sync','clinical','bluetooth','console','storage','device','ota'];
 
 function showTab(id) {
+  if (setupBusy) return;
+  if (id !== 'setup' && setupActive()) {
+    rememberSetup('later');
+    document.getElementById('setupForms').innerHTML = '';
+    document.getElementById('setupPass').value = '';
+    document.getElementById('setupSsid').value = '';
+    if (window.location.pathname === '/wizard') history.replaceState(null, '', '/');
+  }
+  document.getElementById('p-setup').classList.toggle('active', id === 'setup');
   tabNames.forEach(t => {
     const pane = document.getElementById('p-' + t);
     if (pane) pane.classList.toggle('active', t === id);
@@ -694,29 +1092,17 @@ function showTab(id) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   document.querySelectorAll('.bnav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === id));
   window.location.hash = id;
-  if (id === 'status') {
-    loadStatus();
-    if (!window._statusTimer) {
-      var scheduleNext = function() {
-        var ms = 60000 - (Date.now() % 60000) + 500;
-        window._statusTimer = setTimeout(function tick() {
-          if (document.getElementById('p-status').classList.contains('active')) loadStatus();
-          window._statusTimer = setTimeout(tick, 60000 - (Date.now() % 60000) + 500);
-        }, ms);
-      };
-      scheduleNext();
-    }
-  }
+  updateLiveSubscription();
+  if (id === 'status') { renderStatus(lastStatus); updateBleFromPush(lastStatus); }
   if (id === 'report') loadReport();
-  if (['patient','clinical','climate'].includes(id) && !settings.length) loadSettings();
+  if (id === 'clinical') loadSettings();
   if (id === 'bluetooth') loadBle();
   if (id === 'console') document.getElementById('cmdInput').focus();
-  if (id === 'device') {
-    loadWifiNets();
-    if (!document.getElementById('configFields').children.length) loadConfig();
-  }
+  if (id === 'device') loadConfig();
+  if (id === 'sync') renderExports();
   if (id === 'ota') {
     checkFlashReady();
+    if (otaStatus) renderOtaStatus(otaStatus);
     var ev = document.getElementById('espFwVer');
     if (ev && lastStatus.version) ev.textContent = lastStatus.version + (lastStatus.built ? ' (' + lastStatus.built + ')' : '');
   }
@@ -725,10 +1111,11 @@ function showTab(id) {
 // Wire up nav clicks
 document.querySelectorAll('.nav-item, .bnav-item').forEach(n => {
   n.addEventListener('click', () => showTab(n.dataset.tab));
+  if (n.dataset.tab === 'storage') n.addEventListener('click', () => loadStorage());
 });
 
-async function api(url, opts) {
-  const r = await fetch(url, opts);
+async function api(url, opts, timeoutMs = 0) {
+  const r = await fetch(url, timeoutMs ? {...opts, signal:AbortSignal.timeout(timeoutMs)} : opts);
   if (r.status === 401) { alert('Authentication failed'); return null; }
   return r;
 }
@@ -757,9 +1144,25 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
+  if (d.system !== undefined || d.rop !== undefined) renderReportAvailability();
+  if (d.sd !== undefined) {
+    configStorageSupported = d.sd !== 'unsupported';
+    renderStorageStatus(d);
+    if (!configStorageSupported) applyExports({supported:false});
+  }
   // Topbar - update from any push, even without full status
   var el;
-  el = document.getElementById('topHeap'); if (el && d.heap) el.textContent = (d.heap/1024).toFixed(1) + ' KB free';
+  el = document.getElementById('topHeap'); if (el && d.heap !== undefined) el.textContent = (d.heap/1024).toFixed(1) + ' KB heap';
+  if (d.psram_free !== undefined) {
+    el = document.getElementById('topPsram');
+    el.hidden = d.psram_free < 0;
+    el.textContent = el.hidden ? '' : ' / ' + (d.psram_free/1048576).toFixed(1) + ' MB PSRAM';
+  }
+  if (d.ssid !== undefined) {
+    el = document.getElementById('topSsid');
+    el.textContent = 'WiFi: ' + (d.ssid || '--');
+    el.title = d.ssid || 'Not connected';
+  }
   if (d.rssi !== undefined) updateWifiBars(document.getElementById('topWifi'), d.rssi);
   if (d.uptime !== undefined) {
     var s = d.uptime, days = (s/86400)|0, hrs = ((s%86400)/3600)|0, mins = ((s%3600)/60)|0;
@@ -774,76 +1177,65 @@ function renderStatus(d) {
     if (vb && d.built) vb.textContent = d.built;
   }
 
-  if (!d.version && !d.pna) return;  // SSE-only push, no full status data
+  if (!document.getElementById('p-status').classList.contains('active')) return;
+  if (d.sd !== undefined) renderDashboardStorage(d);
+  if (d.mode !== undefined) document.getElementById('dashMode').textContent = d.mode || '--';
 
   // Dashboard cards
-  var pna = d.pna || '--';
-  pna = pna.replace(/_/g, ' ');
-  var el;
-  el = document.getElementById('dashPna'); if (el) el.textContent = pna;
-  el = document.getElementById('dashSrn'); if (el) el.textContent = d.srn || '--';
+  el = document.getElementById('dashPna');
+  if (el && d.pna !== undefined) el.textContent = (d.pna || '--').replace(/_/g, ' ');
+  el = document.getElementById('dashSrn');
+  if (el && d.srn !== undefined) el.textContent = d.srn || '--';
   el = document.getElementById('dashMhr');
   if (el && d.mhr !== undefined && d.mhr >= 0) {
     var h = Math.round(d.mhr / 3600);
     el.textContent = h.toLocaleString() + ' hrs';
   }
-  // Infer rop from system state if not in payload (SSE push)
-  if (d.rop === undefined && d.system) {
-    d.rop = d.system === 'THERAPY' ? 1 : d.system === 'ERROR' ? -1 : 0;
-  }
-  var rop = ROP_NAMES[d.rop] || (d.system || '--');
-  var ropBadge = document.getElementById('dashRopBadge');
-  if (ropBadge) {
-    ropBadge.textContent = rop;
-    ropBadge.className = 'badge ' + (d.rop === 1 ? 'badge-therapy' : d.system === 'ERROR' ? 'badge-error' : 'badge-idle');
-  }
-  el = document.getElementById('dashEspTime'); if (el) el.textContent = d.esp_time || '--';
-  el = document.getElementById('dashResmedTime'); if (el) el.textContent = d.resmed_time || '--';
-
-  // Oxi summary
-  el = document.getElementById('dashSpo2'); if (el) el.textContent = d.spo2 >= 0 ? d.spo2 : '--';
-  el = document.getElementById('dashPulse'); if (el) el.textContent = d.pulse >= 0 ? d.pulse : '--';
-
-  // Highlight active ROP button
-  var ropBtns = {1:'btnTherapy', 0:'btnStandby', 3:'btnPwrSave'};
-  ['btnTherapy','btnStandby','btnPwrSave'].forEach(function(id) {
-    var b = document.getElementById(id);
-    if (b) b.className = (ropBtns[d.rop] === id) ? 'btn btn-accent' : 'btn';
-  });
-
-  // Keep hidden statusGrid for any code that references it
-  const g = document.getElementById('statusGrid');
-  if (g) {
-    g.innerHTML = '';
-    const rows = [
-      ['Time', d.esp_time || '--', 'ResMed Time', d.resmed_time || '--'],
-      ['Version', d.version, 'Built', d.built],
-      ['System', d.system, 'Device State', rop],
-      ['Product', d.pna || '--', 'Serial', d.srn || '--'],
-      ['Oximeter', d.oxi || '--', 'Feeding', d.feeding || '--'],
-      ['SpO2', d.spo2 >= 0 ? d.spo2 + '%' : '--', 'Pulse', d.pulse >= 0 ? d.pulse + ' bpm' : '--'],
-    ];
-    rows.forEach(([k1,v1,k2,v2]) => {
-      g.innerHTML += '<div class="stat"><span class="k">'+k1+':</span> <span class="v">'+v1+'</span></div>';
-      if (k2) g.innerHTML += '<div class="stat"><span class="k">'+k2+':</span> <span class="v">'+v2+'</span></div>';
+  if (d.rop !== undefined) {
+    var ropBadge = document.getElementById('dashRopBadge');
+    if (ropBadge) {
+      ropBadge.textContent = ROP_NAMES[d.rop] || (d.system || '--');
+      ropBadge.className = 'badge ' + (d.rop === 1 ? 'badge-therapy' : d.system === 'ERROR' ? 'badge-error' : 'badge-idle');
+    }
+    var ropBtns = {1:'btnTherapy', 0:'btnStandby', 3:'btnPwrSave'};
+    ['btnTherapy','btnStandby','btnPwrSave'].forEach(function(id) {
+      var b = document.getElementById(id);
+      if (b) b.className = (ropBtns[d.rop] === id) ? 'btn btn-accent' : 'btn';
     });
   }
+  el = document.getElementById('dashEspTime');
+  if (el && d.esp_time !== undefined) el.textContent = d.esp_time || '--';
+  el = document.getElementById('dashResmedTime');
+  if (el && d.resmed_time !== undefined) el.textContent = d.resmed_time || '--';
+
 }
 
-async function loadStatus() {
+function loadStatus() {
+  if (statusRead) return statusRead;
+  const serial = statusSerial;
+  for (const key of Object.keys(statusPush)) delete statusPush[key];
+  statusRead = (async () => {
   try {
-    const r = await api('/api/status');
+    const r = await api('/api/status', undefined, 5000);
     if (!r) return;
-    lastStatus = await r.json();
+    if (!r.ok) throw new Error("Status read failed");
+    const data = await r.json();
+    const current = {...data, ...(serial === statusSerial ? {} : statusPush)};
+    applyConfigRevision(current);
+    Object.assign(lastStatus, current);
     renderStatus(lastStatus);
+    renderSetupDevice();
+    finishOtaObservation();
+    return lastStatus;
   } catch(e) { console.error(e); }
+  })().finally(() => { statusRead = null; });
+  return statusRead;
 }
 
 async function ropCmd(action) {
   const cmds = {start:'P S #ROP 0001',standby:'P S #ROP 0000',energy_save:'P S #ROP 0003'};
   try {
-    const r = await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmds[action]})});
-    if (r) setTimeout(loadStatus, 1000);
+    await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmds[action]})});
   } catch(e) { console.error(e); }
 }
 
@@ -853,108 +1245,317 @@ async function timeAction(action) {
     if (!r) return;
     const d = await r.json();
     showMsg(null, d.result, d.ok === 'true' ? 'ok' : 'err');
-    setTimeout(loadStatus, 1000);
   } catch(e) { showMsg(null, 'Error: ' + e.message, 'err'); }
 }
 
-async function loadReport() {
-  const sp = document.getElementById('reportSpinner');
-  if (sp) sp.style.display = 'block';
+let reportGeneration = 0;
+
+function renderReportAvailability() {
+  const blocked = lastStatus.system !== 'IDLE' || lastStatus.rop !== 0;
+  const busy = document.getElementById('reportResult').getAttribute('aria-busy') === 'true';
+  for (const id of ['reportView', 'reportDay', 'reportPeriod', 'reportLatest', 'reportRefresh']) {
+    document.getElementById(id).disabled = blocked || (id === 'reportRefresh' && busy);
+  }
+  document.getElementById('reportAvailability').textContent = blocked ? 'Available in standby.' : '';
+  return blocked;
+}
+
+function reportDate(day) {
+  return new Date(day * 86400000).toISOString().slice(0, 10);
+}
+
+function reportMaskTime(day, minute) {
+  if (minute < 0) return '--';
+  return new Date((day * 1440 + 720 + minute) * 60000).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function renderReport(data) {
+  const day = data.view === 'day';
+  const date = document.getElementById('reportDay');
+  date.min = reportDate(0x1000);
+  date.max = reportDate(data.current_day);
+  if (day && data.day) date.value = reportDate(data.day);
+  document.getElementById('reportTitle').textContent = day
+    ? (data.day ? 'Therapy day ' + reportDate(data.day) : 'Therapy day')
+    : 'Last ' + data.period + (data.period === 1 ? ' day' : ' days');
+  document.getElementById('reportNote').textContent = data.present ? ''
+    : day ? 'No saved data for this therapy day.' : 'No therapy recorded in this period.';
+  const rows = document.createDocumentFragment();
+  for (const value of data.fields) {
+    const row = document.createElement('div'); row.className = 'stat';
+    const label = document.createElement('span'); label.className = 'k'; label.textContent = value.label;
+    const text = document.createElement('span'); text.className = 'v';
+    text.textContent = value.value + (value.raw >= 0 && value.unit ? ' ' + value.unit : '');
+    row.append(label, text); rows.append(row);
+  }
+  document.getElementById('reportGrid').replaceChildren(rows);
+  const intervals = document.getElementById('reportIntervals');
+  intervals.replaceChildren();
+  document.getElementById('reportMaskCard').hidden = !day || !data.present;
+  for (const interval of data.intervals) {
+    const on = reportMaskTime(data.day, interval.on), off = reportMaskTime(data.day, interval.off);
+    const row = document.createElement('div'); row.className = 'report-interval';
+    const range = document.createElement('span'); range.className = 'interval-range';
+    range.textContent = (interval.on < 0 ? '--' : on.slice(11)) + ' \u2013 ' + (interval.off < 0 ? '--' : off.slice(11));
+    const minutes = interval.on >= 0 && interval.off >= interval.on ? interval.off - interval.on : -1;
+    const duration = document.createElement('span'); duration.className = 'interval-duration';
+    duration.textContent = '\u00b7 ' + (minutes < 0 ? '--' : minutes < 60 ? minutes + ' min'
+      : Math.floor(minutes / 60) + ' h' + (minutes % 60 ? ' ' + (minutes % 60) + ' min' : ''));
+    row.append(range, duration); intervals.append(row);
+  }
+  if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
+}
+
+async function loadReport(latest = false) {
+  if (renderReportAvailability()) return;
+  const generation = ++reportGeneration;
+  const view = document.getElementById('reportView').value;
+  const day = view === 'day';
+  const date = document.getElementById('reportDay');
+  if (latest) date.value = '';
+  document.getElementById('reportDayRow').hidden = !day;
+  document.getElementById('reportPeriodRow').hidden = day;
+  document.getElementById('reportLatest').hidden = !day;
+  document.getElementById('reportMaskCard').hidden = true;
+  document.getElementById('reportGrid').replaceChildren();
+  document.getElementById('reportNote').textContent = '';
+  document.getElementById('reportTitle').textContent = day ? 'Therapy day' : 'Period';
+  document.getElementById('reportMsg').style.display = 'none';
+  document.getElementById('reportRefresh').disabled = true;
+  document.getElementById('reportResult').setAttribute('aria-busy', 'true');
+  document.getElementById('reportSpinner').style.display = 'block';
   try {
-    const r = await api('/api/report');
-    if (!r) return;
-    const data = await r.json();
-    const sg = document.getElementById('sessionGrid'); sg.innerHTML = '';
-    const ug = document.getElementById('summaryGrid'); ug.innerHTML = '';
-    data.forEach(v => {
-      if (v.raw < 0) return;
-      const target = v.section === 'summary' ? ug : sg;
-      target.innerHTML += '<div class="stat"><span class="k">'+v.label+':</span> <span class="v">'+v.value+' '+v.unit+'</span></div>';
-    });
-    if (!sg.children.length) sg.innerHTML = '<div class="stat"><span class="k">No session data</span></div>';
-    if (!ug.children.length) ug.innerHTML = '<div class="stat"><span class="k">No summary data</span></div>';
-  } catch(e) { console.error(e); }
-  if (sp) sp.style.display = 'none';
+    const selection = day ? (date.value ? Date.parse(date.value + 'T00:00:00Z') / 86400000 : 0)
+      : Number(document.getElementById('reportPeriod').value);
+    if (!Number.isInteger(selection)) throw new Error('Choose a valid date');
+    const query = '?view=' + view + (day ? '&day=' : '&period=') + selection;
+    const data = await settingsRequest(day ? undefined : {method:'POST'}, '/api/report', query);
+    if (generation !== reportGeneration) return;
+    renderReport(data);
+  } catch(e) {
+    if (generation !== reportGeneration) return;
+    const errors = {
+      report_not_idle: 'Sleep Report is available in standby.',
+      report_restore_failed: 'Could not restore the previous report period. Check Sleep Report on the AirSense.',
+      report_period_changed: 'The report period changed on the device during this request. Refresh to read again.',
+      report_period_not_selected: 'The device has not selected the requested period. Refresh to read again.',
+      report_history_changed: 'The device saved new data during this read. Refresh to read again.',
+      report_history_unsupported: 'This firmware does not provide stored daily reports.',
+      report_read_failed: 'Could not read the report from the AirSense.',
+      report_day_unavailable: 'This therapy date is not available.',
+      report_deadline: 'The report request timed out.'
+    };
+    if (e.message !== 'report_not_idle' || !renderReportAvailability())
+      showMsg(document.getElementById('reportMsg'), errors[e.message] || e.message, 'err');
+  } finally {
+    if (generation === reportGeneration) {
+      document.getElementById('reportSpinner').style.display = 'none';
+      document.getElementById('reportResult').setAttribute('aria-busy', 'false');
+      renderReportAvailability();
+    }
+  }
 }
 
 function renderField(s) {
   const div = document.createElement('div');
   div.className = 'row';
-  div.innerHTML = '<label>'+s.label+'</label>';
-  if (s.type === 'enum' && s.options) {
-    let sel = '<select data-cmd="'+s.cmd+'">';
-    s.options.forEach((o,i) => sel += '<option value="'+i+'"'+(i==s.value?' selected':'')+'>'+o+'</option>');
-    sel += '</select>';
-    div.innerHTML += sel;
+  const label = document.createElement('label');
+  label.textContent = s.label + (s.units ? ' (' + s.units + ')' : '');
+  div.appendChild(label);
+  if (s.type === 'enum') {
+    const select = document.createElement('select');
+    select.dataset.cmd = s.cmd;
+    const options = s.options || [];
+    options.forEach((o, i) => {
+      const option = document.createElement('option');
+      option.value = typeof o === 'object' ? o.value : i;
+      option.textContent = typeof o === 'object' ? o.label : o;
+      select.appendChild(option);
+    });
+    select.value = String(s.value);
+    select.dataset.orig = select.value;
+    select.disabled = s.editable === false || options.length === 0;
+    div.appendChild(select);
   } else {
-    div.innerHTML += '<input type="number" data-cmd="'+s.cmd+'" value="'+(s.display||s.value)+'" step="'+(s.step||1)+'">';
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.dataset.cmd = s.cmd;
+    input.value = s.display !== undefined ? s.display : (s.value >= 0 ? s.value : '');
+    input.dataset.orig = input.value;
+    input.step = s.step || 1;
+    if (s.min !== undefined) input.min = s.min;
+    if (s.max !== undefined) input.max = s.max;
+    input.disabled = s.editable === false;
+    div.appendChild(input);
   }
   return div;
 }
 
-async function loadSettings() {
-  ['patientSpinner','clinicalSpinner','climateSpinner'].forEach(id => {
-    const el = document.getElementById(id); if (el) el.style.display = 'block';
-  });
+async function settingsRequest(options, endpoint = '/api/settings', query = '') {
+  const deadline = Date.now() + 35000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35000);
   try {
-    const r = await api('/api/settings');
-    if (!r) return;
-    settings = await r.json();
-    const containers = {patient:'patientFields',clinical:'clinicalFields',comfort:'comfortFields',mode:'modeFields',climate:'climateFields',alarm:'alarmFields',system:'systemFields'};
+  let r = await api(endpoint + query, {...options, signal:controller.signal});
+  if (!r) throw new Error('Request cancelled');
+  let data = await r.json();
+  const job = data.job;
+  while (r.status === 202 && job && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    r = await api(endpoint + '?job=' + job, {signal:controller.signal});
+    if (!r) throw new Error('Request cancelled');
+    data = await r.json();
+  }
+  if (r.status === 202) throw new Error('Settings timeout; writes are not automatically retried');
+  if (!r.ok) throw new Error(data.error || 'Settings request failed');
+  return data;
+  } finally { clearTimeout(timer); }
+}
+
+let clinicalRead = null, clinicalGeneration = 0, clinicalSaving = false;
+function clinicalDirty(except) {
+  return Array.from(document.querySelectorAll('#p-clinical [data-cmd]')).some(
+    inp => inp.dataset.cmd !== except && inp.value !== inp.dataset.orig);
+}
+
+function loadSettings(force = false) {
+  if (clinicalRead) return clinicalRead;
+  if (clinicalSaving && !force) return Promise.resolve(false);
+  if (!force && clinicalDirty() && !confirm('Discard unsaved Clinical changes and refresh?'))
+    return Promise.resolve(false);
+  const generation = ++clinicalGeneration;
+  const fields = Array.from(document.querySelectorAll('#p-clinical [data-cmd]'));
+  const values = fields.map(inp => inp.value);
+  clinicalRead = (async () => {
+  const spinner = document.getElementById('clinicalSpinner');
+  const msgEl = document.getElementById('clinicalMsg');
+  if (spinner) spinner.style.display = 'block';
+  try {
+    const data = await settingsRequest();
+    if (generation !== clinicalGeneration) return false;
+    if (fields.some((inp, i) => inp.value !== values[i])) {
+      showMsg(msgEl, 'New readings not applied: unsaved changes kept', 'ok');
+      return false;
+    }
+    settings = data;
+    const containers = {therapy:'therapyFields',comfort:'comfortFields',accessories:'accessoriesFields',options:'optionsFields',configuration:'configurationFields'};
     for (const c in containers) { const el = document.getElementById(containers[c]); if (el) el.innerHTML = ''; }
-    const mf = document.getElementById('modeField'); if (mf) mf.innerHTML = '';
+    const groups = new Map();
     settings.forEach(s => {
-      const target = s.cmd === 'MOP' ? 'modeField' : (containers[s.group] || 'clinicalFields');
+      const target = containers[s.group];
       const el = document.getElementById(target);
       if (el) {
+        let parent = el;
+        const path = [s.group];
+        (s.groups || []).forEach(name => {
+          path.push(name);
+          const key = JSON.stringify(path);
+          let section = groups.get(key);
+          if (!section) {
+            section = document.createElement('section');
+            section.className = 'setting-group';
+            const heading = document.createElement('h4');
+            heading.textContent = name;
+            section.appendChild(heading);
+            parent.appendChild(section);
+            groups.set(key, section);
+          }
+          parent = section;
+        });
         const field = renderField(s);
-        el.appendChild(field);
+        parent.appendChild(field);
         if (s.cmd === 'MOP') {
-          field.querySelector('select').addEventListener('change', async e => {
-            await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({cmd:'P S #MOP ' + parseInt(e.target.value).toString(16).toUpperCase().padStart(4,'0')})});
-            setTimeout(loadSettings, 500);
+          const select = field.querySelector('select');
+          if (select) select.addEventListener('change', async e => {
+            const previous = select.dataset.orig;
+            if (clinicalSaving || (clinicalDirty('MOP') &&
+                !confirm('Changing therapy mode discards other unsaved Clinical changes. Continue?'))) {
+              select.value = previous;
+              return;
+            }
+            try {
+              const saved = await writeClinical({MOP:String(e.target.value)});
+              if (saved.errors) throw new Error(saved.errors.join(', '));
+            } catch (error) {
+              select.value = previous;
+              showMsg(msgEl, error.message, 'err');
+            }
           });
           curMode = parseInt(s.value) || 0;
         }
       }
     });
-    updateModeVisibility();
-  } catch(e) { console.error(e); }
-  ['patientSpinner','clinicalSpinner','climateSpinner'].forEach(id => {
-    const el = document.getElementById(id); if (el) el.style.display = 'none';
-  });
+    return true;
+  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); return false; }
+  finally { if (spinner && generation === clinicalGeneration) spinner.style.display = 'none'; }
+  })();
+  const pending = clinicalRead;
+  pending.finally(() => { if (clinicalRead === pending) clinicalRead = null; });
+  return pending;
 }
 
-function updateModeVisibility() {}
+async function writeClinical(changes) {
+  clinicalSaving = true;
+  clinicalGeneration++;
+  clinicalRead = null;
+  const controls = Array.from(document.querySelectorAll(
+    '#p-clinical input:enabled, #p-clinical select:enabled, #p-clinical button:enabled'));
+  controls.forEach(control => { control.disabled = true; });
+  try {
+    const result = await settingsRequest({method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(changes)});
+    if (!result.errors && !await loadSettings(true))
+      throw new Error('Settings saved, but refresh failed; read back before another write');
+    return result;
+  } finally {
+    clinicalSaving = false;
+    controls.forEach(control => { control.disabled = false; });
+    document.getElementById('clinicalSpinner').style.display = 'none';
+  }
+}
 
-async function saveSettings(group) {
+async function saveSettings() {
+  if (clinicalSaving) return;
   const changes = {};
-  const groups = group === 'clinical' ? ['clinical','comfort','mode','alarm'] : [group];
-  groups.forEach(g => {
-    const containers = {patient:'patientFields',clinical:'clinicalFields',comfort:'comfortFields',mode:'modeFields',climate:'climateFields',alarm:'alarmFields',system:'systemFields'};
+  let invalid = null;
+  const containers = {therapy:'therapyFields',comfort:'comfortFields',accessories:'accessoriesFields',options:'optionsFields',configuration:'configurationFields'};
+  Object.keys(containers).forEach(g => {
     const el = document.getElementById(containers[g]); if (!el) return;
     el.querySelectorAll('[data-cmd]').forEach(inp => {
-      if (inp.closest('.row').style.display === 'none') return;
+      if (inp.disabled) return;
       const s = settings.find(x => x.cmd === inp.dataset.cmd); if (!s) return;
       const newVal = inp.value;
+      if (s.type !== 'enum') {
+        if (newVal === '' && s.value < 0) return;
+        if (newVal.trim() === '' || !Number.isFinite(Number(newVal)) || !inp.checkValidity()) {
+          if (!invalid) invalid = inp;
+          return;
+        }
+      }
       if (s.type === 'enum') { if (parseInt(newVal) !== parseInt(s.value)) changes[s.cmd] = newVal; }
+      else if (s.type === 'numeric') {
+        const display = parseFloat(newVal);
+        let raw = Math.round(display);
+        if (s.scale > 0) raw = Math.round(display * s.scale);
+        else if (s.scale < 0) raw = Math.round(display / Math.abs(s.scale));
+        if (raw !== Number(s.value)) changes[s.cmd] = String(raw);
+      }
       else if (s.scale_div && s.scale_div > 1) { const raw = Math.round(parseFloat(newVal) * s.scale_div); if (raw !== parseInt(s.value)) changes[s.cmd] = String(raw); }
       else { if (newVal !== String(s.value)) changes[s.cmd] = newVal; }
     });
   });
-  if (group === 'clinical') {
-    const mopSel = document.querySelector('#modeField [data-cmd="MOP"]');
-    if (mopSel) { const s = settings.find(x => x.cmd === 'MOP'); if (s && parseInt(mopSel.value) !== parseInt(s.value)) changes['MOP'] = mopSel.value; }
+  const msgEl = document.getElementById('clinicalMsg');
+  if (invalid) {
+    invalid.focus();
+    invalid.reportValidity();
+    showMsg(msgEl, 'Invalid value: ' + invalid.dataset.cmd, 'err');
+    return;
   }
-  const msgEl = document.getElementById(group + 'Msg');
   if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return; }
   try {
-    const r = await api('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
-    if (!r) return;
-    const d = await r.json();
+    const d = await writeClinical(changes);
     if (d.errors && d.errors.length) showMsg(msgEl, 'Errors: ' + d.errors.join(', '), 'err');
-    else { showMsg(msgEl, 'Saved ' + Object.keys(changes).length + ' settings', 'ok'); loadSettings(); }
+    else showMsg(msgEl, 'Saved ' + Object.keys(changes).length + ' settings', 'ok');
   } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
 }
 
@@ -986,10 +1587,15 @@ var TZ_ZONES=['Pacific/Honolulu','America/Anchorage','America/Los_Angeles','Amer
 function attachTzHelper(inp){var wrap=document.createElement('div');wrap.style.cssText='display:flex;gap:6px;align-items:center;flex-wrap:wrap';inp.parentNode.insertBefore(wrap,inp);wrap.appendChild(inp);var btn=document.createElement('button');btn.className='btn';btn.style.cssText='padding:4px 10px;font-size:12px';btn.textContent='detect';wrap.appendChild(btn);var sel=document.createElement('select');sel.style.cssText='font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px';var o0=document.createElement('option');o0.value='';o0.textContent='preset...';sel.appendChild(o0);TZ_ZONES.forEach(function(tz){var o=document.createElement('option');o.value=tz;o.textContent=tz;sel.appendChild(o)});wrap.appendChild(sel);btn.onclick=function(){try{var detected=Intl.DateTimeFormat().resolvedOptions().timeZone;inp.value=getPosixTz(detected);inp.title=detected}catch(e){inp.value='detection failed'}};sel.onchange=function(){if(sel.value){try{inp.value=getPosixTz(sel.value);inp.title=sel.value}catch(e){inp.value='error'}}}}
 
 // WiFi network management
-async function loadWifiNets() {
+let wifiRead = null, wifiSerial = 0, wifiRevision = null;
+function loadWifiNets() {
+  if (wifiRead) return wifiRead;
+  const serial = wifiSerial;
+  wifiRead = (async () => {
   try {
-    var r = await api('/api/wifi'); if (!r) return;
+    var r = await api('/api/wifi', undefined, 5000); if (!r || !r.ok) return;
     var d = await r.json();
+    if (serial !== wifiSerial) return;
     var el = document.getElementById('wifiNetList');
     el.innerHTML = '';
     if (d.networks && d.networks.length) {
@@ -1001,8 +1607,10 @@ async function loadWifiNets() {
         var status = connected
           ? ' <span class="badge badge-streaming" style="margin-left:8px">Connected' + rssi_str + '</span>'
           : (net.rssi ? ' <span style="color:var(--text-dim);margin-left:8px;font-size:12px">' + net.rssi + ' dBm</span>' : '');
-        row.innerHTML = '<label><strong>' + net.ssid + '</strong>' + status +
-          '</label><button class="btn btn-danger" onclick="wifiRemove(' + i + ')" style="padding:4px 12px;font-size:12px">Remove</button>';
+        row.innerHTML = '<label><strong></strong>' + status +
+          '</label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px">Remove</button>';
+        row.querySelector('strong').textContent = net.ssid;
+        row.querySelector('button').onclick = () => wifiRemove(i);
         el.appendChild(row);
       });
     } else {
@@ -1011,6 +1619,11 @@ async function loadWifiNets() {
     var ws = document.getElementById('wifiState');
     if (ws) ws.textContent = 'State: ' + d.state + (d.roam === '1' ? ' | Roaming enabled' : '');
   } catch(e) { console.error(e); }
+  })().finally(() => {
+    wifiRead = null;
+    if (serial !== wifiSerial && document.getElementById('p-device').classList.contains('active') && configSection === 'network') loadWifiNets();
+  });
+  return wifiRead;
 }
 
 function wifiAddPrompt() {
@@ -1020,7 +1633,7 @@ function wifiAddPrompt() {
   wifiAction('add', ssid, pass);
 }
 
-async function wifiAction(action, ssid, pass, idx) {
+async function wifiAction(action, ssid, pass, idx, messageId = 'wifiMsg') {
   var body = {action: action};
   if (ssid) body.ssid = ssid;
   if (pass !== undefined) body.pass = pass;
@@ -1029,8 +1642,9 @@ async function wifiAction(action, ssid, pass, idx) {
     var r = await api('/api/wifi', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     var d = await r.json();
-    showMsg(document.getElementById('wifiMsg'), d.result, d.ok === 'true' ? 'ok' : 'err');
-    loadWifiNets();
+    showMsg(document.getElementById(messageId), d.result, d.ok === 'true' ? 'ok' : 'err');
+    if (messageId === 'wifiMsg') loadWifiNets();
+    return r.ok && d.ok === 'true';
   } catch(e) { showMsg(document.getElementById('wifiMsg'), 'Error: ' + e.message, 'err'); }
 }
 
@@ -1039,76 +1653,548 @@ function wifiRemove(idx) {
   wifiAction('remove', null, undefined, idx);
 }
 
-async function loadConfig() {
-  const sp = document.getElementById('configSpinner'); sp.style.display = 'block';
-  var CFG_SECTIONS = ['WiFi & Network','Time & Timezone','Oximetry','UART','Advanced'];
-  var CFG_META = {
-    hostname:['WiFi & Network','Device hostname (mDNS + AP name)'],wifi_mode:['WiFi & Network','Operating mode',[['0','auto (STA + AP fallback)'],['1','AP only'],['2','off'],['3','STA only'],['4','STA+AP always']]],wifi_roam:['WiFi & Network','Enable hysteresis-based roaming'],wifi_country:['WiFi & Network','ISO 3166 country code (01 = worldwide)'],tcp_port:['WiFi & Network','TCP command port'],debug_port:['WiFi & Network','Debug log stream port (read-only)'],http_port:['WiFi & Network','Web server port'],http_user:['WiFi & Network','Web UI username'],http_pass:['WiFi & Network','Web UI password'],ota_password:['WiFi & Network','ArduinoOTA password'],udp_oxi_port:['WiFi & Network','UDP oximetry port (0=disabled)'],
-    ntp_server:['Time & Timezone','NTP server (empty = DHCP or pool.ntp.org)'],tz:['Time & Timezone','POSIX timezone string'],
-    oxi_enabled:['Oximetry','Enable BLE oximeter support'],oxi_auto_start:['Oximetry','Auto-start feeding on connect'],oxi_feed_therapy_only:['Oximetry','Only inject during active therapy'],oxi_device_type:['Oximetry','0=auto, 1=Nonin, 2=O2Ring, 3=PLX, 4=WS20A'],oxi_device_addr:['Oximetry','Preferred oximeter MAC'],oxi_interval_ms:['Oximetry','Injection interval (ms)'],oxi_lframe_continuous:['Oximetry','Send L-frames even without valid reading'],oxi_require_known:['Oximetry','Only auto-connect to known devices'],
-    uart_baud:['UART','AirSense UART baud rate'],uart_cmd_timeout_ms:['UART','Command response timeout (ms)'],uart_max_retries:['UART','Retry count for failed commands'],
-    allow_transparent_during_therapy:['Advanced','Allow raw UART passthrough during therapy'],mitm_mode:['Advanced','0=off, 1=forward, 2=log, 3=filter']
+const CFG_SECTIONS = /* CONFIG_SECTIONS */ [];
+const CFG_META = {
+    hostname:['DHCP hostname and AP SSID prefix'],wifi_mode:['Operating mode'],wifi_roam:['Enable hysteresis-based roaming'],wifi_country:['ISO 3166 country code (01 = worldwide)'],
+    http_port:['Web server port'],http_user:['Web UI username'],http_pass:['Web UI password'],
+    update_url:['Release manifest URL (empty disables automatic checks)'],
+    ntp_server:['NTP server (empty = DHCP or pool.ntp.org)'],tz:['POSIX timezone string'],
+    resmed_time:['Automatically synchronize the ResMed clock from NTP'],
+    udp_oxi_port:['UDP oximetry port (0=disabled)'],
+    oxi_enabled:['Enable BLE oximeter support'],oxi_auto_start:['Auto-start feeding on connect'],oxi_feed_therapy_only:['Only inject during active therapy'],oxi_interval_ms:['Injection interval (ms)'],oxi_lframe_continuous:['Send L-frames even without valid reading'],
+    smb_enabled:['Enable SMB synchronization'],smb_auto_after_therapy:['Sync backlog at startup and after therapy'],smb_endpoint:['//host/share/optional/path'],smb_user:['SMB username'],smb_password:['SMB password'],
+    sleephq_enabled:['Enable SleepHQ synchronization'],sleephq_auto_after_therapy:['Sync backlog at startup and after therapy'],sleephq_client_id:['SleepHQ API client ID'],sleephq_client_secret:['SleepHQ API client secret'],sleephq_team_id:['Optional team ID (resolved automatically when empty)'],sleephq_device_id:['Optional SleepHQ device ID'],
+    uart_cmd_timeout_ms:['Command response timeout (ms)'],tcp_port:['TCP command port'],
+    allow_transparent_during_therapy:['Allow raw UART passthrough during therapy'],
+    syslog_en:['Forward logs to a UDP syslog server'],syslog_host:['Syslog server IPv4 address'],syslog_port:['Syslog UDP port (1-65535, default 514)'],debug_port:['Debug log stream port (read-only)']
   };
-  try {
-    const r = await api('/api/config'); if (!r) return;
-    const d = await r.json();
-    const el = document.getElementById('configFields'); el.innerHTML = '';
-    var lastGroup = '';
-    var entries = Object.entries(d).sort(function(a,b){var sa=CFG_META[a[0]]?CFG_SECTIONS.indexOf(CFG_META[a[0]][0]):99;var sb=CFG_META[b[0]]?CFG_SECTIONS.indexOf(CFG_META[b[0]][0]):99;return sa-sb});
-    for (const [k,v] of entries) {
-      var meta = CFG_META[k] || ['Other',''];
-      if (meta[0] !== lastGroup) {
-        lastGroup = meta[0];
-        var hdr = document.createElement('h4');
-        hdr.textContent = lastGroup;
-        hdr.style.cssText = 'color:var(--accent);margin:16px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px';
-        el.appendChild(hdr);
-      }
-      var row = document.createElement('div'); row.className = 'row';
-      var isPass = k.includes('pass');
-      var opts = meta[2];
-      var labelHtml = '<label>' + k + (meta[1] ? '<br><small style="color:#555;font-weight:normal">' + meta[1] + '</small>' : '') + '</label>';
-      if (opts) {
-        var optHtml = opts.map(function(o){return '<option value="' + o[0] + '"' + (String(o[0]) === String(v) ? ' selected' : '') + '>' + o[1] + '</option>';}).join('');
-        row.innerHTML = labelHtml + '<select data-key="' + k + '" data-orig="' + v + '">' + optHtml + '</select>';
-      } else {
-        row.innerHTML = labelHtml + '<input type="' + (isPass ? 'password' : 'text') + '" data-key="' + k + '" data-orig="' + (isPass ? '' : v) + '"' + (isPass ? ' placeholder="(unchanged)" data-pass="1"' : '') + ' value="' + (isPass ? '' : v) + '">';
-      }
-      el.appendChild(row);
-      if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
-      if (k === 'tz') attachTzHelper(row.querySelector('input'));
+
+let configStorageSupported = false;
+let configSection = 'network';
+
+function renderConfigFields(root, d) {
+  root.innerHTML = '';
+  var lastGroup = '';
+  const category = key => {
+    const index = CFG_SECTIONS.findIndex(section => section.keys.includes(key));
+    return index < 0 ? CFG_SECTIONS.length : index;
+  };
+  const entries = Object.entries(d).sort((a,b) => category(a[0]) - category(b[0]));
+  for (const [k,v] of entries) {
+    const categoryInfo = CFG_SECTIONS[category(k)];
+    if (!configStorageSupported && ['smb','sleephq'].includes(categoryInfo?.id)) continue;
+    const group = categoryInfo?.label || 'Other';
+    var meta = CFG_META[k] || [''];
+    if (group !== lastGroup) {
+      lastGroup = group;
+      const heading = document.createElement('h4');
+      heading.className = 'config-section-title';
+      heading.textContent = lastGroup;
+      root.appendChild(heading);
     }
-  } catch(e) { console.error(e); }
-  sp.style.display = 'none';
+    var row = document.createElement('div'); row.className = 'row';
+    var isPass = k.includes('pass') || k.includes('secret');
+    var opts = categoryInfo?.options[k];
+    var label = document.createElement('label');
+    label.textContent = k;
+    if (meta[0]) {
+      var help = document.createElement('small');
+      help.textContent = meta[0];
+      label.appendChild(help);
+    }
+    row.appendChild(label);
+    var control = document.createElement(opts ? 'select' : 'input');
+    control.id = root.id + '-' + k;
+    label.htmlFor = control.id;
+    control.dataset.key = k;
+    control.dataset.orig = isPass ? '' : v;
+    if (opts) {
+      // Preserve an older/newer saved value until the user chooses a replacement.
+      if (!opts.some(option => option[0] === String(v))) opts = [...opts, [String(v), v + ' (unknown)']];
+      opts.forEach(function(o) {
+        var option = document.createElement('option');
+        option.value = o[0];
+        option.textContent = o[1];
+        control.appendChild(option);
+      });
+    } else {
+      control.type = isPass ? 'password' : 'text';
+      if (isPass) {
+        control.placeholder = '(unchanged)';
+        control.dataset.pass = '1';
+      }
+    }
+    control.value = isPass ? '' : v;
+    row.appendChild(control);
+    root.appendChild(row);
+    if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
+    if (k === 'tz') attachTzHelper(row.querySelector('input'));
+  }
 }
 
-async function saveConfig() {
+function confirmAccessChange(root, changes) {
+  if (!Object.hasOwn(changes, 'http_user') && !Object.hasOwn(changes, 'http_pass')) return true;
+  const user = root.querySelector('[data-key="http_user"]');
+  if (!user || user.value || changes.http_pass) return true;
+  return confirm('An empty username and password disable Web UI authentication. Save these access settings?');
+}
+
+function collectConfigChanges(root) {
   const changes = {};
-  document.querySelectorAll('#configFields [data-key]').forEach(inp => {
+  const fields = root.querySelectorAll('[data-key]');
+  fields.forEach(inp => {
     if (inp.dataset.pass) {
       if (inp.getAttribute('data-dirty')) changes[inp.dataset.key] = inp.value;
     } else {
       if (inp.value !== inp.dataset.orig) changes[inp.dataset.key] = inp.value;
     }
   });
-  const msgEl = document.getElementById('configMsg');
-  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return; }
+  return changes;
+}
+
+async function loadConfigFields(root, section, messageId) {
+  if (root.dataset.loading === '1' || root.dataset.saving === '1') return;
+  root.dataset.loading = '1';
+  delete root.dataset.stale;
+  try {
+    const r = await api('/api/config' + (section ? '?section=' + encodeURIComponent(section) : ''));
+    if (!r) { root.dataset.stale = '1'; return; }
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Config read failed');
+    const drafts = collectConfigChanges(root);
+    renderConfigFields(root, d);
+    root.querySelectorAll('[data-key]').forEach(input => {
+      if (!Object.hasOwn(drafts, input.dataset.key)) return;
+      input.value = drafts[input.dataset.key];
+      if (input.dataset.pass) {
+        input.setAttribute('data-dirty', '1');
+        input.placeholder = '(empty = remove)';
+      }
+    });
+    root.dataset.loaded = '1';
+    showMsg(document.getElementById(messageId), '', 'ok');
+    return true;
+  } catch(e) {
+    root.dataset.stale = '1';
+    showMsg(document.getElementById(messageId), 'Error: ' + e.message, 'err');
+  } finally {
+    delete root.dataset.loading;
+  }
+}
+
+async function loadConfig(selected = configSection) {
+  const categories = document.getElementById('configCategories');
+  const container = document.getElementById('configFields');
+  if (!categories.children.length) {
+    for (const section of CFG_SECTIONS) {
+      if (!configStorageSupported && ['smb','sleephq'].includes(section.id)) continue;
+      const button = document.createElement('button');
+      button.textContent = section.label;
+      button.dataset.section = section.id;
+      button.onclick = () => loadConfig(section.id);
+      categories.appendChild(button);
+
+      const panel = document.createElement('div');
+      panel.id = 'config-panel-' + section.id;
+      panel.hidden = true;
+      if (section.id === 'network') {
+        const wifi = document.getElementById('configWifi');
+        wifi.hidden = false;
+        panel.appendChild(wifi);
+      }
+      const root = document.createElement('div');
+      root.id = 'config-' + section.id;
+      root.dataset.configForm = section.id;
+      panel.appendChild(root);
+      const actions = document.createElement('div');
+      actions.className = 'btn-row';
+      const message = document.createElement('div');
+      message.id = root.id + '-msg';
+      message.className = 'msg';
+      const save = document.createElement('button');
+      save.className = 'btn btn-accent';
+      save.textContent = 'Save & Persist';
+      save.onclick = () => saveConfig(root.id, message.id);
+      actions.appendChild(save);
+      const refresh = document.createElement('button');
+      refresh.className = 'btn';
+      refresh.textContent = 'Refresh';
+      refresh.onclick = () => loadConfigFields(root, section.id, message.id);
+      actions.appendChild(refresh);
+      panel.appendChild(actions);
+      panel.appendChild(message);
+      container.appendChild(panel);
+    }
+  }
+  configSection = selected;
+  for (const button of categories.children) {
+    const active = button.dataset.section === selected;
+    button.className = active ? 'btn btn-accent' : 'btn';
+    button.setAttribute('aria-pressed', String(active));
+    document.getElementById('config-panel-' + button.dataset.section).hidden = !active;
+  }
+  if (selected === 'network') loadWifiNets();
+  const root = document.getElementById('config-' + selected);
+  if (root.dataset.loaded !== '1' || root.dataset.stale === '1')
+    return loadConfigFields(root, selected, root.id + '-msg');
+}
+
+async function saveConfig(rootId, messageId) {
+  const root = document.getElementById(rootId);
+  if (root.dataset.saving === '1' || root.dataset.loading === '1') return;
+  const changes = collectConfigChanges(root);
+  const fields = root.querySelectorAll('[data-key]');
+  const msgEl = document.getElementById(messageId);
+  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return true; }
+  if (!confirmAccessChange(root, changes)) return false;
+  root.dataset.saving = '1';
   try {
     const r = await api('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
     if (!r) return;
     const d = await r.json();
-    showMsg(msgEl, d.ok ? 'Config saved' : 'Error: ' + (d.error || 'unknown'), d.ok ? 'ok' : 'err');
+    if (!r.ok || d.ok !== true) throw new Error(d.error || 'Config save failed');
+    if (d.saved !== Object.keys(changes).length)
+      throw new Error('Only ' + d.saved + ' settings saved; reload Config before retrying');
+    fields.forEach(inp => {
+      const key = inp.dataset.key;
+      if (!Object.hasOwn(changes, key)) return;
+      if (inp.dataset.pass) {
+        if (inp.value === changes[key]) {
+          inp.value = '';
+          inp.removeAttribute('data-dirty');
+          inp.placeholder = '(unchanged)';
+        }
+      } else inp.dataset.orig = changes[key];
+    });
+    document.querySelectorAll('[data-config-form]').forEach(other => {
+      if (other === root) return;
+      const section = CFG_SECTIONS.find(section => section.id === other.dataset.configForm);
+      if (!section || section.keys.some(key => Object.hasOwn(changes, key)))
+        other.dataset.stale = '1';
+    });
+    showMsg(msgEl, 'Config saved', 'ok');
+    return true;
   } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+  finally { delete root.dataset.saving; }
 }
 
+
+const SYNC_ENDPOINTS = {smb: 'SMB', sleephq: 'SleepHQ'};
+let exportsSnapshot = null;
+let exportsFresh = false;
+const syncRequests = new Set();
+
+function createSyncCards() {
+  const cards = document.getElementById('syncCards');
+  if (cards.children.length) return;
+  for (const [id, name] of Object.entries(SYNC_ENDPOINTS)) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = id + 'SyncCard';
+    card.innerHTML = `<div class="card-header"><span class="label">${name}</span><span class="badge" data-sync="state">--</span></div>
+      <div class="time-row"><span class="label">Endpoint</span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
+      <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">&mdash;</span></div>
+      <div class="time-row"><span class="label">Files</span><span class="value sync-value" data-sync="files">&mdash;</span></div>
+      <div class="time-row"><span class="label">Connection check</span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
+      <div class="sync-note" data-sync="import"></div>
+      <div class="sync-note" data-sync="availability"></div>
+      <div class="sync-error" data-sync="error"></div>
+      <div class="btn-row"><button class="btn btn-accent" data-sync="start">Sync now</button><button class="btn" data-sync="check">${id === 'smb' ? 'Check share' : 'Check account'}</button><button class="btn" data-sync="edit">Edit</button></div>
+      <div class="msg" id="${id}SyncMsg"></div>
+      <div id="${id}ConfigPanel" hidden>
+        <div id="${id}ConfigFields" data-config-form="${id}"></div>
+        <div class="sync-note">Configuration changes apply to the next sync.</div>
+        <div class="btn-row"><button class="btn btn-accent" data-sync="save">Save</button><button class="btn" data-sync="cancel">Cancel</button></div>
+        <div class="msg" id="${id}ConfigMsg"></div>
+      </div>`;
+    card.querySelector('[data-sync="start"]').onclick = () => startSync(id);
+    card.querySelector('[data-sync="check"]').onclick = () => startSync(id, true);
+    card.querySelector('[data-sync="edit"]').onclick = () => editSyncEndpoint(id);
+    card.querySelector('[data-sync="save"]').onclick = () => saveConfig(id + 'ConfigFields', id + 'ConfigMsg');
+    card.querySelector('[data-sync="cancel"]').onclick = () => cancelSyncEndpoint(id);
+    cards.appendChild(card);
+  }
+}
+
+function renderExports(changed = null) {
+  const data = exportsSnapshot;
+  if (!data) return;
+  const supported = data.supported === true;
+  document.querySelectorAll('[data-tab="sync"]').forEach(link => { link.hidden = !supported; });
+  document.getElementById('syncCards').hidden = !supported;
+  document.getElementById('syncUnavailable').hidden = supported;
+  if (!supported) return;
+  if (!document.getElementById('p-sync').classList.contains('active')) return;
+  createSyncCards();
+  const blockedText = {sd_unavailable:'SD card unavailable', not_configured:'Configure this endpoint first',
+    not_idle:'Waiting for AirSense standby', offline:'Waiting for WiFi', unavailable:'Sync unavailable'};
+  for (const id of Object.keys(SYNC_ENDPOINTS)) {
+    if (changed && !changed[id]) continue;
+    const state = data[id];
+    const card = document.getElementById(id + 'SyncCard');
+    const text = (key, value) => { card.querySelector('[data-sync="' + key + '"]').textContent = value; };
+    text('state', state.state);
+    text('endpoint', id === 'smb' ? state.endpoint || 'Not configured' :
+      'SleepHQ' + (state.team_id ? ' / Team ' + state.team_id : '') + (state.device_id ? ' / Device ' + state.device_id : ''));
+    text('last', state.last_sync_epoch ? new Date(state.last_sync_epoch * 1000).toLocaleString() : '\u2014');
+    const files = [];
+    if (state.has_files) {
+      files.push(state.files_uploaded + ' uploaded');
+      if (state.files_skipped) files.push(state.files_skipped + ' skipped');
+    }
+    if (['ready', 'confirming'].includes(state.backlog_state)) {
+      files.push(state.backlog_files + ' pending');
+      if (state.backlog_waiting) files.push(state.backlog_waiting + ' sessions not ready');
+      if (state.backlog_state === 'confirming') files.push('awaiting confirmation');
+    } else {
+      files.push('pending unknown');
+    }
+    text('files', state.backlog_state === 'unconfigured' ? '\u2014' : files.join(' \u00b7 '));
+    text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
+    text('error', [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
+      .filter((error, index, errors) => error && errors.indexOf(error) === index).join('; '));
+    text('check-result', state.check_state === 'passed' ? 'Passed' :
+      state.check_state === 'failed' ? state.check_error || 'Failed' :
+      ['pending','working'].includes(state.check_state) ? 'Checking...' : '\u2014');
+    const unavailable = !exportsFresh ? 'Status unavailable; reconnecting' :
+      blockedText[state.sync_blocked] || '';
+    text('availability', unavailable);
+    card.querySelector('[data-sync="start"]').disabled = !exportsFresh || !!state.sync_blocked || syncRequests.size > 0;
+    card.querySelector('[data-sync="check"]').disabled = !exportsFresh || !!state.check_blocked || syncRequests.size > 0;
+  }
+}
+
+let storagePath = '/', storageOffset = 0, storageMore = false, storageLoading = false;
+const storageSelection = new Set();
+
+function renderDashboardStorage(data) {
+  const summary = document.getElementById('dashStorageSummary');
+  const meter = document.getElementById('dashStorageMeter');
+  const fill = document.getElementById('dashStorageFill');
+  if (data.sd === undefined && data.version === undefined) return;
+  const total = Number(data.sd_total_mb), used = Number(data.sd_used_mb);
+  const mounted = data.sd === 'mounted' && Number.isFinite(total) && total > 0 &&
+    Number.isFinite(used) && used >= 0;
+  meter.hidden = !mounted;
+  if (!mounted) {
+    summary.textContent = !data.sd || data.sd === 'unsupported' ? 'Not supported' : 'Card unavailable';
+    fill.style.width = '0%';
+    meter.removeAttribute('aria-valuenow');
+    return;
+  }
+  const format = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GiB' : Math.round(mb) + ' MiB';
+  const percent = Math.min(100, used / total * 100);
+  summary.textContent = format(used) + ' used / ' + format(Math.max(0, total - used)) + ' free';
+  fill.style.width = percent.toFixed(1) + '%';
+  meter.setAttribute('aria-valuenow', percent.toFixed(1));
+  meter.title = percent.toFixed(1) + '% used of ' + format(total);
+}
+
+function renderStorageStatus(data) {
+  if (data.sd === undefined) return;
+  const supported = data.sd !== 'unsupported';
+  document.querySelectorAll('[data-tab="storage"]').forEach(link => { link.hidden = !supported; });
+  document.getElementById('storageState').textContent = !supported ? 'Not supported' :
+    data.sd === 'mounted' ? 'Mounted' : 'Card unavailable';
+  document.getElementById('storageUsage').textContent = data.sd === 'mounted' ?
+    (data.sd_used_mb || 0) + ' MiB used / ' + (data.sd_total_mb || 0) + ' MiB total' : '';
+}
+
+function storageControls() {
+  document.getElementById('storageRefresh').disabled = storageLoading;
+  document.getElementById('storageUp').disabled = storageLoading || storagePath === '/';
+  document.getElementById('storagePrev').disabled = storageLoading || !storageOffset;
+  document.getElementById('storageNext').disabled = storageLoading || !storageMore;
+  document.getElementById('storageZip').disabled = storageLoading;
+  document.getElementById('storageSelected').disabled = storageLoading || !storageSelection.size;
+  document.getElementById('storageDelete').disabled = storageLoading || !storageSelection.size;
+  document.querySelectorAll('#storageEntries button, #storageEntries input').forEach(el => { el.disabled = storageLoading; });
+}
+
+function storageChild(name) { return (storagePath === '/' ? '' : storagePath) + '/' + name; }
+
+async function loadStorage(path = storagePath, offset = storageOffset) {
+  if (storageLoading) return;
+  storageLoading = true;
+  storageControls();
+  const message = document.getElementById('storageMessage');
+  message.textContent = 'Reading directory...';
+  try {
+    const response = await api('/api/storage/list?path=' + encodeURIComponent(path) + '&offset=' + offset);
+    if (!response) return;
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Directory unavailable');
+    storagePath = data.path;
+    storageOffset = offset;
+    storageMore = data.more;
+    storageSelection.clear();
+    document.getElementById('storagePath').textContent = storagePath;
+    const entries = document.getElementById('storageEntries');
+    entries.replaceChildren();
+    for (const entry of data.entries) {
+      const row = document.createElement('div'); row.className = 'storage-row';
+      const check = document.createElement('input'); check.type = 'checkbox';
+      check.setAttribute('aria-label', 'Select ' + entry.name);
+      check.onchange = () => { if (check.checked) storageSelection.add(entry.name); else storageSelection.delete(entry.name); storageControls(); };
+      const content = document.createElement('div');
+      const link = document.createElement('a'); link.textContent = entry.name + (entry.directory ? '/' : '');
+      link.href = entry.directory ? '#storage' : '/api/storage/download?path=' + encodeURIComponent(storageChild(entry.name));
+      if (entry.directory) link.onclick = event => { event.preventDefault(); loadStorage(storageChild(entry.name), 0); };
+      else link.download = entry.name;
+      const detail = document.createElement('small');
+      const unit = entry.size >= 1048576 ? 2 : entry.size >= 1024 ? 1 : 0;
+      detail.textContent = (entry.directory ? 'Folder' :
+        (entry.size / 1024 ** unit).toFixed(unit ? 1 : 0) + ' ' + ['B', 'KiB', 'MiB'][unit]) +
+        (entry.modified ? ' | ' + new Date(entry.modified * 1000).toLocaleString() : '');
+      content.append(link, detail);
+      const action = document.createElement('button'); action.className = 'btn btn-accent storage-download';
+      action.textContent = '\u2193';
+      action.title = (entry.directory ? 'Download folder ZIP: ' : 'Download: ') + entry.name;
+      action.setAttribute('aria-label', action.title);
+      action.onclick = () => storageDownload(entry.directory ? 'archive' : 'download', entry.name);
+      const rename = document.createElement('button'); rename.className = 'btn';
+      rename.textContent = 'Rename'; rename.setAttribute('aria-label', 'Rename ' + entry.name);
+      rename.onclick = () => storageRename(entry.name);
+      const actions = document.createElement('div'); actions.className = 'storage-entry-actions';
+      actions.append(rename, action);
+      row.append(check, content, actions); entries.append(row);
+    }
+    document.getElementById('storagePage').textContent = 'Page ' + (offset / 32 + 1);
+    message.textContent = data.entries.length ? '' : 'This directory is empty.';
+  } catch (error) {
+    message.textContent = error.message;
+  } finally { storageLoading = false; storageControls(); }
+}
+
+function storageUp() {
+  const slash = storagePath.lastIndexOf('/');
+  loadStorage(slash > 0 ? storagePath.slice(0, slash) : '/', 0);
+}
+
+function storageDownload(kind, name = null, selected = false) {
+  if (storageLoading) return;
+  let url = '/api/storage/' + kind + '?path=' + encodeURIComponent(name === null ? storagePath : storageChild(name));
+  if (selected) {
+    if (!storageSelection.size) return;
+    const names = [...storageSelection];
+    if (new TextEncoder().encode(names.join('\n')).length >= 2048) {
+      document.getElementById('storageMessage').textContent = 'Select fewer entries or download the whole folder.';
+      return;
+    }
+    for (const item of names) url += '&item=' + encodeURIComponent(item);
+  }
+  const link = document.createElement('a'); link.href = url;
+  link.download = kind === 'archive' ? 'airbridge.zip' : name;
+  document.body.append(link); link.click(); link.remove();
+}
+
+async function storageMutate(kind, body) {
+  if (storageLoading) return;
+  storageLoading = true;
+  storageControls();
+  const message = document.getElementById('storageMessage');
+  message.textContent = kind === 'delete' ? 'Deleting...' : 'Renaming...';
+  let result;
+  try {
+    const response = await api('/api/storage/' + kind, {method:'POST', body});
+    if (!response) return;
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error((data.error || 'Operation failed') +
+        (data.changed ? ' (' + data.changed + ' entries changed)' : ''));
+    }
+    result = kind === 'delete' ? 'Deleted.' : 'Renamed.';
+  } catch (error) {
+    result = error.message;
+  } finally {
+    storageLoading = false;
+    storageControls();
+  }
+  // A failed or interrupted recursive delete may already have removed files.
+  await loadStorage(storagePath, 0);
+  message.textContent = result;
+}
+
+async function storageRename(name) {
+  if (storageLoading) return;
+  const replacement = prompt('New name for ' + name + ':', name);
+  if (replacement === null || replacement === name) return;
+  if (!replacement || /[\/\\\r\n]/.test(replacement) || replacement === '.' || replacement === '..') {
+    document.getElementById('storageMessage').textContent = 'Enter a name, not a path.';
+    return;
+  }
+  await storageMutate('rename', new URLSearchParams({path:storageChild(name), name:replacement}));
+}
+
+async function storageDelete() {
+  if (storageLoading || !storageSelection.size) return;
+  const names = [...storageSelection];
+  if (!confirm('Permanently delete these entries and all folder contents?\n\n' + names.join('\n'))) return;
+  const body = new URLSearchParams({path:storagePath});
+  for (const name of names) body.append('item', name);
+  await storageMutate('delete', body);
+}
+
+function applyExports(data) {
+  if (!exportsSnapshot) exportsSnapshot = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (key === 'smb' || key === 'sleephq')
+      exportsSnapshot[key] = {...exportsSnapshot[key], ...value};
+    else exportsSnapshot[key] = value;
+  }
+  exportsFresh = true;
+  renderExports(data);
+}
+
+async function startSync(id, check = false) {
+  if (syncRequests.size) return;
+  syncRequests.add(id);
+  renderExports();
+  const message = document.getElementById(id + 'SyncMsg');
+  try {
+    const response = await api('/api/export/' + id + (check ? '?action=check' : ''), {method: 'POST'});
+    if (!response) return;
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Sync request failed');
+    showMsg(message, check ? 'Check queued' : 'Sync queued', 'ok');
+  } catch(e) {
+    showMsg(message, e.message, 'err');
+  } finally {
+    syncRequests.delete(id);
+    renderExports();
+  }
+}
+
+async function editSyncEndpoint(id) {
+  document.getElementById(id + 'ConfigPanel').hidden = false;
+  const root = document.getElementById(id + 'ConfigFields');
+  if (!root.children.length || root.dataset.stale === '1')
+    await loadConfigFields(root, id, id + 'ConfigMsg');
+}
+
+function cancelSyncEndpoint(id) {
+  const root = document.getElementById(id + 'ConfigFields');
+  if (root.dataset.saving === '1') return;
+  root.innerHTML = '';
+  document.getElementById(id + 'ConfigPanel').hidden = true;
+}
+
+
 function showMsg(el, text, type, timeout) {
+  text = text == null ? '' : String(text);
+  const empty = !text.trim();
   // Inline msg element
   if (el) {
-    el.textContent = text;
-    el.className = 'msg ' + type;
     if (el._msgTimer) clearTimeout(el._msgTimer);
+    el._msgTimer = null;
+    el.style.removeProperty('display');
+    el.textContent = empty ? '' : text;
+    el.className = empty ? 'msg' : 'msg ' + type;
+    if (empty) return;
     if (timeout !== 0) el._msgTimer = setTimeout(() => { el.className = 'msg'; }, timeout || 5000);
+    return;
   }
+  if (empty) return;
   // Toast
   var tc = document.getElementById('toastContainer');
   if (tc) {
@@ -1122,7 +2208,71 @@ function showMsg(el, text, type, timeout) {
 }
 
 // BLE
-let bleTimer = null;
+let bleRead = null, bleRevision = null, bleLoadedRevision = null;
+
+function updateBleConnections() {
+  const state = lastStatus.oxi;
+  const address = (lastStatus.oxi_addr || '').toLowerCase();
+  document.querySelectorAll('#bleDevices [data-addr], #bleBonds [data-addr]').forEach(row => {
+    const active = state === 'STREAMING' && row.dataset.addr === address;
+    const button = row.querySelector('.ble-connect');
+    button.textContent = active ? 'Connected' : 'Connect';
+    button.disabled = active || ['DISABLED', 'CONNECTING', 'BONDING'].includes(state);
+  });
+}
+
+function renderBleDevices(id, devices, known) {
+  const list = document.getElementById(id);
+  list.innerHTML = '';
+  if (!devices.length) {
+    const empty = document.createElement('div');
+    empty.className = 'ble-empty';
+    empty.textContent = known ? 'No known devices' : 'No devices found. Click Scan to search.';
+    list.appendChild(empty);
+    return;
+  }
+  devices.forEach(device => {
+    const row = document.createElement('div'); row.className = 'ble-device';
+    row.dataset.addr = device.addr.toLowerCase();
+    row.innerHTML = '<div class="ble-device-info"><strong class="ble-device-name"></strong>' +
+      '<small class="ble-device-address"></small></div><div class="ble-device-actions"></div>';
+    const name = device.name || device.addr;
+    row.querySelector('strong').textContent = name;
+    const address = row.querySelector('small');
+    address.textContent = device.addr + (known ? '' : ' (' + device.rssi + ' dBm)');
+    address.hidden = known && !device.name;
+    const actions = row.querySelector('.ble-device-actions');
+    const message = known ? 'bleKnownMsg' : 'bleMsg';
+    if (known) {
+      const auto = document.createElement('button');
+      auto.className = 'btn ble-auto' + (device.autoconnect ? ' btn-accent' : '');
+      auto.textContent = device.autoconnect ? 'Auto-connect On' : 'Auto-connect Off';
+      auto.setAttribute('aria-pressed', String(device.autoconnect));
+      auto.onclick = async () => {
+        auto.disabled = true;
+        await bleAction('autoconnect', device.addr, {enabled:String(!device.autoconnect)}, message);
+        auto.disabled = false;
+      };
+      actions.appendChild(auto);
+    }
+    const connect = document.createElement('button');
+    connect.className = 'btn btn-accent ble-connect';
+    connect.textContent = 'Connect';
+    connect.onclick = () => bleConnect(device.addr, message);
+    actions.appendChild(connect);
+    if (known) {
+      const forget = document.createElement('button');
+      forget.className = 'btn btn-danger';
+      forget.textContent = 'Forget';
+      forget.onclick = () => {
+        if (confirm('Forget ' + name + '?')) bleAction('delete_bond', device.addr, {}, message);
+      };
+      actions.appendChild(forget);
+    }
+    list.appendChild(row);
+  });
+}
+
 function toggleOxi() {
   var st = document.getElementById('bleStatusGrid');
   var isDisabled = st && st.querySelector('[data-field="state"]') &&
@@ -1130,14 +2280,29 @@ function toggleOxi() {
   bleAction(isDisabled ? 'enable' : 'disable');
 }
 
-async function loadBle() {
+function loadBle() {
+  if (bleRead) return bleRead;
+  const revision = bleRevision;
+  const configRevision = lastStatus.config_revision;
+  bleRead = (async () => {
   try {
-    const r = await api('/api/ble'); if (!r) return;
+    const r = await api('/api/ble', undefined, 5000); if (!r) return null;
+    if (!r.ok) throw new Error('Oximetry status read failed');
     const d = await r.json();
+    if (revision !== bleRevision || configRevision !== lastStatus.config_revision) return;
+    Object.assign(d, {state:lastStatus.oxi, feeding:lastStatus.feeding,
+      spo2:lastStatus.spo2, pulse:lastStatus.pulse});
     const g = document.getElementById('bleStatusGrid'); g.innerHTML = '';
-    const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',configured:d.configured_addr||'(none)',auto_start:d.auto_start};
-    for (const [k,v] of Object.entries(fields))
-      g.innerHTML += '<div class="stat"><span class="k">'+k+':</span> <span class="v" data-field="'+k+'">'+v+'</span></div>';
+    const fields = {state:d.state,feeding:d.feeding,spo2:d.spo2>=0?d.spo2+'%':'--',pulse:d.pulse>=0?d.pulse+' bpm':'--',auto_start:d.auto_start};
+    for (const [k,v] of Object.entries(fields)) {
+      const stat = document.createElement('div'); stat.className = 'stat';
+      stat.innerHTML = '<span class="k"></span> <span class="v"></span>';
+      stat.querySelector('.k').textContent = k + ':';
+      const value = stat.querySelector('.v');
+      value.dataset.field = k;
+      value.textContent = v;
+      g.appendChild(stat);
+    }
     const fb = document.getElementById('btnFeed');
     if (d.feeding === 'yes') { fb.textContent = 'Stop Feed'; fb.onclick = () => bleAction('stop_feed'); }
     else { fb.textContent = 'Start Feed'; fb.onclick = () => bleAction('start_feed'); }
@@ -1145,71 +2310,47 @@ async function loadBle() {
     if (ot) ot.textContent = d.state === 'DISABLED' ? 'Enable' : 'Disable';
     const sp = document.getElementById('bleScanSpinner');
     sp.style.display = d.state === 'SCANNING' ? 'inline-block' : 'none';
-    const dl = document.getElementById('bleDevices'); dl.innerHTML = '';
-    if (d.devices && d.devices.length) {
-      var connAddr = (lastStatus.oxi_addr || '').toLowerCase();
-      var isConn = connAddr && (d.state === 'STREAMING' || d.state === 'BONDING');
-      d.devices.forEach(dev => {
-        const row = document.createElement('div'); row.className = 'row';
-        var active = isConn && dev.addr.toLowerCase() === connAddr;
-        var btn = active
-          ? '<span class="badge badge-streaming" style="padding:6px 14px">Connected</span>'
-          : '<button class="btn btn-accent" onclick="bleConnect(\''+dev.addr+'\')">Connect</button>';
-        row.innerHTML = '<label><strong>'+(dev.name||'Unknown')+'</strong><br><small style="color:var(--text-dim)">'+dev.addr+' ('+dev.rssi+' dBm)</small></label>' + btn;
-        dl.appendChild(row);
-      });
-    } else {
-      dl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No devices found. Click Scan to search.</div>';
-    }
+    renderBleDevices('bleDevices', d.devices || [], false);
     // Update dashboard oxi address
     var oa = document.getElementById('dashOxiAddr');
-    if (oa && d.configured_addr) {
-      oa.textContent = d.configured_addr;
+    if (oa && lastStatus.oxi_addr) {
+      oa.textContent = lastStatus.oxi_addr;
       oa.style.display = '';
     }
-    const bl = document.getElementById('bleBonds'); bl.innerHTML = '';
-    if (d.bonds && d.bonds.length) {
-      d.bonds.forEach(addr => {
-        const row = document.createElement('div'); row.className = 'row';
-        row.innerHTML = '<label style="font-family:monospace">'+addr+'</label><button class="btn btn-danger" onclick="bleAction(\'delete_bond\',\''+addr+'\')" style="padding:4px 12px;font-size:12px">Delete</button>';
-        bl.appendChild(row);
-      });
-    } else {
-      bl.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No bonded devices</div>';
-    }
+    renderBleDevices('bleBonds', d.known || [], true);
+    document.getElementById('bleForgetAll').hidden = !d.known || d.known.length < 2;
+    updateBleConnections();
+    bleLoadedRevision = revision;
+    return d;
   } catch(e) { console.error(e); }
+  })().finally(() => {
+    bleRead = null;
+    if ((revision !== bleRevision || configRevision !== lastStatus.config_revision) &&
+        document.getElementById('p-bluetooth').classList.contains('active')) loadBle();
+  });
+  return bleRead;
 }
 
 async function bleScan() {
   await bleAction('scan');
-  if (bleTimer) clearInterval(bleTimer);
-  document.getElementById('bleScanSpinner').style.display = 'inline-block';
-  let polls = 0;
-  bleTimer = setInterval(async () => {
-    await loadBle(); polls++;
-    const r = await api('/api/ble'); if (!r) return;
-    const d = await r.json();
-    if (d.state !== 'SCANNING' || polls > 20) { clearInterval(bleTimer); bleTimer = null; document.getElementById('bleScanSpinner').style.display = 'none'; }
-  }, 1500);
 }
 
-var pendingConnect = false;
-async function bleConnect(addr) {
-  var msgEl = document.getElementById('bleMsg');
-  showMsg(msgEl, 'Connecting to ' + addr + '...', 'ok', 0);
-  pendingConnect = true;
-  await bleAction('connect', addr);
+async function bleConnect(addr, message = 'bleMsg') {
+  await bleAction('connect', addr, {}, message);
 }
 
-async function bleAction(action, addr) {
+async function bleAction(action, addr, settings = {}, message = 'bleMsg') {
   try {
-    const body = addr ? {action,addr} : {action};
+    const body = {action, ...settings};
+    if (addr) body.addr = addr;
     const r = await api('/api/ble', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     const d = await r.json();
-    if (action !== 'scan') showMsg(document.getElementById('bleMsg'), d.result, 'ok');
-    setTimeout(loadBle, 500);
-  } catch(e) { showMsg(document.getElementById('bleMsg'), 'Error: ' + e.message, 'err'); }
+    if (!r.ok || !d.ok) throw new Error(d.error || d.result || 'Oximetry action failed');
+    if (action !== 'scan') showMsg(document.getElementById(message), d.result, 'ok');
+    await loadBle();
+    return true;
+  } catch(e) { showMsg(document.getElementById(message), 'Error: ' + e.message, 'err'); return false; }
 }
 
 // Console
@@ -1232,9 +2373,9 @@ async function sendCmd() {
     const r = await api('/api/cmd', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});
     if (!r) return;
     const d = await r.json();
-    if (d.error) cmdLog(d.error, 'var(--red)');
-    else if (d.response) cmdLog(d.response, 'var(--green)');
-    else cmdLog('OK', 'var(--green)');
+    if (d.error || (d.ok !== true && d.ok !== 'true'))
+      cmdLog('Error: ' + (d.error || 'Command failed') + (d.response ? '\n' + d.response : ''), 'var(--red)');
+    else cmdLog(d.response || 'OK', 'var(--green)');
   } catch(e) { cmdLog('Error: ' + e.message, 'var(--red)'); }
 }
 function clearConsole() { document.getElementById('cmdOutput').innerHTML = ''; }
@@ -1242,6 +2383,99 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
   if (e.key === 'ArrowUp' && cmdHistory.length) { histIdx = Math.max(0, histIdx - 1); e.target.value = cmdHistory[histIdx] || ''; }
   if (e.key === 'ArrowDown') { histIdx = Math.min(cmdHistory.length, histIdx + 1); e.target.value = cmdHistory[histIdx] || ''; }
 });
+
+let otaStatusTimer = null;
+let otaStatus = null, otaWatch = null, otaSerial = 0;
+
+function renderOtaStatus(d) {
+  var version = document.getElementById('espFwVer');
+  if (version && lastStatus.version) version.textContent = lastStatus.version;
+
+  var latest = d.update_version || '--';
+  if (d.state === 'disabled') latest = 'Checks disabled';
+  else if (d.state === 'checking') latest = 'Checking...';
+  else if (d.state === 'current') latest += ' (current)';
+  else if (d.state === 'available') latest += ' available';
+  document.getElementById('espFwLatest').textContent = latest;
+
+  var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
+  var check = document.getElementById('btnOtaCheck');
+  check.disabled = d.state === 'disabled' || active || !!d.blocked;
+  var install = document.getElementById('btnOtaInstall');
+  install.style.display = d.state === 'available' ? '' : 'none';
+  install.textContent = d.update_version ? 'Install ' + d.update_version : 'Install update';
+  install.disabled = d.state !== 'available' || !!d.blocked;
+  check.title = install.title = d.blocked || '';
+
+  var progress = document.getElementById('otaReleaseProgress');
+  var bar = document.getElementById('otaReleaseBar');
+  progress.style.display = ['installing', 'rebooting'].includes(d.state) ? 'block' : 'none';
+  bar.style.width = (d.state === 'rebooting' ? 100 : (d.progress || 0)) + '%';
+
+  var msgEl = document.getElementById('otaReleaseMsg');
+  var text = d.state === 'rebooting' ? 'Update complete. Restarting...' :
+    d.state === 'installing' ? 'Installing update: ' + (d.progress || 0) + '%' :
+    d.state === 'checking' ? 'Checking for updates...' :
+    d.state === 'busy' ? 'Another firmware operation is in progress.' :
+    d.state === 'error' ? d.error : '';
+  msgEl.textContent = text;
+  msgEl.className = text ? 'msg ' + (d.state === 'error' ? 'err' : 'ok') : 'msg';
+}
+
+function applyOtaStatus(d) {
+  if (otaStatus && d.revision <= otaStatus.revision) { finishOtaObservation(); return; }
+  otaStatus = d;
+  if (document.getElementById('p-ota').classList.contains('active')) renderOtaStatus(d);
+  finishOtaObservation();
+}
+
+function finishOtaObservation() {
+  if (!otaWatch || !otaStatus) return;
+  const d = otaStatus;
+  var message = '', type = 'ok';
+  const restarted = (otaWatch.version && lastStatus.version && lastStatus.version !== otaWatch.version) ||
+    (Number.isFinite(otaWatch.uptime) && Number.isFinite(lastStatus.uptime) && lastStatus.uptime < otaWatch.uptime);
+  if (otaWatch.restarting && restarted) {
+    message = 'Device is back online with firmware ' + (lastStatus.version || '--') + '.';
+  } else if (d.state === 'error') { message = d.error; type = 'err'; }
+  else if (otaWatch.restarting) return;
+  else if (d.state === 'current' || d.state === 'available') {
+    message = d.state === 'available' ? 'Version ' + d.update_version + ' is available.' : 'This device is up to date.';
+  } else return;
+  clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
+  showMsg(document.getElementById('otaReleaseMsg'), message, type, 0);
+}
+
+function watchOta(restarting, baseline) {
+  if (otaStatusTimer) clearTimeout(otaStatusTimer);
+  otaWatch = {restarting, version:baseline.version, uptime:baseline.uptime};
+  otaStatusTimer = setTimeout(() => {
+    otaStatusTimer = null;
+    otaWatch = null;
+    showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status. Refresh to check the device.', 'err', 0);
+  }, 120000);
+}
+
+async function otaAction(action) {
+  const restarting = action === 'install';
+  const baseline = {...lastStatus};
+  const serial = otaSerial;
+  var msgEl = document.getElementById('otaReleaseMsg');
+  showMsg(msgEl, restarting ? 'Starting release update...' : 'Checking for updates...', 'ok', 0);
+  try {
+    var r = await api('/api/ota/' + action, {method:'POST'});
+    if (!r) return;
+    var d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Update request rejected');
+    watchOta(restarting, {version:baseline.version || d.version, uptime:baseline.uptime ?? d.uptime});
+    const newerPush = serial !== otaSerial && otaStatus &&
+      (otaStatus.revision > d.revision || lastStatus.version !== baseline.version || lastStatus.uptime < baseline.uptime);
+    applyOtaStatus(newerPush ? otaStatus : d);
+  } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
+}
+
+function otaCheckRelease() { return otaAction('check'); }
+function otaInstallRelease() { return otaAction('install'); }
 
 // Upload
 const dz = document.getElementById('dropZone'), fi = document.getElementById('fileInput');
@@ -1259,6 +2493,15 @@ edz.addEventListener('dragleave', () => edz.classList.remove('dragover'));
 edz.addEventListener('drop', e => { e.preventDefault(); edz.classList.remove('dragover'); espUploadFile(e.dataTransfer.files[0]); });
 efi.addEventListener('change', e => { if (e.target.files[0]) espUploadFile(e.target.files[0]); });
 
+function uploadResponse(xhr) {
+  let data;
+  try { data = JSON.parse(xhr.responseText); }
+  catch(e) { throw new Error('Bad server response (HTTP ' + xhr.status + ')'); }
+  if (xhr.status !== 200 || !data || (data.ok !== true && data.ok !== 'true'))
+    throw new Error((data && data.error) || xhr.statusText || 'Upload rejected');
+  return data;
+}
+
 async function espUploadFile(file) {
   var msgEl = document.getElementById('espUploadMsg');
   document.getElementById('espFileInfo').textContent = file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
@@ -1269,17 +2512,11 @@ async function espUploadFile(file) {
     var xhr = new XMLHttpRequest();
     xhr.upload.onprogress = function(e) { if (e.lengthComputable) bar.style.width = (e.loaded/e.total*100)+'%'; };
     xhr.onload = function() {
-      if (xhr.status === 200) {
-        var d = JSON.parse(xhr.responseText);
-        if (d.ok === 'true') {
-          showMsg(msgEl, 'Upload OK: ' + d.size + ' bytes to ' + (d.partition||'OTA') + '. Ready to reboot.', 'ok', 0);
-          document.getElementById('btnEspReboot').style.display = '';
-        } else {
-          showMsg(msgEl, 'Upload failed: ' + (d.error || 'invalid firmware image'), 'err');
-        }
-      } else {
-        showMsg(msgEl, 'Upload failed: ' + xhr.statusText, 'err');
-      }
+      try {
+        const d = uploadResponse(xhr);
+        showMsg(msgEl, 'Upload OK: ' + d.size + ' bytes to ' + (d.partition||'OTA') + '. Ready to reboot.', 'ok', 0);
+        document.getElementById('btnEspReboot').style.display = '';
+      } catch(e) { showMsg(msgEl, 'Upload failed: ' + e.message, 'err'); }
     };
     xhr.onerror = function() { showMsg(msgEl, 'Upload error', 'err'); };
     var fd = new FormData(); fd.append('firmware', file);
@@ -1318,16 +2555,12 @@ async function uploadFile(file) {
     const xhr = new XMLHttpRequest();
     xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded/e.total*100)+'%'; };
     xhr.onload = () => {
-      let d = {};
-      try { d = JSON.parse(xhr.responseText || '{}'); }
-      catch(e) { showMsg(msgEl, 'Upload failed: bad server response', 'err'); return; }
-      if (xhr.status === 200 && d.ok === 'true') {
+      try {
+        const d = uploadResponse(xhr);
         showMsg(msgEl, 'Upload OK: '+d.size+' bytes, CRC: '+(d.crc||'n/a'), 'ok', 0);
         showFwWarnings(d);
         showFlashCard();
-      } else {
-        showMsg(msgEl, 'Upload failed: ' + (d.error || xhr.statusText || xhr.status), 'err');
-      }
+      } catch(e) { showMsg(msgEl, 'Upload failed: ' + e.message, 'err'); }
     };
     xhr.onerror = () => showMsg(msgEl, 'Upload error', 'err');
     xhr.open('POST', '/api/upload'); xhr.send(fd);
@@ -1361,6 +2594,7 @@ document.getElementById('flashBlock').addEventListener('change', updateBlxVisibi
 document.getElementById('flashBlx').addEventListener('change', updateBlxVisibility);
 
 let flashPollTimer = null;
+let flashPolling = false;
 async function startFlash() {
   const block = document.getElementById('flashBlock').value;
   const flashBlx = document.getElementById('flashBlx').checked;
@@ -1379,23 +2613,39 @@ async function startFlash() {
 }
 
 function pollFlash() {
-  if (flashPollTimer) clearInterval(flashPollTimer);
-  flashPollTimer = setInterval(async () => {
+  if (flashPolling) return;
+  flashPolling = true;
+  let failedAt = null;
+  const poll = async () => {
     try {
-      const r = await api('/api/flash'); if (!r) return; const d = await r.json();
+      const r = await api('/api/flash', undefined, 5000);
+      if (!r) { flashPolling = false; flashPollTimer = null; return; }
+      if (!r.ok) throw new Error('Flash status read failed');
+      const d = await r.json();
+      failedAt = null;
       const bar = document.getElementById('flashBar'), phase = document.getElementById('flashPhase'), msgEl = document.getElementById('flashMsg');
       if (d.total > 0) bar.style.width = (d.sent/d.total*100)+'%';
       phase.textContent = d.phase + (d.total > 0 ? ' - ' + Math.round(d.sent/1024) + '/' + Math.round(d.total/1024) + ' KB' : '');
       if (d.active !== 'true') {
-        clearInterval(flashPollTimer); flashPollTimer = null;
+        flashPolling = false; flashPollTimer = null;
         document.getElementById('btnFlash').disabled = false;
         document.getElementById('btnFlashCancel').style.display = 'none';
         if (d.error) showMsg(msgEl, d.error, 'err');
         else if (d.phase === 'Complete') showMsg(msgEl, 'Flash completed successfully!', 'ok');
         else showMsg(msgEl, 'Flash finished: ' + d.phase, 'ok');
+        return;
       }
-    } catch(e) { console.error(e); }
-  }, 500);
+    } catch(e) {
+      if (failedAt === null) failedAt = Date.now();
+      if (Date.now() - failedAt >= 30000) {
+        flashPolling = false; flashPollTimer = null;
+        showMsg(document.getElementById('flashMsg'), 'Flash status unavailable. The operation may still be running; refresh to check.', 'err', 0);
+        return;
+      }
+    }
+    flashPollTimer = setTimeout(poll, 500);
+  };
+  flashPollTimer = setTimeout(poll, 500);
 }
 
 async function cancelFlash() { try { await api('/api/flash/cancel', {method:'POST'}); } catch(e) { console.error(e); } }
@@ -1405,7 +2655,7 @@ const WAVE_PTS = 500;     // ~20 s @ 25 Hz; covers 4-5 breath cycles
 const waveData = {press:[],flow:[],leak:[]};
 const slowData = {spo2:[],pulse:[]};
 const SLOW_PTS = 150;
-let liveSeq = 0, slowTick = 0;
+let liveSeq = null, slowBucket = null;
 
 // Auto-rescaling. Values stored are raw; min/max grow on overshoot
 const chartScales = {
@@ -1497,15 +2747,17 @@ function drawChart(canvasId, data, label, color, minY, maxY, unit, scale, signed
   ctx.stroke();
 }
 
-function updateCharts() {
+function updateCharts(slowChanged = true) {
   const ps = expandChartScale('press', waveData.press);
   const fs = expandChartScale('flow',  waveData.flow);
   const ls = expandChartScale('leak',  waveData.leak);
   drawChart('cPress', waveData.press, 'Pressure', '#22d3ee', ps.min, ps.max, '', 50, false);
   drawChart('cFlow', waveData.flow, 'Flow (L/min)', '#818cf8', fs.min, fs.max, ' ', 8.33, true);
   drawChart('cLeak', waveData.leak, 'Leak (L/min)', '#fb923c', ls.min, ls.max, '', 0.833, false);
-  drawChart('cSpo2', slowData.spo2, 'SpO2', '#4ade80', 80, 100, '%', 1, false);
-  drawChart('cPulse', slowData.pulse, 'Pulse', '#e94560', 40, 160, '', 1, false);
+  if (slowChanged) {
+    drawChart('cSpo2', slowData.spo2, 'SpO2', '#4ade80', 80, 100, '%', 1, false);
+    drawChart('cPulse', slowData.pulse, 'Pulse', '#e94560', 40, 160, '', 1, false);
+  }
   // Update chart header values
   var p = waveData.press, f = waveData.flow, lk = waveData.leak,
       s = slowData.spo2, hr = slowData.pulse;
@@ -1517,37 +2769,42 @@ function updateCharts() {
   el = document.getElementById('chartPressVal'); if (el) el.textContent = lastValid(p, 50);
   el = document.getElementById('chartFlowVal'); if (el) el.textContent = lastValid(f, 8.33);
   el = document.getElementById('chartLeakVal'); if (el) el.textContent = lastValid(lk, 0.833);
-  el = document.getElementById('chartSpo2Val'); if (el) { var v = lastValid(s, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
-  el = document.getElementById('chartPulseVal'); if (el) { var v = lastValid(hr, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
+  if (slowChanged) {
+    el = document.getElementById('chartSpo2Val'); if (el) { var v = lastValid(s, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
+    el = document.getElementById('chartPulseVal'); if (el) { var v = lastValid(hr, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
+  }
 }
 
-let liveBusy = false;
+let liveBackfill = 0;
 async function backfillLive() {
-  if (liveBusy) return;
-  liveBusy = true;
+  const generation = ++liveBackfill;
+  const connection = liveEvtSrc;
+  const requestedSeq = liveSeq;
   try {
-    const r = await api('/api/live?since='+liveSeq);
-    if (!r) { liveBusy=false; return; }
+    const r = await api('/api/live?since='+(requestedSeq === null ? 0 : requestedSeq));
+    if (!r) return;
     const d = await r.json();
-    if (d.samples && d.samples.length) {
-      d.samples.forEach(s => {
-        waveData.press.push(s[0]);
-        waveData.flow.push(s[1]);
-        waveData.leak.push(s[2]);
-      });
-      for (const k in waveData) { while (waveData[k].length > WAVE_PTS) waveData[k].shift(); }
-    }
-    liveSeq = d.seq;
+    if (!connection || connection !== liveEvtSrc || generation !== liveBackfill) return;
+    // A response older than the requested sequence indicates a device restart
+    // or an absence longer than the sequence comparison window.
+    const reset = requestedSeq !== null && ((d.seq - requestedSeq) & 0xffff) >= 0x8000;
+    appendLiveSamples(d, reset);
     updateCharts();
   } catch(e) { console.error(e); }
-  liveBusy = false;
 }
 
 // Init
-const ht = window.location.hash.slice(1);
-showTab(tabNames.includes(ht) ? ht : 'status');
+async function startUI() {
+  const ht = window.location.hash.slice(1);
+  const status = lastStatus;
+  let deferred = false;
+  try { deferred = sessionStorage.getItem('airbridge.setup') === 'later'; } catch(e) {}
+  if (window.location.pathname === '/wizard' || ht === 'setup' ||
+      (status && !status.onboarding_complete && !deferred)) await startSetup();
+  else showTab(tabNames.includes(ht) ? ht : 'status');
+  if (ht === 'storage' && !setupActive()) loadStorage();
+}
 initSSE();
-backfillLive();
 </script>
 </body>
 </html>

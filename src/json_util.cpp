@@ -1,0 +1,201 @@
+#include "json_util.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "large_text_buffer.h"
+#include "string_util.h"
+
+namespace aircannect {
+namespace {
+
+template <typename Out>
+void json_add_string_impl(Out &out, const char *key, const char *value, bool comma) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":\"";
+    json_escape_append(out, value, value ? strlen(value) : 0);
+    out += '"';
+}
+
+template <typename Out>
+void json_add_bool_impl(Out &out, const char *key, bool value, bool comma) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    out += value ? "true" : "false";
+}
+
+template <typename Out>
+void json_add_int_impl(Out &out, const char *key, long value, bool comma) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%ld", value);
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    out += buf;
+}
+
+template <typename Out>
+void append_json_float_impl(Out &out, float value) {
+    if (!isfinite(value)) {
+        out += "null";
+        return;
+    }
+    const bool negative = value < 0.0f;
+    const float abs_value = negative ? -value : value;
+    const unsigned long scaled =
+        static_cast<unsigned long>(abs_value * 1000.0f + 0.5f);
+    const unsigned long whole = scaled / 1000UL;
+    const unsigned long frac = scaled % 1000UL;
+
+    char buf[24];
+    if (negative && scaled != 0) out += '-';
+    snprintf(buf, sizeof(buf), "%lu", whole);
+    out += buf;
+    if (!frac) return;
+
+    char frac_buf[3];
+    frac_buf[0] = static_cast<char>('0' + (frac / 100UL) % 10UL);
+    frac_buf[1] = static_cast<char>('0' + (frac / 10UL) % 10UL);
+    frac_buf[2] = static_cast<char>('0' + frac % 10UL);
+    size_t digits = 3;
+    while (digits > 0 && frac_buf[digits - 1] == '0') --digits;
+    out += '.';
+    for (size_t i = 0; i < digits; ++i) out += frac_buf[i];
+}
+
+template <typename Out>
+void json_add_float_impl(Out &out, const char *key, float value, bool comma) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    append_json_float_impl(out, value);
+}
+
+template <typename Out>
+void json_add_uint64_impl(Out &out, const char *key, uint64_t value, bool comma) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%llu",
+             static_cast<unsigned long long>(value));
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":";
+    out += buf;
+}
+
+}  // namespace
+
+bool json_variant_to_string(JsonVariantConst value, std::string &out) {
+    if (value.isNull()) return false;
+    if (value.is<const char *>()) {
+        out = value.as<const char *>();
+        return true;
+    }
+    if (value.is<int>()) {
+        out = std::to_string(value.as<int>());
+        return true;
+    }
+    if (value.is<unsigned int>()) {
+        out = std::to_string(value.as<unsigned int>());
+        return true;
+    }
+    if (value.is<long>()) {
+        out = std::to_string(value.as<long>());
+        return true;
+    }
+    if (value.is<unsigned long>()) {
+        out = std::to_string(value.as<unsigned long>());
+        return true;
+    }
+    if (value.is<bool>()) {
+        out = value.as<bool>() ? "true" : "false";
+        return true;
+    }
+    return false;
+}
+
+bool json_variant_to_uint32(JsonVariantConst value, uint32_t &out) {
+    if (value.is<uint32_t>()) {
+        out = value.as<uint32_t>();
+        return true;
+    }
+    if (value.is<const char *>()) {
+        return parse_uint32_decimal(value.as<const char *>(), out);
+    }
+    return false;
+}
+
+void append_json_escaped(std::string &out, const char *value, size_t len) {
+    json_escape_append(out, value, len);
+}
+
+void append_json_escaped(std::string &out, std::string_view value) {
+    json_escape_append(out, value.data(), value.size());
+}
+
+#if AIRCANNECT_JSON_UTIL_HAS_ARDUINO
+bool json_variant_to_string(JsonVariantConst value, String &out) {
+    if (!value.is<const char *>()) return false;
+    out = value.as<const char *>();
+    return true;
+}
+
+void json_add_string(String &out, const char *key, const char *value, bool comma) {
+    json_add_string_impl(out, key, value, comma);
+}
+
+void json_add_bool(String &out, const char *key, bool value, bool comma) {
+    json_add_bool_impl(out, key, value, comma);
+}
+
+void json_add_int(String &out, const char *key, long value, bool comma) {
+    json_add_int_impl(out, key, value, comma);
+}
+
+#endif
+
+void append_json_escaped(LargeTextBuffer &out, const char *value, size_t len) {
+    json_escape_append(out, value, len);
+}
+
+void append_json_float(LargeTextBuffer &out, float value) {
+    append_json_float_impl(out, value);
+}
+
+void json_add_string(LargeTextBuffer &out, const char *key, const char *value, bool comma) {
+    json_add_string_impl(out, key, value, comma);
+}
+
+void json_add_string_view(LargeTextBuffer &out, const char *key, std::string_view value, bool comma) {
+    if (comma) out += ',';
+    out += '"';
+    out += key;
+    out += "\":\"";
+    json_escape_append(out, value.data(), value.size());
+    out += '"';
+}
+
+void json_add_bool(LargeTextBuffer &out, const char *key, bool value, bool comma) {
+    json_add_bool_impl(out, key, value, comma);
+}
+
+void json_add_int(LargeTextBuffer &out, const char *key, long value, bool comma) {
+    json_add_int_impl(out, key, value, comma);
+}
+
+void json_add_float(LargeTextBuffer &out, const char *key, float value, bool comma) {
+    json_add_float_impl(out, key, value, comma);
+}
+
+void json_add_uint64(LargeTextBuffer &out, const char *key, uint64_t value, bool comma) {
+    json_add_uint64_impl(out, key, value, comma);
+}
+
+}  // namespace aircannect

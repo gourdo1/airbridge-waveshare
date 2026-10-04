@@ -5,6 +5,8 @@
 #include "debug_log.h"
 #include "app_config.h"
 #include "live_stream.h"
+#include "custom_settings.h"
+#include "airsense_state.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
@@ -185,9 +187,17 @@ static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
 
     Arbiter::clear_rx_frames();
     Arbiter::write_raw(frame, frame_len);
+    if (!timeout_ms) return true;  // Reset commands need TX completion, not ACK.
 
     qframe_t rx;
-    if (Arbiter::wait_frame(&rx, timeout_ms)) {
+    uint32_t started = millis();
+    while (true) {
+        uint32_t elapsed = millis() - started;
+        if (elapsed >= timeout_ms) break;
+        uint16_t remaining = timeout_ms - elapsed;
+        if (!Arbiter::wait_frame(&rx, remaining)) break;
+        if ((rx.type != QFRAME_TYPE_R && rx.type != QFRAME_TYPE_E) ||
+            !qframe_response_matches(frame, frame_len, rx)) continue;
         if (resp && resp_size > 0) {
             uint16_t copy = min((uint16_t)rx.payload_len, (uint16_t)(resp_size - 1));
             memcpy(resp, rx.payload, copy);
@@ -230,7 +240,7 @@ static bool check_bid(const esp_partition_t *part, size_t blx_partition_offset, 
                  "BID mismatch: image=%.20s device=%.20s", img_bid, dev_bid_str);
         return false;
     }
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] BID check passed\n");
+    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BID check passed\n");
     return true;
 }
 
@@ -245,26 +255,30 @@ static bool negotiate_baud_460800() {
     qframe_t rx;
     Arbiter::wait_frame(&rx, 500);
     Arbiter::set_baud(460800);
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Baud set to %u\n", Arbiter::get_baud());
+    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Baud set to %u\n", Arbiter::get_baud());
     return true;
 }
 
 static bool enter_bootloader(bool send_bll = true) {
+    if (flash_cancel) return false;
     char resp[48] = {};
     strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
+    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
 
     if (send_bll) {
         // Check if already in bootloader
         if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 300)) {
             const char *bv = qframe_response_value(resp);
             if (bv && strtol(bv, nullptr, 16) >= 1) {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Already in bootloader\n");
+                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Already in bootloader\n");
                 return true;
             }
         }
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Triggering reboot...\n");
-        send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+        Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Triggering reboot...\n");
+        if (flash_cancel) return false;
+        if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
+        // write_raw flushes TX at the old baud; reset starts at 57600.
+        Arbiter::set_baud(57600);
     }
 
 
@@ -277,22 +291,24 @@ static bool enter_bootloader(bool send_bll = true) {
             if (bv) {
                 int bls = (int)strtol(bv, nullptr, 16);
                 if (bls >= 1) {
-                    Log::logf(CAT_OTA, LOG_INFO, "[OTA] In bootloader (BLS=%d) after %d polls\n", bls, i);
+                    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] In bootloader (BLS=%d) after %d polls\n", bls, i);
                     return true;
                 }
                 // BLS=0: app is running; send BLL to reboot into bootloader
                 bls0_count++;
-                Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: app running (BLS=0)\n", i);
+                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BLS poll %d: app running (BLS=0)\n", i);
                 if (bls0_count >= 3) {
-                    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Sending BLL...\n");
-                    send_raw_cmd("P S #BLL 0001", resp, sizeof(resp), 2000);
+                    if (flash_cancel) return false;
+                    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Sending BLL...\n");
+                    if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
+                    Arbiter::set_baud(57600);
                     bls0_count = 0;
                 }
             }
         } else {
             // No response; device resetting? keep polling fast
             bls0_count = 0;
-            if (i < 3 || i % 20 == 0) Log::logf(CAT_OTA, LOG_DEBUG, "[OTA] BLS poll %d: no response\n", i);
+            if (i < 3 || i % 20 == 0) Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BLS poll %d: no response\n", i);
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -311,7 +327,7 @@ static bool wait_for_erase(uint32_t timeout_ms) {
             if (rx.type == QFRAME_TYPE_P) {
                 p_count++;
             } else if (rx.type == QFRAME_TYPE_R) {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Erase done (%d ACKs)\n", p_count);
+                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Erase done (%d ACKs)\n", p_count);
                 return true;
             } else if (rx.type == QFRAME_TYPE_E) {
                 char err[32] = {};
@@ -352,11 +368,11 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
     // Align to 4 bytes
     trimmed_size = (trimmed_size + 3) & ~3;
     if (trimmed_size == 0) {
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s data is all 0xFF, skipping\n", block->name);
+        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s data is all 0xFF, skipping\n", block->name);
         return true;
     }
 
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s: %u bytes (trimmed from %u)\n",
+    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s: %u bytes (trimmed from %u)\n",
                  block->name, trimmed_size, data_size);
 
     // ERASE
@@ -364,7 +380,7 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
         char erase_cmd[24];
         snprintf(erase_cmd, sizeof(erase_cmd), "P F *%s 0000", block->name);
         snprintf(flash_phase, sizeof(flash_phase), "Erase %s", block->name);
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Erasing %s...\n", block->name);
+        Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Erasing %s...\n", block->name);
 
         uint8_t frame[64];
         int frame_len = qframe_build_cmd(erase_cmd, frame, sizeof(frame));
@@ -382,7 +398,7 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
 
     // WRITE
     snprintf(flash_phase, sizeof(flash_phase), "Flash %s", block->name);
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Writing %u bytes to %s @ %u baud...\n",
+    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Writing %u bytes to %s @ %u baud...\n",
                  trimmed_size, block->name, Arbiter::get_baud());
 
     uint8_t seq = 0;
@@ -454,7 +470,7 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
     if (send_completion) {
         // Completion frame
         snprintf(flash_phase, sizeof(flash_phase), "Complete %s", block->name);
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Sending completion frame for %s (%d frames sent)...\n",
+        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Sending completion frame for %s (%d frames sent)...\n",
                      block->name, frame_count);
 
         {
@@ -471,11 +487,11 @@ static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
         // Device resets after completion - restore baud
         Arbiter::set_baud(57600);
     } else {
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s data sent (%d frames), skipping completion (chaining)\n",
+        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s data sent (%d frames), skipping completion (chaining)\n",
                      block->name, frame_count);
     }
 
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] %s flash done\n", block->name);
+    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] %s flash done\n", block->name);
     return true;
 }
 
@@ -507,7 +523,7 @@ static void flash_task(void *param) {
         snprintf(flash_error, sizeof(flash_error), "No staging partition found");
         goto done;
     }
-    Log::logf(CAT_OTA, LOG_INFO, "[OTA] Using partition '%s' (0x%X, %u bytes)\n",
+    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Using partition '%s' (0x%X, %u bytes)\n",
               part->label, part->address, part->size);
 
     Arbiter::set_state(SYS_OTA_AIRSENSE);
@@ -528,13 +544,14 @@ static void flash_task(void *param) {
         if (!check_bid(part, 0, p->force_blx)) goto cleanup;
     }
 
+    AirSenseState::invalidate_identity();
     if (!enter_bootloader()) goto cleanup;
     if (flash_cancel) goto cleanup;
 
     // Negotiate baud
     {
         strncpy(flash_phase, "Baud negotiate", sizeof(flash_phase));
-        Log::logf(CAT_OTA, LOG_INFO, "[OTA] Negotiating baud 460800...\n");
+        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Negotiating baud 460800...\n");
         negotiate_baud_460800();
     }
 
@@ -549,7 +566,7 @@ static void flash_task(void *param) {
             // Without completion frame, mode 5 times out after ~2s and
             // bootloader reverts to idle at 57600 baud.
             strncpy(flash_phase, "BLX mode timeout", sizeof(flash_phase));
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Waiting for mode 5 timeout (~2s)...\n");
+            Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Waiting for mode 5 timeout (~2s)...\n");
             vTaskDelay(pdMS_TO_TICKS(2500));
             Arbiter::set_baud(57600);
 
@@ -560,11 +577,11 @@ static void flash_task(void *param) {
                          "Lost bootloader after BLX flash");
                 goto cleanup;
             }
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Still in bootloader after BLX\n");
+            Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Still in bootloader after BLX\n");
 
             // Re-negotiate baud for CMX
             {
-                Log::logf(CAT_OTA, LOG_INFO, "[OTA] Re-negotiating baud 460800...\n");
+                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Re-negotiating baud 460800...\n");
                 negotiate_baud_460800();
             }
         }
@@ -607,8 +624,7 @@ static void flash_task(void *param) {
 
         if (app_running) {
             strncpy(flash_phase, "Complete", sizeof(flash_phase));
-            Log::logf(CAT_OTA, LOG_INFO, "[OTA] Flash complete, device running\n");
-            Config::invalidate_device_info();
+            Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Flash complete, device running\n");
         } else if (!flash_cancel) {
             snprintf(flash_error, sizeof(flash_error),
                      "Device did not return to app after flash");
@@ -626,7 +642,7 @@ cleanup:
 done:
     if (flash_error[0] != '\0') {
         strncpy(flash_phase, "Error", sizeof(flash_phase));
-        Log::logf(CAT_OTA, LOG_ERROR, "[OTA] Error: %s\n", flash_error);
+        Log::logf(CAT_OTA, LOG_ERROR, "[RESMED] Error: %s\n", flash_error);
     }
     flash_active = false;
     flash_task_handle = nullptr;
@@ -656,6 +672,8 @@ void ResmedOta::start_flash(const char *block, size_t fw_size,
             return;
         }
     }
+
+    CustomSettings::invalidate("ResMed OTA");
 
     strncpy(flash_params.block, block, sizeof(flash_params.block) - 1);
     flash_params.block[sizeof(flash_params.block) - 1] = '\0';
