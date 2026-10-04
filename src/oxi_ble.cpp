@@ -989,7 +989,7 @@ class OxiClientCB : public NimBLEClientCallbacks {
         oxyii_reset();
         ws20a_write_chr = nullptr;
         ws20a_rx_len = 0;
-        OxiArbiter::stop_feed(OXI_SRC_BLE);
+        OxiArbiter::release_source(OXI_SRC_BLE);
         if (state == OXI_STREAMING || state == OXI_BONDING) {
             set_state(OXI_DISCONNECTED);
         }
@@ -1350,7 +1350,7 @@ void OxiBle::task(void *param) {
             NimBLEDevice::getScan()->stop();
             scan_requested = active_scan_requested = false;
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed(OXI_SRC_BLE);
+            OxiArbiter::release_source(OXI_SRC_BLE);
             set_state(OXI_DISABLED);
         }
 
@@ -1386,7 +1386,7 @@ void OxiBle::task(void *param) {
             update_observer(false);
             NimBLEDevice::getScan()->stop();
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed(OXI_SRC_BLE);
+            OxiArbiter::release_source(OXI_SRC_BLE);
             set_state(OXI_DISCONNECTED);
         }
 
@@ -1396,7 +1396,7 @@ void OxiBle::task(void *param) {
             NimBLEDevice::getScan()->stop();
             update_observer(false);
             if (pClient->isConnected()) pClient->disconnect();
-            OxiArbiter::stop_feed(OXI_SRC_BLE);
+            OxiArbiter::release_source(OXI_SRC_BLE);
             scan_requested = false;
             request_connect(CONN_NONE, nullptr);
             if (state != OXI_DISABLED) set_state(OXI_DISCONNECTED);
@@ -1672,7 +1672,7 @@ void OxiBle::task(void *param) {
                     set_nonin_datetime(pClient);
                     // Probe Viatom first: charging devices must not be kept awake
                     // by configuration writes before their charging state is known.
-                    OxiArbiter::set_source(pClient->getPeerAddress().toString().c_str(),
+                    OxiArbiter::set_source(OXI_SRC_BLE, pClient->getPeerAddress().toString().c_str(),
                                            dev_name.length() ? dev_name.c_str() : saved_name);
                     portENTER_CRITICAL(&sample_mux);
                     ble_samples.subscribed(millis());

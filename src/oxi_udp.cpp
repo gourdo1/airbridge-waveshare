@@ -75,7 +75,7 @@ static void udp_task(void *param) {
             if (OxiArbiter::active_source() == OXI_SRC_NONE) {
                 char address[INET_ADDRSTRLEN];
                 if (inet_ntop(AF_INET, &remote.sin_addr, address, sizeof(address)))
-                    OxiArbiter::set_source(address, "");
+                    OxiArbiter::set_source(OXI_SRC_UDP, address, "");
             }
             Log::logf(CAT_OXI, LOG_DEBUG, "UDP SpO2=%d HR=%d\n", spo2, hr);
             OxiArbiter::feed(OXI_SRC_UDP, spo2, hr, true);

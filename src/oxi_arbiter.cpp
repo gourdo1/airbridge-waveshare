@@ -46,6 +46,7 @@ static uint8_t history_count = 0, history_next = 0;
 static bool feeding = false;
 static oxi_source_t src_active = OXI_SRC_NONE;
 static uint32_t src_last_time = 0;
+static oxi_source_t source_owner = OXI_SRC_NONE;
 static char source_id[32] = "";
 static char source_name[32] = "";
 static portMUX_TYPE reading_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -129,6 +130,7 @@ void OxiArbiter::init() {
     feeding = false;
     src_active = OXI_SRC_NONE;
     src_last_time = 0;
+    source_owner = OXI_SRC_NONE;
     source_id[0] = '\0';
     source_name[0] = '\0';
     oxh_seq = 0;
@@ -239,11 +241,38 @@ oxi_source_t OxiArbiter::active_source() {
     return source;
 }
 
-void OxiArbiter::set_source(const char *id, const char *name) {
+void OxiArbiter::set_source(oxi_source_t source, const char *id, const char *name) {
     portENTER_CRITICAL(&reading_mux);
+    if (source == OXI_SRC_NONE || (src_active != OXI_SRC_NONE && src_active != source)) {
+        portEXIT_CRITICAL(&reading_mux);
+        return;
+    }
+    source_owner = source;
     strlcpy(source_id, id ? id : "", sizeof(source_id));
     strlcpy(source_name, name ? name : "", sizeof(source_name));
     portEXIT_CRITICAL(&reading_mux);
+}
+
+void OxiArbiter::release_source(oxi_source_t source) {
+    if (source == OXI_SRC_NONE) return;
+    bool feed_stopped = false;
+    portENTER_CRITICAL(&reading_mux);
+    if (source_owner == source) {
+        source_owner = OXI_SRC_NONE;
+        source_id[0] = source_name[0] = '\0';
+    }
+    if (src_active == source) {
+        src_active = OXI_SRC_NONE;
+        reading = {-1, -1, false, millis()};
+        // Preserve earlier EDF samples, but never hold one past disconnect.
+        reading_history[history_next] = reading;
+        history_next = (history_next + 1) % READING_HISTORY_SIZE;
+        if (history_count < READING_HISTORY_SIZE) history_count++;
+        feed_stopped = feeding;
+        feeding = false;
+    }
+    portEXIT_CRITICAL(&reading_mux);
+    if (feed_stopped) Log::logf(CAT_OXI, LOG_INFO, "Feeding stopped\n");
 }
 
 void OxiArbiter::get_source(char *id, size_t id_size, char *name, size_t name_size) {
@@ -262,6 +291,7 @@ void OxiArbiter::poll() {
         timed_out_source = src_active;
         src_active = OXI_SRC_NONE;
         reading.valid = false;
+        source_owner = OXI_SRC_NONE;
         source_id[0] = '\0';
         source_name[0] = '\0';
         feed_stopped = feeding;
