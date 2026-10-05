@@ -13,7 +13,8 @@ namespace EdfReport {
 bool Request::operator==(const Request &other) const {
     return action == other.action && view == other.view && day == other.day &&
         period == other.period && from_ms == other.from_ms && to_ms == other.to_ms &&
-        px == other.px && revision == other.revision;
+        px == other.px && revision == other.revision &&
+        !memcmp(excluded, other.excluded, sizeof(excluded));
 }
 
 bool valid(const Request &request) {
@@ -22,6 +23,8 @@ bool valid(const Request &request) {
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
+    for (uint8_t excluded : request.excluded)
+        if (excluded && (request.action != Action::Series || !request.revision)) return false;
     return request.action != Action::Series ||
         (request.from_ms > 0 && request.to_ms > request.from_ms &&
          request.to_ms - request.from_ms <= 366ll * 86400000 &&
@@ -58,6 +61,7 @@ Result::Result(Result &&other) noexcept
 #include "edf_catalog.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
+#include "hex_util.h"
 #include "report_edf.h"
 #include <Arduino.h>
 #include <FS.h>
@@ -70,7 +74,6 @@ Result::Result(Result &&other) noexcept
 namespace EdfReport {
 namespace {
 constexpr uint32_t CACHE_VERSION = 5;
-constexpr size_t MAX_INDEX = 8192;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
@@ -310,7 +313,7 @@ bool refresh_index(const SdStorage::Session &session) {
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
     const size_t old_count = index_count;
-    if (changes.catalog.entries > MAX_INDEX) return false;
+    if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
     if (changes.catalog.entries != index_count) {
         const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
         if (!bytes) {
@@ -939,8 +942,8 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
             events_known &= data.header.events_known;
             for (size_t c = 0; c < 5; ++c) counts[c] += data.header.counts[c];
         }
-        job.body.print("%s{\"day\":%u,\"prefix\":\"%s\",\"start_ms\":",
-                       session_comma ? "," : "", entry.day, entry.entry.file_prefix);
+        job.body.print("%s{\"id\":%u,\"day\":%u,\"prefix\":\"%s\",\"start_ms\":",
+                       session_comma ? "," : "", static_cast<unsigned>(i), entry.day, entry.entry.file_prefix);
         if (entry.bounds_known)
             job.body.print("%lld,\"end_ms\":%lld}", static_cast<long long>(entry.start_ms),
                            static_cast<long long>(entry.end_ms));
@@ -1430,7 +1433,7 @@ bool series_json(const SdStorage::Session &session, Job &job) {
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
     for (size_t i = 0; i < index_count; ++i) {
         auto &entry = index[i];
-        if (!selected(entry, first, last)) continue;
+        if (job.request.excludes(i) || !selected(entry, first, last)) continue;
         const int64_t noon = int64_t(entry.day) * 86400000 + 43200000;
         if (noon + 86400000 <= series.from_ms || noon >= series.to_ms ||
             (entry.bounds_known && (entry.end_ms <= series.from_ms || entry.start_ms >= series.to_ms) &&
@@ -1463,7 +1466,16 @@ bool series_json(const SdStorage::Session &session, Job &job) {
                            events, event_comma, events_truncated)) series.partial = true;
     }
     start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"day\":%u,\"from_ms\":%lld,\"to_ms\":%lld,\"bucket_ms\":%lld,\"px\":%u,",
+    job.body.print("\"excluded\":\"");
+    size_t mask_bytes = sizeof(job.request.excluded);
+    while (mask_bytes && !job.request.excluded[mask_bytes - 1]) --mask_bytes;
+    for (size_t i = 0; i < mask_bytes; ++i) {
+        const char pair[] = {
+            aircannect::hex_digit(job.request.excluded[i] >> 4, aircannect::HexCase::Lower),
+            aircannect::hex_digit(job.request.excluded[i], aircannect::HexCase::Lower)};
+        job.body.append(pair, sizeof(pair));
+    }
+    job.body.print("\",\"day\":%u,\"from_ms\":%lld,\"to_ms\":%lld,\"bucket_ms\":%lld,\"px\":%u,",
                    last, static_cast<long long>(series.from_ms), static_cast<long long>(series.to_ms),
                    static_cast<long long>(series.step_ms), series.px);
     job.body.print("\"requested_from_ms\":%lld,\"requested_to_ms\":%lld,\"partial\":%s,\"channels\":[",

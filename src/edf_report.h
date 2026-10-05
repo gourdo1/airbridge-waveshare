@@ -10,6 +10,8 @@ enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
 enum class Action : uint8_t { Days, Summary, Series };
 enum class View : uint8_t { Day, Period };
 
+constexpr size_t MAX_SESSION_COUNT = 8192;
+
 struct Request {
     Action action = Action::Summary;
     View view = View::Day;
@@ -18,7 +20,13 @@ struct Request {
     int64_t from_ms = 0, to_ms = 0;
     uint16_t px = 800;      // Shared aligned min/max buckets, at most 1600.
     uint32_t revision = 0;  // Dataset revision, NOT status.revision; zero accepts latest.
+    // Summary session IDs are catalog indexes valid only for that data revision.
+    // Bit n excludes session n from series values and events, never statistics.
+    uint8_t excluded[MAX_SESSION_COUNT / 8] = {};
 
+    bool excludes(size_t id) const {
+        return id < MAX_SESSION_COUNT && (excluded[id / 8] & (1u << (id % 8)));
+    }
     bool operator==(const Request &other) const;
 };
 

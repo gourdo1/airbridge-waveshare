@@ -25,6 +25,7 @@
 #include "memory_manager.h"
 #include "json_util.h"
 #include "string_util.h"
+#include "hex_util.h"
 #include "air10_clock.h"
 #include "board.h"
 
@@ -837,7 +838,7 @@ private:
 
 static bool reportQueryKeys(AsyncWebServerRequest *request) {
     const char *keys[] = {"source", "action", "view", "day", "period", "job",
-                          "from_ms", "to_ms", "px", "revision"};
+                          "from_ms", "to_ms", "px", "revision", "exclude"};
     const size_t count = request->params();
     if (count > sizeof(keys) / sizeof(keys[0])) return false;
     for (size_t i = 0; i < count; i++) {
@@ -862,6 +863,20 @@ static bool reportNumber(AsyncWebServerRequest *request, const char *key,
         parsed > maximum) return false;
     value = parsed;
     return true;
+}
+
+static bool reportExclusions(AsyncWebServerRequest *request, SleepReport::LocalRequest &local) {
+    const auto *param = request->getParam("exclude");
+    if (!param) return true;
+#if AB_STORAGE_HAS_SDCARD
+    const auto &text = param->value();
+    size_t decoded = 0;
+    return aircannect::hex_decode(text.c_str(), text.length(), local.excluded,
+                                  sizeof(local.excluded), decoded);
+#else
+    (void)local;
+    return false;
+#endif
 }
 
 static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &source,
@@ -963,7 +978,7 @@ static void handleReport(AsyncWebServerRequest *request) {
         !reportNumber(request, "revision", UINT32_MAX, revision) ||
         (!period_view && request->hasParam("period")) ||
         (!series && (request->hasParam("from_ms") || request->hasParam("to_ms") ||
-                     request->hasParam("px")))) {
+                     request->hasParam("px") || request->hasParam("exclude")))) {
         invalid(); return;
     }
     local.day = static_cast<uint16_t>(day);
@@ -972,6 +987,7 @@ static void handleReport(AsyncWebServerRequest *request) {
     local.to_ms = static_cast<int64_t>(to);
     local.px = static_cast<uint16_t>(px);
     local.revision = static_cast<uint32_t>(revision);
+    if (!reportExclusions(request, local)) { invalid(); return; }
 
     if (source == SleepReport::Source::Device) {
         if (local.action != EdfReport::Action::Summary || request->hasParam("revision") ||

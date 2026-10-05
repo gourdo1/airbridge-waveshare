@@ -85,11 +85,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .row select,.row input[type=number],.row input[type=date]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:140px;font-size:14px}
 #p-report .row{gap:12px;flex-wrap:wrap}
 #p-report .btn-row{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.report-controls{display:flex;align-items:flex-end;gap:10px 16px;flex-wrap:wrap}
+#p-report .report-controls .row{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding:0;border:0}
+#p-report .report-controls label{font-size:12px;color:var(--text-dim)}
+#p-report .report-controls .btn-row{align-self:flex-end}
+.report-date-controls{display:flex;gap:4px}
+.report-date-controls .btn{padding:7px 9px}
 .report-note{font-size:12px;color:var(--text-dim);margin:12px 0;line-height:1.5}
 .report-note:empty{display:none}
 #reportGrid .stat{gap:12px;align-items:baseline}
 .report-interval{display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
 .report-interval:last-child{border-bottom:none}
+.report-sessions{display:flex;flex-wrap:wrap;gap:8px}
+.report-session{border:1px solid var(--accent);border-radius:999px;padding:5px 10px;background:var(--accent-dim);color:var(--accent);font:inherit;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;cursor:pointer}
+.report-session[aria-pressed=false]{border-color:var(--border);background:transparent;color:var(--text-dim);text-decoration:line-through}
+.report-picker{position:relative}
+.report-calendar{position:absolute;left:0;top:calc(100% + 6px);z-index:10;width:262px;max-width:calc(100vw - 72px);padding:10px;background:var(--card);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px #0006}
+.report-calendar-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;font-size:13px}
+.report-calendar-head .btn{padding:4px 10px}
+.report-calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
+.report-calendar-grid span{text-align:center;padding:5px 0;font-size:11px;color:var(--text-dim)}
+.report-calendar-grid button{position:relative;border:0;border-radius:5px;padding:8px 0;background:transparent;color:var(--text);font:inherit;font-size:12px;cursor:pointer}
+.report-calendar-grid button:disabled{color:var(--text-dim);opacity:.35;cursor:default}
+.report-calendar-grid button:not(:disabled)::after{content:'';position:absolute;bottom:2px;left:calc(50% - 2px);width:4px;height:4px;border-radius:50%;background:var(--accent)}
+.report-calendar-grid button[aria-pressed=true]{background:var(--border);font-weight:700}
 .interval-duration{font-size:12px;color:var(--text-dim);white-space:nowrap}
 .interval-range{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
 .report-table-wrap{overflow-x:auto}
@@ -99,7 +118,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-plots canvas{display:block;width:100%;touch-action:none;cursor:crosshair}
 .report-plots .chart-card{margin:12px 0}
 .report-events{display:flex;gap:6px;flex-wrap:wrap;max-height:180px;overflow-y:auto}
-#reportCursor{font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.report-chart-head,.report-chart-toolbar{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;font-variant-numeric:tabular-nums}
+.report-chart-head{margin-bottom:4px}
+.report-chart-value{margin-left:auto;color:var(--text);white-space:nowrap}
+.report-chart-toolbar{color:var(--text-dim)}
+#reportCursor{min-width:8ch;color:var(--text);font-variant-numeric:tabular-nums}
 .row input[type=number]{width:100px}
 input[type=text],input[type=password]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:200px;font-size:14px}
 
@@ -428,12 +451,21 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <div class="pane" id="p-report">
         <div class="card">
           <h3>Sleep Report</h3>
-          <div class="row" id="reportSourceRow" hidden><label for="reportSourceChoice">Report source</label><select id="reportSourceChoice" onchange="loadReport(true)"><option value="">Local EDF recordings</option><option value="device">AirSense device report</option></select></div>
+          <div class="report-controls">
+          <div class="row" id="reportSourceRow" hidden><label for="reportSourceChoice">Source</label><select id="reportSourceChoice" onchange="loadReport(true)"><option value="">EDF</option><option value="device">AirSense</option></select></div>
           <div class="row"><label for="reportView">View</label><select id="reportView" onchange="loadReport()"><option value="day">Day</option><option value="period">Period</option></select></div>
-          <div class="row" id="reportDayRow"><label for="reportDay">Therapy date</label><input type="date" id="reportDay" onchange="loadReport()"></div>
-          <p class="report-note" id="reportDays"></p>
+          <div class="row" id="reportDayRow"><label id="reportDateLabel" for="reportDay">Therapy date</label><input type="date" id="reportDay" onchange="loadReport()">
+            <div class="report-picker" id="reportDatePicker" hidden>
+              <div class="report-date-controls"><button class="btn" id="reportDayPrevious" aria-label="Previous recorded day" onclick="stepReportDay(-1)">&lt;</button><button class="btn" id="reportDateButton" aria-expanded="false" aria-controls="reportCalendar" onclick="toggleReportCalendar()">Last saved day</button><button class="btn" id="reportDayNext" aria-label="Next recorded day" onclick="stepReportDay(1)">&gt;</button></div>
+              <div class="report-calendar" id="reportCalendar" hidden>
+                <div class="report-calendar-head"><button class="btn" id="reportMonthPrevious" aria-label="Previous month" onclick="stepReportMonth(-1)">&lt;</button><span id="reportMonth"></span><button class="btn" id="reportMonthNext" aria-label="Next month" onclick="stepReportMonth(1)">&gt;</button></div>
+                <div class="report-calendar-grid" id="reportCalendarGrid"></div>
+              </div>
+            </div>
+          </div>
           <div class="row" id="reportPeriodRow" hidden><label for="reportPeriod">Period</label><select id="reportPeriod" onchange="loadReport()"><option value="0">1 day</option><option value="1">7 days</option><option value="2">30 days</option><option value="3">90 days</option><option value="4">180 days</option><option value="5">365 days</option></select></div>
-          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)">Last saved day</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
+          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)" title="Last saved day">Latest</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
+          </div>
           <div class="msg" id="reportMsg" role="status"></div>
           <p class="report-note" id="reportAvailability" role="status"></p>
         </div>
@@ -449,17 +481,13 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
         </div>
         <div class="card" id="reportStatsCard" hidden>
           <h3>Statistics</h3>
-          <p class="report-note">Full selected day or period, not the chart viewport. Coverage excludes missing samples.</p>
           <div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th><th>Coverage</th></tr></thead><tbody id="reportStats"></tbody></table></div>
         </div>
         <div class="card report-plots" id="reportChartsCard" hidden>
           <h3>Charts</h3>
-          <p class="report-note">Drag the overview selection or edges; drag plots to pan. Wheel/pinch to zoom, double-click to reset; time and cursor are shared.</p>
-          <p class="report-note">Device-local time. Min/max envelopes: dimmed = partial coverage, blank = no samples.</p>
-          <div class="btn-row"><button class="btn" onclick="resetReportViewport()">Reset</button></div>
+          <div class="report-chart-toolbar"><span id="reportCursor" aria-live="off"></span><button class="btn" onclick="resetReportViewport()" title="Reset zoom (double-click a chart)">Reset</button></div>
           <canvas id="reportOverview" height="90" aria-label="EDF overview selection" tabindex="0"></canvas>
           <p class="report-note" id="reportRange"></p>
-          <p class="report-note" id="reportCursor" aria-live="off"></p>
           <p class="report-note" id="reportSeriesNote" role="status"></p>
           <div id="reportPlots"></div>
           <h3>Respiratory Events</h3>
@@ -1292,9 +1320,10 @@ let reportGeneration = 0;
 let reportController = null, reportRevision = null, reportEpoch = 0, reportPublishedSource = null;
 let reportDataRevision = null, reportDataEpoch = 0, reportLoading = false, reportDirty = false, reportRefreshQueued = false;
 const reportReads = {};
+const reportCalendar = {days:[], month:null};
 const reportPlot = {summary:null, selection:null, full:null, view:null, overview:null, series:null,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
-  pointers:new Map(), gesture:null};
+  axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null};
 
 function reportSource() {
   if (lastStatus.report_source === 'edf') return document.getElementById('reportSourceChoice').value === 'device' ? 'device' : 'edf';
@@ -1405,15 +1434,22 @@ function edfReportRequest(slot, query, generation, signal) {
 function renderReportAvailability() {
   const source = reportSource();
   document.getElementById('reportSourceRow').hidden = lastStatus.report_source !== 'edf';
+  document.getElementById('reportDay').hidden = source === 'edf';
+  document.getElementById('reportDatePicker').hidden = source !== 'edf';
+  document.getElementById('reportDateLabel').setAttribute('for', source === 'edf' ? 'reportDateButton' : 'reportDay');
   const blocked = !source || (source === 'edf' ? lastStatus.report_available !== true
     : lastStatus.system !== 'IDLE' || lastStatus.rop !== 0);
   const busy = document.getElementById('reportResult').getAttribute('aria-busy') === 'true';
   for (const id of ['reportView', 'reportDay', 'reportPeriod', 'reportLatest', 'reportRefresh']) {
     document.getElementById(id).disabled = blocked || (id === 'reportRefresh' && busy);
   }
+  document.getElementById('reportDateButton').disabled = blocked || !reportCalendar.days.length;
+  const selected = document.getElementById('reportDay').value;
+  document.getElementById('reportDayPrevious').disabled = blocked || !reportCalendar.days.some(d => reportDate(d.day) < selected);
+  document.getElementById('reportDayNext').disabled = blocked || !reportCalendar.days.some(d => reportDate(d.day) > selected);
   document.getElementById('reportAvailability').textContent = !source ? 'Waiting for report availability.'
-    : source === 'device' ? (blocked ? 'Available in standby.' : lastStatus.report_source === 'edf' ? 'Source: AirSense device report.' : '')
-    : 'Source: local EDF. ' + (lastStatus.report_error || ({waiting_storage:'Waiting for SD storage.',
+    : source === 'device' ? (blocked ? 'Available in standby.' : '')
+    : (lastStatus.report_error || ({waiting_storage:'Waiting for SD storage.',
         building:'Preparing report...', blocked:'Local report unavailable.',
         error:'Local report error.'}[lastStatus.report_state] || ''));
   return blocked;
@@ -1422,6 +1458,75 @@ function renderReportAvailability() {
 function reportDate(day) {
   return new Date(day * 86400000).toISOString().slice(0, 10);
 }
+
+function closeReportCalendar() {
+  document.getElementById('reportCalendar').hidden = true;
+  document.getElementById('reportDateButton').setAttribute('aria-expanded', 'false');
+}
+
+function toggleReportCalendar() {
+  const calendar = document.getElementById('reportCalendar');
+  if (!calendar.hidden) { closeReportCalendar(); return; }
+  const selected = document.getElementById('reportDay').value;
+  const day = selected ? Date.parse(selected + 'T00:00:00Z') / 86400000 : reportCalendar.days.at(-1)?.day;
+  if (!Number.isFinite(day)) return;
+  const date = new Date(day * 86400000);
+  reportCalendar.month = Date.UTC(date.getUTCFullYear(),date.getUTCMonth(),1);
+  renderReportCalendar();
+  calendar.hidden = false;
+  document.getElementById('reportDateButton').setAttribute('aria-expanded', 'true');
+}
+
+function stepReportMonth(delta) {
+  const date = new Date(reportCalendar.month);
+  reportCalendar.month = Date.UTC(date.getUTCFullYear(),date.getUTCMonth()+delta,1);
+  renderReportCalendar();
+}
+
+function stepReportDay(delta) {
+  const selected = document.getElementById('reportDay').value;
+  const days = reportCalendar.days.filter(d => delta < 0 ? reportDate(d.day) < selected : reportDate(d.day) > selected);
+  const next = delta < 0 ? days.at(-1) : days[0];
+  if (!next) return;
+  document.getElementById('reportDay').value = reportDate(next.day);
+  loadReport();
+}
+
+function renderReportCalendar() {
+  const grid = document.getElementById('reportCalendarGrid'); grid.replaceChildren();
+  const date = new Date(reportCalendar.month), year = date.getUTCFullYear(), month = date.getUTCMonth();
+  document.getElementById('reportMonth').textContent = date.toLocaleString('en-US', {month:'long',year:'numeric',timeZone:'UTC'});
+  const from = Date.UTC(year,month,1)/86400000, to = Date.UTC(year,month+1,1)/86400000;
+  document.getElementById('reportMonthPrevious').disabled = !reportCalendar.days.some(d => d.day < from);
+  document.getElementById('reportMonthNext').disabled = !reportCalendar.days.some(d => d.day >= to);
+  const days = new Map(reportCalendar.days.map(d => [d.day,d.session_count]));
+  const selected = document.getElementById('reportDay').value;
+  for (const text of ['M','T','W','T','F','S','S']) {
+    const cell = document.createElement('span'); cell.textContent = text; grid.append(cell);
+  }
+  for (let i = 0; i < (date.getUTCDay()+6)%7; i++) grid.append(document.createElement('span'));
+  for (let day = from; day < to; day++) {
+    const button = document.createElement('button'), value = reportDate(day);
+    button.textContent = String(day-from+1); button.disabled = !days.has(day);
+    button.setAttribute('aria-label', value);
+    button.setAttribute('aria-pressed', String(value === selected));
+    if (days.has(day)) button.title = days.get(day) + (days.get(day) === 1 ? ' session' : ' sessions');
+    button.addEventListener('click', () => {
+      document.getElementById('reportDay').value = value;
+      closeReportCalendar(); loadReport();
+    });
+    grid.append(button);
+  }
+}
+
+document.addEventListener('click', event => {
+  if (!event.target.closest?.('#reportDatePicker')) closeReportCalendar();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !document.getElementById('reportCalendar').hidden) {
+    closeReportCalendar(); document.getElementById('reportDateButton').focus();
+  }
+});
 
 function reportMaskTime(day, minute) {
   if (minute < 0) return '--';
@@ -1450,6 +1555,7 @@ function renderReport(data) {
   }
   document.getElementById('reportGrid').replaceChildren(rows);
   const intervals = document.getElementById('reportIntervals');
+  intervals.className = '';
   intervals.replaceChildren();
   document.getElementById('reportMaskCard').hidden = !day || !data.present;
   for (const interval of data.intervals) {
@@ -1475,7 +1581,7 @@ async function loadReport(latest = false) {
   document.getElementById('reportNote').textContent = '';
   document.getElementById('reportStatsCard').hidden = true;
   document.getElementById('reportIntervalTitle').textContent = 'Mask intervals';
-  document.getElementById('reportDays').textContent = '';
+  closeReportCalendar();
   reportPublishedSource = reportSource();
   reportLoading = false; reportDirty = false;
   if (renderReportAvailability()) {
@@ -1509,11 +1615,12 @@ async function loadReport(latest = false) {
     if (source === 'edf') {
       const days = await edfReportRequest('days', 'action=days', generation, reportController.signal);
       if (generation !== reportGeneration) return;
-      const dates = days.days || [];
+      const dates = (days.days || []).filter(d => Number.isInteger(d.day) && d.day > 0).sort((a,b) => a.day-b.day);
+      reportCalendar.days = dates;
       date.min = dates.length ? reportDate(Math.min(...dates.map(d => d.day))) : '';
       date.max = dates.length ? reportDate(Math.max(...dates.map(d => d.day))) : '';
-      document.getElementById('reportDays').textContent = dates.length
-        ? 'EDF: ' + dates.length + ' saved days, ' + date.min + ' to ' + date.max + '.' : 'No indexed EDF days.';
+      document.getElementById('reportDateButton').textContent = date.value || (dates.length ? date.max : 'No recordings');
+      renderReportAvailability();
       const query = 'view=' + view + (day ? '&day=' : '&period=') + selection;
       data = await edfReportRequest('summary', 'action=summary&' + query, generation, reportController.signal);
       if ((dataEpoch !== reportDataEpoch && data.data_revision !== reportDataRevision)
@@ -1564,7 +1671,9 @@ function reportNumber(value) {
 }
 
 function reportDuration(seconds) {
-  return Number.isFinite(seconds) ? Math.floor(seconds / 3600) + ' h ' + Math.floor(seconds % 3600 / 60) + ' min' : '--';
+  if (!Number.isFinite(seconds)) return '--';
+  const hours = Math.floor(seconds/3600), minutes = Math.floor(seconds%3600/60);
+  return (hours ? hours + ' h' : '') + (minutes || !hours ? (hours ? ' ' : '') + minutes + ' min' : '');
 }
 
 function renderEdfReport(data) {
@@ -1572,11 +1681,12 @@ function renderEdfReport(data) {
   const day = data.view === 'day';
   if (day && data.day) document.getElementById('reportDay').value = reportDate(data.day);
   const selectedDate = document.getElementById('reportDay').value;
+  document.getElementById('reportDateButton').textContent = selectedDate || (reportCalendar.days.length ? 'Last saved day' : 'No recordings');
   document.getElementById('reportTitle').textContent = day
     ? data.day > 0 ? 'Therapy day ' + reportDate(data.day) : selectedDate ? 'Therapy day ' + selectedDate : 'Sleep Report'
     : data.first_day > 0 && data.last_day > 0 ? 'Period ' + reportDate(data.first_day) + ' to ' + reportDate(data.last_day) : 'Sleep Report';
   document.getElementById('reportNote').textContent = !data.present ? 'No saved EDF data for this selection.'
-    : data.partial ? 'Partial EDF report: missing or unreadable data is excluded, not filled in.' : '';
+    : data.partial ? 'Incomplete report' : '';
   const rows = document.createDocumentFragment();
   for (const [label, value] of [['Usage',reportDuration(data.used_seconds)], ['Sessions',reportNumber(data.session_count)],
       ['AHI',reportNumber(data.ahi)], ...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)])]) {
@@ -1601,12 +1711,7 @@ function renderEdfReport(data) {
   const sessions = (data.sessions || []).filter(s => Number.isFinite(s.start_ms) && s.end_ms > s.start_ms);
   document.getElementById('reportIntervalTitle').textContent = 'Sessions';
   document.getElementById('reportMaskCard').hidden = !sessions.length;
-  const intervals = document.getElementById('reportIntervals'); intervals.replaceChildren();
-  for (const session of sessions) {
-    const row = document.createElement('div'); row.className = 'report-interval';
-    row.textContent = reportTime(session.start_ms) + ' to ' + reportTime(session.end_ms) + ' / ' + reportDuration((session.end_ms-session.start_ms)/1000);
-    intervals.append(row);
-  }
+  renderReportSessions();
   if (!data.present || !sessions.length) return;
   reportPlot.full = [Math.min(...sessions.map(s => s.start_ms)), Math.max(...sessions.map(s => s.end_ms))];
   reportPlot.view = [...reportPlot.full];
@@ -1614,6 +1719,39 @@ function renderEdfReport(data) {
   const overview = document.getElementById('reportOverview');
   bindReportPlot(overview, true);
   renderReportEvents(data, true);
+  scheduleReportDraw(true);
+}
+
+function renderReportSessions(focusId = null) {
+  const intervals = document.getElementById('reportIntervals'); intervals.replaceChildren();
+  intervals.className = 'report-sessions';
+  for (const session of reportPlot.summary.sessions || []) {
+    if (!Number.isFinite(session.start_ms) || session.end_ms <= session.start_ms) continue;
+    const button = document.createElement('button'); button.className = 'report-session';
+    button.textContent = reportTime(session.start_ms).slice(reportPlot.summary.view === 'period' ? 5 : 11,16) + '-' + reportTime(session.end_ms).slice(11,16)
+      + ' ' + reportDuration((session.end_ms-session.start_ms)/1000);
+    button.setAttribute('aria-pressed', String(!reportPlot.hiddenSessions.has(session.id)));
+    button.title = reportTime(session.start_ms) + ' - ' + reportTime(session.end_ms);
+    button.disabled = !Number.isInteger(session.id) || session.id < 0 || session.id >= 8192;
+    button.addEventListener('click', () => toggleReportSession(session.id));
+    intervals.append(button);
+    if (session.id === focusId) button.focus();
+  }
+}
+
+function toggleReportSession(id) {
+  if (reportPlot.hiddenSessions.has(id)) reportPlot.hiddenSessions.delete(id);
+  else reportPlot.hiddenSessions.add(id);
+  const bytes = new Uint8Array(Math.floor(Math.max(-1,...reportPlot.hiddenSessions)/8)+1);
+  for (const hidden of reportPlot.hiddenSessions) bytes[Math.floor(hidden/8)] |= 1 << (hidden%8);
+  reportPlot.excluded = Array.from(bytes, byte => byte.toString(16).padStart(2,'0')).join('');
+  reportPlot.serial++;
+  // Merged envelopes cannot be separated in the browser; replace both views.
+  reportPlot.overview = reportPlot.series = reportPlot.cursor = reportPlot.pending = null;
+  if (reportReads.series) reportReads.series.cancel();
+  renderReportSessions(id);
+  document.getElementById('reportEvents').replaceChildren();
+  document.getElementById('reportEventsNote').textContent = '';
   scheduleReportDraw(true);
 }
 
@@ -1633,14 +1771,15 @@ function renderReportEvents(data, overview = false) {
     events.append(button);
   }
   document.getElementById('reportEventsNote').textContent = truncated
-    ? 'Only part of the event list is shown. Zoom to see events in a smaller time range.'
-    : events.children.length ? 'Events in this time range. Click an event to view +/-60 seconds.' : 'No respiratory events in this time range.';
+    ? 'Zoom for more events.' : events.children.length ? '' : 'No respiratory events in this time range.';
 }
 
 function clearReportPlots() {
   reportPlot.serial++;
   reportPlot.summary = reportPlot.selection = reportPlot.full = reportPlot.view = null;
   reportPlot.overview = reportPlot.series = reportPlot.pending = reportPlot.cursor = reportPlot.gesture = null;
+  reportPlot.axes = null; reportPlot.axesAllSessions = false;
+  reportPlot.hiddenSessions.clear(); reportPlot.excluded = '';
   reportPlot.pointers.clear();
   reportPlot.rows = [];
   reportPlot.request = false;
@@ -1688,7 +1827,7 @@ function scheduleReportDraw(request = false) {
     // Only interaction/release queues data; animation frames never form a loop.
     if (reportPlot.request) {
       reportPlot.request = false;
-      reportPlot.pending = {view:[...reportPlot.view], serial:reportPlot.serial, generation:reportGeneration};
+      reportPlot.pending = {view:[...reportPlot.view], serial:reportPlot.serial, generation:reportGeneration, excluded:reportPlot.excluded};
       drainReportSeries();
     }
   });
@@ -1696,38 +1835,58 @@ function scheduleReportDraw(request = false) {
 
 async function drainReportSeries() {
   if (reportPlot.flight || reportPlot.gesture || !reportPlot.pending || !reportPlot.summary) return;
-  const request = reportPlot.pending; reportPlot.pending = null;
+  let request = reportPlot.pending; reportPlot.pending = null;
+  const full = reportPlot.full;
+  if (!reportPlot.overview && (request.view[0] !== full[0] || request.view[1] !== full[1])) {
+    reportPlot.pending = request;
+    request = {...request,view:[...full]};
+  }
   reportPlot.flight = request;
-  const note = document.getElementById('reportSeriesNote'); note.textContent = 'Loading chart data...';
+  const allHidden = reportPlot.summary.sessions.every(s => reportPlot.hiddenSessions.has(s.id));
+  const note = document.getElementById('reportSeriesNote'); note.textContent = allHidden ? 'No sessions selected' : 'Loading chart data...';
   try {
     const px = Math.max(1, Math.min(1200, document.getElementById('reportOverview').width - 52));
     const query = 'action=series&' + reportPlot.selection + '&from_ms=' + Math.floor(request.view[0])
-      + '&to_ms=' + Math.ceil(request.view[1]) + '&px=' + px + '&revision=' + reportPlot.summary.data_revision;
+      + '&to_ms=' + Math.ceil(request.view[1]) + '&px=' + px + '&revision=' + reportPlot.summary.data_revision
+      + (request.excluded ? '&exclude=' + request.excluded : '');
     const data = await edfReportRequest('series', query, request.generation, reportController.signal);
     if (request.generation !== reportGeneration) return;
+    if (request.excluded !== reportPlot.excluded) return;
     if (data.data_revision !== reportPlot.summary.data_revision) throw new Error('EDF data changed; refresh the report');
-    const full = reportPlot.full;
-    if (request.view[0] === full[0] && request.view[1] === full[1]) reportPlot.overview = data;
+    if (data.excluded !== request.excluded) throw new Error('Session selection changed; refresh the report');
+    if (request.view[0] === full[0] && request.view[1] === full[1]) {
+      reportPlot.overview = data;
+      // Only a full, unfiltered overview establishes the final selection scale.
+      if (!reportPlot.axesAllSessions) reportPlot.axes = reportAxes(data.channels);
+      if (!request.excluded) reportPlot.axesAllSessions = true;
+    }
     if (request.serial !== reportPlot.serial) return;
     reportPlot.series = data;
     renderReportEvents(data);
-    note.textContent = data.partial ? 'Partial chart data. Blank regions are missing, not zero.' : '';
+    if (allHidden) document.getElementById('reportEventsNote').textContent = '';
+    note.textContent = allHidden ? 'No sessions selected' : data.partial ? 'Incomplete chart data' : '';
     const plots = document.getElementById('reportPlots');
     if (reportPlot.rows.map(row => row.channel).join('|') !== data.channels.map(channel => channel.id).join('|')) {
       plots.replaceChildren(); reportPlot.rows = [];
       for (const channel of data.channels) {
         const card = document.createElement('div'); card.className = 'chart-card';
+        const head = document.createElement('div'); head.className = 'report-chart-head';
+        const title = document.createElement('span'); title.textContent = channel.label + (channel.unit ? ' (' + channel.unit + ')' : '');
+        const value = document.createElement('span'); value.className = 'report-chart-value';
+        head.append(title,value);
         const canvas = document.createElement('canvas'); canvas.height = 150;
         canvas.setAttribute('aria-label', channel.label + ' EDF plot'); canvas.tabIndex = 0;
-        card.append(canvas); plots.append(card);
+        card.append(head,canvas); plots.append(card);
         bindReportPlot(canvas, false);
-        reportPlot.rows.push({channel:channel.id,canvas});
+        reportPlot.rows.push({channel:channel.id,canvas,title,value});
       }
     }
     scheduleReportDraw();
   } catch(e) {
-    if (request.generation === reportGeneration && request.serial === reportPlot.serial && e.name !== 'AbortError')
+    if (request.generation === reportGeneration && request.serial === reportPlot.serial && e.name !== 'AbortError') {
+      reportPlot.pending = null;
       note.textContent = 'EDF chart unavailable: ' + e.message + '. Refresh to retry.';
+    }
   } finally {
     if (reportPlot.flight === request) reportPlot.flight = null;
     drainReportSeries();
@@ -1738,36 +1897,60 @@ function reportBucket(bucket) {
   return Array.isArray(bucket) && Number.isFinite(bucket[0]) && Number.isFinite(bucket[1]) && bucket[0] <= bucket[1];
 }
 
-function drawEdfChart(canvas, channel, data, overview, color) {
+function reportAxes(channels) {
+  const axes = {};
+  const pressure = channels.filter(c => c.unit === 'cmH2O');
+  for (const channel of channels) {
+    let low = Infinity, high = -Infinity;
+    const group = channel.unit === 'cmH2O' ? pressure : [channel];
+    for (const member of group) for (const bucket of member.buckets || []) {
+      if (!reportBucket(bucket)) continue;
+      low = Math.min(low,bucket[0]); high = Math.max(high,bucket[1]);
+    }
+    const id = channel.id.toLowerCase();
+    const minimum = channel.unit === 'cmH2O' ? 2 : channel.unit === '%' ? 5
+      : channel.unit === 'mL' ? 200 : id === 'flow' || id === 'pulse' ? 20
+      : id === 'leak' || channel.unit === 'bpm' ? 10 : channel.unit === 'L/min' ? 5 : 1;
+    if (!Number.isFinite(low)) { low = channel.unit === '%' ? 95 : 0; high = low+minimum; }
+    const center = (low+high)/2, span = Math.max(minimum,(high-low)*1.16);
+    low = center-span/2; high = center+span/2;
+    if (id === 'flow') {
+      high = Math.max(Math.abs(low),Math.abs(high),minimum/2); low = -high;
+    } else if (low < 0) { high -= low; low = 0; }
+    if (channel.unit === '%' && high > 100) { low = Math.max(0,low-(high-100)); high = 100; }
+    const rough = (high-low)/4, power = 10**Math.floor(Math.log10(rough));
+    const step = [1,2,5,10].find(n => n*power >= rough)*power;
+    low = Math.floor(low/step)*step; high = Math.ceil(high/step)*step;
+    if (channel.unit === '%') high = Math.min(100,high);
+    axes[channel.id] = {low,high,step};
+  }
+  return axes;
+}
+
+function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlot.cursor) {
   const width = Math.max(100, canvas.parentElement.clientWidth - (overview ? 0 : 32));
   if (canvas.width !== width) canvas.width = width;
   const ctx = canvas.getContext('2d'), W = canvas.width, H = canvas.height;
   const pad = {l:44,r:8,t:18,b:22}, gw = W-pad.l-pad.r, gh = H-pad.t-pad.b;
   const view = overview ? reportPlot.full : reportPlot.view;
   const x = time => pad.l + (time-view[0])/(view[1]-view[0])*gw;
-  let low = Infinity, high = -Infinity;
-  for (const bucket of channel?.buckets || []) {
-    if (!reportBucket(bucket)) continue;
-    low = Math.min(low,bucket[0]); high = Math.max(high,bucket[1]);
-  }
-  if (!Number.isFinite(low)) { low = 0; high = 1; }
-  const margin = (high-low || Math.max(1,Math.abs(high)*0.1))*0.1;
-  low -= margin; high += margin;
+  const {low,high,step} = reportPlot.axes?.[channel?.id]
+    || reportAxes(data?.channels || [])[channel?.id] || {low:0,high:1,step:0.25};
   const y = value => pad.t + gh*(1-(value-low)/(high-low));
   ctx.clearRect(0,0,W,H); ctx.fillStyle = '#08081a'; ctx.fillRect(0,0,W,H);
   ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
   ctx.strokeStyle = '#1a1a3a'; ctx.fillStyle = '#777'; ctx.textAlign = 'right';
   ctx.setLineDash([2,4]);
-  for (let i = 0; i <= 4; i++) {
-    const v = high-(high-low)*i/4, yy = y(v);
+  for (let i = 0; i <= Math.round((high-low)/step); i++) {
+    const v = high-step*i, yy = y(v);
     ctx.beginPath(); ctx.moveTo(pad.l,yy); ctx.lineTo(W-pad.r,yy); ctx.stroke();
     if (!overview) ctx.fillText(reportNumber(v),pad.l-4,yy+3);
   }
   ctx.setLineDash([]);
   ctx.textAlign = 'left'; ctx.fillStyle = color;
-  ctx.fillText(overview ? 'Overview' : channel.label + (channel.unit ? ' (' + channel.unit + ')' : ''),pad.l,12);
+  if (overview) ctx.fillText('Overview',pad.l,12);
   ctx.save(); ctx.beginPath(); ctx.rect(pad.l,pad.t,gw,gh); ctx.clip();
-  for (const event of (overview ? reportPlot.summary : data)?.events || []) {
+  for (const event of data?.events || []) {
     if (!['oa','ca','ua','h','rera'].includes(String(event.type).toLowerCase())) continue;
     ctx.fillStyle = '#e9456022';
     // EDF EVE time is event publication/end, so the band precedes it.
@@ -1797,9 +1980,9 @@ function drawEdfChart(canvas, channel, data, overview, color) {
     ctx.strokeStyle = '#22d3ee'; ctx.strokeRect(left,pad.t,right-left,gh);
     ctx.fillStyle = '#22d3ee'; ctx.fillRect(left-3,pad.t,6,gh); ctx.fillRect(right-3,pad.t,6,gh);
   }
-  if (reportPlot.cursor !== null) {
+  if (cursor !== null) {
     ctx.strokeStyle = '#aaa'; ctx.setLineDash([3,3]);
-    ctx.beginPath(); ctx.moveTo(x(reportPlot.cursor),pad.t); ctx.lineTo(x(reportPlot.cursor),H-pad.b); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x(cursor),pad.t); ctx.lineTo(x(cursor),H-pad.b); ctx.stroke();
     ctx.setLineDash([]);
   }
   ctx.restore(); ctx.fillStyle = '#777';
@@ -1817,21 +2000,21 @@ function drawReportPlots() {
   const overview = reportPlot.overview;
   const current = reportPlot.series, view = reportPlot.view;
   const data = current && overview && (view[0] < current.from_ms || view[1] > current.to_ms) ? overview : current;
-  drawEdfChart(document.getElementById('reportOverview'), overview && overview.channels[0], overview, true, colors[1]);
-  reportPlot.rows.forEach((row,i) => drawEdfChart(row.canvas,data.channels.find(c => c.id === row.channel),data,false,colors[i%colors.length]));
+  const cursor = reportPlot.cursor !== null && reportPlot.summary.sessions.some(s => !reportPlot.hiddenSessions.has(s.id)
+    && reportPlot.cursor >= s.start_ms && reportPlot.cursor < s.end_ms) ? reportPlot.cursor : null;
+  drawEdfChart(document.getElementById('reportOverview'), overview && overview.channels[0], overview, true, colors[1],cursor);
+  reportPlot.rows.forEach((row,i) => {
+    const channel = data?.channels.find(c => c.id === row.channel);
+    drawEdfChart(row.canvas,channel || {id:row.channel},data,false,colors[i%colors.length],cursor);
+    row.title.style.color = colors[i%colors.length];
+    const index = cursor !== null && data ? Math.floor((cursor-data.from_ms)/data.bucket_ms) : -1;
+    const bucket = channel?.buckets[index];
+    const low = reportBucket(bucket) ? reportNumber(bucket[0]) : '--';
+    const high = reportBucket(bucket) ? reportNumber(bucket[1]) : '--';
+    row.value.textContent = cursor === null ? '' : low === high ? low : low + '..' + high;
+  });
   document.getElementById('reportRange').textContent = reportTime(reportPlot.view[0]) + ' to ' + reportTime(reportPlot.view[1]);
-  let cursor = '';
-  if (reportPlot.cursor !== null && data) {
-    const index = Math.floor((reportPlot.cursor-data.from_ms)/data.bucket_ms);
-    cursor = reportTime(reportPlot.cursor) + ' / ' + data.channels.map(channel => {
-      const bucket = channel.buckets[index];
-      const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-index*data.bucket_ms);
-      const coverage = reportBucket(bucket) && Number.isFinite(bucket[2]) && expected > 0
-        ? ' (' + reportNumber(Math.min(100,bucket[2]/expected*100)) + '% recorded)' : '';
-      return channel.label + ': ' + (reportBucket(bucket) ? reportNumber(bucket[0]) + '..' + reportNumber(bucket[1]) + ' ' + channel.unit + coverage : '--');
-    }).join(' / ');
-  }
-  document.getElementById('reportCursor').textContent = cursor;
+  document.getElementById('reportCursor').textContent = cursor === null ? '' : reportTime(cursor).slice(11);
 }
 
 function reportPointerX(canvas, clientX) {
