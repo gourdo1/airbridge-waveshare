@@ -73,7 +73,8 @@ Result::Result(Result &&other) noexcept
 
 namespace EdfReport {
 namespace {
-constexpr uint32_t CACHE_VERSION = 5;
+constexpr uint32_t STATS_CACHE_VERSION = 6;
+constexpr uint32_t SERIES_CACHE_VERSION = 5;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
@@ -136,7 +137,7 @@ struct CachedChannel {
     uint32_t bins = 0;
 };
 struct CacheHeader {
-    uint32_t version = CACHE_VERSION, header_bytes = sizeof(CacheHeader), bytes = 0;
+    uint32_t version = STATS_CACHE_VERSION, header_bytes = sizeof(CacheHeader), bytes = 0;
     char magic[8] = {'A','B','R','P','T','0','1',0};
     SourceKey key;
     int64_t start_ms = 0, end_ms = 0;
@@ -148,6 +149,7 @@ struct CacheHeader {
     uint32_t events = 0;
     uint16_t day = 0;
     bool recorded = false, partial = false, events_truncated = false, events_known = false;
+    bool usage_known = false;
 };
 struct SessionData {
     CacheHeader header;
@@ -484,7 +486,7 @@ bool allocate_data(SessionData &out) {
 }
 
 bool sane_header(const CacheHeader &h, const IndexedSession &entry, uint64_t bytes) {
-    if (h.version != CACHE_VERSION || h.header_bytes != sizeof(h) ||
+    if (h.version != STATS_CACHE_VERSION || h.header_bytes != sizeof(h) ||
         memcmp(h.magic, "ABRPT01", 8) || !(h.key == entry.key) || h.day != entry.day ||
         h.events > MAX_DISK_EVENTS || total_bins(h) > MAX_BINS ||
         h.start_ms < 0 || h.end_ms < h.start_ms ||
@@ -610,7 +612,7 @@ bool prepare_channels(Input &input, uint8_t file, SessionData &data) {
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
         if (CHANNELS[c].file != file) continue;
         const int signal = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
-        if (signal < 0) { data.header.partial = true; continue; }
+        if (signal < 0) continue;
         auto &channel = data.header.channels[c];
         channel.signal = input.header->signals[signal];
         channel.bins = ReportEdf::histogram_bins(channel.signal);
@@ -716,6 +718,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
             out.header.chart_end_ms = std::max(out.header.chart_end_ms, end);
         }
         if (kind == 1) {
+            out.header.usage_known = input.header->records == 0;
             int coverage = -1;
             for (const char *name : {"Press.2s", "EprPress.2s", "MaskPress.2s"}) {
                 coverage = ReportEdf::find_signal(*input.header, name);
@@ -726,12 +729,13 @@ bool build_session(const SdStorage::Session &session, const Job &job,
                 if (!ReportEdf::recorded_bounds(input.reader, *input.header, coverage, bounds))
                     return false;
                 out.header.recorded = bounds.present;
+                out.header.usage_known |= bounds.present;
                 if (bounds.present) {
                     out.header.start_ms = llround(bounds.begin_seconds * 1000);
                     out.header.end_ms = llround(bounds.end_seconds * 1000);
                     out.header.used_seconds = bounds.end_seconds - bounds.begin_seconds;
                 }
-            } else out.header.partial = true;
+            }
         }
         input.file.close();
     }
@@ -796,7 +800,6 @@ bool build_session(const SdStorage::Session &session, const Job &job,
         input.file.close();
     }
     out.header.events = events;
-    if (!out.header.recorded && entry.key.sizes[1]) out.header.partial = true;
     if (events) std::sort(out.events, out.events + std::min<uint32_t>(events, event_capacity), [](const Event &a, const Event &b) {
         return a.time_ms < b.time_ms;
     });
@@ -811,7 +814,7 @@ bool session_data(const SdStorage::Session &session, const Job &job,
     if (!build_session(session, job, entry, out)) return false;
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    if (!store_cache(session, job, entry, out) && !aborted(&job, session)) out.header.partial = true;
+    store_cache(session, job, entry, out);
     return !aborted(&job, session);
 }
 
@@ -910,7 +913,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
     Payload events;
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
     bool partial = false, event_comma = false, session_comma = false, events_truncated = false;
-    bool events_known = true;
+    bool usage_known = true, events_known = true;
     uint32_t sessions = 0;
     uint64_t counts[5] = {};
     double seconds = 0;
@@ -921,15 +924,21 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         auto &entry = index[i];
         if (!selected(entry, first, last)) continue;
         if (aborted(&job, session)) return false;
-        if (!(entry.key.present & 7)) { partial = true; continue; }
+        if (!(entry.key.present & 7)) {
+            partial = true;
+            usage_known = events_known = false;
+            continue;
+        }
         SessionData data;
         if (!session_data(session, job, entry, data)) {
             if (aborted(&job, session)) return false;
             partial = true;
-            events_known = false;
+            usage_known = events_known = false;
             continue;
         }
         partial |= data.header.partial;
+        usage_known &= data.header.usage_known;
+        events_known &= data.header.usage_known;
         entry.bounds_known = data.header.chart_end_ms > data.header.chart_start_ms;
         entry.start_ms = data.header.chart_start_ms;
         entry.end_ms = data.header.chart_end_ms;
@@ -959,7 +968,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
     }
     job.body.print("],\"present\":%s,\"partial\":%s,\"used_seconds\":",
                    sessions ? "true" : "false", partial ? "true" : "false");
-    if (seconds > 0) job.body.print("%.10g", seconds);
+    if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
     else job.body.print("null");
     job.body.print(",\"session_count\":%u,\"ahi\":", sessions);
     if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3]) * 3600.0 / seconds);
@@ -1004,7 +1013,7 @@ struct ReducedChannel {
 };
 struct ReducedHeader {
     char magic[8] = {'A','B','S','E','R','0','1',0};
-    uint32_t version = CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
+    uint32_t version = SERIES_CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
     uint64_t bytes = 0;
     SourceKey key;
     ReducedChannel channels[CHANNEL_COUNT + 1];
@@ -1128,7 +1137,7 @@ bool reduced_header(const SdStorage::Session &session, const IndexedSession &ent
     cache_path(entry, "series", path);
     SdStorage::Reader reader;
     if (!reader.open(session, path) || reader.read(reinterpret_cast<uint8_t *>(&out), sizeof(out)) != sizeof(out) ||
-        memcmp(out.magic, "ABSER01", 8) || out.version != CACHE_VERSION ||
+        memcmp(out.magic, "ABSER01", 8) || out.version != SERIES_CACHE_VERSION ||
         out.header_bytes != sizeof(out) || !(out.key == entry.key) || out.bytes != reader.size()) return false;
     uint64_t offset = sizeof(out);
     for (const auto &channel : out.channels) {
