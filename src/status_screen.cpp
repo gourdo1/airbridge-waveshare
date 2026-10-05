@@ -12,6 +12,8 @@
 #include "live_tce.h"
 #include "airsense_state.h"
 #include "debug_log.h"
+#include <esp32-hal-periman.h>
+#include <driver/gpio.h>
 
 
 
@@ -26,15 +28,24 @@ namespace StatusScreen {
 #define BL_FULL             ((1u << BL_RES_BITS) - 1)
 #define PMD_STALE_MS        3000    // no PMD sample for this long -> show "--"
 #define PMD_RETRY_MS        5000    // throttle failed subscribe attempts
+#define BTN_STUCK_MS        5000    // held longer than this: treat as stuck, ignore
+#define BL_REFRESH_MS       1000    // re-check the backlight hardware this often
+#define THERAPY_POLL_MS     3000    // read therapy pressure (MKI/MKE) this often
+#define THERAPY_STALE_MS    10000   // no successful read for this long -> show "--"
+#define THERAPY_READ_MS     400     // per-read response timeout
 
 static Arduino_DataBus *bus = nullptr;
 static Arduino_GFX *gfx = nullptr;
 
 static const int btn_pins[] = { AB_BTN1_GPIO, AB_BTN2_GPIO, AB_BTN3_GPIO };
+#define BTN_COUNT (sizeof(btn_pins) / sizeof(btn_pins[0]))
+static uint32_t btn_down_ms[BTN_COUNT] = {};   // 0 = released
+static bool     btn_stuck[BTN_COUNT] = {};
 
 static uint32_t wake_until = 0;
 static bool     woke_once = false;
 static int      bl_duty = -1;
+static uint32_t bl_check_ms = 0;
 static uint32_t last_draw_ms = 0;
 
 // ---- Mask pressure from the PMD live stream (subscribed during therapy) ----
@@ -93,6 +104,67 @@ static bool take_pressure(float *out) {
     return true;
 }
 
+// ---- Therapy pressure (MKI) and exhale pressure (MKE), polled in therapy ----
+//
+// These are the AirSense's own pressure values (OSCAR: Pressure and EPR
+// Pressure), unlike the measured mask pressure above. Plain request/reply
+// reads, kept outside the SD recorder's acquisition windows, never blocking.
+
+static uart_transaction_t *therapy_ticket = nullptr;
+static uint8_t  therapy_step = 0;           // 0 = MKI, 1 = MKE
+static uint32_t therapy_poll_ms = 0;
+static int32_t  therapy_raw[2] = {-1, -1};  // raw /50 = cmH2O
+static uint32_t therapy_ok_ms[2] = {0, 0};
+
+static void cancel_therapy_read() {
+    if (therapy_ticket) Arbiter::cancel_transaction(therapy_ticket);
+    therapy_ticket = nullptr;
+    therapy_step = 0;
+}
+
+static void poll_therapy_pressure(bool therapy) {
+    if (!therapy) {
+        cancel_therapy_read();
+        therapy_raw[0] = therapy_raw[1] = -1;
+        return;
+    }
+    const uint32_t now = millis();
+    if (!therapy_ticket) {
+        if (therapy_step == 0 && therapy_poll_ms &&
+            uint32_t(now - therapy_poll_ms) < THERAPY_POLL_MS) return;
+        if (therapy_step == 0) therapy_poll_ms = now ? now : 1;
+        const uart_send_window_t window = {0, 0, false, true};  // outside acquisition
+        therapy_ticket = Arbiter::begin_var(therapy_step == 0 ? "MKI" : "MKE",
+                                            CMD_SRC_INTERNAL, CMD_PRIO_LOW, 16,
+                                            THERAPY_READ_MS, window);
+        return;
+    }
+    if (!Arbiter::transaction_done(therapy_ticket)) {
+        if (!Arbiter::transaction_expired(therapy_ticket)) return;
+        cancel_therapy_read();
+        return;
+    }
+    char value[16] = {};
+    const auto result = Arbiter::finish_var(therapy_ticket, value, sizeof(value));
+    therapy_ticket = nullptr;
+    if (result == Arbiter::VarResult::Ok && value[0]) {
+        char *end = nullptr;
+        const unsigned long raw = strtoul(value, &end, 16);
+        if (end && *end == 0 && raw <= 2000) {
+            therapy_raw[therapy_step] = int32_t(raw);
+            therapy_ok_ms[therapy_step] = now ? now : 1;
+        }
+    }
+    therapy_step = therapy_step == 0 ? 1 : 0;
+}
+
+static bool therapy_value(int idx, float *out) {
+    if (therapy_raw[idx] < 0 || !therapy_ok_ms[idx] ||
+        uint32_t(millis() - therapy_ok_ms[idx]) > THERAPY_STALE_MS) return false;
+    *out = therapy_raw[idx] / 50.0f;
+    return true;
+}
+
 // ---- Drawing ----
 
 struct Line {
@@ -102,15 +174,16 @@ struct Line {
     uint16_t color;
 };
 
-enum { L_IP, L_TIME, L_STATE, L_PRES, L_SPO2, L_PULSE, L_COUNT };
+enum { L_IP, L_TIME, L_STATE, L_PRES, L_THER, L_SPO2, L_PULSE, L_COUNT };
 
 static Line lines[L_COUNT] = {
     {   6, 2, "", 0 },      // IP address
-    {  34, 5, "", 0 },      // time
-    {  88, 3, "", 0 },      // AirSense state
-    { 128, 3, "", 0 },      // mask pressure
-    { 166, 3, "", 0 },      // SpO2
-    { 204, 2, "", 0 },      // pulse
+    {  30, 5, "", 0 },      // time
+    {  80, 3, "", 0 },      // AirSense state
+    { 114, 2, "", 0 },      // mask pressure (measured)
+    { 136, 2, "", 0 },      // therapy / exhale pressure (AirSense)
+    { 164, 3, "", 0 },      // SpO2
+    { 202, 2, "", 0 },      // pulse
 };
 
 // Draw text on a line, padded to the full width with background-filled
@@ -173,14 +246,26 @@ static void draw_status() {
         draw_line(L_STATE, system_state_name(st), RGB565_YELLOW);
     }
 
-    // Mask pressure, only meaningful during therapy
+    // Measured mask pressure (1 s average of the live stream)
     float p;
     if (therapy && take_pressure(&p)) {
-        snprintf(buf, sizeof(buf), "%.1f cmH2O", p);
+        snprintf(buf, sizeof(buf), "Mask    %.1f cmH2O", p);
         draw_line(L_PRES, buf, RGB565_WHITE);
     } else {
         take_pressure(&p);      // drain any leftover samples
-        draw_line(L_PRES, "-- cmH2O", RGB565_DARKGREY);
+        draw_line(L_PRES, "Mask    --", RGB565_DARKGREY);
+    }
+
+    // AirSense therapy pressure, plus exhale pressure when EPR lowers it
+    float ipap, epap;
+    if (therapy && therapy_value(0, &ipap)) {
+        if (therapy_value(1, &epap) && epap < ipap - 0.05f)
+            snprintf(buf, sizeof(buf), "Therapy %.1f/%.1f", ipap, epap);
+        else
+            snprintf(buf, sizeof(buf), "Therapy %.1f cmH2O", ipap);
+        draw_line(L_THER, buf, RGB565_CYAN);
+    } else {
+        draw_line(L_THER, "Therapy --", RGB565_DARKGREY);
     }
 
     // SpO2 / pulse from whichever oximetry source is feeding
@@ -204,9 +289,56 @@ static void draw_status() {
 // ---- Backlight ----
 
 static void set_backlight(int duty) {
-    if (duty == bl_duty) return;
+    const uint32_t now = millis();
+    if (duty == bl_duty && uint32_t(now - bl_check_ms) < BL_REFRESH_MS) return;
+    bl_check_ms = now;
+
+    // Self-heal: if anything took the pin away from LEDC or changed its duty,
+    // restore it and say so in the log.
+    if (perimanGetPinBusType(AB_LCD_BL_GPIO) != ESP32_BUS_TYPE_LEDC) {
+        Log::logf(CAT_GENERAL, LOG_WARN,
+                  "[LCD] backlight GPIO%d lost its PWM output, re-attaching\n",
+                  AB_LCD_BL_GPIO);
+        ledcAttach(AB_LCD_BL_GPIO, BL_FREQ_HZ, BL_RES_BITS);
+        bl_duty = -1;
+    } else if (duty == bl_duty) {
+        const uint32_t hw = ledcRead(AB_LCD_BL_GPIO);
+        if (hw != uint32_t(duty))
+            Log::logf(CAT_GENERAL, LOG_WARN,
+                      "[LCD] backlight duty was %lu, expected %d; restoring\n",
+                      (unsigned long)hw, duty);
+    }
     ledcWrite(AB_LCD_BL_GPIO, duty);
     bl_duty = duty;
+}
+
+// A press wakes the screen. A button held longer than BTN_STUCK_MS is
+// treated as stuck (or a pin pulled low by other circuitry) and ignored
+// until it reads released again.
+static void poll_buttons(uint32_t now) {
+    for (size_t i = 0; i < BTN_COUNT; i++) {
+        const int pin = btn_pins[i];
+        if (pin < 0) continue;
+        if (digitalRead(pin) == HIGH) {
+            if (btn_stuck[i])
+                Log::logf(CAT_GENERAL, LOG_INFO,
+                          "[LCD] button GPIO%d released after %lu ms\n",
+                          pin, (unsigned long)(now - btn_down_ms[i]));
+            btn_down_ms[i] = 0;
+            btn_stuck[i] = false;
+            continue;
+        }
+        if (!btn_down_ms[i]) btn_down_ms[i] = now ? now : 1;
+        if (btn_stuck[i]) continue;
+        if (uint32_t(now - btn_down_ms[i]) >= BTN_STUCK_MS) {
+            btn_stuck[i] = true;
+            Log::logf(CAT_GENERAL, LOG_WARN,
+                      "[LCD] button GPIO%d held low for %d s, ignoring it until released\n",
+                      pin, BTN_STUCK_MS / 1000);
+            continue;
+        }
+        wake_until = now + AB_LCD_WAKE_MS;
+    }
 }
 
 // ---- Public ----
@@ -245,18 +377,58 @@ void tick() {
         woke_once = true;
     }
 
-    for (int pin : btn_pins) {
-        if (pin >= 0 && digitalRead(pin) == LOW) wake_until = now + AB_LCD_WAKE_MS;
-    }
+    poll_buttons(now);
     bool awake = (int32_t)(wake_until - now) > 0;
     set_backlight(awake ? BL_FULL : AB_LCD_DIM_DUTY);
 
     update_pmd_subscription(Arbiter::get_state() == SYS_THERAPY);
+    poll_therapy_pressure(Arbiter::get_state() == SYS_THERAPY);
 
     if (last_draw_ms != 0 && now - last_draw_ms < REFRESH_MS) return;
     last_draw_ms = now;
     if (last_draw_ms == 0) last_draw_ms = 1;
     draw_status();
+}
+
+void status(String &out) {
+    if (!gfx) {
+        out = "lcd: not initialized\n";
+        return;
+    }
+    const uint32_t now = millis();
+    const int32_t left = int32_t(wake_until - now);
+    const bool attached = perimanGetPinBusType(AB_LCD_BL_GPIO) == ESP32_BUS_TYPE_LEDC;
+    out = "backlight: GPIO" + String(AB_LCD_BL_GPIO) +
+          " duty=" + String(bl_duty) + "/" + String(BL_FULL) +
+          " hw=" + (attached ? String(ledcRead(AB_LCD_BL_GPIO)) : String("detached")) +
+          " dim=" + String(AB_LCD_DIM_DUTY) + "\n";
+    out += "awake: " + String(left > 0 ? "yes" : "no") +
+           " (" + String(left > 0 ? left : 0) + " ms left)\n";
+    for (size_t i = 0; i < BTN_COUNT; i++) {
+        const int pin = btn_pins[i];
+        if (pin < 0) continue;
+        out += "button GPIO" + String(pin) + ": " +
+               (digitalRead(pin) == HIGH ? String("released") : String("LOW"));
+        if (btn_down_ms[i])
+            out += " (held " + String(now - btn_down_ms[i]) + " ms" +
+                   (btn_stuck[i] ? String(", ignored as stuck)") : String(")"));
+        out += "\n";
+
+        // Hardware view of the pad, to see what (if anything) has taken it
+        // over: out_sig 256 = plain GPIO output, other values = peripheral.
+        gpio_io_config_t io = {};
+        if (gpio_get_io_config((gpio_num_t)pin, &io) == ESP_OK) {
+            char line[160];
+            snprintf(line, sizeof(line),
+                     "  io: owner=%s fun=%lu out_sig=%lu oe=%d oe_periph=%d ie=%d "
+                     "pu=%d pd=%d od=%d slp=%d level=%d\n",
+                     perimanGetTypeName(perimanGetPinBusType(pin)),
+                     (unsigned long)io.fun_sel, (unsigned long)io.sig_out,
+                     io.oe, io.oe_ctrl_by_periph, io.ie, io.pu, io.pd, io.od,
+                     io.slp_sel, gpio_get_level((gpio_num_t)pin));
+            out += line;
+        }
+    }
 }
 
 }

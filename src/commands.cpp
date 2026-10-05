@@ -22,6 +22,7 @@
 #include "sd_storage.h"
 #include "memory_manager.h"
 #include "crash_diagnostics.h"
+#include "status_screen.h"
 
 
 static String parse_quoted_token(const String &s, int *pos) {
@@ -433,6 +434,11 @@ void dispatch_command(const char *line, String &response) {
         return;
     }
 
+    if (upper == "LCD") {
+        StatusScreen::status(response);
+        return;
+    }
+
     if (upper == "RESETREASON") {
         esp_reset_reason_t reason = esp_reset_reason();
         const char *name = Log::reset_reason_name();
@@ -704,6 +710,7 @@ void dispatch_command(const char *line, String &response) {
                    "  TRANSPARENT         Enter raw UART mode\n"
                    "  VERSION             Firmware version info\n"
                    "  RESETREASON         Last reset reason\n"
+                   "  LCD                 Status screen backlight and buttons\n"
                    "  CRASH STATUS|SUMMARY|CLEAR  Retained crash dump\n"
                    "  REBOOT              Restart ESP32\n"
                    "  HELP                This help\n"
