@@ -1,12 +1,15 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace aircannect {
 
 class LargeTextBuffer {
 public:
-    LargeTextBuffer() = default;
+    explicit LargeTextBuffer(size_t max_capacity = SIZE_MAX - 1,
+                             size_t internal_fallback_limit = SIZE_MAX)
+        : max_capacity_(max_capacity), internal_fallback_limit_(internal_fallback_limit) {}
     ~LargeTextBuffer();
 
     LargeTextBuffer(const LargeTextBuffer &) = delete;
@@ -35,6 +38,7 @@ private:
     size_t length_ = 0;
     size_t capacity_ = 0;
     bool overflowed_ = false;
+    size_t max_capacity_, internal_fallback_limit_;
 };
 
 }  // namespace aircannect

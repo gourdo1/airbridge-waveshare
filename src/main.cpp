@@ -23,6 +23,7 @@
 #include "export_sync.h"
 #include "custom_settings.h"
 #include "clinical_jobs.h"
+#include "sleep_report.h"
 #include "airsense_state.h"
 #include "air10_clock.h"
 #include "board.h"
@@ -142,6 +143,7 @@ void setup() {
     OxiUdp::init();
 
     EdfRecorder::init();
+    SleepReport::init();
 
     Log::logf(CAT_GENERAL, LOG_DEBUG, "Startup initialization complete\n");
 }
@@ -149,6 +151,7 @@ void setup() {
 void loop() {
     serial_poll();
     ClinicalJobs::tick();
+    SleepReport::tick();
 
 #if AB_STORAGE_HAS_SDCARD
     static uint32_t recorder_retry_ms = 0;

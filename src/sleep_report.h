@@ -1,10 +1,30 @@
 #pragma once
 
 #include "json_cursor.h"
+#include "edf_report.h"
 #include <stddef.h>
 #include <stdint.h>
 
 namespace SleepReport {
+
+enum class Source : uint8_t { Device, Edf };
+struct Publication {
+    Source source = Source::Device;
+    EdfReport::Status local;
+};
+using LocalRequest = EdfReport::Request;
+using Result = EdfReport::Result;
+
+// Capability selection never falls back from an SD build to UART on failure.
+void init();
+void tick();
+Source default_source();
+const char *source_name(Source source);
+void get_publication(Publication &out);
+bool submit(const LocalRequest &request, uint32_t &id,
+            const char **error = nullptr);
+int poll(uint32_t id, Result &out);
+void cancel(uint32_t id);
 
 enum class View : uint8_t { Day, Period };
 struct Request {
