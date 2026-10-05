@@ -116,6 +116,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-table th,.report-table td{padding:8px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
 .report-table th:first-child,.report-table td:first-child{text-align:left}
 .report-plots canvas{display:block;width:100%;touch-action:none;cursor:crosshair}
+.report-plots canvas:focus{outline:none}
+.report-plots canvas:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .report-plots .chart-card{margin:12px 0}
 .report-events{display:flex;gap:6px;flex-wrap:wrap;max-height:180px;overflow-y:auto}
 .report-chart-head,.report-chart-toolbar{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;font-variant-numeric:tabular-nums}
@@ -1834,7 +1836,7 @@ function scheduleReportDraw(request = false) {
 }
 
 async function drainReportSeries() {
-  if (reportPlot.flight || reportPlot.gesture || !reportPlot.pending || !reportPlot.summary) return;
+  if (reportPlot.flight || reportPlot.gesture || reportPlot.request || !reportPlot.pending || !reportPlot.summary) return;
   let request = reportPlot.pending; reportPlot.pending = null;
   const full = reportPlot.full;
   if (!reportPlot.overview && (request.view[0] !== full[0] || request.view[1] !== full[1])) {
@@ -1980,6 +1982,12 @@ function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlo
     ctx.strokeStyle = '#22d3ee'; ctx.strokeRect(left,pad.t,right-left,gh);
     ctx.fillStyle = '#22d3ee'; ctx.fillRect(left-3,pad.t,6,gh); ctx.fillRect(right-3,pad.t,6,gh);
   }
+  const selection = reportPlot.gesture?.selection;
+  if (selection) {
+    const left = x(selection[0]), right = x(selection[1]);
+    ctx.fillStyle = '#22d3ee33'; ctx.fillRect(left,pad.t,right-left,gh);
+    ctx.strokeStyle = '#22d3ee'; ctx.strokeRect(left,pad.t,right-left,gh);
+  }
   if (cursor !== null) {
     ctx.strokeStyle = '#aaa'; ctx.setLineDash([3,3]);
     ctx.beginPath(); ctx.moveTo(x(cursor),pad.t); ctx.lineTo(x(cursor),H-pad.b); ctx.stroke();
@@ -2025,6 +2033,7 @@ function reportPointerX(canvas, clientX) {
 function bindReportPlot(canvas, overview) {
   if (canvas.dataset.reportBound) return;
   canvas.dataset.reportBound = '1';
+  if (!overview) canvas.title = 'Drag to zoom; double-click to reset';
   canvas.addEventListener('dblclick', resetReportViewport);
   canvas.addEventListener('keydown', e => {
     if (!reportPlot.view) return;
@@ -2036,33 +2045,26 @@ function bindReportPlot(canvas, overview) {
     } else return;
     e.preventDefault();
   });
-  canvas.addEventListener('wheel', e => {
-    if (!reportPlot.view || reportPlot.gesture) return;
-    e.preventDefault();
-    const [from,to] = reportPlot.view, ratio = reportPointerX(canvas,e.clientX);
-    const anchor = overview ? reportPlot.full[0]+ratio*(reportPlot.full[1]-reportPlot.full[0]) : from+ratio*(to-from);
-    const factor = Math.exp(Math.max(-1,Math.min(1,e.deltaY*(e.deltaMode === 0 ? 0.002 : 0.05))));
-    const relative = (anchor-from)/(to-from);
-    const width = Math.min(reportPlot.full[1]-reportPlot.full[0],Math.max(Math.min(1000,reportPlot.full[1]-reportPlot.full[0]),(to-from)*factor));
-    setReportViewport(anchor-width*relative,anchor+width*(1-relative));
-    scheduleReportDraw(true);
-  }, {passive:false});
   canvas.addEventListener('pointerdown', e => {
     if (!reportPlot.view || (e.pointerType === 'mouse' && e.button !== 0)) return;
     if ((reportPlot.gesture && reportPlot.gesture.canvas !== canvas) || reportPlot.pointers.size >= 2) return;
     e.preventDefault(); canvas.setPointerCapture(e.pointerId);
-    reportPlot.pending = null; reportPlot.request = false;
+    canvas.focus({preventScroll:true});
     const x = reportPointerX(canvas,e.clientX);
     reportPlot.pointers.set(e.pointerId,x);
     const full = reportPlot.full, view = reportPlot.view;
     const time = full[0]+x*(full[1]-full[0]);
     const tolerance = 10/(canvas.width-52)*(full[1]-full[0]);
-    const mode = !overview ? 'pan' : Math.abs(time-view[0]) <= tolerance ? 'left'
+    const mode = reportPlot.pointers.size === 2 ? 'pinch' : !overview ? 'select' : Math.abs(time-view[0]) <= tolerance ? 'left'
       : Math.abs(time-view[1]) <= tolerance ? 'right'
       : !e.shiftKey && view[1]-view[0] < full[1]-full[0] && time > view[0] && time < view[1] ? 'move' : 'select';
-    reportPlot.gesture = {canvas,overview,mode,view:[...view],points:[...reportPlot.pointers.values()],anchor:time};
+    const minimum = 5*canvas.width/(canvas.getBoundingClientRect().width*(canvas.width-52));
+    reportPlot.gesture = {canvas,overview,mode,view:[...view],points:[...reportPlot.pointers.values()],anchor:time,
+      initialView:reportPlot.gesture?.initialView || [...view],initialSerial:reportPlot.gesture?.initialSerial ?? reportPlot.serial,
+      minimum,selection:null};
+    scheduleReportDraw();
   });
-  canvas.addEventListener('pointermove', e => {
+  const move = e => {
     if (!reportPlot.view) return;
     const x = reportPointerX(canvas,e.clientX);
     const range = overview ? reportPlot.full : reportPlot.view;
@@ -2081,32 +2083,55 @@ function bindReportPlot(canvas, overview) {
           const start = overview ? anchor-(anchor-view[0])/width*span+(center-current)*fullWidth : anchor-current*span;
           setReportViewport(start,start+span);
         }
-      } else if (points.length === 1) {
+      } else if (points.length === 1 && gesture.mode !== 'pinch') {
         const time = reportPlot.full[0]+x*fullWidth;
-        if (gesture.mode === 'left') setReportViewport(Math.min(time,view[1]-Math.min(1000,fullWidth)),view[1]);
+        if (!overview) {
+          gesture.selection = Math.abs(x-base[0]) >= gesture.minimum
+            ? [view[0]+Math.min(x,base[0])*width,view[0]+Math.max(x,base[0])*width] : null;
+        } else if (Math.abs(x-base[0]) < gesture.minimum) setReportViewport(...view);
+        else if (gesture.mode === 'left') setReportViewport(Math.min(time,view[1]-Math.min(1000,fullWidth)),view[1]);
         else if (gesture.mode === 'right') setReportViewport(view[0],Math.max(time,view[0]+Math.min(1000,fullWidth)));
         else if (gesture.mode === 'select') setReportViewport(Math.min(time,gesture.anchor),Math.max(time,gesture.anchor));
         else {
-          const shift = (x-base[0])*(overview ? fullWidth : -width);
+          const shift = (x-base[0])*fullWidth;
           setReportViewport(view[0]+shift,view[1]+shift);
         }
       }
     }
     if (!overview) reportPlot.cursor = reportPlot.view[0]+x*(reportPlot.view[1]-reportPlot.view[0]);
     scheduleReportDraw();
-  });
-  const release = e => {
-    if (!reportPlot.pointers.has(e.pointerId)) return;
-    reportPlot.pointers.delete(e.pointerId);
-    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
-    if (reportPlot.pointers.size) {
-      reportPlot.gesture.view = [...reportPlot.view];
-      reportPlot.gesture.points = [...reportPlot.pointers.values()];
-    } else { reportPlot.gesture = null; scheduleReportDraw(true); }
+  };
+  canvas.addEventListener('pointermove', move);
+  const release = (e, cancelled = false) => {
+    const gesture = reportPlot.gesture;
+    if (!gesture || gesture.canvas !== canvas || !reportPlot.pointers.has(e.pointerId)) return;
+    if (cancelled) {
+      const pointers = [...reportPlot.pointers.keys()];
+      reportPlot.pointers.clear(); reportPlot.gesture = null;
+      reportPlot.cursor = null;
+      setReportViewport(...gesture.initialView);
+      for (const id of pointers) if (canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id);
+    } else {
+      move(e);
+      reportPlot.pointers.delete(e.pointerId);
+      if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+      if (reportPlot.pointers.size) return;
+      if (!overview && gesture.selection) setReportViewport(...gesture.selection);
+      reportPlot.gesture = null;
+    }
+    if (reportPlot.pending) reportPlot.pending = {...reportPlot.pending,view:[...reportPlot.view],serial:reportPlot.serial};
+    const changed = reportPlot.view[0] !== gesture.initialView[0] || reportPlot.view[1] !== gesture.initialView[1];
+    const data = reportPlot.series;
+    // A gesture can return to its starting range after cancelling that range's read.
+    const needsData = reportPlot.serial !== gesture.initialSerial
+      && (!data || (data.requested_from_ms ?? data.from_ms) !== Math.floor(reportPlot.view[0])
+        || (data.requested_to_ms ?? data.to_ms) !== Math.ceil(reportPlot.view[1]));
+    scheduleReportDraw(changed || needsData);
+    if (!reportPlot.request) drainReportSeries();
   };
   canvas.addEventListener('pointerup', release);
-  canvas.addEventListener('pointercancel', release);
-  canvas.addEventListener('lostpointercapture', release);
+  canvas.addEventListener('pointercancel', e => release(e,true));
+  canvas.addEventListener('lostpointercapture', e => release(e,true));
   canvas.addEventListener('pointerleave', () => {
     if (!reportPlot.gesture) { reportPlot.cursor = null; scheduleReportDraw(); }
   });
