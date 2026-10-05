@@ -28,6 +28,7 @@ static Status status = {
     "",
 };
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t file_mutation_revision = 0;
 
 #if AB_STORAGE_HAS_SDCARD
 namespace {
@@ -263,6 +264,19 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
+uint32_t files_revision() {
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t revision = file_mutation_revision;
+    portEXIT_CRITICAL(&status_mux);
+    return revision;
+}
+
+void notify_files_changed() {
+    portENTER_CRITICAL(&status_mux);
+    ++file_mutation_revision;
+    portEXIT_CRITICAL(&status_mux);
+}
+
 bool acquire() {
 #if AB_STORAGE_HAS_SDCARD
     __atomic_add_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
@@ -382,6 +396,22 @@ bool Reader::next(Entry &entry, bool &end) {
         entry.modified = file.getLastWrite();
         return true;
     });
+#else
+    return false;
+#endif
+}
+
+bool Reader::seek(uint64_t offset) {
+#if AB_STORAGE_HAS_SDCARD
+    if (!handle_ || offset > size_ || offset > UINT32_MAX) return false;
+    const bool sought = session_.run([&](fs::FS &) {
+        OpenFile *reader = find_reader(handle_);
+        return reader && reader->file && !reader->file.isDirectory() &&
+            reader->file.seek(static_cast<uint32_t>(offset));
+    });
+    if (!sought) return false;
+    offset_ = offset;
+    return true;
 #else
     return false;
 #endif

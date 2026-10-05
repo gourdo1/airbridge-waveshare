@@ -253,7 +253,9 @@ const char *mutate(Job &job, uint32_t &changed) {
             if (!fs.exists(job.request.path)) { error = "not_found"; return false; }
             if (fs.exists(destination)) { error = "destination_exists"; return false; }
             error = "rename_failed";
-            return fs.rename(job.request.path, destination);
+            if (!fs.rename(job.request.path, destination)) return false;
+            SdStorage::notify_files_changed();
+            return true;
         });
         if (!renamed) return error;
         changed = 1;
@@ -268,7 +270,9 @@ const char *mutate(Job &job, uint32_t &changed) {
         const ZipEntry &entry = job.entries[i - 1];
         const bool removed = job.session.run([&](fs::FS &fs) {
             if (job.cancelled.load()) return false;
-            return entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path);
+            if (!(entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path))) return false;
+            SdStorage::notify_files_changed();
+            return true;
         });
         if (!removed) { error = job.session.valid() ? "delete_failed" : "cancelled"; break; }
         changed++;
