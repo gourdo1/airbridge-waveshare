@@ -1292,6 +1292,58 @@ struct Series {
     }
 };
 
+void series_channel_json(Payload &out, const Series &series, size_t channel) {
+    auto format_bucket = [&](size_t at, char *text) -> size_t {
+        const auto &bucket = series.buckets[channel * series.px + at];
+        if (!bucket.covered_ms || !std::isfinite(bucket.low) || !std::isfinite(bucket.high))
+            return 0;
+        const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
+            (series.from_ms + int64_t(at) * series.step_ms));
+        return snprintf(text, 64, "%.7g,%.7g,%llu", bucket.low, bucket.high,
+                        static_cast<unsigned long long>(std::min(bucket.covered_ms, expected)));
+    };
+    auto visit_runs = [&](auto &&visit) {
+        char value[64], next[64];
+        size_t begin = 0, length = format_bucket(0, value);
+        for (size_t at = 1; at <= series.px; ++at) {
+            const size_t next_length = at < series.px ? format_bucket(at, next) : 0;
+            // Compare wire values, including tail-clipped coverage and the
+            // existing seven-significant-digit representation, not raw floats.
+            if (at < series.px && length == next_length && !memcmp(value, next, length))
+                continue;
+            visit(at - begin, value, length);
+            begin = at;
+            length = next_length;
+            if (length) memcpy(value, next, length + 1);
+        }
+    };
+
+    size_t dense_bytes = sizeof("\"buckets\":[]") - 1 + series.px - 1;
+    size_t run_bytes = sizeof("\"runs\":[]") - 1, run_count = 0;
+    visit_runs([&](size_t count, const char *, size_t length) {
+        dense_bytes += count * (length ? length + 2 : 4);
+        run_bytes += snprintf(nullptr, 0, "%zu", count) + 2 +
+            (length ? length + 1 : 0) + (run_count++ ? 1 : 0);
+    });
+    const bool compact = run_bytes < dense_bytes;
+    out.print("\"%s\":[", compact ? "runs" : "buckets");
+    bool comma = false;
+    visit_runs([&](size_t count, const char *value, size_t length) {
+        if (compact) {
+            if (length) out.print("%s[%zu,%s]", comma ? "," : "", count, value);
+            else out.print("%s[%zu]", comma ? "," : "", count);
+            comma = true;
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                if (length) out.print("%s[%s]", comma ? "," : "", value);
+                else out.print("%snull", comma ? "," : "");
+                comma = true;
+            }
+        }
+    });
+    out.print("]");
+}
+
 bool cached_series(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, Series &series) {
     ReducedHeader header;
@@ -1491,19 +1543,11 @@ bool series_json(const SdStorage::Session &session, Job &job) {
                    static_cast<long long>(job.request.from_ms), static_cast<long long>(job.request.to_ms),
                    series.partial ? "true" : "false");
     for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-        job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",\"buckets\":[", c ? "," : "",
+        job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",", c ? "," : "",
                        c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].label : "Flow",
                        c ? CHANNELS[c - 1].unit : "L/min");
-        for (size_t b = 0; b < series.px; ++b) {
-            const auto &bucket = series.buckets[c * series.px + b];
-            const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
-                (series.from_ms + int64_t(b) * series.step_ms));
-            if (bucket.covered_ms && std::isfinite(bucket.low) && std::isfinite(bucket.high))
-                job.body.print("%s[%.7g,%.7g,%llu]", b ? "," : "", bucket.low, bucket.high,
-                    static_cast<unsigned long long>(std::min(bucket.covered_ms, expected)));
-            else job.body.print("%snull", b ? "," : "");
-        }
-        job.body.print("]}");
+        series_channel_json(job.body, series, c);
+        job.body.print("}");
     }
     job.body.print("],\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
     if (events.length()) job.body.append(events.c_str(), events.length());

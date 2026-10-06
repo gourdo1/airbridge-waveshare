@@ -1325,7 +1325,8 @@ const reportReads = {};
 const reportCalendar = {days:[], month:null};
 const reportPlot = {summary:null, selection:null, full:null, view:null, overview:null, series:null,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
-  axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null};
+  axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
+  cache:new Map()};
 
 function reportSource() {
   if (lastStatus.report_source === 'edf') return document.getElementById('reportSourceChoice').value === 'device' ? 'device' : 'edf';
@@ -1336,9 +1337,11 @@ function applyReportStatus(d) {
   const source = reportSource();
   const changed = source !== reportPublishedSource;
   reportPublishedSource = source;
+  if (changed) reportPlot.cache.clear();
   if (d.report_data_revision !== undefined) {
     if (reportDataRevision !== null && d.report_data_revision !== reportDataRevision) {
       reportDataEpoch++;
+      reportPlot.cache.clear();
       if (source === 'edf' && (reportLoading || (reportPlot.summary && reportPlot.summary.data_revision !== d.report_data_revision))) queueReportRefresh();
     }
     reportDataRevision = d.report_data_revision;
@@ -1769,6 +1772,7 @@ function clearReportPlots() {
   reportPlot.axes = null; reportPlot.axesAllSessions = false;
   reportPlot.hiddenSessions.clear(); reportPlot.excluded = '';
   reportPlot.pointers.clear();
+  reportPlot.cache.clear();
   reportPlot.rows = [];
   reportPlot.request = false;
   document.getElementById('reportPlots').replaceChildren();
@@ -1784,6 +1788,7 @@ function suspendReport() {
   reportPlot.request = false;
   reportLoading = false;
   reportPlot.pointers.clear(); reportPlot.gesture = null;
+  reportPlot.cache.clear();
   document.getElementById('reportSpinner').style.display = 'none';
   document.getElementById('reportResult').setAttribute('aria-busy', 'false');
 }
@@ -1833,15 +1838,19 @@ async function drainReportSeries() {
   const allHidden = reportPlot.summary.sessions.every(s => reportPlot.hiddenSessions.has(s.id));
   const note = document.getElementById('reportSeriesNote'); note.textContent = allHidden ? 'No sessions selected' : 'Loading chart data...';
   try {
+    const dataEpoch = reportDataEpoch, selection = reportPlot.selection, signal = reportController.signal;
     const px = Math.max(1, Math.min(1200, document.getElementById('reportOverview').width - 52));
-    const query = 'action=series&' + reportPlot.selection + '&from_ms=' + Math.floor(request.view[0])
+    const query = 'action=series&' + selection + '&from_ms=' + Math.floor(request.view[0])
       + '&to_ms=' + Math.ceil(request.view[1]) + '&px=' + px + '&revision=' + reportPlot.summary.data_revision
       + (request.excluded ? '&exclude=' + request.excluded : '');
-    const data = await edfReportRequest('series', query, request.generation, reportController.signal);
-    if (request.generation !== reportGeneration) return;
+    const key = 'source=edf&' + query, cached = reportPlot.cache.get(key);
+    const data = cached || await edfReportRequest('series', query, request.generation, signal);
+    if (request.generation !== reportGeneration || signal.aborted || dataEpoch !== reportDataEpoch
+        || selection !== reportPlot.selection || reportSource() !== 'edf') return;
     if (request.excluded !== reportPlot.excluded) return;
     if (data.data_revision !== reportPlot.summary.data_revision) throw new Error('EDF data changed; refresh the report');
     if (data.excluded !== request.excluded) throw new Error('Session selection changed; refresh the report');
+    if (!cached) normalizeReportSeries(data);
     if (request.view[0] === full[0] && request.view[1] === full[1]) {
       reportPlot.overview = data;
       // Only a full, unfiltered overview establishes the final selection scale.
@@ -1849,6 +1858,11 @@ async function drainReportSeries() {
       if (!request.excluded) reportPlot.axesAllSessions = true;
     }
     if (request.serial !== reportPlot.serial) return;
+    if (data.partial === false && !data.events_truncated) {
+      reportPlot.cache.delete(key);
+      reportPlot.cache.set(key,data);
+      if (reportPlot.cache.size > 4) reportPlot.cache.delete(reportPlot.cache.keys().next().value);
+    }
     reportPlot.series = data;
     note.textContent = allHidden ? 'No sessions selected'
       : [data.partial ? 'Incomplete chart data.' : '', data.events_truncated ? 'Zoom for more events.' : ''].filter(Boolean).join(' ');
@@ -1879,6 +1893,31 @@ async function drainReportSeries() {
     if (reportPlot.flight === request) reportPlot.flight = null;
     drainReportSeries();
   }
+}
+
+function normalizeReportSeries(data) {
+  for (const channel of data.channels || []) {
+    if (channel.runs === undefined) continue;
+    if (!Number.isInteger(data.px) || data.px < 1 || data.px > 1600 || !Array.isArray(channel.runs))
+      throw new Error('Invalid EDF chart runs');
+    const buckets = new Array(data.px);
+    let offset = 0;
+    for (const run of channel.runs) {
+      if (!Array.isArray(run) || !Number.isInteger(run[0]) || run[0] < 1 || offset+run[0] > data.px
+          || (run.length !== 1 && run.length !== 4)) throw new Error('Invalid EDF chart runs');
+      const bucket = run.length === 1 ? null : run.slice(1);
+      if (bucket && (!reportBucket(bucket) || !Number.isFinite(bucket[2]) || bucket[2] < 0))
+        throw new Error('Invalid EDF chart runs');
+      // Repeated buckets share one immutable triple, retaining the original grid.
+      if (bucket) Object.freeze(bucket);
+      buckets.fill(bucket,offset,offset+run[0]);
+      offset += run[0];
+    }
+    if (offset !== data.px) throw new Error('Invalid EDF chart runs');
+    channel.buckets = buckets;
+    delete channel.runs;
+  }
+  return data;
 }
 
 function reportBucket(bucket) {
