@@ -1861,7 +1861,7 @@ async function drainReportSeries() {
     if (data.partial === false && !data.events_truncated) {
       reportPlot.cache.delete(key);
       reportPlot.cache.set(key,data);
-      if (reportPlot.cache.size > 4) reportPlot.cache.delete(reportPlot.cache.keys().next().value);
+      if (reportPlot.cache.size > 64) reportPlot.cache.delete(reportPlot.cache.keys().next().value);
     }
     reportPlot.series = data;
     note.textContent = allHidden ? 'No sessions selected'
