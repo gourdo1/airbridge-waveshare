@@ -94,9 +94,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-note{font-size:12px;color:var(--text-dim);margin:12px 0;line-height:1.5}
 .report-note:empty{display:none}
 #reportGrid .stat{gap:12px;align-items:baseline}
-.report-result-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.report-result-head{position:relative;display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.report-result-head h3{margin-bottom:16px}
 .report-selection{font-size:12px;color:var(--text-dim);font-variant-numeric:tabular-nums}
-.report-totals{margin-bottom:16px}
+.report-load-state{position:absolute;right:0;bottom:0;display:flex;align-items:center;gap:6px;height:14px;white-space:nowrap;font-size:11px;color:var(--text-dim)}
+.report-load-state .spinner{flex:none;margin:0;width:14px;height:14px;border-width:2px}
+.report-totals{margin-bottom:8px}
+.report-statistics>summary,.report-channel-picker>summary{cursor:pointer;font-size:12px;color:var(--text-dim);padding:4px 0}
+.report-statistics[open]>summary{margin-bottom:8px}
+.report-channel-picker{margin:6px 0}
+.report-channel-options{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.report-channel-options .btn{padding:4px 9px;font-weight:500}
+.report-channel-options .btn[aria-pressed=true]{background:var(--accent-dim);border-color:var(--accent)}
+.report-channel-options .btn[aria-pressed=false]{color:var(--text-dim)}
 .report-interval{display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
 .report-interval:last-child{border-bottom:none}
 .report-sessions{display:flex;flex-wrap:wrap;gap:8px}
@@ -118,10 +128,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
 .report-table th,.report-table td{padding:8px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
 .report-table th:first-child,.report-table td:first-child{text-align:left}
-.report-plots canvas{display:block;width:100%;touch-action:none;cursor:crosshair}
+.report-plots canvas{display:block;width:100%;touch-action:pan-y;cursor:crosshair}
 .report-plots canvas:focus{outline:none}
 .report-plots canvas:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.report-plots .chart-card{margin:12px 0}
+.report-plots .chart-card{margin:8px 0;padding:10px 16px}
+.report-chart-legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px}
+.report-chart-legend span{white-space:nowrap}
+#reportRange{margin:4px 0}
+#reportSeriesNote{margin:4px 0}
 #reportSeriesNote{display:block;min-height:18px}
 .report-chart-head,.report-chart-toolbar{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12px;font-variant-numeric:tabular-nums}
 .report-chart-head{margin-bottom:4px}
@@ -475,13 +489,12 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <p class="report-note" id="reportAvailability" role="status"></p>
         </div>
         <div class="card" aria-busy="false" id="reportResult">
-          <div class="report-result-head"><h3 id="reportTitle">Therapy day</h3><span class="report-selection" id="reportSelection"></span></div>
-          <div class="spinner" id="reportSpinner"></div>
+          <div class="report-result-head"><h3 id="reportTitle">Therapy day</h3><span class="report-selection" id="reportSelection"></span><span class="report-load-state"><span id="reportLoadState" role="status"></span><span class="spinner" id="reportSpinner"></span></span></div>
           <p class="report-note" id="reportNote"></p>
           <div id="reportGrid" class="status-grid"></div>
           <div id="reportStatsCard" hidden>
             <div class="report-table-wrap report-totals"><table class="report-table" id="reportTotals" aria-label="Therapy totals"></table></div>
-            <div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th><th>Coverage</th></tr></thead><tbody id="reportStats"></tbody></table></div>
+            <details class="report-statistics"><summary>Channel statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th><th>Coverage</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
           </div>
         </div>
         <div class="card" id="reportMaskCard" hidden>
@@ -491,9 +504,11 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
         <div class="card report-plots" id="reportChartsCard" hidden>
           <h3>Charts</h3>
           <div class="report-chart-toolbar"><span id="reportCursor" aria-live="off"></span><button class="btn" onclick="resetReportViewport()" title="Reset zoom (double-click a chart)">Reset</button></div>
-          <canvas id="reportOverview" height="90" aria-label="EDF overview selection" tabindex="0"></canvas>
+          <canvas id="reportOverview" height="70" aria-label="EDF overview selection" tabindex="0"></canvas>
           <p class="report-note" id="reportRange"></p>
           <p class="report-note" id="reportSeriesNote" role="status"></p>
+          <details class="report-channel-picker"><summary>Channels</summary><div class="report-channel-options" id="reportChannelOptions"></div></details>
+          <div class="chart-card" id="reportEventCard" hidden><div class="report-chart-head">Events</div><canvas id="reportEventStrip" height="76" aria-label="Respiratory events" tabindex="0"></canvas></div>
           <div id="reportPlots"></div>
         </div>
       </div>
@@ -1322,11 +1337,12 @@ let reportGeneration = 0;
 let reportController = null, reportRevision = null, reportEpoch = 0, reportPublishedSource = null;
 let reportDataRevision = null, reportDataEpoch = 0, reportLoading = false, reportDirty = false, reportRefreshQueued = false;
 const reportReads = {};
-const reportCalendar = {days:[], month:null};
+const reportCalendar = {days:[], month:null, cache:null, epoch:0};
+let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, overview:null, series:null,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
   axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
-  cache:new Map()};
+  cache:new Map(), hiddenChannels:new Set(), availableChannels:[]};
 
 function reportSource() {
   if (lastStatus.report_source === 'edf') return document.getElementById('reportSourceChoice').value === 'device' ? 'device' : 'edf';
@@ -1337,14 +1353,16 @@ function applyReportStatus(d) {
   const source = reportSource();
   const changed = source !== reportPublishedSource;
   reportPublishedSource = source;
-  if (changed) reportPlot.cache.clear();
+  if (changed) { reportPlot.cache.clear(); invalidateReportDays(); }
   if (d.report_data_revision !== undefined) {
     if (reportDataRevision !== null && d.report_data_revision !== reportDataRevision) {
       reportDataEpoch++;
       reportPlot.cache.clear();
+      invalidateReportDays();
       if (source === 'edf' && (reportLoading || (reportPlot.summary && reportPlot.summary.data_revision !== d.report_data_revision))) queueReportRefresh();
     }
     reportDataRevision = d.report_data_revision;
+    if (reportCalendar.cache && reportCalendar.cache.data_revision !== reportDataRevision) invalidateReportDays();
   }
   if (d.report_revision !== undefined && d.report_revision !== reportRevision) {
     reportRevision = d.report_revision;
@@ -1368,8 +1386,19 @@ function queueReportRefresh() {
 }
 
 function reportReconnect() {
+  invalidateReportDays();
+  if (reportLoading) {
+    reportDirty = true;
+    if (reportReads.days) reportReads.days.cancel();
+  }
   reportEpoch++;
   Object.values(reportReads).forEach(read => read.wake());
+}
+
+function invalidateReportDays() {
+  reportCalendar.epoch++;
+  reportCalendar.cache = null;
+  reportCalendar.days = [];
 }
 
 function edfReportRequest(slot, query, generation, signal) {
@@ -1540,7 +1569,11 @@ function reportMaskTime(day, minute) {
 
 function renderReport(data) {
   if (data.source === 'edf') { renderEdfReport(data); return; }
+  clearReportPlots();
+  reportDisplayedSource = 'device';
+  document.getElementById('reportLoadState').textContent = '';
   document.getElementById('reportSelection').textContent = '';
+  document.getElementById('reportIntervalTitle').textContent = 'Mask intervals';
   document.getElementById('reportGrid').hidden = false;
   document.getElementById('reportStatsCard').hidden = true;
   const day = data.view === 'day';
@@ -1584,16 +1617,16 @@ async function loadReport(latest = false) {
   const generation = ++reportGeneration;
   if (reportController) reportController.abort();
   reportController = new AbortController();
-  clearReportPlots();
-  document.getElementById('reportGrid').replaceChildren();
-  document.getElementById('reportNote').textContent = '';
-  document.getElementById('reportSelection').textContent = '';
-  document.getElementById('reportStatsCard').hidden = true;
-  document.getElementById('reportIntervalTitle').textContent = 'Mask intervals';
+  reportPlot.pending = null; reportPlot.request = false;
+  reportPlot.gesture = null; reportPlot.pointers.clear();
+  reportPlot.cache.clear();
   closeReportCalendar();
+  if (reportPublishedSource !== reportSource()) invalidateReportDays();
   reportPublishedSource = reportSource();
   reportLoading = false; reportDirty = false;
+  for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
   if (renderReportAvailability()) {
+    document.getElementById('reportLoadState').textContent = reportDisplayedSource ? 'Previous report' : '';
     document.getElementById('reportSpinner').style.display = 'none';
     document.getElementById('reportResult').setAttribute('aria-busy', 'false');
     return;
@@ -1601,6 +1634,7 @@ async function loadReport(latest = false) {
   const source = reportSource();
   reportLoading = true;
   const dataEpoch = reportDataEpoch;
+  const daysEpoch = reportCalendar.epoch;
   const view = document.getElementById('reportView').value;
   const day = view === 'day';
   const date = document.getElementById('reportDay');
@@ -1608,10 +1642,10 @@ async function loadReport(latest = false) {
   document.getElementById('reportDayRow').hidden = !day;
   document.getElementById('reportPeriodRow').hidden = day;
   document.getElementById('reportLatest').hidden = !day;
-  document.getElementById('reportMaskCard').hidden = true;
-  document.getElementById('reportGrid').replaceChildren();
-  document.getElementById('reportNote').textContent = '';
-  document.getElementById('reportTitle').textContent = source === 'edf' ? 'Statistics' : day ? 'Therapy day' : 'Period';
+  const prior = reportDisplayedSource !== null;
+  document.getElementById('reportLoadState').textContent = prior ? 'Loading... (previous report)' : 'Loading...';
+  for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = true;
+  if (!prior) document.getElementById('reportTitle').textContent = source === 'edf' ? 'Statistics' : day ? 'Therapy day' : 'Period';
   document.getElementById('reportMsg').style.display = 'none';
   document.getElementById('reportRefresh').disabled = true;
   document.getElementById('reportResult').setAttribute('aria-busy', 'true');
@@ -1622,8 +1656,13 @@ async function loadReport(latest = false) {
     if (!Number.isInteger(selection)) throw new Error('Choose a valid date');
     let data;
     if (source === 'edf') {
-      const days = await edfReportRequest('days', 'action=days', generation, reportController.signal);
+      const days = reportCalendar.cache || await edfReportRequest('days', 'action=days', generation, reportController.signal);
       if (generation !== reportGeneration) return;
+      if (daysEpoch !== reportCalendar.epoch || (dataEpoch !== reportDataEpoch && days.data_revision !== reportDataRevision)) {
+        reportDirty = true; return;
+      }
+      if (days.partial !== true && Number.isInteger(days.data_revision)
+          && (reportDataRevision === null || days.data_revision === reportDataRevision)) reportCalendar.cache = days;
       const dates = (days.days || []).filter(d => Number.isInteger(d.day) && d.day > 0).sort((a,b) => a.day-b.day);
       reportCalendar.days = dates;
       date.min = dates.length ? reportDate(Math.min(...dates.map(d => d.day))) : '';
@@ -1632,8 +1671,10 @@ async function loadReport(latest = false) {
       renderReportAvailability();
       const query = 'view=' + view + (day ? '&day=' : '&period=') + selection;
       data = await edfReportRequest('summary', 'action=summary&' + query, generation, reportController.signal);
-      if ((dataEpoch !== reportDataEpoch && data.data_revision !== reportDataRevision)
+      if (generation !== reportGeneration) return;
+      if (daysEpoch !== reportCalendar.epoch || (dataEpoch !== reportDataEpoch && data.data_revision !== reportDataRevision)
           || (days.data_revision !== undefined && days.data_revision !== data.data_revision)) {
+        invalidateReportDays();
         reportDirty = true;
         return;
       }
@@ -1663,6 +1704,8 @@ async function loadReport(latest = false) {
   } finally {
     if (generation === reportGeneration) {
       reportLoading = false;
+      for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
+      if (document.getElementById('reportLoadState').textContent) document.getElementById('reportLoadState').textContent = prior ? 'Previous report' : '';
       document.getElementById('reportSpinner').style.display = 'none';
       document.getElementById('reportResult').setAttribute('aria-busy', 'false');
       renderReportAvailability();
@@ -1686,6 +1729,11 @@ function reportDuration(seconds) {
 }
 
 function renderEdfReport(data) {
+  const selection = reportPlot.selection;
+  clearReportPlots();
+  reportPlot.selection = selection;
+  reportDisplayedSource = 'edf';
+  document.getElementById('reportLoadState').textContent = '';
   reportPlot.summary = data;
   const day = data.view === 'day';
   if (day && data.day) document.getElementById('reportDay').value = reportDate(data.day);
@@ -1731,6 +1779,7 @@ function renderEdfReport(data) {
   document.getElementById('reportChartsCard').hidden = false;
   const overview = document.getElementById('reportOverview');
   bindReportPlot(overview, true);
+  bindReportPlot(document.getElementById('reportEventStrip'), false);
   scheduleReportDraw(true);
 }
 
@@ -1752,6 +1801,7 @@ function renderReportSessions(focusId = null) {
 }
 
 function toggleReportSession(id) {
+  if (reportLoading) return;
   if (reportPlot.hiddenSessions.has(id)) reportPlot.hiddenSessions.delete(id);
   else reportPlot.hiddenSessions.add(id);
   const bytes = new Uint8Array(Math.floor(Math.max(-1,...reportPlot.hiddenSessions)/8)+1);
@@ -1774,6 +1824,8 @@ function clearReportPlots() {
   reportPlot.pointers.clear();
   reportPlot.cache.clear();
   reportPlot.rows = [];
+  reportPlot.availableChannels = [];
+  document.getElementById('reportChannelOptions').replaceChildren();
   reportPlot.request = false;
   document.getElementById('reportPlots').replaceChildren();
   document.getElementById('reportChartsCard').hidden = true;
@@ -1787,6 +1839,8 @@ function suspendReport() {
   reportPlot.pending = null;
   reportPlot.request = false;
   reportLoading = false;
+  for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
+  invalidateReportDays();
   reportPlot.pointers.clear(); reportPlot.gesture = null;
   reportPlot.cache.clear();
   document.getElementById('reportSpinner').style.display = 'none';
@@ -1827,7 +1881,7 @@ function scheduleReportDraw(request = false) {
 }
 
 async function drainReportSeries() {
-  if (reportPlot.flight || reportPlot.gesture || reportPlot.request || !reportPlot.pending || !reportPlot.summary) return;
+  if (reportLoading || reportPlot.flight || reportPlot.gesture || reportPlot.request || !reportPlot.pending || !reportPlot.summary) return;
   let request = reportPlot.pending; reportPlot.pending = null;
   const full = reportPlot.full;
   if (!reportPlot.overview && (request.view[0] !== full[0] || request.view[1] !== full[1])) {
@@ -1839,7 +1893,7 @@ async function drainReportSeries() {
   const note = document.getElementById('reportSeriesNote'); note.textContent = allHidden ? 'No sessions selected' : 'Loading chart data...';
   try {
     const dataEpoch = reportDataEpoch, selection = reportPlot.selection, signal = reportController.signal;
-    const px = Math.max(1, Math.min(1200, document.getElementById('reportOverview').width - 52));
+    const px = Math.max(1, Math.min(1200, Math.floor(document.getElementById('reportOverview').getBoundingClientRect().width - 52)));
     const query = 'action=series&' + selection + '&from_ms=' + Math.floor(request.view[0])
       + '&to_ms=' + Math.ceil(request.view[1]) + '&px=' + px + '&revision=' + reportPlot.summary.data_revision
       + (request.excluded ? '&exclude=' + request.excluded : '');
@@ -1868,19 +1922,40 @@ async function drainReportSeries() {
       : [data.partial ? 'Incomplete chart data.' : '', data.events_truncated ? 'Zoom for more events.' : ''].filter(Boolean).join(' ');
     const plots = document.getElementById('reportPlots');
     const channels = data.channels || [];
-    if (reportPlot.rows.map(row => row.channel).join('|') !== channels.map(channel => channel.id).join('|')) {
+    if (reportPlot.availableChannels.map(c => c.id).join('|') !== channels.map(channel => channel.id).join('|')) {
+      reportPlot.availableChannels = channels.map(({id,label,unit}) => ({id,label,unit}));
+      renderReportChannelOptions();
       plots.replaceChildren(); reportPlot.rows = [];
+      const groups = [];
       for (const channel of channels) {
+        if (channel.unit === 'cmH2O') {
+          const pressure = groups.find(group => group[0].unit === 'cmH2O');
+          if (pressure) pressure.push(channel); else groups.push([channel]);
+        } else groups.push([channel]);
+      }
+      for (const group of groups) {
         const card = document.createElement('div'); card.className = 'chart-card';
         const head = document.createElement('div'); head.className = 'report-chart-head';
-        const title = document.createElement('span'); title.textContent = channel.label + (channel.unit ? ' (' + channel.unit + ')' : '');
+        const channel = group[0];
+        const title = document.createElement('span'); title.textContent = (group.length > 1 ? 'Pressure' : channel.label) + (channel.unit ? ' (' + channel.unit + ')' : '');
         const value = document.createElement('span'); value.className = 'report-chart-value';
         head.append(title,value);
-        const canvas = document.createElement('canvas'); canvas.height = 150;
-        canvas.setAttribute('aria-label', channel.label + ' EDF plot'); canvas.tabIndex = 0;
+        const members = group.map(member => ({id:member.id,title:null,value:null}));
+        if (group.length > 1) {
+          const legend = document.createElement('div'); legend.className = 'report-chart-legend';
+          members.forEach((member,i) => {
+            member.title = document.createElement('span'); member.title.textContent = group[i].label;
+            member.title.style.color = reportChannelColor(member.id);
+            member.value = document.createElement('span'); member.value.className = 'report-chart-value';
+            member.title.append(member.value); legend.append(member.title);
+          });
+          head.append(legend);
+        }
+        const canvas = document.createElement('canvas'); canvas.height = 120;
+        canvas.setAttribute('aria-label', group.map(c => c.label).join(', ') + ' EDF plot'); canvas.tabIndex = 0;
         card.append(head,canvas); plots.append(card);
         bindReportPlot(canvas, false);
-        reportPlot.rows.push({channel:channel.id,canvas,title,value});
+        reportPlot.rows.push({channel:channel.id,channels:members,card,canvas,title,value});
       }
     }
     scheduleReportDraw();
@@ -1893,6 +1968,27 @@ async function drainReportSeries() {
     if (reportPlot.flight === request) reportPlot.flight = null;
     drainReportSeries();
   }
+}
+
+function renderReportChannelOptions() {
+  const options = document.getElementById('reportChannelOptions'); options.replaceChildren();
+  for (const channel of reportPlot.availableChannels) {
+    const button = document.createElement('button'); button.className = 'btn';
+    button.textContent = channel.label;
+    button.setAttribute('aria-pressed',String(!reportPlot.hiddenChannels.has(channel.id)));
+    button.addEventListener('click', () => {
+      if (reportPlot.hiddenChannels.has(channel.id)) reportPlot.hiddenChannels.delete(channel.id);
+      else reportPlot.hiddenChannels.add(channel.id);
+      button.setAttribute('aria-pressed',String(!reportPlot.hiddenChannels.has(channel.id)));
+      scheduleReportDraw();
+    });
+    options.append(button);
+  }
+}
+
+function reportChannelColor(id) {
+  return {flow:'#818cf8',press:'#22d3ee',pressure:'#22d3ee',eprpress:'#fb923c',maskpress:'#4ade80',
+    leak:'#fb923c',minvent:'#4ade80',resprate:'#22d3ee',tidvol:'#cbd5e1',spo2:'#4ade80',pulse:'#e94560'}[String(id).toLowerCase()] || '#22d3ee';
 }
 
 function normalizeReportSeries(data) {
@@ -1955,46 +2051,66 @@ function reportAxes(channels) {
 }
 
 function drawReportEventMarkers(ctx, events, view, x, pad, height, overview) {
-  const colors = {oa:'#22d3ee',ca:'#d946ef',ua:'#a78bfa',h:'#fb923c',rera:'#cbd5e1'};
-  const markers = (events || []).filter(event => colors[String(event.type).toLowerCase()]
-    && Number.isFinite(event.time_ms) && event.time_ms >= view[0]
-    && event.time_ms - (event.duration_ms || 0) <= view[1]).sort((a,b) => a.time_ms-b.time_ms);
+  const colors = {oa:'#22d3ee',ca:'#d946ef',ua:'#a78bfa',h:'#fb923c',rera:'#cbd5e1',
+    csr:'#a78bfa',csr_start:'#a78bfa',csr_end:'#a78bfa'};
+  const markers = (events || []).filter(event => {
+    const type = String(event.type).toLowerCase();
+    return colors[type] && Number.isFinite(event.time_ms) && (event.duration_ms > 0
+      ? (type === 'csr' ? event.time_ms > view[0] : event.time_ms >= view[0]) && event.time_ms-event.duration_ms < view[1]
+      : event.time_ms >= view[0] && event.time_ms < view[1]);
+  }).sort((a,b) => a.time_ms-b.time_ms);
   const lanes = [-Infinity,-Infinity,-Infinity];
   ctx.save();
   ctx.lineWidth = 1; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
   for (const event of markers) {
     const type = String(event.type).toLowerCase(), color = colors[type];
-    const end = x(event.time_ms), start = x(event.time_ms - (event.duration_ms || 0));
+    const end = x(Math.min(view[1],event.time_ms)), start = x(Math.max(view[0],event.time_ms - (event.duration_ms || 0)));
     // EVE marks publication/end; show the preceding duration only when resolved.
     if (end-start >= 4) { ctx.fillStyle = color+'22'; ctx.fillRect(start,pad.t,end-start,height); }
-    if (event.time_ms > view[1]) continue;
-    ctx.strokeStyle = color;
-    ctx.beginPath(); ctx.moveTo(end,pad.t); ctx.lineTo(end,pad.t+height); ctx.stroke();
+    const inView = event.time_ms >= view[0] && event.time_ms < view[1];
+    if (inView) {
+      ctx.strokeStyle = color;
+      ctx.beginPath(); ctx.moveTo(end,pad.t); ctx.lineTo(end,pad.t+height); ctx.stroke();
+    }
     if (overview) continue;
-    const lane = lanes.findIndex(last => end-last >= 12);
+    const labelX = type === 'csr' ? start : end;
+    const lane = lanes.findIndex(last => labelX-last >= 30);
     if (lane < 0) continue; // Keep every marker even when all label lanes are full.
-    lanes[lane] = end;
-    ctx.save(); ctx.translate(end+3,pad.t+4+lane*26); ctx.rotate(Math.PI/2);
-    ctx.fillStyle = color; ctx.fillText(type.toUpperCase(),0,0); ctx.restore();
+    if (!inView && type !== 'csr') continue;
+    lanes[lane] = labelX;
+    ctx.fillStyle = color;
+    ctx.fillText(type === 'csr_start' ? 'CSR+' : type === 'csr_end' ? 'CSR-' : type.toUpperCase(),labelX+3,pad.t+10+lane*12);
   }
   ctx.restore();
 }
 
+function prepareReportCanvas(canvas) {
+  const W = Math.max(100, canvas.getBoundingClientRect().width);
+  const H = Number(canvas.dataset.reportHeight ||= canvas.getAttribute('height') || canvas.height);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.height = H + 'px';
+  if (canvas.width !== Math.round(W*dpr)) canvas.width = Math.round(W*dpr);
+  if (canvas.height !== Math.round(H*dpr)) canvas.height = Math.round(H*dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,W,H};
+}
+
 function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlot.cursor) {
-  const width = Math.max(100, canvas.parentElement.clientWidth - (overview ? 0 : 32));
-  if (canvas.width !== width) canvas.width = width;
-  const ctx = canvas.getContext('2d'), W = canvas.width, H = canvas.height;
+  const {ctx,W,H} = prepareReportCanvas(canvas);
+  const members = (Array.isArray(channel) ? channel : [channel]).filter(Boolean);
+  const firstChannel = members[0];
   const pad = {l:44,r:8,t:18,b:22}, gw = W-pad.l-pad.r, gh = H-pad.t-pad.b;
   const view = overview ? reportPlot.full : reportPlot.view;
   const x = time => pad.l + (time-view[0])/(view[1]-view[0])*gw;
-  const {low,high,step} = reportPlot.axes?.[channel?.id]
-    || reportAxes(data?.channels || [])[channel?.id] || {low:0,high:1,step:0.25};
+  const {low,high,step} = reportPlot.axes?.[firstChannel?.id]
+    || reportAxes(data?.channels || [])[firstChannel?.id] || {low:0,high:1,step:0.25};
   const y = value => pad.t + gh*(1-(value-low)/(high-low));
   ctx.clearRect(0,0,W,H); ctx.fillStyle = '#08081a'; ctx.fillRect(0,0,W,H);
   ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
   ctx.strokeStyle = '#1a1a3a'; ctx.fillStyle = '#777'; ctx.textAlign = 'right';
   ctx.setLineDash([2,4]);
-  for (let i = 0; i <= Math.round((high-low)/step); i++) {
+  for (let i = 0; (overview || members.length) && i <= Math.round((high-low)/step); i++) {
     const v = high-step*i, yy = y(v);
     ctx.beginPath(); ctx.moveTo(pad.l,yy); ctx.lineTo(W-pad.r,yy); ctx.stroke();
     if (!overview) ctx.fillText(reportNumber(v),pad.l-4,yy+3);
@@ -2003,15 +2119,33 @@ function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlo
   ctx.textAlign = 'left'; ctx.fillStyle = color;
   if (overview) ctx.fillText('Overview',pad.l,12);
   ctx.save(); ctx.beginPath(); ctx.rect(pad.l,pad.t,gw,gh); ctx.clip();
-  if (channel && data) {
-    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.2;
-    // Coverage describes this bucket only; never join min/max proxies.
+  for (const member of members) if (data) {
+    const memberColor = members.length > 1 ? reportChannelColor(member.id) : color;
+    ctx.strokeStyle = memberColor; ctx.fillStyle = memberColor; ctx.lineWidth = 1.2;
+    if (String(member.id).toLowerCase() === 'flow') {
+      let previous = null;
+      (member.buckets || []).forEach((bucket,i) => {
+        const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-i*data.bucket_ms);
+        if (!reportBucket(bucket) || !Number.isFinite(bucket[2]) || bucket[2] < expected || expected <= 0) { previous = null; return; }
+        const xx = x(data.from_ms+(i+0.5)*data.bucket_ms);
+        if (previous) {
+          // Join only envelope edges, never a fabricated midpoint waveform.
+          ctx.globalAlpha = 0.18;
+          ctx.beginPath(); ctx.moveTo(previous.x,y(previous.bucket[0])); ctx.lineTo(xx,y(bucket[0]));
+          ctx.lineTo(xx,y(bucket[1])); ctx.lineTo(previous.x,y(previous.bucket[1])); ctx.closePath(); ctx.fill();
+          ctx.globalAlpha = 0.65;
+          ctx.beginPath(); ctx.moveTo(previous.x,y(previous.bucket[0])); ctx.lineTo(xx,y(bucket[0]));
+          ctx.moveTo(previous.x,y(previous.bucket[1])); ctx.lineTo(xx,y(bucket[1])); ctx.stroke();
+        }
+        previous = {x:xx,bucket};
+      });
+    }
     for (const partial of [false,true]) {
       ctx.globalAlpha = partial ? 0.45 : 1; ctx.beginPath();
-      (channel.buckets || []).forEach((bucket,i) => {
+      (member.buckets || []).forEach((bucket,i) => {
         if (!reportBucket(bucket)) return;
         const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-i*data.bucket_ms);
-        if ((Number.isFinite(bucket[2]) && bucket[2] < expected) !== partial) return;
+        if ((!Number.isFinite(bucket[2]) || bucket[2] < expected) !== partial) return;
         const xx = x(data.from_ms+(i+0.5)*data.bucket_ms);
         ctx.moveTo(xx,y(bucket[0])); ctx.lineTo(xx,y(bucket[1]));
         if (bucket[0] === bucket[1]) ctx.fillRect(xx-0.5,y(bucket[0])-0.5,1,1);
@@ -2020,7 +2154,7 @@ function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlo
     }
     ctx.globalAlpha = 1;
   }
-  drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,overview);
+  drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,overview || members.length > 0);
   if (overview) {
     const left = x(reportPlot.view[0]), right = x(reportPlot.view[1]);
     ctx.fillStyle = '#22d3ee22'; ctx.fillRect(left,pad.t,right-left,gh);
@@ -2049,22 +2183,31 @@ function drawEdfChart(canvas, channel, data, overview, color, cursor = reportPlo
 }
 
 function drawReportPlots() {
-  const colors = ['#818cf8','#22d3ee','#fb923c','#4ade80','#e94560'];
   const overview = reportPlot.overview;
   const current = reportPlot.series, view = reportPlot.view;
   const data = current && overview && (view[0] < current.from_ms || view[1] > current.to_ms) ? overview : current;
   const cursor = reportPlot.cursor !== null && reportPlot.summary.sessions.some(s => !reportPlot.hiddenSessions.has(s.id)
     && reportPlot.cursor >= s.start_ms && reportPlot.cursor < s.end_ms) ? reportPlot.cursor : null;
-  drawEdfChart(document.getElementById('reportOverview'), overview?.channels?.[0], overview, true, colors[1],cursor);
-  reportPlot.rows.forEach((row,i) => {
-    const channel = data?.channels?.find(c => c.id === row.channel);
-    drawEdfChart(row.canvas,channel || {id:row.channel},data,false,colors[i%colors.length],cursor);
-    row.title.style.color = colors[i%colors.length];
+  drawEdfChart(document.getElementById('reportOverview'), overview?.channels?.[0], overview, true, '#22d3ee',cursor);
+  document.getElementById('reportEventCard').hidden = !data?.events?.length;
+  if (data?.events?.length) drawEdfChart(document.getElementById('reportEventStrip'),null,data,false,'#22d3ee',cursor);
+  reportPlot.rows.forEach(row => {
+    const members = row.channels || [{id:row.channel,title:row.title,value:row.value}];
+    const shown = members.filter(member => !reportPlot.hiddenChannels.has(member.id));
+    if (row.card) row.card.hidden = !shown.length;
+    for (const member of members) if (member.title) member.title.hidden = !shown.includes(member);
+    if (!shown.length) return;
+    const channels = shown.map(member => data?.channels?.find(c => c.id === member.id) || {id:member.id});
+    drawEdfChart(row.canvas,channels,data,false,reportChannelColor(shown[0].id),cursor);
+    row.title.style.color = members.length > 1 ? '' : reportChannelColor(shown[0].id);
     const index = cursor !== null && data ? Math.floor((cursor-data.from_ms)/data.bucket_ms) : -1;
-    const bucket = channel?.buckets[index];
-    const low = reportBucket(bucket) ? reportNumber(bucket[0]) : '--';
-    const high = reportBucket(bucket) ? reportNumber(bucket[1]) : '--';
-    row.value.textContent = cursor === null ? '' : low === high ? low : low + '..' + high;
+    shown.forEach((member,i) => {
+      const bucket = channels[i].buckets?.[index];
+      const low = reportBucket(bucket) ? reportNumber(bucket[0]) : '--';
+      const high = reportBucket(bucket) ? reportNumber(bucket[1]) : '--';
+      const text = cursor === null ? '' : low === high ? low : low + '..' + high;
+      (member.value || row.value).textContent = text ? (members.length > 1 ? ' ' : '') + text : '';
+    });
   });
   document.getElementById('reportRange').textContent = reportTime(reportPlot.view[0]) + ' to ' + reportTime(reportPlot.view[1]);
   document.getElementById('reportCursor').textContent = cursor === null ? '' : reportTime(cursor).slice(11);
@@ -2072,7 +2215,7 @@ function drawReportPlots() {
 
 function reportPointerX(canvas, clientX) {
   const rect = canvas.getBoundingClientRect();
-  return Math.max(0,Math.min(1,((clientX-rect.left)*canvas.width/rect.width-44)/(canvas.width-52)));
+  return Math.max(0,Math.min(1,(clientX-rect.left-44)/(Math.max(100,rect.width)-52)));
 }
 
 function bindReportPlot(canvas, overview) {
@@ -2091,30 +2234,40 @@ function bindReportPlot(canvas, overview) {
     e.preventDefault();
   });
   canvas.addEventListener('pointerdown', e => {
-    if (!reportPlot.view || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    if (reportLoading || !reportPlot.view || (e.pointerType === 'mouse' && e.button !== 0)) return;
     if ((reportPlot.gesture && reportPlot.gesture.canvas !== canvas) || reportPlot.pointers.size >= 2) return;
-    e.preventDefault(); canvas.setPointerCapture(e.pointerId);
+    if (e.pointerType !== 'touch') { e.preventDefault(); canvas.setPointerCapture(e.pointerId); }
     canvas.focus({preventScroll:true});
     const x = reportPointerX(canvas,e.clientX);
     reportPlot.pointers.set(e.pointerId,x);
     const full = reportPlot.full, view = reportPlot.view;
     const time = full[0]+x*(full[1]-full[0]);
-    const tolerance = 10/(canvas.width-52)*(full[1]-full[0]);
+    const logicalWidth = Math.max(100,canvas.getBoundingClientRect().width);
+    const tolerance = 10/(logicalWidth-52)*(full[1]-full[0]);
     const mode = reportPlot.pointers.size === 2 ? 'pinch' : !overview ? 'select' : Math.abs(time-view[0]) <= tolerance ? 'left'
       : Math.abs(time-view[1]) <= tolerance ? 'right'
       : !e.shiftKey && view[1]-view[0] < full[1]-full[0] && time > view[0] && time < view[1] ? 'move' : 'select';
-    const minimum = 5*canvas.width/(canvas.getBoundingClientRect().width*(canvas.width-52));
+    const minimum = 5/(logicalWidth-52);
     reportPlot.gesture = {canvas,overview,mode,view:[...view],points:[...reportPlot.pointers.values()],anchor:time,
       initialView:reportPlot.gesture?.initialView || [...view],initialSerial:reportPlot.gesture?.initialSerial ?? reportPlot.serial,
-      minimum,selection:null};
+      minimum,selection:null,awaitDirection:e.pointerType === 'touch' && reportPlot.pointers.size === 1,
+      origin:[e.clientX,e.clientY]};
+    if (reportPlot.pointers.size === 2) for (const id of reportPlot.pointers.keys()) canvas.setPointerCapture(id);
     scheduleReportDraw();
   });
   const move = e => {
-    if (!reportPlot.view) return;
+    if (reportLoading || !reportPlot.view) return;
+    const gesture = reportPlot.gesture;
+    if (gesture?.canvas === canvas && gesture.awaitDirection) {
+      const dx = Math.abs(e.clientX-gesture.origin[0]), dy = Math.abs(e.clientY-gesture.origin[1]);
+      if (dy >= 5 && dy > dx) { release(e,true); return; }
+      if (dx < 5) return;
+      gesture.awaitDirection = false;
+      canvas.setPointerCapture(e.pointerId);
+    }
     const x = reportPointerX(canvas,e.clientX);
     const range = overview ? reportPlot.full : reportPlot.view;
     reportPlot.cursor = range[0]+x*(range[1]-range[0]);
-    const gesture = reportPlot.gesture;
     if (gesture && gesture.canvas === canvas && reportPlot.pointers.has(e.pointerId)) {
       reportPlot.pointers.set(e.pointerId,x);
       const points = [...reportPlot.pointers.values()], base = gesture.points, view = gesture.view;
