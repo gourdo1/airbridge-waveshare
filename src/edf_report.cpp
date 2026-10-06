@@ -59,6 +59,7 @@ Result::Result(Result &&other) noexcept
 #include "air10_clock.h"
 #include "airsense_state.h"
 #include "edf_catalog.h"
+#include "debug_log.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
 #include "hex_util.h"
@@ -187,6 +188,33 @@ struct Job {
     int code = 0;
     Payload body;
 };
+
+struct JobTiming {
+    bool enabled;
+    uint32_t id, started_us;
+    Action action;
+    uint32_t index_us = 0, numeric_us = 0, events_us = 0, encode_us = 0;
+
+    explicit JobTiming(const Job *job)
+        : enabled(job && Log::get_cat_level(CAT_EDF) >= LOG_DEBUG),
+          id(job ? job->id : 0), started_us(stamp()),
+          action(job ? job->request.action : Action::Days) {}
+
+    uint32_t stamp() const { return enabled ? micros() : 0; }
+
+    void log(int code, size_t bytes) const {
+        if (!enabled) return;
+        Log::logf(CAT_EDF, LOG_DEBUG,
+            "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
+            "idx=%lu num=%lu evt=%lu enc=%lu\n",
+            static_cast<unsigned long>(id), action == Action::Days ? "days" :
+                action == Action::Summary ? "summary" : "series", code,
+            static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
+            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(numeric_us / 1000),
+            static_cast<unsigned long>(events_us / 1000), static_cast<unsigned long>(encode_us / 1000));
+    }
+};
+
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr, wake = nullptr;
 TaskHandle_t worker_task = nullptr;
@@ -1304,8 +1332,21 @@ void series_channel_json(Payload &out, const Series &series, size_t channel) {
     };
     auto visit_runs = [&](auto &&visit) {
         char value[64], next[64];
+        const auto *buckets = series.buckets + channel * series.px;
         size_t begin = 0, length = format_bucket(0, value);
         for (size_t at = 1; at <= series.px; ++at) {
+            if (at < series.px) {
+                const auto &bucket = buckets[at], &previous = buckets[at - 1];
+                const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
+                    (series.from_ms + int64_t(at) * series.step_ms));
+                // The preceding bucket cannot be the clipped tail. Bitwise
+                // float equality also distinguishes +0 from -0.
+                if (std::min(bucket.covered_ms, expected) ==
+                    std::min(previous.covered_ms, static_cast<uint64_t>(series.step_ms)) &&
+                    !memcmp(&bucket.low, &previous.low, sizeof(bucket.low)) &&
+                    !memcmp(&bucket.high, &previous.high, sizeof(bucket.high)))
+                    continue;
+            }
             const size_t next_length = at < series.px ? format_bucket(at, next) : 0;
             // Compare wire values, including tail-clipped coverage and the
             // existing seven-significant-digit representation, not raw floats.
@@ -1513,8 +1554,10 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     return out.good();
 }
 
-bool series_json(const SdStorage::Session &session, Job &job) {
+bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing) {
+    uint32_t started = timing.stamp();
     Series series(job.request);
+    timing.numeric_us += timing.stamp() - started;
     if (!series.buckets) return false;
     Payload events;
     bool event_comma = false, events_truncated = false;
@@ -1528,8 +1571,10 @@ bool series_json(const SdStorage::Session &session, Job &job) {
              (entry.event_to_ms < series.from_ms || entry.event_from_ms >= series.to_ms))) continue;
         if (aborted(&job, session)) return false;
         if (!(entry.key.present & 7)) { series.partial = true; continue; }
+        started = timing.stamp();
         CacheHeader header;
         if (!cached_summary_header(session, entry, header) && !build_summary_header(session, job, entry, header)) {
+            timing.numeric_us += timing.stamp() - started;
             if (aborted(&job, session)) return false;
             series.partial = true;
             continue;
@@ -1546,13 +1591,17 @@ bool series_json(const SdStorage::Session &session, Job &job) {
             (entry.end_ms > series.from_ms && entry.start_ms < series.to_ms);
         const bool success = !numeric_overlap || (series.level_ms ? cached_series(session, job, entry, series)
                                                                   : window_series(session, job, entry, series));
+        timing.numeric_us += timing.stamp() - started;
         if (!success) {
             if (aborted(&job, session)) return false;
             series.partial = true;
         }
+        started = timing.stamp();
         if (!window_events(session, job, entry, header, series.from_ms, series.to_ms,
                            events, event_comma, events_truncated)) series.partial = true;
+        timing.events_us += timing.stamp() - started;
     }
+    started = timing.stamp();
     start_json(job.body, revision() + 1, job.data_revision);
     job.body.print("\"excluded\":\"");
     size_t mask_bytes = sizeof(job.request.excluded);
@@ -1579,6 +1628,7 @@ bool series_json(const SdStorage::Session &session, Job &job) {
     job.body.print("],\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
     if (events.length()) job.body.append(events.c_str(), events.length());
     job.body.print("]}");
+    timing.encode_us += timing.stamp() - started;
     return job.body.good() && events.good();
 }
 
@@ -1622,8 +1672,12 @@ bool work_once() {
     if (!job && !dirty()) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
+    JobTiming timing(job);
     publish(State::Building);
-    if (!refresh_index(session)) {
+    const uint32_t index_started = timing.stamp();
+    const bool indexed = refresh_index(session);
+    timing.index_us = timing.stamp() - index_started;
+    if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
         session.end();
         if (preempted || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
@@ -1637,10 +1691,13 @@ bool work_once() {
                 error_body(*job, job->cancelled ? 410 : 503, job->cancelled ? "cancelled" : "index_unavailable");
                 job->state = JobState::Complete;
                 job->completed_ms = millis();
+                const int code = job->code;
+                const size_t bytes = job->body.length();
                 xSemaphoreGive(mutex);
                 portENTER_CRITICAL(&status_mux);
                 ++status.revision;
                 portEXIT_CRITICAL(&status_mux);
+                timing.log(code, bytes);
             }
             publish(State::Error, "index_unavailable");
             return job != nullptr;
@@ -1663,7 +1720,7 @@ bool work_once() {
         error_body(*job, 409, "stale_revision");
     else {
         success = job->request.action == Action::Days ? days_json(*job) :
-            job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job);
+            job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
         if (success) job->code = 200;
     }
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();
@@ -1685,11 +1742,14 @@ bool work_once() {
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
     job->state = JobState::Complete;
     job->completed_ms = millis();
+    const int code = job->code;
+    const size_t bytes = job->body.length();
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
     publish(State::Ready);
+    timing.log(code, bytes);
     return true;
 }
 
