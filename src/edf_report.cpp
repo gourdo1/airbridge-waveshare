@@ -839,10 +839,10 @@ void start_json(Payload &body, uint32_t publication, uint32_t dataset) {
     body.print("{\"source\":\"edf\",\"revision\":%u,\"data_revision\":%u,",
                publication, dataset);
 }
-void append_event(Payload &body, const Event &event, bool &comma) {
+void append_event(Payload &body, const Event &event, bool &comma, const char *type = nullptr) {
     body.print("%s{\"time_ms\":%lld,\"duration_ms\":%lld,\"type\":\"%s\"}",
                comma ? "," : "", static_cast<long long>(event.time_ms),
-               static_cast<long long>(event.duration_ms), event_name(event.kind));
+               static_cast<long long>(event.duration_ms), type ? type : event_name(event.kind));
     comma = true;
 }
 
@@ -1443,14 +1443,39 @@ bool window_events(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, const CacheHeader &header,
                    int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated) {
     if (truncated) return true;
-    auto append = [&](const Event &event) {
-        const bool intersects = event.duration_ms > 0 ?
+    auto append = [&](const Event &event, const char *type = nullptr) {
+        const bool intersects = type ?
+            event.time_ms > from && event.time_ms - event.duration_ms < to :
+            event.duration_ms > 0 ?
             event.time_ms >= from && event.time_ms - event.duration_ms < to :
             event.time_ms >= from && event.time_ms < to;
         if (event.kind == ReportEdf::EventKind::Unknown || !intersects)
             return;
         if (out.length() > MAX_BODY / 4 - 256) { truncated = true; return; }
-        append_event(out, event, comma);
+        append_event(out, event, comma, type);
+    };
+    // Pair before viewport filtering, retaining only one pending start per
+    // session. A repeated start leaves the preceding boundary unmatched.
+    Event csr_start;
+    bool csr_active = false;
+    auto consume = [&](const Event &event) {
+        if (event.kind == ReportEdf::EventKind::CsrStart) {
+            if (csr_active) append(csr_start);
+            csr_start = event;
+            csr_active = true;
+        } else if (event.kind == ReportEdf::EventKind::CsrEnd) {
+            if (csr_active && event.time_ms > csr_start.time_ms) {
+                Event interval = event;
+                interval.duration_ms = event.time_ms - csr_start.time_ms;
+                append(interval, "csr");
+            } else {
+                if (csr_active) append(csr_start);
+                append(event);
+            }
+            csr_active = false;
+        } else {
+            append(event);
+        }
     };
     char path[96];
     cache_path(entry, "stats", path);
@@ -1462,10 +1487,11 @@ bool window_events(const SdStorage::Session &session, const Job &job,
             const size_t take = std::min<uint32_t>(32, header.events - n);
             if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(block),
                 take * sizeof(Event)) != take * sizeof(Event)) return false;
-            for (size_t i = 0; i < take; ++i) append(block[i]);
+            for (size_t i = 0; i < take; ++i) consume(block[i]);
             if (truncated) return out.good();
             n += take;
         }
+        if (csr_active) append(csr_start);
         return out.good();
     }
     reader.close();
@@ -1478,11 +1504,12 @@ bool window_events(const SdStorage::Session &session, const Job &job,
         for (uint32_t i = 0; i < input.header->records; ++i) {
             Event event;
             if (!read_event(input, i, event)) return false;
-            append(event);
+            consume(event);
             if (truncated) return out.good();
         }
         input.file.close();
     }
+    if (csr_active) append(csr_start);
     return out.good();
 }
 
