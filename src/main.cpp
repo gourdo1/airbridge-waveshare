@@ -10,6 +10,7 @@
 #include "oxi_udp.h"
 #include "oxi_arbiter.h"
 #include "airbridge_ota.h"
+#include "factory_reset.h"
 #include "tls_memory.h"
 #include "web_ui.h"
 #include "qframe.h"
@@ -97,6 +98,12 @@ void setup() {
     delay(500);
     while (Serial.available()) Serial.read();  // flush boot garbage
     Log::init();
+    if (!FactoryReset::run_pending_on_boot()) {
+        for (;;) {
+            Log::poll();
+            delay(1000);
+        }
+    }
 
     if (!aircannect::TlsMemory::begin())
         Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
@@ -111,6 +118,7 @@ void setup() {
     NetworkHints::init();
     Config::load();
     Log::logf(CAT_CONFIG, LOG_DEBUG, "Configuration loaded\n");
+    OtaManager::init();
 
     SdStorage::init();
     CustomSettings::init();
@@ -131,8 +139,6 @@ void setup() {
 
         if (cfg.http_port > 0 && cfg.http_port != cfg.tcp_port)
             WebUI::init(cfg.http_port);
-
-        OtaManager::init();
     }
 
     // If NTP didn't sync, fall back to resmed device clock

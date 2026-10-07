@@ -3,6 +3,7 @@
 #include "debug_log.h"
 #include "app_config.h"
 #include "build_info.h"
+#include "airbridge_ota.h"
 #include "live_stream.h"
 #include "memory_manager.h"
 #include <WiFi.h>
@@ -347,8 +348,21 @@ static void handle_transparent() {
         return;
     }
 
+    if (OtaManager::busy()) {
+        client.println("ERR: transparent mode blocked during OTA/reboot");
+        return;
+    }
+
     TransparentOutput output;
     Arbiter::enter_transparent(&output);
+
+    // Publish raw mode before rechecking a racing factory reboot reservation.
+    if (OtaManager::busy()) {
+        Arbiter::exit_transparent();
+        client.println("ERR: transparent mode blocked during OTA/reboot");
+        return;
+    }
+
     client.println("OK: entering transparent mode (idle timeout 5s)");
 
     static const uint32_t TRANSPARENT_IDLE_TIMEOUT = 5000;

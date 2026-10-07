@@ -22,7 +22,10 @@ namespace OtaManager {
 
     void init();
     void handle();
-    void request_reboot();  // Deferred to handle(); repeated requests coalesce.
+    // Normal requests retain reboot/coalescing behavior during OTA. Prepared
+    // requests require an idle lease and the running image selected for boot.
+    // Preparation runs in handle(); it cannot replace any pending reboot.
+    bool request_reboot(bool (*prepare)() = nullptr);
 
     bool request_check(const char **error = nullptr);
     bool request_install(const char **error = nullptr);

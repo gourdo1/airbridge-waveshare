@@ -49,6 +49,11 @@ inline void put_le32(uint8_t *data, uint32_t value) {
 
 bool write_exact(fs::File &file, const uint8_t *data, size_t size);
 
+// Boot coordinator only, before init or any worker/network/recorder starts.
+// Replaces the card partition table and creates one empty FAT32 partition.
+// Logical format, not secure erase. Leaves the card unmounted; false on failure
+// or unsupported builds. Once init is attempted, formatting is forbidden.
+bool factory_format();
 void init();
 bool mounted();
 fs::FS *filesystem();

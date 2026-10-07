@@ -12,6 +12,12 @@
 #include <FS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <driver/sdmmc_host.h>
+#include <sdmmc_cmd.h>
+#include <ff.h>
+#include <diskio_impl.h>
+#include <diskio_sdmmc.h>
+#include <esp_heap_caps.h>
 #include "memory_manager.h"
 #include "uart_arbiter.h"
 #include "airsense_state.h"
@@ -32,6 +38,9 @@ static uint32_t file_mutation_revision = 0;
 
 #if AB_STORAGE_HAS_SDCARD
 namespace {
+bool init_started = false;
+bool formatting = false;
+
 struct Request {
     enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End } kind;
     bool (*operation)(fs::FS &, void *);
@@ -183,8 +192,142 @@ static void mount_error(const char *message) {
 }
 #endif
 
+bool factory_format() {
+#if AB_STORAGE_HAS_SDCARD
+    portENTER_CRITICAL(&status_mux);
+    const bool allowed = !init_started && !formatting && !status.mounted &&
+        !__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&active_session, __ATOMIC_ACQUIRE);
+    if (allowed) formatting = true;
+    portEXIT_CRITICAL(&status_mux);
+    if (!allowed) {
+        mount_error("format requires pre-init boot");
+        Log::logf(CAT_STORAGE, LOG_WARN, "format requires pre-init boot\n");
+        return false;
+    }
+
+    constexpr size_t work_bytes = 4096;
+    static_assert(FF_MAX_SS <= work_bytes, "SD format work buffer too small");
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.flags = AB_SDMMC_WIDTH == 1 ? SDMMC_HOST_FLAG_1BIT : SDMMC_HOST_FLAG_4BIT;
+    host.max_freq_khz = AB_SDMMC_FREQ_KHZ;
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = AB_SDMMC_WIDTH;
+    slot.clk = static_cast<gpio_num_t>(AB_SDMMC_CLK_GPIO);
+    slot.cmd = static_cast<gpio_num_t>(AB_SDMMC_CMD_GPIO);
+    slot.d0 = static_cast<gpio_num_t>(AB_SDMMC_D0_GPIO);
+    slot.d1 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D1_GPIO);
+    slot.d2 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D2_GPIO);
+    slot.d3 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D3_GPIO);
+
+    sdmmc_card_t card = {};
+    BYTE pdrv = FF_DRV_NOT_USED;
+    PARTITION previous_partition = {};
+    void *work = nullptr;
+    bool host_started = false;
+    bool disk_registered = false;
+    const char *step = "host state";
+    int result = ESP_OK;
+    const bool formatted = [&]() {
+        sdmmc_host_state_t host_state = {};
+        result = sdmmc_host_get_state(&host_state);
+        if (result != ESP_OK) return false;
+        if (host_state.host_initialized) {
+            result = ESP_ERR_INVALID_STATE;
+            return false;
+        }
+
+        // DMA-capable internal memory avoids card-sized allocation and bounce I/O.
+        step = "buffer";
+        work = heap_caps_malloc(work_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!work) { result = ESP_ERR_NO_MEM; return false; }
+        step = "drive";
+        result = ff_diskio_get_drive(&pdrv);
+        if (result != ESP_OK) return false;
+        step = "host init";
+        result = sdmmc_host_init();
+        if (result != ESP_OK) return false;
+        host_started = true;
+        step = "slot init";
+        result = sdmmc_host_init_slot(host.slot, &slot);
+        if (result != ESP_OK) return false;
+        step = "card init";
+        result = sdmmc_card_init(&host, &card);
+        if (result != ESP_OK) return false;
+        step = "card type";
+        // MMC can trigger a whole-volume trim in the SDK diskio formatter path.
+        if (card.is_mmc || card.is_sdio) {
+            result = ESP_ERR_NOT_SUPPORTED;
+            return false;
+        }
+        step = "card geometry";
+        if (card.csd.sector_size != 512 || card.csd.capacity < 2) {
+            result = ESP_ERR_NOT_SUPPORTED;
+            return false;
+        }
+
+        ff_diskio_register_sdmmc(pdrv, &card);
+        disk_registered = true;
+        previous_partition = VolToPart[pdrv];
+        VolToPart[pdrv] = {pdrv, 1};
+        const char drive[] = {static_cast<char>('0' + pdrv), ':', 0};
+        const LBA_t partitions[] = {100, 0, 0, 0};
+        step = "partition";
+        result = f_fdisk(pdrv, partitions, work);
+        if (result != FR_OK) return false;
+        // f_fdisk writes only the MBR; invalidate old GPT headers without a full erase.
+        memset(work, 0, card.csd.sector_size);
+        step = "GPT headers";
+        result = sdmmc_write_sectors(&card, work, 1, 1);
+        if (result != ESP_OK) return false;
+        result = sdmmc_write_sectors(&card, work, card.csd.capacity - 1, 1);
+        if (result != ESP_OK) return false;
+        // Force partition 1 of the new table, never an old detected volume or SFD.
+        const MKFS_PARM options = {FM_FAT32, 2, 0, 0, 0};
+        step = "FAT32";
+        result = f_mkfs(drive, &options, work, work_bytes);
+        return result == FR_OK;
+    }();
+
+    if (disk_registered) {
+        VolToPart[pdrv] = previous_partition;
+        ff_diskio_unregister(pdrv);
+    }
+    bool success = formatted;
+    if (host_started) {
+        const esp_err_t shutdown = sdmmc_host_deinit();
+        if (shutdown != ESP_OK) {
+            Log::logf(CAT_STORAGE, LOG_ERROR, "format host shutdown failed (%d)\n", shutdown);
+            if (success) { step = "host shutdown"; result = shutdown; }
+            success = false;
+        }
+    }
+    heap_caps_free(work);
+
+    char error[sizeof(status.error)] = {};
+    if (!success) snprintf(error, sizeof(error), "format %s failed (%d)", step, result);
+    mount_error(error);
+    portENTER_CRITICAL(&status_mux);
+    formatting = false;
+    portEXIT_CRITICAL(&status_mux);
+    Log::logf(CAT_STORAGE, success ? LOG_INFO : LOG_ERROR,
+              success ? "new SD partition table and empty FAT32 created\n" : "%s\n", error);
+    return success;
+#else
+    return false;
+#endif
+}
+
 void init() {
 #if AB_STORAGE_HAS_SDCARD
+    portENTER_CRITICAL(&status_mux);
+    const bool busy = formatting;
+    if (!busy) init_started = true;
+    portEXIT_CRITICAL(&status_mux);
+    if (busy) {
+        Log::logf(CAT_STORAGE, LOG_WARN, "mount deferred during factory format\n");
+        return;
+    }
     if (mounted()) return;
     if (!init_worker())
         Log::logf(CAT_STORAGE, LOG_WARN, "auxiliary I/O unavailable; recorder only\n");
