@@ -131,7 +131,10 @@ static void poll_local() {
     static char serial_pending[160];
     static size_t serial_pos = 0, serial_len = 0;
     for (size_t i = 0; i < SYSLOG_SEND_BUDGET; i++) {
-        int room = Serial.availableForWrite();
+        const bool serial_ready = (bool)Serial;
+        // An absent USB receiver is not a stalled sink; discard its pending tail.
+        if (!serial_ready) serial_pos = serial_len = 0;
+        int room = serial_ready ? Serial.availableForWrite() : 0;
         if (room > 0 && serial_pos < serial_len) {
             size_t remaining = serial_len - serial_pos;
             size_t count = remaining < (size_t)room ? remaining : (size_t)room;
@@ -153,6 +156,7 @@ static void poll_local() {
         for (int j = 0; j < output_count; j++)
             outputs[j]->write((const uint8_t *)line, len);
         xSemaphoreGive(log_mutex);
+        if (!serial_ready) continue;
         if (serial_pos == serial_len) {
             memcpy(serial_pending, line, len);
             serial_pos = 0;
