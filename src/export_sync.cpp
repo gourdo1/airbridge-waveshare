@@ -879,6 +879,20 @@ static void run_check(const Request &request) {
               error[0] ? ": " : "", error);
 }
 
+static void log_backlog_result(const char *destination, const Backlog &previous,
+                               const Backlog &current) {
+    const auto failed = [](const Backlog &value) {
+        return !value.known && value.error[0] &&
+            strcmp(value.error, "endpoint_missing") && strcmp(value.error, "credentials_missing");
+    };
+    if (failed(current) && (!failed(previous) || strcmp(previous.error, current.error)))
+        Log::logf(CAT_EXPORT, LOG_WARN, "[%s] Backlog failed generation=%lu: %s\n",
+            destination, (unsigned long)current.catalog_generation, current.error);
+    else if (current.known && failed(previous))
+        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Backlog recovered files=%lu\n",
+            destination, (unsigned long)current.files);
+}
+
 static void refresh_backlog() {
     EdfCatalog::Changes changes;
     const bool incremental = EdfCatalog::changes_since(backlog_catalog_generation, changes);
@@ -1023,12 +1037,17 @@ static void refresh_backlog() {
         return;
     }
     storage.end();
+    Backlog previous_smb, previous_shq;
     portENTER_CRITICAL(&status_mux);
+    previous_smb = status.backlog;
     status.backlog = smb;
     portEXIT_CRITICAL(&status_mux);
     portENTER_CRITICAL(&sleephq_status_mux);
+    previous_shq = sleephq_status.backlog;
     sleephq_status.backlog = shq;
     portEXIT_CRITICAL(&sleephq_status_mux);
+    log_backlog_result("SMB", previous_smb, smb);
+    log_backlog_result("SleepHQ", previous_shq, shq);
     publish_change();
 }
 
