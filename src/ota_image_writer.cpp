@@ -35,8 +35,11 @@ void Writer::abort() {
     write_buffer_ = nullptr;
 }
 
-bool Writer::fail(const char *error) {
-    status_.error = error;
+bool Writer::fail(const char *error, const char *stage) {
+    if (!status_.error) {
+        status_.error = error;
+        status_.error_stage = stage;
+    }
     abort();
     return false;
 }
@@ -50,17 +53,17 @@ bool Writer::begin(size_t wire_size, size_t image_size, Encoding encoding) {
     probe_size_ = 0;
     finished_ = false;
     partition_ = esp_ota_get_next_update_partition(nullptr);
-    if (!partition_) return fail("ota_partition_missing");
-    if (image_size > partition_->size) return fail("artifact_too_large");
+    if (!partition_) return fail("ota_partition_missing", "begin");
+    if (image_size > partition_->size) return fail("artifact_too_large", "begin");
     snprintf(status_.partition, sizeof(status_.partition), "%s", partition_->label);
 
     // IDF otherwise copies PSRAM data through a 32-byte bounce buffer.
     write_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(
         WRITE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!write_buffer_) return fail("ota_buffer_alloc_failed");
+    if (!write_buffer_) return fail("ota_buffer_alloc_failed", "begin");
     erased_ = std::min(ERASE_BYTES, size_t(partition_->size));
     esp_err_t err = esp_ota_begin(partition_, erased_, &handle_);
-    return err == ESP_OK || fail(esp_err_to_name(err));
+    return err == ESP_OK || fail(esp_err_to_name(err), "begin");
 }
 
 bool Writer::resolve_encoding() {
@@ -94,22 +97,22 @@ bool Writer::resolve_encoding() {
 
 bool Writer::write_image(const uint8_t *data, size_t len) {
     if (!len) return true;
-    if (status_.bytes == 0 && data[0] != 0xe9) return fail("bad_esp32_image");
+    if (status_.bytes == 0 && data[0] != 0xe9) return fail("bad_esp32_image", "write");
     if (len > partition_->size - status_.bytes ||
         (image_size_ && len > image_size_ - status_.bytes))
-        return fail("upload_overrun");
+        return fail("upload_overrun", "write");
 
     while (len) {
         const size_t chunk = std::min(WRITE_BYTES, len);
         while (erased_ < status_.bytes + chunk) {
             const size_t erase = std::min(ERASE_BYTES, size_t(partition_->size) - erased_);
             esp_err_t err = esp_partition_erase_range(partition_, erased_, erase);
-            if (err != ESP_OK) return fail(esp_err_to_name(err));
+            if (err != ESP_OK) return fail(esp_err_to_name(err), "erase");
             erased_ += erase;
         }
         memcpy(write_buffer_, data, chunk);
         esp_err_t err = esp_ota_write(handle_, write_buffer_, chunk);
-        if (err != ESP_OK) return fail(esp_err_to_name(err));
+        if (err != ESP_OK) return fail(esp_err_to_name(err), "write");
         status_.bytes += chunk;
         data += chunk;
         len -= chunk;
@@ -162,9 +165,9 @@ bool Writer::write(size_t index, const uint8_t *data, size_t len) {
     if (!handle_ || status_.error) return false;
     if (index != status_.wire_bytes || len > SIZE_MAX - index ||
         (wire_size_ && (index > wire_size_ || len > wire_size_ - index)))
-        return fail("upload_offset_or_size_mismatch");
+        return fail("upload_offset_or_size_mismatch", "input");
     if (!len) return true;
-    if (!data) return fail("upload_data_missing");
+    if (!data) return fail("upload_data_missing", "input");
     const size_t received = len;
     if (status_.encoding == Encoding::Auto) {
         const size_t count = std::min(sizeof(probe_) - probe_size_, len);
@@ -186,13 +189,14 @@ bool Writer::finish() {
     if (status_.encoding == Encoding::Auto || status_.bytes == 0 ||
         (wire_size_ && status_.wire_bytes != wire_size_) ||
         (image_size_ && status_.bytes != image_size_))
-        return fail("incomplete_upload");
+        return fail("incomplete_upload", "finish");
     if (status_.encoding == Encoding::Zlib && !finished_)
-        return fail("zlib_stream_incomplete");
+        return fail("zlib_stream_incomplete", "finish");
     esp_err_t err = esp_ota_end(handle_);
     handle_ = 0;
-    if (err == ESP_OK) err = esp_ota_set_boot_partition(partition_);
-    if (err != ESP_OK) return fail(esp_err_to_name(err));
+    if (err != ESP_OK) return fail(esp_err_to_name(err), "validate");
+    err = esp_ota_set_boot_partition(partition_);
+    if (err != ESP_OK) return fail(esp_err_to_name(err), "boot");
     abort();
     return true;
 }

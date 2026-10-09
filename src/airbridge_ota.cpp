@@ -45,6 +45,7 @@ struct RuntimeStatus {
     bool enabled = false;
     State result = State::Idle;
     bool reboot_pending = false;
+    bool (*reboot_prepare)() = nullptr;
     size_t bytes = 0;
     size_t total_size = 0;
     uint32_t last_check_ms = 0;
@@ -52,6 +53,7 @@ struct RuntimeStatus {
     uint32_t reboot_at_ms = 0;
     uint32_t resmed_claimed_at_ms = 0;
     bool resmed_started = false;
+    bool manual_image_started = false;
     Operation operation = OP_NONE;
     char update_version[OtaRelease::VERSION_MAX] = {};
     char error[64] = {};
@@ -85,6 +87,14 @@ void set_error_locked(const char *error) {
 
 bool deadline_due(uint32_t now, uint32_t deadline) {
     return deadline && (int32_t)(now - deadline) >= 0;
+}
+
+const char *reboot_image_blocked() {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    if (!running) return "running_image_unavailable";
+    if (!boot) return "boot_image_unavailable";
+    return running->address != boot->address ? "different_boot_image_selected" : nullptr;
 }
 
 bool operation_allowed() {
@@ -344,7 +354,7 @@ void init() {
     auto &cfg = Config::get();
     esp_ota_mark_app_valid_cancel_rollback();
     if (!mutex) mutex = xSemaphoreCreateRecursiveMutex();
-    if (!lock()) return;
+    if (!mutex || !lock()) return;
     runtime = {};
     runtime.initialized = cfg.wifi_mode != WIFI_MODE_OFF;
     runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
@@ -356,25 +366,43 @@ void init() {
               "Ready, release target=%s\n", AB_OTA_RELEASE_TARGET);
 }
 
-void request_reboot() {
-    if (!lock()) return;
+bool request_reboot(bool (*prepare)()) {
+    if ((prepare && !mutex) || !lock()) {
+        if (prepare) Log::logf(CAT_OTA, LOG_WARN, "Prepared reboot refused: ota_unavailable\n");
+        return false;
+    }
+    const char *rejected = nullptr;
+    if (prepare) {
+        if (runtime.operation != OP_NONE || ResmedOta::is_active()) rejected = "ota_busy";
+        else if (runtime.reboot_pending) rejected = "reboot_pending";
+        else rejected = reboot_image_blocked();
+    }
+    if (rejected) {
+        unlock();
+        Log::logf(CAT_OTA, LOG_WARN, "Prepared reboot refused: %s\n", rejected);
+        return false;
+    }
     const bool changed = !runtime.reboot_pending;
     if (changed) {
         runtime.reboot_pending = true;
         runtime.reboot_at_ms = millis() + REBOOT_DELAY_MS;
+        runtime.reboot_prepare = prepare;
     }
     unlock(changed);
+    return true;
 }
 
 void handle() {
     bool initialized = false;
     bool reboot = false;
+    bool (*prepare)() = nullptr;
     bool auto_check = false;
     const char *blocked = "ota_unavailable";
     if (lock(pdMS_TO_TICKS(10))) {
         initialized = runtime.initialized;
         reboot = runtime.reboot_pending &&
                  deadline_due(millis(), runtime.reboot_at_ms);
+        if (reboot) prepare = runtime.reboot_prepare;
         auto_check = runtime.enabled && runtime.operation == OP_NONE &&
                      !runtime.reboot_pending &&
                      deadline_due(millis(), runtime.next_check_ms);
@@ -395,12 +423,26 @@ void handle() {
         blocked = cached_start_blocked();
         unlock();
     }
-    if (!initialized) return;
     if (reboot) {
+        // Keep reboot_pending reserved while preparation runs outside the lock.
+        const char *image_blocked = prepare ? reboot_image_blocked() : nullptr;
+        if (prepare && (image_blocked || !prepare())) {
+            if (lock()) {
+                runtime.reboot_pending = false;
+                runtime.reboot_at_ms = 0;
+                runtime.reboot_prepare = nullptr;
+                unlock(true);
+            }
+            Log::logf(CAT_OTA, LOG_ERROR,
+                      "Prepared reboot cancelled: %s\n",
+                      image_blocked ? image_blocked : "preparation_failed");
+            return;
+        }
         delay(50);
         ESP.restart();
         return;
     }
+    if (!initialized) return;
     if (auto_check && !blocked) {
         if (!request_check() && lock(pdMS_TO_TICKS(10))) {
             if (deadline_due(millis(), runtime.next_check_ms))
@@ -533,6 +575,7 @@ bool begin_manual_upload() {
                    !ResmedOta::is_active() && background_work_idle();
     if (allowed) {
         runtime.operation = OP_MANUAL;
+        runtime.manual_image_started = false;
         runtime.bytes = 0;
         runtime.total_size = 0;
     }
@@ -543,15 +586,26 @@ bool begin_manual_upload() {
 void end_manual_upload(bool success, const char *error) {
     if (!lock()) return;
     bool ended = runtime.operation == OP_MANUAL;
+    const bool image_started = ended && runtime.manual_image_started;
+    const OtaImage::Status image = image_started ? image_writer.status() : OtaImage::Status{};
     if (ended) runtime.operation = OP_NONE;
     unlock(ended);
-    if (ended && !success)
-        Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
+    if (ended && !success) {
+        if (image_started)
+            Log::logf(CAT_OTA, LOG_ERROR,
+                "HTTP upload failed stage=%s bytes=%u wire=%u: %s\n",
+                image.error_stage ? image.error_stage : "transport",
+                unsigned(image.bytes), unsigned(image.wire_bytes),
+                image.error ? image.error : error ? error : "upload_failed");
+        else
+            Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
+    }
 }
 
 bool begin_image(size_t wire_size, size_t image_size, OtaImage::Encoding encoding) {
     if (!lock()) return false;
     const bool owned = runtime.operation == OP_MANUAL || runtime.operation == OP_INSTALL;
+    if (runtime.operation == OP_MANUAL) runtime.manual_image_started = true;
     unlock();
     return owned && image_writer.begin(wire_size, image_size, encoding);
 }

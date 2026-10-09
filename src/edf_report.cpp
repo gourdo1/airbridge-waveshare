@@ -186,8 +186,31 @@ struct Job {
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
     int code = 0;
+    const char *error = nullptr;
+    mutable const char *issue = nullptr;
+    mutable char issue_path[96] = {};
     Payload body;
 };
+
+bool note_issue(const Job &job, const char *reason, const char *path = "") {
+    if (!job.issue) {
+        job.issue = reason;
+        snprintf(job.issue_path, sizeof(job.issue_path), "%s", path);
+    }
+    return false;
+}
+
+void log_result(const Job &job) {
+    const bool expected = job.code == 409 || job.code == 410;
+    const char *reason = expected ? job.error : job.issue ? job.issue : job.error;
+    Log::logf(CAT_REPORT, expected ? LOG_DEBUG : job.code >= 500 ? LOG_ERROR :
+        job.issue ? LOG_WARN : LOG_DEBUG,
+        "EDF job=%lu %s day=%u code=%d %s path=%s\n",
+        (unsigned long)job.id, job.request.action == Action::Days ? "days" :
+        job.request.action == Action::Summary ? "summary" : "series",
+        unsigned(job.request.day), job.code, reason ? reason : "complete",
+        expected || !job.issue_path[0] ? "-" : job.issue_path);
+}
 
 struct JobTiming {
     bool enabled;
@@ -196,7 +219,7 @@ struct JobTiming {
     uint32_t index_us = 0, numeric_us = 0, events_us = 0, encode_us = 0;
 
     explicit JobTiming(const Job *job)
-        : enabled(job && Log::get_cat_level(CAT_EDF) >= LOG_DEBUG),
+        : enabled(job && Log::get_cat_level(CAT_REPORT) >= LOG_DEBUG),
           id(job ? job->id : 0), started_us(stamp()),
           action(job ? job->request.action : Action::Days) {}
 
@@ -204,7 +227,7 @@ struct JobTiming {
 
     void log(int code, size_t bytes) const {
         if (!enabled) return;
-        Log::logf(CAT_EDF, LOG_DEBUG,
+        Log::logf(CAT_REPORT, LOG_DEBUG,
             "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
             "idx=%lu num=%lu evt=%lu enc=%lu\n",
             static_cast<unsigned long>(id), action == Action::Days ? "days" :
@@ -230,6 +253,8 @@ bool cache_usage_known = false;
 uint64_t cache_bytes = 0;
 enum class IndexFailure : uint8_t { Error, WaitingCatalog, Preempted };
 IndexFailure index_failure = IndexFailure::Error;
+const char *index_error = nullptr;
+size_t index_error_entry = SIZE_MAX;
 bool prune_cache(const SdStorage::Session &session, uint64_t needed = 0,
                  const char *keep = nullptr);
 
@@ -325,6 +350,8 @@ bool fingerprint(const SdStorage::Session &session, IndexedSession &entry) {
 
 bool refresh_index(const SdStorage::Session &session) {
     index_failure = IndexFailure::Error;
+    index_error = "catalog_status";
+    index_error_entry = SIZE_MAX;
     EdfCatalog::Changes changes;
     bool incremental = false;
     if (!session.run([&](fs::FS &) {
@@ -343,6 +370,7 @@ bool refresh_index(const SdStorage::Session &session) {
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
     const size_t old_count = index_count;
+    index_error = "session_limit";
     if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
     if (changes.catalog.entries != index_count) {
         const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
@@ -351,7 +379,7 @@ bool refresh_index(const SdStorage::Session &session) {
             index = nullptr;
         } else {
             void *grown = aircannect::Memory::realloc_large(index, bytes, bytes <= INTERNAL_WORK);
-            if (!grown) return false;
+            if (!grown) { index_error = "index_alloc"; return false; }
             index = static_cast<IndexedSession *>(grown);
         }
         if (changes.catalog.entries > index_count)
@@ -368,17 +396,23 @@ bool refresh_index(const SdStorage::Session &session) {
             return false;
         }
         const size_t i = full ? n : changes.indexes[n];
+        index_error_entry = i;
+        index_error = "catalog_index";
         if (i >= index_count) return false;
         IndexedSession next;
-        if (!session.run([&](fs::FS &) { return EdfCatalog::read(i, next.entry); }) ||
-            !catalog_day(next.entry.therapy_day, next.day)) return false;
+        index_error = "catalog_read";
+        if (!session.run([&](fs::FS &) { return EdfCatalog::read(i, next.entry); })) return false;
+        index_error = "catalog_day";
+        if (!catalog_day(next.entry.therapy_day, next.day)) return false;
         // STR/Identification readiness is not a detail-data revision.
         const bool changed = strcmp(index[i].entry.file_prefix, next.entry.file_prefix) ||
             strcmp(index[i].entry.therapy_day, next.entry.therapy_day) ||
             ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_LIVE_COMPLETE);
         if (full || changed) {
+            index_error = "source_fingerprint";
             if (!fingerprint(session, next)) { index_ready = false; return false; }
             const bool key_changed = !(index[i].key == next.key);
+            index_error = "cache_retire";
             if (index[i].entry.file_prefix[0] && index[i].key.present && (changed || key_changed) &&
                 !retire_cache(session, index[i])) { index_ready = false; return false; }
             detail_changed |= changed || key_changed;
@@ -405,7 +439,7 @@ bool refresh_index(const SdStorage::Session &session) {
     index_ready = true;
     if (full) {
         cache_usage_known = false;
-        if (!prune_cache(session)) { index_ready = false; return false; }
+        if (!prune_cache(session)) { index_ready = false; index_error = "cache_prune"; return false; }
     }
     if (detail_changed && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
@@ -425,6 +459,7 @@ struct Input {
     uint8_t *record = nullptr;
     size_t record_capacity = 0;
     uint64_t record_offset = UINT64_MAX;
+    char path[96] = {};
     const SdStorage::Session &session;
     const Job &job;
     Input(const SdStorage::Session &session, const Job &job) : session(session), job(job) {
@@ -437,12 +472,11 @@ struct Input {
         aircannect::Memory::free(record);
     }
     bool open(const SdStorage::Session &session, const IndexedSession &entry, uint8_t kind) {
-        if (!header) return false;
+        if (!header) return note_issue(job, "header_alloc");
         record_offset = UINT64_MAX;
         *header = {};
-        char path[96];
         source_path(entry, kind, "edf", path);
-        if (!file.open(session, path)) return false;
+        if (!file.open(session, path)) return note_issue(job, "source_open", path);
         reader = {[](void *ctx, uint64_t offset, uint8_t *out, size_t count) {
             auto &input = *static_cast<Input *>(ctx);
             if (aborted(&input.job, input.session)) return false;
@@ -454,11 +488,12 @@ struct Input {
                     ((offset - header.header_bytes) / header.record_bytes) * header.record_bytes;
                 if (offset + count <= base + header.record_bytes) {
                     if (base != input.record_offset) {
-                        if (!file.seek(base)) return false;
+                        if (!file.seek(base)) return note_issue(input.job, "source_seek", input.path);
                         for (size_t at = 0; at < header.record_bytes;) {
                             const size_t take = std::min<size_t>(header.record_bytes - at,
                                                                 SdStorage::READ_CHUNK_BYTES);
-                            if (file.read(input.record + at, take) != take) return false;
+                            if (file.read(input.record + at, take) != take)
+                                return note_issue(input.job, "source_read", input.path);
                             at += take;
                         }
                         input.record_offset = base;
@@ -467,16 +502,17 @@ struct Input {
                     return true;
                 }
             }
-            if (!file.seek(offset)) return false;
+            if (!file.seek(offset)) return note_issue(input.job, "source_seek", input.path);
             size_t done = 0;
             while (done < count) {
                 const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
-                if (file.read(out + done, take) != take) return false;
+                if (file.read(out + done, take) != take)
+                    return note_issue(input.job, "source_read", input.path);
                 done += take;
             }
             return true;
         }, this, file.size()};
-        if (!ReportEdf::read_header(reader, *header)) return false;
+        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
         if (header->record_bytes > record_capacity) {
             // One actual record, at most the reader's validated 64 KiB limit.
             void *grown = aircannect::Memory::realloc_large(record, header->record_bytes,
@@ -486,7 +522,7 @@ struct Input {
                 record_capacity = header->record_bytes;
             }
         }
-        if (record_capacity < header->record_bytes) return false;
+        if (record_capacity < header->record_bytes) return note_issue(job, "record_alloc", path);
         return true;
     }
 };
@@ -562,7 +598,8 @@ bool finish_part(const SdStorage::Session &, const char *, const char *, uint64_
 
 bool read_event(Input &input, uint32_t record, Event &event) {
     ReportEdf::Annotation annotation;
-    if (!ReportEdf::read_annotation(input.reader, *input.header, record, annotation)) return false;
+    if (!ReportEdf::read_annotation(input.reader, *input.header, record, annotation))
+        return note_issue(input.job, "annotation_record", input.path);
     event.time_ms = llround((input.header->start_seconds + annotation.onset_seconds) * 1000);
     event.duration_ms = annotation.has_duration ? llround(annotation.duration_seconds * 1000) : 0;
     event.kind = annotation.kind;
@@ -836,13 +873,19 @@ bool build_session(const SdStorage::Session &session, const Job &job,
 
 bool session_data(const SdStorage::Session &session, const Job &job,
                   const IndexedSession &entry, SessionData &out) {
-    if (load_cache(session, entry, out)) return true;
+    if (load_cache(session, entry, out)) {
+        if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
+        return true;
+    }
     out.~SessionData();
     new (&out) SessionData;
-    if (!build_session(session, job, entry, out)) return false;
+    if (!build_session(session, job, entry, out))
+        return note_issue(job, "session_build", entry.entry.file_prefix);
+    if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    store_cache(session, job, entry, out);
+    if (!store_cache(session, job, entry, out) && !aborted(&job, session))
+        note_issue(job, "cache_write", entry.entry.file_prefix);
     return !aborted(&job, session);
 }
 
@@ -953,6 +996,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         if (!selected(entry, first, last)) continue;
         if (aborted(&job, session)) return false;
         if (!(entry.key.present & 7)) {
+            note_issue(job, "numeric_files_missing", entry.entry.file_prefix);
             partial = true;
             usage_known = events_known = false;
             continue;
@@ -1389,7 +1433,7 @@ bool cached_series(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, Series &series) {
     ReducedHeader header;
     if (!reduced_header(session, entry, header) && !build_reduced(session, job, entry, header))
-        return false;
+        return note_issue(job, "series_cache_build", entry.entry.file_prefix);
     char path[96];
     cache_path(entry, "series", path);
     SdStorage::Reader reader;
@@ -1636,6 +1680,7 @@ void error_body(Job &job, int code, const char *error) {
     job.body.~Payload();
     new (&job.body) Payload;
     job.code = code;
+    job.error = error;
     job.body.print("{\"source\":\"edf\",\"error\":\"%s\"}", error);
 }
 
@@ -1656,6 +1701,7 @@ void defer_job(Job *job) {
 }
 
 bool work_once() {
+    static const char *reported_index_error = nullptr;
     Job *job = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
     for (auto &candidate : jobs) {
@@ -1685,6 +1731,10 @@ bool work_once() {
             publish(preempted ? State::Blocked : State::WaitingStorage,
                     preempted ? "not_idle" : "catalog_not_ready");
         } else {
+            Log::logf(CAT_REPORT, reported_index_error == index_error ? LOG_DEBUG : LOG_WARN,
+                "EDF index failed: %s entry=%ld\n", index_error,
+                index_error_entry == SIZE_MAX ? -1L : long(index_error_entry));
+            reported_index_error = index_error;
             if (job) {
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 job->data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
@@ -1704,6 +1754,10 @@ bool work_once() {
         }
         return false;
     }
+    if (reported_index_error) {
+        Log::logf(CAT_REPORT, LOG_INFO, "EDF index recovered\n");
+        reported_index_error = nullptr;
+    }
     if (!job) {
         session.end();
         publish(State::Ready);
@@ -1713,6 +1767,8 @@ bool work_once() {
     job->state = JobState::Running;
     job->data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
     job->code = 0;
+    job->error = job->issue = nullptr;
+    job->issue_path[0] = 0;
     xSemaphoreGive(mutex);
     bool success = false;
     if (__atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) error_body(*job, 410, "cancelled");
@@ -1744,6 +1800,7 @@ bool work_once() {
     job->completed_ms = millis();
     const int code = job->code;
     const size_t bytes = job->body.length();
+    log_result(*job);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
@@ -1774,7 +1831,11 @@ void init() {
     status.data_revision = data_revision;
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
-    if (!mutex || !wake) { publish(State::Error, "worker_unavailable"); return; }
+    if (!mutex || !wake) {
+        Log::logf(CAT_REPORT, LOG_ERROR, "EDF worker synchronization allocation failed\n");
+        publish(State::Error, "worker_unavailable");
+        return;
+    }
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(worker, "edf_report", 8192, nullptr, 1,
@@ -1782,7 +1843,11 @@ void init() {
     if (created != pdPASS)
         created = xTaskCreatePinnedToCoreWithCaps(worker, "edf_report", 8192, nullptr, 1,
             &worker_task, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (created != pdPASS) { worker_task = nullptr; publish(State::Error, "worker_unavailable"); }
+    if (created != pdPASS) {
+        Log::logf(CAT_REPORT, LOG_ERROR, "EDF worker task allocation failed\n");
+        worker_task = nullptr;
+        publish(State::Error, "worker_unavailable");
+    }
     tick();
 }
 

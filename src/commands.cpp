@@ -9,6 +9,7 @@
 #include "device_status.h"
 #include "build_info.h"
 #include "airbridge_ota.h"
+#include "factory_reset.h"
 #include <esp_partition.h>
 #include <time.h>
 #include "wifi_setup.h"
@@ -385,9 +386,29 @@ void dispatch_command(const char *line, String &response) {
     }
 
     if (upper == "REBOOT") {
-        response = "OK: rebooting...\n";
-        delay(100);
-        ESP.restart();
+        response = OtaManager::request_reboot() ? "OK: reboot queued\n"
+                                              : "ERR: OTA/reboot unavailable or busy\n";
+        return;
+    }
+
+    if (upper == "FACTORYRESET" || upper.startsWith("FACTORYRESET ")) {
+        String confirmation = upper.substring(12);
+        confirmation.trim();
+        if (confirmation != "CONFIRM") {
+            response = "ERR: usage: $FACTORYRESET CONFIRM\n"
+                       "Erases all NVS settings, WiFi profiles and BLE bonds/known sensors; ";
+#if AB_STORAGE_HAS_SDCARD
+            response += "replaces the SD partition table and formats FAT32, erasing ALL SD data. ";
+#else
+            response += "this build resets NVS only (no SD support). ";
+#endif
+            response += "Restarts; firmware, ESP partition table and crash dump remain unchanged.\n";
+            return;
+        }
+        const char *error = nullptr;
+        response = FactoryReset::request(&error)
+            ? "OK: factory reset queued; restarting\n"
+            : String("ERR: ") + error + "\n";
         return;
     }
 
@@ -713,6 +734,7 @@ void dispatch_command(const char *line, String &response) {
                    "  LCD                 Status screen backlight and buttons\n"
                    "  CRASH STATUS|SUMMARY|CLEAR  Retained crash dump\n"
                    "  REBOOT              Restart ESP32\n"
+                   "  FACTORYRESET CONFIRM Erase all NVS and SD data, restart\n"
                    "  HELP                This help\n"
                    "Anything without $ prefix is sent to AirSense.\n";
         return;

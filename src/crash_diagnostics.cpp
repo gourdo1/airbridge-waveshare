@@ -1,5 +1,6 @@
 #include "crash_diagnostics.h"
 #include "airsense_state.h"
+#include "debug_log.h"
 
 #include <esp_core_dump.h>
 #include <esp_partition.h>
@@ -81,6 +82,22 @@ void init() {
     if (initialized) return;
     refresh_locked();
     initialized = true;
+    if (cached.state == State::Available) {
+        if (cached.summary_available)
+            Log::logf(CAT_GENERAL, LOG_WARN,
+                "Retained crash dump bytes=%u task=%s pc=0x%08lx cause=%lu ELF=%.12s\n",
+                unsigned(cached.size), cached.task, (unsigned long)cached.pc,
+                (unsigned long)cached.cause, cached.elf_sha);
+        else
+            Log::logf(CAT_GENERAL, LOG_WARN, "Retained crash dump bytes=%u summary=unavailable\n",
+                unsigned(cached.size));
+        if (cached.error != ESP_OK)
+            Log::logf(CAT_GENERAL, LOG_WARN, "Retained crash summary read failed: %s\n",
+                esp_err_to_name(cached.error));
+    } else if (cached.state == State::Invalid) {
+        Log::logf(CAT_GENERAL, LOG_WARN, "Retained crash dump invalid size=%lu: %s\n",
+            (unsigned long)cached.stored_size, esp_err_to_name(cached.error));
+    }
 }
 
 bool snapshot(Snapshot &out) {

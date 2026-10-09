@@ -1,0 +1,5 @@
+# Patch files are applied with `git apply` at build time
+# (python/tools/library_patches.py) against LF library sources. Never convert
+# them to CRLF on checkout (core.autocrlf=true on Windows), or every hunk fails.
+# See docs/local_patches.md.
+*.patch text eol=lf

@@ -14,6 +14,7 @@ struct Status {
     size_t bytes = 0;
     size_t wire_bytes = 0;
     const char *error = nullptr;
+    const char *error_stage = nullptr;
     char partition[17] = {};
 };
 
@@ -28,7 +29,7 @@ public:
     const Status &status() const { return status_; }
 
 private:
-    bool fail(const char *error);
+    bool fail(const char *error, const char *stage = "decode");
     bool resolve_encoding();
     bool decode(const uint8_t *data, size_t len);
     bool write_image(const uint8_t *data, size_t len);

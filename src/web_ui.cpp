@@ -2290,7 +2290,12 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
                 return;
             }
             auto *response = new(std::nothrow) StorageResponse(transfer, kind, size);
-            if (!response) { transfer->cancel(); request->send(503); return; }
+            if (!response) {
+                Log::logf(CAT_WEB, LOG_WARN, "Storage response allocation failed\n");
+                transfer->cancel();
+                request->send(503);
+                return;
+            }
             if (disposition.length()) response->addHeader("Content-Disposition", disposition);
             request->send(response);
         }, active);
@@ -2333,8 +2338,8 @@ void WebUI::init(uint16_t port) {
     http->on("/wizard", HTTP_GET, handleRoot);
     http->on("/api/onboarding", HTTP_POST, handleOnboardingComplete, NULL, handleJsonBody);
     http->on("/api/status", HTTP_GET, handleStatus);
-    http->on("/api/crash", HTTP_GET, handleCrashStatus);
-    http->on("/api/crash/dump", HTTP_GET, handleCrashDump);
+    http->on(AsyncURIMatcher::exact("/api/crash"), HTTP_GET, handleCrashStatus);
+    http->on(AsyncURIMatcher::exact("/api/crash/dump"), HTTP_GET, handleCrashDump);
     http->on("/api/settings", HTTP_GET, handleGetSettings);
     http->on("/api/settings", HTTP_POST, handlePostSettings, NULL, handleJsonBody);
     http->on("/api/config", HTTP_GET, handleGetConfig);

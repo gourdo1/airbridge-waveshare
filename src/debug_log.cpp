@@ -13,23 +13,30 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
+#include <errno.h>
 
 static Preferences log_prefs;
 
 static Print *outputs[LOG_MAX_OUTPUTS] = {};
 static int output_count = 0;
+// Output lifetime and configuration can wait; producers use only queue_mux.
 static SemaphoreHandle_t log_mutex = nullptr;
+static portMUX_TYPE queue_mux = portMUX_INITIALIZER_UNLOCKED;
 static log_level_t cat_levels[CAT_COUNT];
 
 static constexpr size_t SYSLOG_QUEUE_DEPTH = 8;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
+static constexpr uint32_t SYSLOG_RETRY_MS = 100;
 
 struct SyslogRecord {
     int64_t epoch_ms;
     uint8_t cat;
     uint8_t level;
+    bool loss_report;
     char text[128];
+    uint32_t queue_id;
 };
+static uint32_t next_queue_id = 0;
 
 static SyslogRecord *local_queue = nullptr;
 static size_t local_head = 0;
@@ -41,6 +48,18 @@ static size_t syslog_count = 0;
 static sockaddr_in syslog_remote = {};
 static char syslog_hostname[64] = {};
 static bool boot_pending = false;
+static uint32_t local_drops = 0, syslog_drops = 0, serial_drops = 0;
+static uint32_t udp_errors = 0, udp_retries = 0;
+static struct {
+    const char *operation;
+    int error;
+    int64_t epoch_ms;
+    uint32_t at_ms;
+    in_addr ip;
+    bool sta_connected;
+    uint8_t ap_clients;
+    uint32_t internal_free, largest;
+} udp_failure = {};
 
 const char *Log::reset_reason_name() {
     static const char *const names[] = {
@@ -79,9 +98,11 @@ void Log::init() {
     log_prefs.end();
 }
 
-static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
+// Count both rejected arrivals and lower-priority records evicted for them.
+static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                     const SyslogRecord &record) {
-    if (!queue) return;
+    if (!queue) return !record.loss_report;
+    unsigned dropped = 0;
     if (count == SYSLOG_QUEUE_DEPTH) {
         size_t victim = count;
         uint8_t lowest_priority = record.level;
@@ -92,21 +113,27 @@ static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                 lowest_priority = level;
             }
         }
-        if (victim == count) return;
+        if (victim == count) return !record.loss_report;
+        dropped = !queue[(head + victim) % SYSLOG_QUEUE_DEPTH].loss_report;
         for (size_t i = victim; i + 1 < count; i++)
             queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
                 queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
         count--;
     }
-    queue[(head + count++) % SYSLOG_QUEUE_DEPTH] = record;
+    SyslogRecord &slot = queue[(head + count++) % SYSLOG_QUEUE_DEPTH];
+    slot = record;
+    slot.queue_id = ++next_queue_id;
+    return dropped;
 }
 
 void Log::boot() {
     if (!log_mutex || cat_levels[CAT_GENERAL] < LOG_INFO) return;
     SyslogRecord record = boot_record();
     xSemaphoreTake(log_mutex, portMAX_DELAY);
-    enqueue(local_queue, local_head, local_count, record);
+    portENTER_CRITICAL(&queue_mux);
+    local_drops += enqueue(local_queue, local_head, local_count, record);
     boot_pending = true;
+    portEXIT_CRITICAL(&queue_mux);
     xSemaphoreGive(log_mutex);
 }
 
@@ -121,7 +148,10 @@ static void poll_local() {
     static char serial_pending[162];
     static size_t serial_pos = 0, serial_len = 0;
     for (size_t i = 0; i < SYSLOG_SEND_BUDGET; i++) {
-        int room = Serial.availableForWrite();
+        const bool serial_ready = (bool)Serial;
+        // An absent USB receiver is not a stalled sink; discard its pending tail.
+        if (!serial_ready) serial_pos = serial_len = 0;
+        int room = serial_ready ? Serial.availableForWrite() : 0;
         if (room > 0 && serial_pos < serial_len) {
             size_t remaining = serial_len - serial_pos;
             size_t count = remaining < (size_t)room ? remaining : (size_t)room;
@@ -129,13 +159,16 @@ static void poll_local() {
                 (const uint8_t *)serial_pending + serial_pos, count);
         }
         if (xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
+        portENTER_CRITICAL(&queue_mux);
         if (!local_count) {
+            portEXIT_CRITICAL(&queue_mux);
             xSemaphoreGive(log_mutex);
             return;
         }
         SyslogRecord record = local_queue[local_head];
         local_head = (local_head + 1) % SYSLOG_QUEUE_DEPTH;
         local_count--;
+        portEXIT_CRITICAL(&queue_mux);
         // CRLF so line-oriented terminals (telnet, PuTTY, Windows consoles)
         // return to column 0 instead of drawing a staircase.
         char line[162];
@@ -147,12 +180,99 @@ static void poll_local() {
         for (int j = 0; j < output_count; j++)
             outputs[j]->write((const uint8_t *)line, len);
         xSemaphoreGive(log_mutex);
+        if (!serial_ready) continue;
         if (serial_pos == serial_len) {
             memcpy(serial_pending, line, len);
             serial_pos = 0;
             serial_len = len;
-        }
+        } else if (!record.loss_report) serial_drops++;
     }
+}
+
+static int64_t record_time() {
+    struct timeval now;
+    return WiFiSetup::time_synced() && gettimeofday(&now, nullptr) == 0
+        ? (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000 : 0;
+}
+
+static void note_udp_failure(const char *operation, int error) {
+    udp_errors++;
+    udp_failure.operation = operation;
+    udp_failure.error = error;
+    udp_failure.at_ms = millis();
+    udp_failure.epoch_ms = record_time();
+    udp_failure.sta_connected = WiFi.isConnected();
+    udp_failure.ap_clients = WiFi.softAPgetStationNum();
+    udp_failure.ip.s_addr = (uint32_t)WiFi.localIP();
+    const auto memory = aircannect::Memory::status();
+    udp_failure.internal_free = memory.heap_free;
+    udp_failure.largest = memory.heap_max_alloc;
+}
+
+static void report_losses() {
+    static uint32_t reported_ms = 0;
+    const uint32_t now = millis();
+    if (now - reported_ms < 5000 || Log::get_cat_level(CAT_GENERAL) < LOG_WARN ||
+        xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
+    portENTER_CRITICAL(&queue_mux);
+    const uint32_t lost_local = local_drops, lost_syslog = syslog_drops;
+    portEXIT_CRITICAL(&queue_mux);
+    // Retried datagrams and an unread optional USB sink are not delivery failures.
+    const log_level_t level = lost_local || lost_syslog || udp_errors
+        ? LOG_WARN : LOG_DEBUG;
+    // Do not recursively lose diagnostics or displace a producer's record.
+    const size_t slots = udp_errors ? 2 : 1;
+    if (Log::get_cat_level(CAT_GENERAL) >= level &&
+        (lost_local || lost_syslog || serial_drops || udp_errors || udp_retries)) {
+        SyslogRecord records[2] = {};
+        SyslogRecord &record = records[0];
+        record.cat = CAT_GENERAL;
+        record.level = level;
+        record.loss_report = true;
+        record.epoch_ms = record_time();
+        if (level == LOG_WARN) {
+            snprintf(record.text, sizeof(record.text),
+                "Log losses local=%lu syslog=%lu UDP_errors=%lu",
+                (unsigned long)lost_local, (unsigned long)lost_syslog,
+                (unsigned long)udp_errors);
+        } else {
+            snprintf(record.text, sizeof(record.text),
+                "Log backpressure serial_drops=%lu UDP_retries=%lu",
+                (unsigned long)serial_drops, (unsigned long)udp_retries);
+        }
+        if (udp_errors) {
+            SyslogRecord &record = records[1];
+            record = records[0];
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &udp_failure.ip, ip, sizeof(ip));
+            record.epoch_ms = udp_failure.epoch_ms;
+            snprintf(record.text, sizeof(record.text),
+                "Syslog last=%s errno=%d sta=%u ap=%u ip=%s internal=%lu largest=%lu ms=%lu",
+                udp_failure.operation, udp_failure.error,
+                (unsigned)udp_failure.sta_connected, (unsigned)udp_failure.ap_clients, ip,
+                (unsigned long)udp_failure.internal_free,
+                (unsigned long)udp_failure.largest, (unsigned long)udp_failure.at_ms);
+        }
+        portENTER_CRITICAL(&queue_mux);
+        if (local_count + slots <= SYSLOG_QUEUE_DEPTH &&
+            (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH)) {
+            for (size_t i = 0; i < slots; ++i) {
+                enqueue(local_queue, local_head, local_count, records[i]);
+                if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, records[i]);
+            }
+            if (level == LOG_WARN) {
+                local_drops -= lost_local;
+                syslog_drops -= lost_syslog;
+                udp_errors = 0;
+                udp_failure = {};
+            } else {
+                serial_drops = udp_retries = 0;
+            }
+            reported_ms = now;
+        }
+        portEXIT_CRITICAL(&queue_mux);
+    }
+    xSemaphoreGive(log_mutex);
 }
 
 size_t Log::write_crlf(Print &out, const char *buf, size_t len) {
@@ -188,20 +308,26 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
 
     xSemaphoreTake(log_mutex, portMAX_DELAY);
     if (!enabled) {
-        aircannect::Memory::free(syslog_queue);
+        portENTER_CRITICAL(&queue_mux);
+        SyslogRecord *retired = syslog_queue;
         syslog_queue = nullptr;
         syslog_head = syslog_count = 0;
+        portEXIT_CRITICAL(&queue_mux);
+        aircannect::Memory::free(retired);
     } else {
-        if (!syslog_queue) {
-            syslog_queue = static_cast<SyslogRecord *>(
+        SyslogRecord *queue = syslog_queue;
+        if (!queue) {
+            queue = static_cast<SyslogRecord *>(
                 aircannect::Memory::alloc_large(
                     SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
         }
-        if (syslog_remote.sin_addr.s_addr != remote.sin_addr.s_addr ||
+        const bool changed = syslog_remote.sin_addr.s_addr != remote.sin_addr.s_addr ||
             syslog_remote.sin_port != remote.sin_port ||
-            strcmp(syslog_hostname, name) != 0) {
-            syslog_head = syslog_count = 0;
-        }
+            strcmp(syslog_hostname, name) != 0;
+        portENTER_CRITICAL(&queue_mux);
+        syslog_queue = queue;
+        if (changed) syslog_head = syslog_count = 0;
+        portEXIT_CRITICAL(&queue_mux);
         syslog_remote = remote;
         strlcpy(syslog_hostname, name, sizeof(syslog_hostname));
         valid = syslog_queue != nullptr;
@@ -213,8 +339,11 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
 void Log::poll() {
     // Only the loop task owns this socket; producers never touch the network.
     static int fd = -1;
+    static bool retry_pending = false;
+    static uint32_t retry_started_ms = 0;
     if (!log_mutex) return;
     poll_local();
+    report_losses();
     if (!log_mutex || xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
     bool enabled = syslog_queue != nullptr;
     xSemaphoreGive(log_mutex);
@@ -226,26 +355,31 @@ void Log::poll() {
             xSemaphoreGive(log_mutex);
             if (fd >= 0) close(fd);
             fd = -1;
+            retry_pending = false;
             return;
         }
+        portENTER_CRITICAL(&queue_mux);
         if (!syslog_count && !boot_pending) {
+            portEXIT_CRITICAL(&queue_mux);
             xSemaphoreGive(log_mutex);
             return;
         }
+        if (retry_pending && millis() - retry_started_ms < SYSLOG_RETRY_MS) {
+            portEXIT_CRITICAL(&queue_mux);
+            xSemaphoreGive(log_mutex);
+            return;
+        }
+        retry_pending = false;
 
         bool sending_boot = boot_pending;
         SyslogRecord record;
-        if (sending_boot) {
-            record = boot_record();
-        } else {
-            record = syslog_queue[syslog_head];
-            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
-            syslog_count--;
-        }
+        if (!sending_boot) record = syslog_queue[syslog_head];
+        portEXIT_CRITICAL(&queue_mux);
         sockaddr_in remote = syslog_remote;
         char hostname[sizeof(syslog_hostname)];
         memcpy(hostname, syslog_hostname, sizeof(hostname));
         xSemaphoreGive(log_mutex);
+        if (sending_boot) record = boot_record();
 
         static const uint8_t severity[] = {3, 4, 6, 7};
         unsigned pri = 16 * 8 + (record.level <= LOG_DEBUG
@@ -266,19 +400,42 @@ void Log::poll() {
                            "<%u>1 %s %s airbridge - %s - %s", pri, timestamp, hostname,
                            cat_name((log_cat_t)record.cat), line);
 
+        int error = 0;
+        const char *operation = "socket";
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (fd < 0) return;
-        if (sendto(fd, payload, len, MSG_DONTWAIT,
-                   (sockaddr *)&remote, sizeof(remote)) < 0) {
-            close(fd);
+        if (fd < 0) {
+            error = errno;
+        } else if (sendto(fd, payload, len, MSG_DONTWAIT,
+                          (sockaddr *)&remote, sizeof(remote)) < 0) {
+            error = errno;
+            operation = "sendto";
+        }
+        if (error) {
+            if (error == ENOMEM || error == ENOBUFS || error == EAGAIN) {
+                // Local backpressure: retain the record and socket, not a busy loop.
+                if (!record.loss_report) udp_retries++;
+                retry_started_ms = millis();
+                retry_pending = true;
+                return;
+            }
+            if (!record.loss_report) note_udp_failure(operation, error);
+            if (fd >= 0) close(fd);
             fd = -1;
-            return;
         }
+
+        xSemaphoreTake(log_mutex, portMAX_DELAY);
+        portENTER_CRITICAL(&queue_mux);
         if (sending_boot) {
-            xSemaphoreTake(log_mutex, portMAX_DELAY);
-            boot_pending = false;
-            xSemaphoreGive(log_mutex);
+            if (!error) boot_pending = false;
+        } else if (syslog_queue && syslog_count &&
+                   syslog_queue[syslog_head].queue_id == record.queue_id) {
+            // Enqueue eviction or reconfiguration may have replaced the head.
+            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
+            syslog_count--;
         }
+        portEXIT_CRITICAL(&queue_mux);
+        xSemaphoreGive(log_mutex);
+        if (error) return;
     }
 }
 
@@ -371,11 +528,7 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
     SyslogRecord record = {};
     record.cat = cat;
     record.level = lvl;
-    if (WiFiSetup::time_synced()) {
-        struct timeval now;
-        if (gettimeofday(&now, nullptr) == 0)
-            record.epoch_ms = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
-    }
+    record.epoch_ms = record_time();
     int len = vsnprintf(record.text, sizeof(record.text), fmt, args);
     if (len <= 0) return;
     if (len >= (int)sizeof(record.text)) {
@@ -386,11 +539,12 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
         record.text[--len] = 0;
     if (!len) return;
 
-    if (log_mutex && xSemaphoreTake(log_mutex, 0) == pdTRUE) {
-        enqueue(local_queue, local_head, local_count, record);
-        enqueue(syslog_queue, syslog_head, syslog_count, record);
-        xSemaphoreGive(log_mutex);
-    }
+    // Only bounded queue copies here, never formatting, allocation or sink I/O.
+    portENTER_CRITICAL(&queue_mux);
+    local_drops += enqueue(local_queue, local_head, local_count, record);
+    if (syslog_queue)
+        syslog_drops += enqueue(syslog_queue, syslog_head, syslog_count, record);
+    portEXIT_CRITICAL(&queue_mux);
 }
 
 void Log::logf(log_cat_t cat, log_level_t lvl, const char *fmt, ...) {

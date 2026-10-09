@@ -1,0 +1,46 @@
+ESPAsyncWebServer 3.12.1: preserve send credit while a producer has no data.
+
+RESPONSE_TRY_AGAIN may leave no bytes queued for transmission. Debiting a
+credit then stalls both chunked and large fixed-length responses: later
+polls cannot refill the buffer, and there is no outstanding data to ACK.
+Only debit actual writes, including partial header writes, and account for
+short body writes before leaving the send loop.
+
+--- a/WebResponses.cpp
++++ b/WebResponses.cpp
+@@ -393,7 +393,9 @@ size_t AsyncAbstractResponse::write_send_buffs(AsyncWebServerRequest *request, size_t len, uint32_t time) {
+ // we were not able to fit all headers in current buff, send this part here and return later for the rest
+ #if ASYNCWEBSERVER_USE_CHUNK_INFLIGHT
+       _in_flight += pcb_written;
+-      --_in_flight_credit;  // take a credit
++      if (pcb_written) {
++        --_in_flight_credit;  // take a credit only for queued data
++      }
+ #endif
+       if (!request->client()->send()) {
+         // something is wrong, what should we do here?
+@@ -415,6 +417,7 @@ size_t AsyncAbstractResponse::write_send_buffs(AsyncWebServerRequest *request, size_t len, uint32_t time) {
+         // data is pending in buffer from a previous call or previous iteration
+         size_t const added_len =
+           request->client()->add(reinterpret_cast<char *>(_send_buffer->data() + _send_buffer_offset), _send_buffer_len - _send_buffer_offset);
++        payloadlen += added_len;
+         if (added_len != _send_buffer_len - _send_buffer_offset) {
+           // we were not able to add entire buffer's content to tcp buffs, leave it for later
+           // (this should not happen normally unless connection's TCP window suddenly changed from remote or mem pressure)
+@@ -423,5 +426,4 @@ size_t AsyncAbstractResponse::write_send_buffs(AsyncWebServerRequest *request, size_t len, uint32_t time) {
+         } else {
+           _send_buffer_len = _send_buffer_offset = 0;  // consider buffer empty
+         }
+-        payloadlen += added_len;
+       }
+@@ -500,7 +502,9 @@ size_t AsyncAbstractResponse::write_send_buffs(AsyncWebServerRequest *request, size_t len, uint32_t time) {
+     _writtenLength += payloadlen;
+ #if ASYNCWEBSERVER_USE_CHUNK_INFLIGHT
+     _in_flight += payloadlen;
+-    --_in_flight_credit;  // take a credit
++    if (payloadlen) {
++      --_in_flight_credit;  // RESPONSE_TRY_AGAIN alone cannot produce an ACK
++    }
+ #endif
+     if (_send_buffer_len == 0) {
+       // buffer empty, we can release mem, otherwise need to keep it till next run (should not happen under normal conditions)
