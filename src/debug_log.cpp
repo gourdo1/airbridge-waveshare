@@ -24,6 +24,7 @@ static log_level_t cat_levels[CAT_COUNT];
 
 static constexpr size_t SYSLOG_QUEUE_DEPTH = 8;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
+static constexpr uint32_t SYSLOG_RETRY_MS = 100;
 
 struct SyslogRecord {
     int64_t epoch_ms;
@@ -31,7 +32,9 @@ struct SyslogRecord {
     uint8_t level;
     bool loss_report;
     char text[128];
+    uint32_t queue_id;
 };
+static uint32_t next_queue_id = 0;
 
 static SyslogRecord *local_queue = nullptr;
 static size_t local_head = 0;
@@ -116,7 +119,9 @@ static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                 queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
         count--;
     }
-    queue[(head + count++) % SYSLOG_QUEUE_DEPTH] = record;
+    SyslogRecord &slot = queue[(head + count++) % SYSLOG_QUEUE_DEPTH];
+    slot = record;
+    slot.queue_id = ++next_queue_id;
     return dropped;
 }
 
@@ -286,6 +291,8 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
 void Log::poll() {
     // Only the loop task owns this socket; producers never touch the network.
     static int fd = -1;
+    static bool retry_pending = false;
+    static uint32_t retry_started_ms = 0;
     if (!log_mutex) return;
     poll_local();
     report_losses();
@@ -300,12 +307,18 @@ void Log::poll() {
             xSemaphoreGive(log_mutex);
             if (fd >= 0) close(fd);
             fd = -1;
+            retry_pending = false;
             return;
         }
         if (!syslog_count && !boot_pending) {
             xSemaphoreGive(log_mutex);
             return;
         }
+        if (retry_pending && millis() - retry_started_ms < SYSLOG_RETRY_MS) {
+            xSemaphoreGive(log_mutex);
+            return;
+        }
+        retry_pending = false;
 
         bool sending_boot = boot_pending;
         SyslogRecord record;
@@ -313,8 +326,6 @@ void Log::poll() {
             record = boot_record();
         } else {
             record = syslog_queue[syslog_head];
-            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
-            syslog_count--;
         }
         sockaddr_in remote = syslog_remote;
         char hostname[sizeof(syslog_hostname)];
@@ -340,23 +351,39 @@ void Log::poll() {
                            "<%u>1 %s %s airbridge - %s - %s", pri, timestamp, hostname,
                            cat_name((log_cat_t)record.cat), line);
 
+        int error = 0;
+        const char *operation = "socket";
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) {
-            if (!record.loss_report) note_udp_failure("socket", errno);
-            return;
+            error = errno;
+        } else if (sendto(fd, payload, len, MSG_DONTWAIT,
+                          (sockaddr *)&remote, sizeof(remote)) < 0) {
+            error = errno;
+            operation = "sendto";
         }
-        if (sendto(fd, payload, len, MSG_DONTWAIT,
-                   (sockaddr *)&remote, sizeof(remote)) < 0) {
-            if (!record.loss_report) note_udp_failure("sendto", errno);
-            close(fd);
+        if (error) {
+            if (!record.loss_report) note_udp_failure(operation, error);
+            if (error == ENOMEM || error == ENOBUFS || error == EAGAIN) {
+                // Local backpressure: retain the record and socket, not a busy loop.
+                retry_started_ms = millis();
+                retry_pending = true;
+                return;
+            }
+            if (fd >= 0) close(fd);
             fd = -1;
-            return;
         }
+
+        xSemaphoreTake(log_mutex, portMAX_DELAY);
         if (sending_boot) {
-            xSemaphoreTake(log_mutex, portMAX_DELAY);
-            boot_pending = false;
-            xSemaphoreGive(log_mutex);
+            if (!error) boot_pending = false;
+        } else if (syslog_queue && syslog_count &&
+                   syslog_queue[syslog_head].queue_id == record.queue_id) {
+            // Enqueue eviction or reconfiguration may have replaced the head.
+            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
+            syslog_count--;
         }
+        xSemaphoreGive(log_mutex);
+        if (error) return;
     }
 }
 
