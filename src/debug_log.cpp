@@ -199,20 +199,24 @@ static void report_losses() {
     const uint32_t now = millis();
     if (now - reported_ms < 5000 || Log::get_cat_level(CAT_GENERAL) < LOG_WARN ||
         xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
+    const uint32_t lock_drops = __atomic_load_n(&contention_drops, __ATOMIC_RELAXED);
+    // USB can remain connected without a terminal reading this optional sink.
+    const log_level_t level = lock_drops || local_drops || syslog_drops || udp_errors
+        ? LOG_WARN : LOG_DEBUG;
     // Do not recursively lose diagnostics or displace a producer's record.
     const size_t slots = udp_errors ? 2 : 1;
-    if (local_count + slots <= SYSLOG_QUEUE_DEPTH &&
+    if (Log::get_cat_level(CAT_GENERAL) >= level &&
+        local_count + slots <= SYSLOG_QUEUE_DEPTH &&
         (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH) &&
-        (__atomic_load_n(&contention_drops, __ATOMIC_RELAXED) || local_drops ||
-         syslog_drops || serial_drops || udp_errors)) {
+        (lock_drops || local_drops || syslog_drops || serial_drops || udp_errors)) {
         SyslogRecord record = {};
         record.cat = CAT_GENERAL;
-        record.level = LOG_WARN;
+        record.level = level;
         record.loss_report = true;
         record.epoch_ms = record_time();
         snprintf(record.text, sizeof(record.text),
             "Log losses lock=%lu local=%lu syslog=%lu serial=%lu UDP_errors=%lu errno=%d",
-            (unsigned long)__atomic_exchange_n(&contention_drops, 0, __ATOMIC_RELAXED),
+            (unsigned long)lock_drops,
             (unsigned long)local_drops, (unsigned long)syslog_drops,
             (unsigned long)serial_drops, (unsigned long)udp_errors, udp_failure.error);
         enqueue(local_queue, local_head, local_count, record);
@@ -230,6 +234,7 @@ static void report_losses() {
             enqueue(local_queue, local_head, local_count, record);
             if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
         }
+        __atomic_fetch_sub(&contention_drops, lock_drops, __ATOMIC_RELAXED);
         local_drops = syslog_drops = serial_drops = udp_errors = 0;
         udp_failure = {};
         reported_ms = now;
