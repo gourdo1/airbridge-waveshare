@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
+#include <errno.h>
 
 static Preferences log_prefs;
 
@@ -41,6 +42,10 @@ static size_t syslog_count = 0;
 static sockaddr_in syslog_remote = {};
 static char syslog_hostname[64] = {};
 static bool boot_pending = false;
+static uint32_t contention_drops = 0;
+static uint32_t local_drops = 0, syslog_drops = 0, serial_drops = 0;
+static uint32_t udp_errors = 0;
+static int udp_errno = 0;
 
 const char *Log::reset_reason_name() {
     static const char *const names[] = {
@@ -79,10 +84,13 @@ void Log::init() {
     log_prefs.end();
 }
 
-static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
+// Count both rejected arrivals and lower-priority records evicted for them.
+static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                     const SyslogRecord &record) {
-    if (!queue) return;
+    if (!queue) return 1;
+    unsigned dropped = 0;
     if (count == SYSLOG_QUEUE_DEPTH) {
+        dropped = 1;
         size_t victim = count;
         uint8_t lowest_priority = record.level;
         for (size_t i = 0; i < count; i++) {
@@ -92,20 +100,21 @@ static void enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                 lowest_priority = level;
             }
         }
-        if (victim == count) return;
+        if (victim == count) return dropped;
         for (size_t i = victim; i + 1 < count; i++)
             queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
                 queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
         count--;
     }
     queue[(head + count++) % SYSLOG_QUEUE_DEPTH] = record;
+    return dropped;
 }
 
 void Log::boot() {
     if (!log_mutex || cat_levels[CAT_GENERAL] < LOG_INFO) return;
     SyslogRecord record = boot_record();
     xSemaphoreTake(log_mutex, portMAX_DELAY);
-    enqueue(local_queue, local_head, local_count, record);
+    local_drops += enqueue(local_queue, local_head, local_count, record);
     boot_pending = true;
     xSemaphoreGive(log_mutex);
 }
@@ -147,8 +156,43 @@ static void poll_local() {
             memcpy(serial_pending, line, len);
             serial_pos = 0;
             serial_len = len;
-        }
+        } else serial_drops++;
     }
+}
+
+static int64_t record_time() {
+    struct timeval now;
+    return WiFiSetup::time_synced() && gettimeofday(&now, nullptr) == 0
+        ? (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000 : 0;
+}
+
+static void report_losses() {
+    static uint32_t reported_ms = 0;
+    const uint32_t now = millis();
+    if (now - reported_ms < 5000 || Log::get_cat_level(CAT_GENERAL) < LOG_WARN ||
+        xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
+    // Do not recursively lose diagnostics or displace a producer's record.
+    if (local_count < SYSLOG_QUEUE_DEPTH &&
+        (!syslog_queue || syslog_count < SYSLOG_QUEUE_DEPTH) &&
+        (__atomic_load_n(&contention_drops, __ATOMIC_RELAXED) || local_drops ||
+         syslog_drops || serial_drops || udp_errors)) {
+        SyslogRecord record = {};
+        record.cat = CAT_GENERAL;
+        record.level = LOG_WARN;
+        record.epoch_ms = record_time();
+        snprintf(record.text, sizeof(record.text),
+            "Log losses lock=%lu local=%lu syslog=%lu serial=%lu UDP_errors=%lu errno=%d",
+            (unsigned long)__atomic_exchange_n(&contention_drops, 0, __ATOMIC_RELAXED),
+            (unsigned long)local_drops, (unsigned long)syslog_drops,
+            (unsigned long)serial_drops, (unsigned long)udp_errors, udp_errno);
+        local_drops = syslog_drops = serial_drops = udp_errors = 0;
+        udp_errno = 0;
+        // Allocation failure leaves the diagnostic pending for a working sink.
+        local_drops += enqueue(local_queue, local_head, local_count, record);
+        if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
+        reported_ms = now;
+    }
+    xSemaphoreGive(log_mutex);
 }
 
 bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
@@ -197,6 +241,7 @@ void Log::poll() {
     static int fd = -1;
     if (!log_mutex) return;
     poll_local();
+    report_losses();
     if (!log_mutex || xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
     bool enabled = syslog_queue != nullptr;
     xSemaphoreGive(log_mutex);
@@ -249,9 +294,15 @@ void Log::poll() {
                            cat_name((log_cat_t)record.cat), line);
 
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (fd < 0) return;
+        if (fd < 0) {
+            udp_errors++;
+            udp_errno = errno;
+            return;
+        }
         if (sendto(fd, payload, len, MSG_DONTWAIT,
                    (sockaddr *)&remote, sizeof(remote)) < 0) {
+            udp_errors++;
+            udp_errno = errno;
             close(fd);
             fd = -1;
             return;
@@ -353,11 +404,7 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
     SyslogRecord record = {};
     record.cat = cat;
     record.level = lvl;
-    if (WiFiSetup::time_synced()) {
-        struct timeval now;
-        if (gettimeofday(&now, nullptr) == 0)
-            record.epoch_ms = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
-    }
+    record.epoch_ms = record_time();
     int len = vsnprintf(record.text, sizeof(record.text), fmt, args);
     if (len <= 0) return;
     if (len >= (int)sizeof(record.text)) {
@@ -369,10 +416,11 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
     if (!len) return;
 
     if (log_mutex && xSemaphoreTake(log_mutex, 0) == pdTRUE) {
-        enqueue(local_queue, local_head, local_count, record);
-        enqueue(syslog_queue, syslog_head, syslog_count, record);
+        local_drops += enqueue(local_queue, local_head, local_count, record);
+        if (syslog_queue)
+            syslog_drops += enqueue(syslog_queue, syslog_head, syslog_count, record);
         xSemaphoreGive(log_mutex);
-    }
+    } else __atomic_fetch_add(&contention_drops, 1, __ATOMIC_RELAXED);
 }
 
 void Log::logf(log_cat_t cat, log_level_t lvl, const char *fmt, ...) {
