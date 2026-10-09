@@ -48,7 +48,7 @@ static char syslog_hostname[64] = {};
 static bool boot_pending = false;
 static uint32_t contention_drops = 0;
 static uint32_t local_drops = 0, syslog_drops = 0, serial_drops = 0;
-static uint32_t udp_errors = 0;
+static uint32_t udp_errors = 0, udp_retries = 0;
 static struct {
     const char *operation;
     int error;
@@ -205,7 +205,7 @@ static void report_losses() {
     if (now - reported_ms < 5000 || Log::get_cat_level(CAT_GENERAL) < LOG_WARN ||
         xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
     const uint32_t lock_drops = __atomic_load_n(&contention_drops, __ATOMIC_RELAXED);
-    // USB can remain connected without a terminal reading this optional sink.
+    // Retried datagrams and an unread optional USB sink are not delivery failures.
     const log_level_t level = lock_drops || local_drops || syslog_drops || udp_errors
         ? LOG_WARN : LOG_DEBUG;
     // Do not recursively lose diagnostics or displace a producer's record.
@@ -213,17 +213,23 @@ static void report_losses() {
     if (Log::get_cat_level(CAT_GENERAL) >= level &&
         local_count + slots <= SYSLOG_QUEUE_DEPTH &&
         (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH) &&
-        (lock_drops || local_drops || syslog_drops || serial_drops || udp_errors)) {
+        (lock_drops || local_drops || syslog_drops || serial_drops || udp_errors || udp_retries)) {
         SyslogRecord record = {};
         record.cat = CAT_GENERAL;
         record.level = level;
         record.loss_report = true;
         record.epoch_ms = record_time();
-        snprintf(record.text, sizeof(record.text),
-            "Log losses lock=%lu local=%lu syslog=%lu serial=%lu UDP_errors=%lu errno=%d",
-            (unsigned long)lock_drops,
-            (unsigned long)local_drops, (unsigned long)syslog_drops,
-            (unsigned long)serial_drops, (unsigned long)udp_errors, udp_failure.error);
+        if (level == LOG_WARN) {
+            snprintf(record.text, sizeof(record.text),
+                "Log losses lock=%lu local=%lu syslog=%lu UDP_errors=%lu",
+                (unsigned long)lock_drops,
+                (unsigned long)local_drops, (unsigned long)syslog_drops,
+                (unsigned long)udp_errors);
+        } else {
+            snprintf(record.text, sizeof(record.text),
+                "Log backpressure serial_drops=%lu UDP_retries=%lu",
+                (unsigned long)serial_drops, (unsigned long)udp_retries);
+        }
         enqueue(local_queue, local_head, local_count, record);
         if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
         if (udp_errors) {
@@ -239,9 +245,13 @@ static void report_losses() {
             enqueue(local_queue, local_head, local_count, record);
             if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
         }
-        __atomic_fetch_sub(&contention_drops, lock_drops, __ATOMIC_RELAXED);
-        local_drops = syslog_drops = serial_drops = udp_errors = 0;
-        udp_failure = {};
+        if (level == LOG_WARN) {
+            __atomic_fetch_sub(&contention_drops, lock_drops, __ATOMIC_RELAXED);
+            local_drops = syslog_drops = udp_errors = 0;
+            udp_failure = {};
+        } else {
+            serial_drops = udp_retries = 0;
+        }
         reported_ms = now;
     }
     xSemaphoreGive(log_mutex);
@@ -362,13 +372,14 @@ void Log::poll() {
             operation = "sendto";
         }
         if (error) {
-            if (!record.loss_report) note_udp_failure(operation, error);
             if (error == ENOMEM || error == ENOBUFS || error == EAGAIN) {
                 // Local backpressure: retain the record and socket, not a busy loop.
+                if (!record.loss_report) udp_retries++;
                 retry_started_ms = millis();
                 retry_pending = true;
                 return;
             }
+            if (!record.loss_report) note_udp_failure(operation, error);
             if (fd >= 0) close(fd);
             fd = -1;
         }
