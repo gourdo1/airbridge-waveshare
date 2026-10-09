@@ -109,7 +109,6 @@ void setup() {
         Log::logf(CAT_GENERAL, LOG_ERROR, "[INIT] TLS allocator installation failed\n");
 
     Log::boot();
-    CrashDiagnostics::init();
     Log::logf(CAT_GENERAL, LOG_DEBUG, "Chip: %s, Heap: %d bytes\n", ESP.getChipModel(), ESP.getFreeHeap());
 
     Config::init();
@@ -117,6 +116,7 @@ void setup() {
     // because that step calls NetworkHints::upsert with legacy hint values.
     NetworkHints::init();
     Config::load();
+    CrashDiagnostics::init();
     Log::logf(CAT_CONFIG, LOG_DEBUG, "Configuration loaded\n");
     OtaManager::init();
 
