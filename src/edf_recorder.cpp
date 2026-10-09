@@ -1829,6 +1829,14 @@ static void process_wave(const RawFrame &raw, const StreamSchema &schema,
                                    static_cast<uint32_t>(delta) * 40;
         const int32_t drift = static_cast<int32_t>(sample_ms - predicted);
         if (delta == 0) return;
+        if (delta != 1) {
+            portENTER_CRITICAL(&status_mux);
+            const bool first = status.sequence_gaps++ == 0;
+            portEXIT_CRITICAL(&status_mux);
+            if (first) Log::logf(CAT_EDF, LOG_WARN,
+                "BRP sequence discontinuity previous=%u current=%u delta=%u\n",
+                unsigned(wave_clock.last_sequence), unsigned(decoded.sequence), unsigned(delta));
+        }
         if (delta > 32 || drift > 400 || drift < -400) {
             Log::logf(CAT_EDF, LOG_DEBUG,
                       "BRP resync seq=%u delta=%u rx=%lu drift=%ld\n",
@@ -2114,7 +2122,7 @@ static void process_csr(const RawFrame &raw, const StreamSchema &schema,
 }
 
 static void process_raw_frame(const RawFrame &raw) {
-    if (raw.len < 5 || !status.active || !advance_segment(raw.captured_ms)) return;
+    if (raw.len < 3 || !status.active || !advance_segment(raw.captured_ms)) return;
     if (int32_t(raw.captured_ms - session_clock.captured_ms) < 0) {
         portENTER_CRITICAL(&status_mux);
         status.raw_dropped++;
@@ -2129,10 +2137,15 @@ static void process_raw_frame(const RawFrame &raw) {
     };
     StreamSchema *schema = find_schema(tag);
     DecodedFrame decoded = {};
-    if (!schema || !Air10Stream::decode_frame(raw.payload, raw.len, *schema, decoded)) return;
-
-    portENTER_CRITICAL(&status_mux);
-    portEXIT_CRITICAL(&status_mux);
+    if (!schema || !Air10Stream::decode_frame(raw.payload, raw.len, *schema, decoded)) {
+        portENTER_CRITICAL(&status_mux);
+        const bool first = status.decode_errors++ == 0;
+        portEXIT_CRITICAL(&status_mux);
+        if (first) Log::logf(CAT_EDF, LOG_WARN,
+            "Stream rejected tag=%s bytes=%u reason=%s\n",
+            tag, unsigned(raw.len), schema ? "decode_failed" : "schema_missing");
+        return;
+    }
 
     if (strcmp(tag, wave_tag) == 0) process_wave(raw, *schema, decoded);
     else if (strcmp(tag, "APN") == 0) process_apnea(raw, *schema, decoded);
@@ -2191,10 +2204,10 @@ static bool frame_sink(const qframe_t *frame, void *) {
     }
 
     const bool wanted = memcmp(wave_tag, frame->payload, 3) == 0 ||
-                        memcmp("APN", frame->payload, 3) == 0 ||
-                        memcmp("CSN", frame->payload, 3) == 0 ||
-                        memcmp("PBT", frame->payload, 3) == 0 ||
-                        memcmp("BRH", frame->payload, 3) == 0;
+                        (stream_leases[1] >= 0 && memcmp("APN", frame->payload, 3) == 0) ||
+                        (stream_leases[2] >= 0 && memcmp("CSN", frame->payload, 3) == 0) ||
+                        (stream_leases[3] >= 0 && memcmp("PBT", frame->payload, 3) == 0) ||
+                        (stream_leases[4] >= 0 && memcmp("BRH", frame->payload, 3) == 0);
     if (!wanted) return true;
 
     RawFrame raw = {};
@@ -2486,6 +2499,8 @@ static void start_session(const ControlEvent &event) {
     status.active = true;
     status.post_processing = false;
     status.raw_dropped = 0;
+    status.decode_errors = 0;
+    status.sequence_gaps = 0;
     status.write_errors = 0;
     status.post_errors = 0;
     status.brp_records = 0;
@@ -2532,10 +2547,12 @@ static void close_segment(uint32_t captured_ms) {
 
     EdfCatalog::Entry catalog_entry;
     complete = commit_session_catalog(false, false, catalog_entry) && complete;
-    Log::logf(CAT_EDF, !complete ? LOG_ERROR : finished.raw_dropped ? LOG_WARN : LOG_INFO,
-              "%s %s drops=%u\n",
-              !complete ? "incomplete" : finished.raw_dropped ? "complete with gaps" : "complete",
-              finished.file_prefix, finished.raw_dropped);
+    const bool gaps = finished.raw_dropped || finished.decode_errors || finished.sequence_gaps;
+    Log::logf(CAT_EDF, !complete ? LOG_ERROR : gaps ? LOG_WARN : LOG_INFO,
+              "%s %s drops=%u decode=%u seq_gaps=%u\n",
+              !complete ? "incomplete" : gaps ? "complete with gaps" : "complete",
+              finished.file_prefix, finished.raw_dropped, finished.decode_errors,
+              finished.sequence_gaps);
     Log::logf(CAT_EDF, LOG_DEBUG, "records BRP=%u PLD=%u SAD=%u EVE=%u CSL=%u\n",
               finished.brp_records, finished.pld_records,
               finished.sad_records, finished.eve_records, finished.csl_records);

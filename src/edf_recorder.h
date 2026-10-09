@@ -11,6 +11,8 @@ struct Status {
     bool post_processing;
     bool identification_ready;
     uint32_t raw_dropped;
+    uint32_t decode_errors;
+    uint32_t sequence_gaps;
     uint32_t write_errors;
     uint32_t brp_records;
     uint32_t pld_records;
