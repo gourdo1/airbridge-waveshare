@@ -2745,7 +2745,9 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
         snprintf(after, sizeof(after), "%lu", (unsigned long)trace.generation);
     const bool interrupted = post_processing_cancelled();
     if (interrupted) trace.result = "interrupted";
-    Log::logf(CAT_EDF, read_attempted && !interrupted ? LOG_INFO : LOG_DEBUG,
+    const bool unchanged = success && summary_ready &&
+        !identification_changed && !ready_changed && !content_changed;
+    Log::logf(CAT_EDF, read_attempted && !interrupted && !unchanged ? LOG_INFO : LOG_DEBUG,
               "STR %s %s ZEN=%lu>%s %s "
               "ident+=%u ready+=%u token=%u read=%lu sd=%lums\n",
               day_text, reason, (unsigned long)generation, after, trace.result,
