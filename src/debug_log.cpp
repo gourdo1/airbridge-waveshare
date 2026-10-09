@@ -29,6 +29,7 @@ struct SyslogRecord {
     int64_t epoch_ms;
     uint8_t cat;
     uint8_t level;
+    bool loss_report;
     char text[128];
 };
 
@@ -87,10 +88,9 @@ void Log::init() {
 // Count both rejected arrivals and lower-priority records evicted for them.
 static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                     const SyslogRecord &record) {
-    if (!queue) return 1;
+    if (!queue) return !record.loss_report;
     unsigned dropped = 0;
     if (count == SYSLOG_QUEUE_DEPTH) {
-        dropped = 1;
         size_t victim = count;
         uint8_t lowest_priority = record.level;
         for (size_t i = 0; i < count; i++) {
@@ -100,7 +100,8 @@ static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
                 lowest_priority = level;
             }
         }
-        if (victim == count) return dropped;
+        if (victim == count) return !record.loss_report;
+        dropped = !queue[(head + victim) % SYSLOG_QUEUE_DEPTH].loss_report;
         for (size_t i = victim; i + 1 < count; i++)
             queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
                 queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
@@ -156,7 +157,7 @@ static void poll_local() {
             memcpy(serial_pending, line, len);
             serial_pos = 0;
             serial_len = len;
-        } else serial_drops++;
+        } else if (!record.loss_report) serial_drops++;
     }
 }
 
@@ -179,6 +180,7 @@ static void report_losses() {
         SyslogRecord record = {};
         record.cat = CAT_GENERAL;
         record.level = LOG_WARN;
+        record.loss_report = true;
         record.epoch_ms = record_time();
         snprintf(record.text, sizeof(record.text),
             "Log losses lock=%lu local=%lu syslog=%lu serial=%lu UDP_errors=%lu errno=%d",
@@ -187,8 +189,7 @@ static void report_losses() {
             (unsigned long)serial_drops, (unsigned long)udp_errors, udp_errno);
         local_drops = syslog_drops = serial_drops = udp_errors = 0;
         udp_errno = 0;
-        // Allocation failure leaves the diagnostic pending for a working sink.
-        local_drops += enqueue(local_queue, local_head, local_count, record);
+        enqueue(local_queue, local_head, local_count, record);
         if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
         reported_ms = now;
     }
@@ -295,14 +296,12 @@ void Log::poll() {
 
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) {
-            udp_errors++;
-            udp_errno = errno;
+            if (!record.loss_report) { udp_errors++; udp_errno = errno; }
             return;
         }
         if (sendto(fd, payload, len, MSG_DONTWAIT,
                    (sockaddr *)&remote, sizeof(remote)) < 0) {
-            udp_errors++;
-            udp_errno = errno;
+            if (!record.loss_report) { udp_errors++; udp_errno = errno; }
             close(fd);
             fd = -1;
             return;
