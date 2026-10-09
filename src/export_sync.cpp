@@ -1055,10 +1055,11 @@ template <typename T>
 static void run_logged(const Request &request, const char *name,
                         bool (*run)(const Request &), void (*snapshot)(T &)) {
     const uint32_t started = millis();
-    Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s\n", name,
+    Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s wait=%lums\n", name,
               request.kind == RequestKind::PostTherapy ? "post_therapy" :
               request.kind == RequestKind::StartupSmb ||
-              request.kind == RequestKind::StartupSleepHq ? "startup" : "manual");
+              request.kind == RequestKind::StartupSleepHq ? "startup" : "manual",
+              (unsigned long)(started - request.queued_ms));
     bool success = run(request);
     T result;
     snapshot(result);
@@ -1206,6 +1207,7 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     }
     Request request = {RequestKind::PostTherapy, entry,
         __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE)};
+    request.queued_ms = millis();
     if (xQueueSend(request_queue, &request, 0) != pdTRUE) return false;
     if (smb) set_state(State::Pending);
     if (sleephq) set_sleephq_state(State::Pending);

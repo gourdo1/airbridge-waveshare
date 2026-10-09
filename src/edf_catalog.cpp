@@ -324,7 +324,7 @@ bool commit(const Entry &entry) {
         if (change_count < 32) ++change_count;
         __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
         portEXIT_CRITICAL(&status_mux);
-        Log::logf(CAT_EDF, LOG_INFO,
+        Log::logf(CAT_EDF, LOG_DEBUG,
                   "catalog commit %s entries=%u generation=%u\n",
                   entry.file_prefix, status.entries, status.generation);
     }
