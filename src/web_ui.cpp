@@ -2290,7 +2290,12 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
                 return;
             }
             auto *response = new(std::nothrow) StorageResponse(transfer, kind, size);
-            if (!response) { transfer->cancel(); request->send(503); return; }
+            if (!response) {
+                Log::logf(CAT_WEB, LOG_WARN, "Storage response allocation failed\n");
+                transfer->cancel();
+                request->send(503);
+                return;
+            }
             if (disposition.length()) response->addHeader("Content-Disposition", disposition);
             request->send(response);
         }, active);
