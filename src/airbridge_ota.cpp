@@ -53,6 +53,7 @@ struct RuntimeStatus {
     uint32_t reboot_at_ms = 0;
     uint32_t resmed_claimed_at_ms = 0;
     bool resmed_started = false;
+    bool manual_image_started = false;
     Operation operation = OP_NONE;
     char update_version[OtaRelease::VERSION_MAX] = {};
     char error[64] = {};
@@ -574,6 +575,7 @@ bool begin_manual_upload() {
                    !ResmedOta::is_active() && background_work_idle();
     if (allowed) {
         runtime.operation = OP_MANUAL;
+        runtime.manual_image_started = false;
         runtime.bytes = 0;
         runtime.total_size = 0;
     }
@@ -584,15 +586,26 @@ bool begin_manual_upload() {
 void end_manual_upload(bool success, const char *error) {
     if (!lock()) return;
     bool ended = runtime.operation == OP_MANUAL;
+    const bool image_started = ended && runtime.manual_image_started;
+    const OtaImage::Status image = image_started ? image_writer.status() : OtaImage::Status{};
     if (ended) runtime.operation = OP_NONE;
     unlock(ended);
-    if (ended && !success)
-        Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
+    if (ended && !success) {
+        if (image_started)
+            Log::logf(CAT_OTA, LOG_ERROR,
+                "HTTP upload failed stage=%s bytes=%u wire=%u: %s\n",
+                image.error_stage ? image.error_stage : "transport",
+                unsigned(image.bytes), unsigned(image.wire_bytes),
+                image.error ? image.error : error ? error : "upload_failed");
+        else
+            Log::logf(CAT_OTA, LOG_ERROR, "HTTP upload failed: %s\n", error ? error : "upload_failed");
+    }
 }
 
 bool begin_image(size_t wire_size, size_t image_size, OtaImage::Encoding encoding) {
     if (!lock()) return false;
     const bool owned = runtime.operation == OP_MANUAL || runtime.operation == OP_INSTALL;
+    if (runtime.operation == OP_MANUAL) runtime.manual_image_started = true;
     unlock();
     return owned && image_writer.begin(wire_size, image_size, encoding);
 }
