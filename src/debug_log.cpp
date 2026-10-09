@@ -46,7 +46,16 @@ static bool boot_pending = false;
 static uint32_t contention_drops = 0;
 static uint32_t local_drops = 0, syslog_drops = 0, serial_drops = 0;
 static uint32_t udp_errors = 0;
-static int udp_errno = 0;
+static struct {
+    const char *operation;
+    int error;
+    int64_t epoch_ms;
+    uint32_t at_ms;
+    in_addr ip;
+    bool sta_connected;
+    uint8_t ap_clients;
+    uint32_t internal_free, largest;
+} udp_failure = {};
 
 const char *Log::reset_reason_name() {
     static const char *const names[] = {
@@ -171,14 +180,29 @@ static int64_t record_time() {
         ? (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000 : 0;
 }
 
+static void note_udp_failure(const char *operation, int error) {
+    udp_errors++;
+    udp_failure.operation = operation;
+    udp_failure.error = error;
+    udp_failure.at_ms = millis();
+    udp_failure.epoch_ms = record_time();
+    udp_failure.sta_connected = WiFi.isConnected();
+    udp_failure.ap_clients = WiFi.softAPgetStationNum();
+    udp_failure.ip.s_addr = (uint32_t)WiFi.localIP();
+    const auto memory = aircannect::Memory::status();
+    udp_failure.internal_free = memory.heap_free;
+    udp_failure.largest = memory.heap_max_alloc;
+}
+
 static void report_losses() {
     static uint32_t reported_ms = 0;
     const uint32_t now = millis();
     if (now - reported_ms < 5000 || Log::get_cat_level(CAT_GENERAL) < LOG_WARN ||
         xSemaphoreTake(log_mutex, 0) != pdTRUE) return;
     // Do not recursively lose diagnostics or displace a producer's record.
-    if (local_count < SYSLOG_QUEUE_DEPTH &&
-        (!syslog_queue || syslog_count < SYSLOG_QUEUE_DEPTH) &&
+    const size_t slots = udp_errors ? 2 : 1;
+    if (local_count + slots <= SYSLOG_QUEUE_DEPTH &&
+        (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH) &&
         (__atomic_load_n(&contention_drops, __ATOMIC_RELAXED) || local_drops ||
          syslog_drops || serial_drops || udp_errors)) {
         SyslogRecord record = {};
@@ -190,11 +214,24 @@ static void report_losses() {
             "Log losses lock=%lu local=%lu syslog=%lu serial=%lu UDP_errors=%lu errno=%d",
             (unsigned long)__atomic_exchange_n(&contention_drops, 0, __ATOMIC_RELAXED),
             (unsigned long)local_drops, (unsigned long)syslog_drops,
-            (unsigned long)serial_drops, (unsigned long)udp_errors, udp_errno);
-        local_drops = syslog_drops = serial_drops = udp_errors = 0;
-        udp_errno = 0;
+            (unsigned long)serial_drops, (unsigned long)udp_errors, udp_failure.error);
         enqueue(local_queue, local_head, local_count, record);
         if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
+        if (udp_errors) {
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &udp_failure.ip, ip, sizeof(ip));
+            record.epoch_ms = udp_failure.epoch_ms;
+            snprintf(record.text, sizeof(record.text),
+                "Syslog last=%s errno=%d sta=%u ap=%u ip=%s internal=%lu largest=%lu ms=%lu",
+                udp_failure.operation, udp_failure.error,
+                (unsigned)udp_failure.sta_connected, (unsigned)udp_failure.ap_clients, ip,
+                (unsigned long)udp_failure.internal_free,
+                (unsigned long)udp_failure.largest, (unsigned long)udp_failure.at_ms);
+            enqueue(local_queue, local_head, local_count, record);
+            if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, record);
+        }
+        local_drops = syslog_drops = serial_drops = udp_errors = 0;
+        udp_failure = {};
         reported_ms = now;
     }
     xSemaphoreGive(log_mutex);
@@ -300,12 +337,12 @@ void Log::poll() {
 
         if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) {
-            if (!record.loss_report) { udp_errors++; udp_errno = errno; }
+            if (!record.loss_report) note_udp_failure("socket", errno);
             return;
         }
         if (sendto(fd, payload, len, MSG_DONTWAIT,
                    (sockaddr *)&remote, sizeof(remote)) < 0) {
-            if (!record.loss_report) { udp_errors++; udp_errno = errno; }
+            if (!record.loss_report) note_udp_failure("sendto", errno);
             close(fd);
             fd = -1;
             return;
