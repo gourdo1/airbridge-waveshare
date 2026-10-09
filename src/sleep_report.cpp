@@ -4,10 +4,30 @@
 #include "app_config.h"
 #include "hex_util.h"
 #include "uart_arbiter.h"
+#include "board.h"
 #include <stdio.h>
 #include <string.h>
 
 namespace SleepReport {
+
+void init() { EdfReport::init(); }
+void tick() { EdfReport::tick(); }
+Source default_source() {
+    return AB_STORAGE_HAS_SDCARD ? Source::Edf : Source::Device;
+}
+const char *source_name(Source source) {
+    return source == Source::Edf ? "edf" : "device";
+}
+void get_publication(Publication &out) {
+    out.source = default_source();
+    EdfReport::get_status(out.local);
+}
+bool submit(const LocalRequest &request, uint32_t &id, const char **error) {
+    return EdfReport::submit(request, id, error);
+}
+int poll(uint32_t id, Result &out) { return EdfReport::poll(id, out); }
+void cancel(uint32_t id) { EdfReport::cancel(id); }
+
 namespace {
 const Field DAY_FIELDS[] = {
     {"THD", "Usage", 60, 0, "", Format::Duration},

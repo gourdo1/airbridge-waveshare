@@ -24,6 +24,8 @@
 #include "clinical_jobs.h"
 #include "memory_manager.h"
 #include "json_util.h"
+#include "string_util.h"
+#include "hex_util.h"
 #include "air10_clock.h"
 #include "board.h"
 
@@ -335,6 +337,11 @@ static void jsonAddUInt32(FixedJson &json, const char *key, uint32_t val,
     fixedJsonPrintf(json, "%s\"%s\":%lu", comma ? "," : "", key, (unsigned long)val);
 }
 
+static void jsonAddBool(FixedJson &json, const char *key, bool val,
+                        bool comma = true) {
+    fixedJsonPrintf(json, "%s\"%s\":%s", comma ? "," : "", key, val ? "true" : "false");
+}
+
 static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
     strcpy(esp_time, "--");
     time_t now = time(nullptr);
@@ -350,7 +357,7 @@ static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
 
 enum StatusFields : uint8_t {
     STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
-    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_ALL = 31,
+    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_REPORT = 32, STATUS_ALL = 63,
 };
 
 template<class Output>
@@ -400,9 +407,8 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         const auto &r = status.reading;
         jsonAddString(json, "oxi", oxi_state_name(status.oxi));
         jsonAddUInt32(json, "ble_revision", OxiBle::revision());
-        char oxi_addr[32];
-        OxiArbiter::get_source_id(oxi_addr, sizeof(oxi_addr));
-        jsonAddString(json, "oxi_addr", oxi_addr);
+        jsonAddString(json, "oxi_addr", status.oxi_source);
+        jsonAddString(json, "oxi_name", status.oxi_name);
         jsonAddString(json, "feeding", status.feeding ? "yes" : "no");
         jsonAddInt(json, "spo2", r.valid ? r.spo2 : -1);
         jsonAddInt(json, "pulse", r.valid ? r.pulse_bpm : -1);
@@ -410,6 +416,14 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
     if (fields & STATUS_CONFIG) {
         jsonAddUInt32(json, "config_revision", Config::revision());
         jsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
+    }
+    if (fields & STATUS_REPORT) {
+        jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
+        jsonAddUInt32(json, "report_revision", status.report_revision);
+        jsonAddUInt32(json, "report_data_revision", status.report_data_revision);
+        jsonAddString(json, "report_state", EdfReport::state_name(status.report_state));
+        jsonAddString(json, "report_error", status.report_error);
+        jsonAddBool(json, "report_available", status.report_available);
     }
     if (fields & STATUS_IDENTITY) appendStatusIdentity(json);
 }
@@ -479,7 +493,9 @@ static size_t buildStatusJson(char *out, size_t cap) {
 }
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 1408 : 896;
+// Includes bounded owner strings at the WebUI escape worst case (two bytes)
+// and both uint32 report revisions.
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2304 : 1344;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 
@@ -754,12 +770,24 @@ private:
     ClinicalJobs::Cursor cursor_;
 };
 
-static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind kind) {
+static void sendReportJob(AsyncWebServerRequest *request, SleepReport::Source source,
+                           uint32_t id, bool pending = false) {
+    String body = "{";
+    const String token = String(SleepReport::source_name(source)) + ':' + String(id);
+    jsonAddString(body, "job", token.c_str(), false);
+    if (pending) jsonAddBool(body, "pending", true);
+    body += '}';
+    request->send(202, "application/json", body);
+}
+
+static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind kind,
+                              SleepReport::Request report = {}, uint32_t job = 0) {
     if (!checkAuth(request)) return;
     bool write = kind == ClinicalJobs::Kind::Write;
-    if (!write && request->hasArg("job")) {
+    if (!write && (job || request->hasArg("job"))) {
         ClinicalJobs::Result result;
-        int code = ClinicalJobs::poll(strtoul(request->arg("job").c_str(), nullptr, 10), result);
+        int code = ClinicalJobs::poll(job ? job :
+            strtoul(request->arg("job").c_str(), nullptr, 10), result);
         if (result.available()) {
             auto *response = new (std::nothrow) ClinicalResponse(std::move(result));
             if (!response) {
@@ -768,6 +796,8 @@ static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind
             }
             response->begin(code);
             request->send(response);
+        } else if (kind == ClinicalJobs::Kind::Report && code == 202) {
+            sendReportJob(request, SleepReport::Source::Device, job, true);
         } else {
             request->send(code, "application/json", code == 202 ? "{\"pending\":true}"
                 : "{\"error\":\"settings_job_unavailable\"}");
@@ -776,38 +806,224 @@ static void handleClinicalJob(AsyncWebServerRequest *request, ClinicalJobs::Kind
     }
     uint32_t id = 0;
     String body;
-    SleepReport::Request report;
-    if (kind == ClinicalJobs::Kind::Report) {
-        String view = request->arg("view");
-        if (view == "period") report.view = SleepReport::View::Period;
-        String selected = request->arg(report.view == SleepReport::View::Period ? "period" : "day");
-        bool valid = view.isEmpty() || view == "day" || view == "period";
-        if (selected.length() > 5) valid = false;
-        for (size_t i = 0; i < selected.length(); i++)
-            if (selected[i] < '0' || selected[i] > '9') valid = false;
-        unsigned long selection = strtoul(selected.c_str(), nullptr, 10);
-        if (selection > UINT16_MAX) valid = false;
-        report.selection = selection;
-        if (!valid || !SleepReport::valid(report)) {
-            request->send(400, "application/json", "{\"error\":\"report_invalid_selection\"}");
-            return;
-        }
-        if (report.view == SleepReport::View::Period && request->method() != HTTP_POST) {
-            request->send(405, "application/json", "{\"error\":\"report_period_requires_POST\"}");
-            return;
-        }
-    }
     if (write && !getBody(request, body)) return;
     if (!ClinicalJobs::submit(kind, std::move(body), id, report)) {
         request->send(503, "application/json", "{\"error\":\"settings_busy\"}");
         return;
     }
-    request->send(202, "application/json", "{\"job\":" + String(id) + "}");
+    if (kind == ClinicalJobs::Kind::Report)
+        sendReportJob(request, SleepReport::Source::Device, id);
+    else request->send(202, "application/json", "{\"job\":" + String(id) + "}");
 }
 
 static void handleGetSettings(AsyncWebServerRequest *request) { handleClinicalJob(request, ClinicalJobs::Kind::Read); }
 static void handlePostSettings(AsyncWebServerRequest *request) { handleClinicalJob(request, ClinicalJobs::Kind::Write); }
-static void handleReport(AsyncWebServerRequest *request) { handleClinicalJob(request, ClinicalJobs::Kind::Report); }
+
+class ReportResponse : public BufferedResponse {
+public:
+    ReportResponse(int code, SleepReport::Result &&ready) : result_(std::move(ready)) {
+        begin(code, result_.length());
+    }
+
+    bool _sourceValid() const override { return result_.available(); }
+
+protected:
+    size_t readBody(size_t offset, char *out, size_t capacity) override {
+        return result_.read(offset, out, capacity);
+    }
+
+private:
+    SleepReport::Result result_;
+};
+
+static bool reportQueryKeys(AsyncWebServerRequest *request) {
+    const char *keys[] = {"source", "action", "view", "day", "period", "job",
+                          "from_ms", "to_ms", "px", "revision", "exclude"};
+    const size_t count = request->params();
+    if (count > sizeof(keys) / sizeof(keys[0])) return false;
+    for (size_t i = 0; i < count; i++) {
+        const auto *param = request->getParam(i);
+        if (!param || param->isPost() || param->isFile()) return false;
+        bool known = false;
+        for (const char *key : keys) known |= param->name() == key;
+        if (!known) return false;
+        for (size_t j = 0; j < i; j++)
+            if (request->getParam(j)->name() == param->name()) return false;
+    }
+    return true;
+}
+
+static bool reportNumber(AsyncWebServerRequest *request, const char *key,
+                          uint64_t maximum, uint64_t &value) {
+    const auto *param = request->getParam(key);
+    if (!param) return true;
+    uint64_t parsed;
+    if (param->value().length() > 20 ||
+        !aircannect::parse_uint64_decimal(param->value().c_str(), parsed) ||
+        parsed > maximum) return false;
+    value = parsed;
+    return true;
+}
+
+static bool reportExclusions(AsyncWebServerRequest *request, SleepReport::LocalRequest &local) {
+    const auto *param = request->getParam("exclude");
+    if (!param) return true;
+#if AB_STORAGE_HAS_SDCARD
+    const auto &text = param->value();
+    size_t decoded = 0;
+    return aircannect::hex_decode(text.c_str(), text.length(), local.excluded,
+                                  sizeof(local.excluded), decoded);
+#else
+    (void)local;
+    return false;
+#endif
+}
+
+static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &source,
+                       uint32_t &id, bool &qualified) {
+    const auto *param = request->getParam("job");
+    if (!param || param->value().length() > 17) return false;
+    const char *text = param->value().c_str();
+    auto tagged = source;
+    qualified = true;
+    if (!strncmp(text, "device:", 7)) {
+        tagged = SleepReport::Source::Device;
+        text += 7;
+    } else if (!strncmp(text, "edf:", 4)) {
+        tagged = SleepReport::Source::Edf;
+        text += 4;
+    } else qualified = false;
+    if ((qualified && request->hasParam("source") && tagged != source) ||
+        !aircannect::parse_uint32_decimal(text, id) || !id) return false;
+    source = tagged;
+    return true;
+}
+
+static void handleReport(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    auto invalid = [&]() {
+        request->send(400, "application/json", "{\"error\":\"report_invalid_selection\"}");
+    };
+    if (!reportQueryKeys(request)) { invalid(); return; }
+
+    SleepReport::Source source = SleepReport::default_source();
+    if (const auto *param = request->getParam("source")) {
+        if (param->value() == "edf") source = SleepReport::Source::Edf;
+        else if (param->value() == "device") source = SleepReport::Source::Device;
+        else { invalid(); return; }
+    }
+
+    if (request->hasParam("job")) {
+        uint32_t id = 0;
+        bool qualified = false;
+        if (!reportJob(request, source, id, qualified) ||
+            request->params() != (request->hasParam("source") ? 2u : 1u)) {
+            invalid(); return;
+        }
+        if (request->method() == HTTP_DELETE) {
+            if (source == SleepReport::Source::Device) {
+                request->send(405, "application/json", "{\"error\":\"report_device_cancel_unsupported\"}");
+            } else if (!qualified) invalid();
+            else {
+                SleepReport::cancel(id);
+                request->send(204);
+            }
+            return;
+        }
+        if (request->method() != HTTP_GET) {
+            request->send(405, "application/json", "{\"error\":\"report_job_requires_GET\"}");
+            return;
+        }
+        if (source == SleepReport::Source::Device) {
+            handleClinicalJob(request, ClinicalJobs::Kind::Report, {}, id);
+            return;
+        }
+        SleepReport::Result result;
+        int code = SleepReport::poll(id, result);
+        if (result.available()) {
+            auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
+            if (!response) {
+                request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
+                return;
+            }
+            request->send(response);
+        } else if (code == 202) {
+            sendReportJob(request, source, id, true);
+        } else {
+            request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
+        }
+        return;
+    }
+
+    if (request->method() == HTTP_DELETE) { invalid(); return; }
+
+    SleepReport::LocalRequest local;
+    if (const auto *param = request->getParam("action")) {
+        if (param->value() == "days") local.action = EdfReport::Action::Days;
+        else if (param->value() == "series") local.action = EdfReport::Action::Series;
+        else if (param->value() != "summary") { invalid(); return; }
+    }
+    if (const auto *param = request->getParam("view")) {
+        if (param->value() == "period") local.view = EdfReport::View::Period;
+        else if (param->value() != "day") { invalid(); return; }
+    }
+    const bool period_view = local.view == EdfReport::View::Period;
+    const bool series = local.action == EdfReport::Action::Series;
+    uint64_t day = 0, period = 0, from = 0, to = 0, px = local.px, revision = 0;
+    if (!reportNumber(request, "day", UINT16_MAX, day) ||
+        !reportNumber(request, "period", 5, period) ||
+        !reportNumber(request, "from_ms", INT64_MAX, from) ||
+        !reportNumber(request, "to_ms", INT64_MAX, to) ||
+        !reportNumber(request, "px", 1600, px) ||
+        !reportNumber(request, "revision", UINT32_MAX, revision) ||
+        (!period_view && request->hasParam("period")) ||
+        (!series && (request->hasParam("from_ms") || request->hasParam("to_ms") ||
+                     request->hasParam("px") || request->hasParam("exclude")))) {
+        invalid(); return;
+    }
+    local.day = static_cast<uint16_t>(day);
+    local.period = SleepReport::period_days(static_cast<uint16_t>(period));
+    local.from_ms = static_cast<int64_t>(from);
+    local.to_ms = static_cast<int64_t>(to);
+    local.px = static_cast<uint16_t>(px);
+    local.revision = static_cast<uint32_t>(revision);
+    if (!reportExclusions(request, local)) { invalid(); return; }
+
+    if (source == SleepReport::Source::Device) {
+        if (local.action != EdfReport::Action::Summary || request->hasParam("revision") ||
+            (period_view && request->hasParam("day"))) { invalid(); return; }
+        SleepReport::Request device;
+        device.view = period_view ? SleepReport::View::Period : SleepReport::View::Day;
+        device.selection = static_cast<uint16_t>(period_view ? period : day);
+        if (!SleepReport::valid(device)) { invalid(); return; }
+        if (request->method() != (period_view ? HTTP_POST : HTTP_GET)) {
+            request->send(405, "application/json", period_view
+                ? "{\"error\":\"report_period_requires_POST\"}"
+                : "{\"error\":\"report_day_requires_GET\"}");
+            return;
+        }
+        handleClinicalJob(request, ClinicalJobs::Kind::Report, device);
+        return;
+    }
+
+    if (request->method() != HTTP_GET) {
+        request->send(405, "application/json", "{\"error\":\"report_edf_requires_GET\"}");
+        return;
+    }
+    if (!EdfReport::valid(local)) { invalid(); return; }
+    uint32_t id = 0;
+    const char *error = nullptr;
+    if (!SleepReport::submit(local, id, &error)) {
+        String body = "{";
+        jsonAddString(body, "error", error ? error : "report_busy", false);
+        body += '}';
+        const int code = error && (!strcmp(error, "stale_revision") || !strcmp(error, "not_idle"))
+            ? 409 : 503;
+        request->send(code, "application/json", body);
+        return;
+    }
+    sendReportJob(request, source, id);
+}
 
 
 static void handleGetConfig(AsyncWebServerRequest *request) {
@@ -2154,6 +2370,7 @@ void WebUI::init(uint16_t port) {
     http->on("/api/time", HTTP_POST, handleTimeAction, NULL, handleJsonBody);
     http->on("/api/report", HTTP_GET, handleReport);
     http->on("/api/report", HTTP_POST, handleReport);
+    http->on("/api/report", HTTP_DELETE, handleReport);
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
@@ -2174,10 +2391,16 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
+        strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||
         (a.reading.valid && (a.reading.spo2 != b.reading.spo2 ||
                             a.reading.pulse_bpm != b.reading.pulse_bpm)))
         fields |= STATUS_OXI;
+    if (a.report_source != b.report_source || a.report_revision != b.report_revision ||
+        a.report_data_revision != b.report_data_revision ||
+        a.report_state != b.report_state || strcmp(a.report_error, b.report_error) ||
+        a.report_available != b.report_available)
+        fields |= STATUS_REPORT;
     return fields;
 }
 
@@ -2203,16 +2426,12 @@ void WebUI::push_status_event() {
 static void publishStatus() {
     static uint32_t revision = 1, health_at = 0, oxi_at = 0;
     static uint32_t ble_revision = 0, config_revision = 0, device_revision = 0;
-    static char source_id[32] = {};
     static uint8_t pending_fields = STATUS_ALL;
     const auto status = DeviceStatus::snapshot();
     const uint32_t now = millis();
-    char current_source[sizeof(source_id)];
-    OxiArbiter::get_source_id(current_source, sizeof(current_source));
     uint8_t fields = statusChanges(status, last_published);
     if (status_requested) fields |= STATUS_THERAPY;
-    if ((fields & STATUS_OXI) || strcmp(source_id, current_source) ||
-        OxiBle::revision() != ble_revision ||
+    if ((fields & STATUS_OXI) || OxiBle::revision() != ble_revision ||
         (now - oxi_at >= 2000 && live_events && live_events->count())) {
         fields |= STATUS_OXI;
         oxi_at = now;
@@ -2229,7 +2448,6 @@ static void publishStatus() {
         ble_revision = OxiBle::revision();
         config_revision = Config::revision();
         device_revision = AirSenseState::identity_revision();
-        memcpy(source_id, current_source, sizeof(source_id));
         pending_fields = fields;
         if (!++revision) ++revision;
     }

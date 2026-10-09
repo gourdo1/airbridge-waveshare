@@ -55,6 +55,11 @@ fs::FS *filesystem();
 void refresh_usage();
 void get_status(Status &out);
 
+// Explicit rename/delete steps, including partially completed jobs.
+// Recorder/catalog, private cache and mount/card changes are separate.
+uint32_t files_revision();
+void notify_files_changed();
+
 // Recorder/recovery only. Waits for current local I/O, never for a network
 // consumer; acquisition invalidates all previously admitted background work.
 bool acquire();
@@ -98,6 +103,8 @@ public:
     Reader &operator=(const Reader &) = delete;
     bool open(const Session &session, const char *path, bool directory = false);
     bool next(Entry &entry, bool &end);
+    // Absolute file offset through UINT32_MAX, including EOF; failure keeps offset.
+    bool seek(uint64_t offset);
     size_t read(uint8_t *data, size_t length);
     void close();
     uint64_t size() const { return size_; }

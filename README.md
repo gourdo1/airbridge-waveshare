@@ -30,13 +30,13 @@ Both support serial (`-p /dev/ttyUSB0`) and TCP (`-p tcp:hostname`) with `--tcp-
 
 ## Screenshots
 
-| Dashboard | Edf Sync | Sleep Report |
+| Dashboard | Edf Sync | Charts |
 |---|---|---|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Sync](docs/screenshots/sync.png) | ![Report](docs/screenshots/report.png) |
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Sync](docs/screenshots/sync.png) | ![Charts](docs/screenshots/report_charts.png) |
 
-| Clinical Settings | Oximetry | OTA Upload |
+| Sleep Report | Clinical Settings | Oximetry |
 |---|---|---|
-| ![Clinical](docs/screenshots/clinical.png) | ![Bluetooth](docs/screenshots/bluetooth.png) | ![OTA](docs/screenshots/ota.png) |
+| ![Report](docs/screenshots/report.png) | ![Clinical](docs/screenshots/clinical.png) | ![Bluetooth](docs/screenshots/bluetooth.png) |
 
 
 ## License

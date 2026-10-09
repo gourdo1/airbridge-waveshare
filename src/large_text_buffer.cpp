@@ -38,6 +38,14 @@ void LargeTextBuffer::swap(LargeTextBuffer &other) {
     bool overflowed = overflowed_;
     overflowed_ = other.overflowed_;
     other.overflowed_ = overflowed;
+
+    size_t maximum = max_capacity_;
+    max_capacity_ = other.max_capacity_;
+    other.max_capacity_ = maximum;
+
+    size_t fallback = internal_fallback_limit_;
+    internal_fallback_limit_ = other.internal_fallback_limit_;
+    other.internal_fallback_limit_ = fallback;
 }
 
 LargeTextBuffer &LargeTextBuffer::operator=(const char *text) {
@@ -78,19 +86,25 @@ bool LargeTextBuffer::append(const char *text, size_t len) {
 }
 
 bool LargeTextBuffer::ensure_capacity(size_t needed) {
+    if (needed > max_capacity_ || needed == SIZE_MAX) {
+        overflowed_ = true;
+        return false;
+    }
     if (needed <= capacity_) return true;
-    if (needed == SIZE_MAX) return false;
 
     size_t target = capacity_ ? capacity_ : 256;
+    if (target > max_capacity_) target = max_capacity_;
     while (target < needed) {
         if (target > SIZE_MAX / 2) {
             target = needed;
             break;
         }
         target *= 2;
+        if (target > max_capacity_) target = max_capacity_;
     }
 
-    char *next = static_cast<char *>(Memory::realloc_large(data_, target + 1));
+    char *next = static_cast<char *>(Memory::realloc_large(
+        data_, target + 1, target + 1 <= internal_fallback_limit_));
     if (!next) return false;
     next[length_] = 0;
     data_ = next;
