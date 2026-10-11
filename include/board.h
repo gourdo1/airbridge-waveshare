@@ -158,6 +158,15 @@
 #endif
 #endif
 
+// Fork builds (Waveshare ESP32-S3-LCD-1.54): no automatic release checks.
+// Upstream's manifest has no image for these targets (see
+// AB_OTA_RELEASE_TARGET), and this fork publishes no releases yet. An empty
+// URL disables the daily check; set update_url to a fork release manifest
+// once one exists.
+#if !defined(AB_DEFAULT_UPDATE_URL) && defined(AB_BOARD_WAVESHARE_S3_LCD154)
+#define AB_DEFAULT_UPDATE_URL ""
+#endif
+
 #ifndef AB_DEFAULT_UPDATE_URL
 #define AB_DEFAULT_UPDATE_URL                                                \
     "https://github.com/m-kozlowski/airbridge/releases/latest/download/"   \
