@@ -5,30 +5,27 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace EdfReport {
 
 bool Request::operator==(const Request &other) const {
     return action == other.action && view == other.view && day == other.day &&
-        period == other.period && from_ms == other.from_ms && to_ms == other.to_ms &&
-        px == other.px && revision == other.revision &&
-        !memcmp(excluded, other.excluded, sizeof(excluded));
+        period == other.period && revision == other.revision;
 }
 
 bool valid(const Request &request) {
-    if (request.action > Action::Series || request.view > View::Period ||
+    if (request.action > Action::Reindex || uint8_t(request.action) == 2 || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
+    if (request.action == Action::History && request.view != View::Day) return false;
+    if (request.action == Action::Reindex && (request.view != View::Day || request.revision)) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
-    for (uint8_t excluded : request.excluded)
-        if (excluded && (request.action != Action::Series || !request.revision)) return false;
-    return request.action != Action::Series ||
-        (request.from_ms > 0 && request.to_ms > request.from_ms &&
-         request.to_ms - request.from_ms <= 366ll * 86400000 &&
-         request.px && request.px <= 1600);
+    return true;
 }
 
 const char *state_name(State state) {
@@ -57,16 +54,23 @@ Result::Result(Result &&other) noexcept
 
 #if AB_STORAGE_HAS_SDCARD
 #include "air10_clock.h"
+#include "air10_edf.h"
+#include "air10_str_timeline.h"
 #include "airsense_state.h"
 #include "edf_catalog.h"
+#include "export_sync.h"
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
+#include "json_util.h"
 #include "hex_util.h"
 #include "report_edf.h"
+#include "report_artifact_builder.h"
+#include "settings_defs.h"
 #include <Arduino.h>
 #include <FS.h>
 #include <esp_heap_caps.h>
+#include <esp_random.h>
 #include <freertos/semphr.h>
 #include <cstdarg>
 #include <cstdio>
@@ -74,38 +78,48 @@ Result::Result(Result &&other) noexcept
 
 namespace EdfReport {
 namespace {
-constexpr uint32_t STATS_CACHE_VERSION = 6;
-constexpr uint32_t SERIES_CACHE_VERSION = 5;
+constexpr uint32_t STATS_CACHE_VERSION = 7;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
 constexpr size_t MAX_BODY = 512 * 1024;
 constexpr size_t INTERNAL_BODY = 16 * 1024;
 constexpr size_t INTERNAL_WORK = 8 * 1024;
-constexpr uint64_t MAX_SD_CACHE = 128ull * 1024 * 1024;
-constexpr uint32_t RETAIN_MS = 30000;
+constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
+constexpr uint32_t DELIVERY_MS = 30000;
+constexpr uint32_t FOREGROUND_QUIET_MS = 1000;
 constexpr size_t SLOT_COUNT = 2;
-constexpr size_t CHANNEL_COUNT = 9;
-constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
-constexpr size_t LEVEL_COUNT = sizeof(LEVEL_MS) / sizeof(LEVEL_MS[0]);
+constexpr size_t RETAINED_SLOTS = 32;
+constexpr double LEAK_THRESHOLD = 24;
 constexpr const char *CACHE_DIR = "/airbridge/report";
 constexpr const char *SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
+char dataset_id[65] = {};
+uint32_t rebuild_generation = 0;
 
 struct ChannelSpec {
     const char *id, *label, *unit, *signal;
     uint8_t file;
+    ReportArtifact::SignalId artifact_id;
 };
+using ReportArtifact::SignalId;
 constexpr ChannelSpec CHANNELS[] = {
-    {"Press", "Pressure", "cmH2O", "Press.2s", 1},
-    {"EprPress", "Expiratory pressure", "cmH2O", "EprPress.2s", 1},
-    {"MaskPress", "Mask pressure", "cmH2O", "MaskPress.2s", 1},
-    {"Leak", "Leak", "L/min", "Leak.2s", 1},
-    {"MinVent", "Minute ventilation", "L/min", "MinVent.2s", 1},
-    {"RespRate", "Respiratory rate", "bpm", "RespRate.2s", 1},
-    {"TidVol", "Tidal volume", "mL", "TidVol.2s", 1},
-    {"SpO2", "SpO2", "%", "SpO2.1s", 2},
-    {"Pulse", "Pulse", "bpm", "Pulse.1s", 2},
+    {"Press", "Pressure", "cmH2O", "Press.2s", 1, SignalId::Press},
+    {"EprPress", "Expiratory pressure", "cmH2O", "EprPress.2s", 1, SignalId::EprPress},
+    {"MaskPress", "Mask pressure", "cmH2O", "MaskPress.2s", 1, SignalId::MaskPress},
+    {"Leak", "Leak", "L/min", "Leak.2s", 1, SignalId::Leak},
+    {"MinVent", "Minute ventilation", "L/min", "MinVent.2s", 1, SignalId::MinVent},
+    {"RespRate", "Respiratory rate", "bpm", "RespRate.2s", 1, SignalId::RespRate},
+    {"TidVol", "Tidal volume", "mL", "TidVol.2s", 1, SignalId::TidVol},
+    {"SpO2", "SpO2", "%", "SpO2.1s", 2, SignalId::SpO2},
+    {"Pulse", "Pulse", "bpm", "Pulse.1s", 2, SignalId::Pulse},
+    {"FlowLim", "Flow limitation", "", "FlowLim.2s", 1, SignalId::FlowLim},
+    {"Snore", "Snore", "", "Snore.2s", 1, SignalId::Snore},
+    {"TgtVent", "Target ventilation", "L/min", "TgtVent.2s", 1, SignalId::TgtVent},
+    {"Ti", "Inspiratory time", "s", "Ti.2s", 1, SignalId::Ti},
+    {"IERatio", "I:E", "%", "IERatio.2s", 1, SignalId::IERatio},
+    {"AlvMinVent", "Alveolar ventilation", "L/min", "AlvMinVent.2s", 1, SignalId::AlvMinVent},
 };
+constexpr size_t CHANNEL_COUNT = sizeof(CHANNELS) / sizeof(CHANNELS[0]);
 
 // Sidecars are identity inputs, not recomputed source-data checksums.
 struct SourceKey {
@@ -151,21 +165,115 @@ struct CacheHeader {
     uint16_t day = 0;
     bool recorded = false, partial = false, events_truncated = false, events_known = false;
     bool usage_known = false;
+    double csr_seconds = 0, leak_high_seconds = 0;
+    bool csr_known = false;
 };
 struct SessionData {
     CacheHeader header;
     uint64_t *bins = nullptr;
     Event *events = nullptr;
+    // Summaries and history nest during preparation; keep their headers off
+    // the worker stack along with the separately allocated samples/events.
+    static void *operator new(size_t size, const std::nothrow_t &) noexcept {
+        return aircannect::Memory::alloc_large(size, size <= INTERNAL_WORK);
+    }
+    static void operator delete(void *memory) noexcept { aircannect::Memory::free(memory); }
     ~SessionData() {
         aircannect::Memory::free(bins);
         aircannect::Memory::free(events);
     }
 };
 
+struct DailyValues {
+    uint64_t count[4] = {}, events = 0;
+    double sum[4] = {}, seconds = 0;
+    bool present = false, ready = true, usage = true, event_count = true;
+
+    double value(size_t metric) const {
+        if (!present || !ready) return NAN;
+        if (!metric) return usage && seconds > 0 ? seconds : NAN;
+        if (metric == 1) return usage && event_count && seconds > 0 ? events * 3600.0 / seconds : NAN;
+        return count[metric - 2] ? sum[metric - 2] / count[metric - 2] : NAN;
+    }
+};
+struct CachedDay {
+    DailyValues values;
+    uint32_t updated = 0;
+    uint16_t day = 0;
+    bool has_values = false, artifacts_checked = false;
+    uint8_t artifact_key[32] = {};
+    uint8_t cleanup_key[32] = {};
+    bool cleanup_checked = false;
+};
+// Two annual selections; lazy growth, no per-day SD files or internal bulk fallback.
+constexpr size_t MAX_CACHED_DAYS = 2 * 366;
+CachedDay *daily_cache = nullptr;
+size_t daily_capacity = 0;
+uint32_t daily_update = 0;
+
+void invalidate_day(uint16_t day = 0) {
+    if (!day) {
+        aircannect::Memory::free(daily_cache);
+        daily_cache = nullptr;
+        daily_capacity = 0;
+        return;
+    }
+    for (size_t i = 0; i < daily_capacity; ++i)
+        if (daily_cache[i].day == day) daily_cache[i].day = 0;
+}
+CachedDay *cached_day_entry(uint16_t day, bool create) {
+    if (!day) return nullptr;
+    size_t slot = daily_capacity;
+    for (size_t i = 0; i < daily_capacity; ++i) {
+        if (daily_cache[i].day == day) {
+            daily_cache[i].updated = ++daily_update;
+            return &daily_cache[i];
+        }
+        if (!daily_cache[i].day && slot == daily_capacity) slot = i;
+    }
+    if (!create) return nullptr;
+    if (slot == daily_capacity && daily_capacity < MAX_CACHED_DAYS) {
+        const size_t capacity = std::min(MAX_CACHED_DAYS, std::max(size_t(16), daily_capacity * 2));
+        auto *grown = static_cast<CachedDay *>(aircannect::Memory::realloc_large(
+            daily_cache, capacity * sizeof(CachedDay), false));
+        if (grown) {
+            daily_cache = grown;
+            for (size_t i = daily_capacity; i < capacity; ++i) new (&daily_cache[i]) CachedDay;
+            daily_capacity = capacity;
+        }
+    }
+    if (!daily_capacity) return nullptr; // Cache allocation failure does not fail a report.
+    if (slot == daily_capacity) {
+        slot = 0;
+        for (size_t i = 1; i < daily_capacity; ++i)
+            if (int32_t(daily_cache[i].updated - daily_cache[slot].updated) < 0) slot = i;
+    }
+    daily_cache[slot] = {};
+    daily_cache[slot].day = day;
+    daily_cache[slot].updated = ++daily_update;
+    return &daily_cache[slot];
+}
+bool cached_day(uint16_t day, DailyValues &out, bool build) {
+    const auto *cached = cached_day_entry(day, false);
+    if (!cached || !cached->has_values || (build && !cached->values.ready)) return false;
+    out = cached->values;
+    return true;
+}
+void remember_day(uint16_t day, const DailyValues &values) {
+    if (auto *cached = cached_day_entry(day, true)) {
+        cached->values = values;
+        cached->has_values = true;
+    }
+}
+
 struct Payload : aircannect::LargeTextBuffer {
     Payload() : LargeTextBuffer(MAX_BODY, INTERNAL_BODY) {}
     bool format_error = false;
     bool good() const { return !format_error && !overflowed(); }
+    size_t write(uint8_t byte) { return write(&byte, 1); }
+    size_t write(const uint8_t *bytes, size_t length) {
+        return append(reinterpret_cast<const char *>(bytes), length) ? length : 0;
+    }
     bool print(const char *format, ...) {
         char text[256];
         va_list args;
@@ -181,14 +289,21 @@ enum class JobState : uint8_t { Free, Queued, Running, Complete };
 struct Job {
     Request request;
     JobState state = JobState::Free;
-    uint32_t id = 0, completed_ms = 0, data_revision = 0;
+    uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
+    uint32_t artifact_revision = 0, files_revision = 0;
     uint16_t readers = 0;
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
+    bool background = false, recovered_index = false;
+    mutable bool artifact_preempted = false;
+    uint32_t foreground_epoch = 0;
     int code = 0;
     const char *error = nullptr;
     mutable const char *issue = nullptr;
     mutable char issue_path[96] = {};
+    mutable uint64_t source_bytes = 0;
+    mutable uint32_t source_reads = 0, source_us = 0, tiles_us = 0;
+    bool diagnostics = false;
     Payload body;
 };
 
@@ -207,7 +322,8 @@ void log_result(const Job &job) {
         job.issue ? LOG_WARN : LOG_DEBUG,
         "EDF job=%lu %s day=%u code=%d %s path=%s\n",
         (unsigned long)job.id, job.request.action == Action::Days ? "days" :
-        job.request.action == Action::Summary ? "summary" : "series",
+        job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" :
+        job.request.action == Action::Prepare ? "prepare" : "reindex",
         unsigned(job.request.day), job.code, reason ? reason : "complete",
         expected || !job.issue_path[0] ? "-" : job.issue_path);
 }
@@ -216,12 +332,19 @@ struct JobTiming {
     bool enabled;
     uint32_t id, started_us;
     Action action;
-    uint32_t index_us = 0, numeric_us = 0, events_us = 0, encode_us = 0;
+    uint32_t index_us = 0;
+    const Job *job;
 
-    explicit JobTiming(const Job *job)
+    explicit JobTiming(Job *job)
         : enabled(job && Log::get_cat_level(CAT_REPORT) >= LOG_DEBUG),
           id(job ? job->id : 0), started_us(stamp()),
-          action(job ? job->request.action : Action::Days) {}
+          action(job ? job->request.action : Action::Days), job(job) {
+        if (job) {
+            job->diagnostics = enabled;
+            job->source_bytes = 0;
+            job->source_reads = job->source_us = job->tiles_us = 0;
+        }
+    }
 
     uint32_t stamp() const { return enabled ? micros() : 0; }
 
@@ -229,50 +352,182 @@ struct JobTiming {
         if (!enabled) return;
         Log::logf(CAT_REPORT, LOG_DEBUG,
             "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
-            "idx=%lu num=%lu evt=%lu enc=%lu\n",
+            "idx=%lu src=%lu tiles=%lu\n",
             static_cast<unsigned long>(id), action == Action::Days ? "days" :
-                action == Action::Summary ? "summary" : "series", code,
+                action == Action::Summary ? "summary" : action == Action::History ? "history" :
+                action == Action::Prepare ? "prepare" : "reindex", code,
             static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
-            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(numeric_us / 1000),
-            static_cast<unsigned long>(events_us / 1000), static_cast<unsigned long>(encode_us / 1000));
+            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(job->source_us / 1000),
+            static_cast<unsigned long>(job->tiles_us / 1000));
+        if (job->source_reads) Log::logf(CAT_REPORT, LOG_DEBUG,
+            "report job=%lu source reads=%lu bytes=%llu\n", static_cast<unsigned long>(id),
+            static_cast<unsigned long>(job->source_reads), static_cast<unsigned long long>(job->source_bytes));
     }
 };
 
-Job jobs[SLOT_COUNT];
+struct JobPool {
+    Job fallback[SLOT_COUNT];
+    Job *data = fallback;
+    size_t count = SLOT_COUNT;
+    Job *begin() { return data; }
+    Job *end() { return data + count; }
+} jobs;
 SemaphoreHandle_t mutex = nullptr, wake = nullptr;
 TaskHandle_t worker_task = nullptr;
 portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 Status status;
 uint32_t next_id = 1, data_revision = 1;
+uint32_t foreground_epoch = 0;
+uint32_t artifact_reads = 0;
+uint32_t foreground_at = 0;
+bool foreground_seen = false;
+uint32_t backfill_revision = 0;
+uint16_t backfill_before = UINT16_MAX;
+uint8_t backfill_period = 0;
+constexpr uint16_t PERIODS[] = {1, 7, 30, 90, 180, 365};
+uint32_t published_index_data = 0, published_index_artifacts = UINT32_MAX;
+bool index_commit_pending = false;
+ReportArtifact::Document retired_index;
+uint32_t retired_index_files = 0;
+struct IndexCleanup {
+    uint32_t files = UINT32_MAX;
+    uint16_t shard = 0;
+    uint8_t present[32] = {};
+    bool discovered = false;
+} index_cleanup;
+
+struct CleanupAnchor {
+    uint16_t day = 0;
+    uint8_t digest[32] = {};
+    uint32_t bytes = 0;
+};
+struct CleanupLegacy {
+    uint16_t day = 0;
+    uint32_t bytes = 0;
+    char name[33] = {};
+};
+struct ArtifactCleanup {
+    uint32_t files = UINT32_MAX, data = 0, artifacts = UINT32_MAX;
+    size_t next = 0;
+    bool discovered = false, complete = false;
+    aircannect::LargeTextBuffer days{MAX_SESSION_COUNT * sizeof(uint16_t), 0};
+    aircannect::LargeTextBuffer anchors{2 * MAX_BODY, 0};
+    aircannect::LargeTextBuffer legacy{MAX_SESSION_COUNT * sizeof(CleanupLegacy), 0};
+} artifact_cleanup;
+
+struct CachedPublication {
+    ReportArtifact::Document document;
+    uint16_t day = 0, period = 0;
+    ReportArtifact::Lookup state = ReportArtifact::Lookup::Failed;
+};
+CachedPublication *publications = nullptr;
+size_t publication_count = 0, publication_capacity = 0;
+uint32_t publication_files_revision = 0;
+
+uint32_t background_retry = 0;
+bool backfill_enabled = true;
 IndexedSession *index = nullptr;
 size_t index_count = 0;
 uint32_t catalog_generation = 0, file_revision = 0;
 uint32_t invalidation_generation = 0, indexed_invalidation = 0;
 bool index_ready = false;
+struct IndexScan {
+    bool active = false, full = false;
+    bool detail_changed = false, summary_changed = false;
+    uint32_t catalog = 0, files = 0, invalidation = 0;
+    uint32_t started_ms = 0, resumes = 0;
+    size_t next = 0;
+} index_scan;
 bool cache_usage_known = false;
 uint64_t cache_bytes = 0;
+uint32_t cache_generation = 0;
 enum class IndexFailure : uint8_t { Error, WaitingCatalog, Preempted };
 IndexFailure index_failure = IndexFailure::Error;
 const char *index_error = nullptr;
 size_t index_error_entry = SIZE_MAX;
-bool prune_cache(const SdStorage::Session &session, uint64_t needed = 0,
-                 const char *keep = nullptr);
+bool migrate_cache(const SdStorage::Session &session);
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day);
+void invalidate_str();
+bool dataset(const SdStorage::Session &session);
 
-bool retire_cache(const SdStorage::Session &session, const IndexedSession &entry) {
-    bool removed = false;
-    const bool success = session.run([&](fs::FS &fs) {
-        for (const char *suffix : {"stats", "series", "stats.part", "series.part"}) {
-            char path[96];
-            snprintf(path, sizeof(path), "%s/%s.%s", CACHE_DIR, entry.entry.file_prefix, suffix);
-            if (fs.exists(path)) {
-                if (!fs.remove(path)) return false;
-                removed = true;
-            }
-        }
-        return true;
-    });
-    if (removed) cache_usage_known = false;
-    return success;
+void invalidate_publications() {
+    aircannect::Memory::free(publications);
+    publications = nullptr;
+    publication_count = publication_capacity = 0;
+    publication_files_revision = SdStorage::files_revision();
+}
+
+CachedPublication *publication_entry(uint16_t day, uint16_t period) {
+    if (publication_files_revision != SdStorage::files_revision()) invalidate_publications();
+    // Descending days followed by periods: normal cold discovery appends, and
+    // index serialization finds retained metadata without another linear scan.
+    const uint32_t key = period ? 65536u + period : 65535u - day;
+    size_t slot = 0, end = publication_count;
+    while (slot < end) {
+        const size_t mid = slot + (end - slot) / 2;
+        const auto &entry = publications[mid];
+        const uint32_t candidate = entry.period ? 65536u + entry.period : 65535u - entry.day;
+        if (candidate < key) slot = mid + 1;
+        else end = mid;
+    }
+    if (slot < publication_count && publications[slot].period == period &&
+        (period || publications[slot].day == day)) {
+        auto &entry = publications[slot];
+        // Only the selected end date is retained for each of the six periods.
+        if (entry.day != day) entry = {};
+        entry.day = day;
+        entry.period = period;
+        return &entry;
+    }
+    if (publication_count == publication_capacity) {
+        const size_t capacity = std::min(index_count + sizeof(PERIODS) / sizeof(PERIODS[0]),
+            std::max(size_t(16), publication_capacity * 2));
+        if (capacity <= publication_capacity) return nullptr;
+        const size_t bytes = capacity * sizeof(CachedPublication);
+        auto *grown = static_cast<CachedPublication *>(aircannect::Memory::realloc_large(
+            publications, bytes, bytes <= INTERNAL_WORK));
+        if (!grown) return nullptr;
+        publications = grown;
+        publication_capacity = capacity;
+    }
+    memmove(publications + slot + 1, publications + slot,
+        (publication_count - slot) * sizeof(CachedPublication));
+    auto *entry = new (&publications[slot]) CachedPublication;
+    ++publication_count;
+    entry->day = day;
+    entry->period = period;
+    return entry;
+}
+
+void remember_publication(uint16_t day, uint16_t period, const ReportArtifact::Document &document) {
+    if (auto *entry = publication_entry(day, period)) {
+        entry->document = document;
+        entry->state = ReportArtifact::Lookup::Ready;
+    }
+    if (auto *entry = cached_day_entry(day, false)) entry->cleanup_checked = false;
+}
+
+ReportArtifact::Lookup lookup_publication(const SdStorage::Session &session,
+    uint16_t day, uint16_t period, const char *prefix, ReportArtifact::Document &document) {
+    if (!session.valid()) return ReportArtifact::Lookup::Failed;
+    auto *entry = publication_entry(day, period);
+    if (entry && entry->state != ReportArtifact::Lookup::Failed) {
+        document = entry->document;
+        return entry->state;
+    }
+    const auto state = ReportArtifact::document_lookup(session, prefix, nullptr, document);
+    if (state == ReportArtifact::Lookup::Ready) {
+        Payload verified;
+        // Validate old publications once, including fallback to an older slot.
+        // A failed read may be transient; never memoize it as missing.
+        if (!ReportArtifact::document_read(session, prefix, document, verified, nullptr))
+            return ReportArtifact::Lookup::Failed;
+    }
+    if (entry && session.valid()) {
+        entry->document = document;
+        entry->state = state;
+    }
+    return state;
 }
 
 void publish(State state, const char *error = "") {
@@ -288,14 +543,44 @@ void publish(State state, const char *error = "") {
 bool reusable(const Job &job) {
     return job.state == JobState::Free || (job.state == JobState::Complete &&
         !job.readers && (job.cancelled || uint32_t(millis() - job.completed_ms) >=
-            RETAIN_MS));
+            (job.code == 200 && !job.issue ? RETAIN_MS : DELIVERY_MS)));
 }
 void reset_job(Job &job) {
     job.~Job();
     new (&job) Job;
 }
+
+// Caller holds mutex. Undelivered results get the existing delivery grace;
+// active HTTP leases are never candidates, even under memory pressure.
+bool evictable(const Job &job) {
+    return job.state == JobState::Complete && !job.readers &&
+        (job.deliveries >= job.consumers || uint32_t(millis() - job.completed_ms) >= DELIVERY_MS);
+}
+bool reclaim_result() {
+    // Called by Memory in any allocating task, including error serialization
+    // with this mutex already held. Do not wait or touch SD here.
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    Job *oldest = nullptr;
+    for (auto &job : jobs) {
+        if (evictable(job) && job.body.capacity() &&
+            (!oldest || int32_t(job.completed_ms - oldest->completed_ms) < 0)) oldest = &job;
+    }
+    if (oldest) reset_job(*oldest);
+    xSemaphoreGive(mutex);
+    return oldest != nullptr;
+}
 bool aborted(const Job *job, const SdStorage::Session &session) {
+    // Owner-only work batches: SD operations remain individually bounded, and
+    // CPU codec/histogram loops also yield without a delay per sample or tile.
+    static uint32_t batch_us = 0;
+    const uint32_t now = micros();
+    if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || SdStorage::maintenance_pending()) {
+        if (job) job->artifact_preempted = true;
+        return true;
+    }
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
+        (job && job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
         !AirSenseState::local_background_allowed() || !session.valid();
 }
 
@@ -305,7 +590,10 @@ void source_path(const IndexedSession &entry, uint8_t file, const char *ext,
              entry.entry.file_prefix, SUFFIXES[file], ext);
 }
 void cache_path(const IndexedSession &entry, const char *ext, char (&out)[96]) {
-    snprintf(out, sizeof(out), "%s/%s.%s", CACHE_DIR, entry.entry.file_prefix, ext);
+    if (rebuild_generation) snprintf(out, sizeof(out), "%s/%s/%s.g%lu.%s", CACHE_DIR,
+        entry.entry.therapy_day, entry.entry.file_prefix, static_cast<unsigned long>(rebuild_generation), ext);
+    else snprintf(out, sizeof(out), "%s/%s/%s.%s", CACHE_DIR,
+        entry.entry.therapy_day, entry.entry.file_prefix, ext);
 }
 
 bool catalog_day(const char *text, uint16_t &out) {
@@ -367,35 +655,45 @@ bool refresh_index(const SdStorage::Session &session) {
     const bool invalidated = invalidation != indexed_invalidation;
     if (index_ready && !invalidated && changes.catalog.generation == catalog_generation && files == file_revision)
         return true;
-    const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
-        changes.catalog.entries < index_count;
-    const size_t old_count = index_count;
-    index_error = "session_limit";
-    if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
-    if (changes.catalog.entries != index_count) {
-        const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
-        if (!bytes) {
-            aircannect::Memory::free(index);
-            index = nullptr;
-        } else {
-            void *grown = aircannect::Memory::realloc_large(index, bytes, bytes <= INTERNAL_WORK);
-            if (!grown) { index_error = "index_alloc"; return false; }
-            index = static_cast<IndexedSession *>(grown);
+    const bool resume = index_scan.active && index_scan.catalog == changes.catalog.generation &&
+        index_scan.files == files && index_scan.invalidation == invalidation &&
+        changes.catalog.entries == index_count;
+    if (!resume) {
+        // A changed source invalidates the partially updated in-memory index.
+        // Mere SD/therapy preemption retains both the cursor and change flags.
+        const bool full = index_scan.active || !index_ready || invalidated || !incremental ||
+            files != file_revision || changes.catalog.entries < index_count;
+        if (full) { invalidate_day(); invalidate_str(); dataset_id[0] = 0; }
+        if (!dataset(session)) { index_error = "dataset_identity"; return false; }
+        const size_t old_count = index_count;
+        index_error = "session_limit";
+        if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
+        if (changes.catalog.entries != index_count) {
+            const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
+            if (!bytes) {
+                aircannect::Memory::free(index);
+                index = nullptr;
+            } else {
+                void *grown = aircannect::Memory::realloc_large(index, bytes, bytes <= INTERNAL_WORK);
+                if (!grown) { index_error = "index_alloc"; return false; }
+                index = static_cast<IndexedSession *>(grown);
+            }
+            if (changes.catalog.entries > index_count)
+                for (size_t i = index_count; i < changes.catalog.entries; ++i)
+                    new (&index[i]) IndexedSession;
+            index_count = changes.catalog.entries;
         }
-        if (changes.catalog.entries > index_count)
-            for (size_t i = index_count; i < changes.catalog.entries; ++i)
-                new (&index[i]) IndexedSession;
-        index_count = changes.catalog.entries;
-    }
-    bool detail_changed = !index_ready || changes.catalog.entries < old_count;
-    const size_t count = full ? index_count : changes.count;
-    for (size_t n = 0; n < count; ++n) {
+        index_scan = {true, full, !index_ready || changes.catalog.entries < old_count, false,
+                      changes.catalog.generation, files, invalidation, millis(), 0, 0};
+        index_ready = false;
+    } else ++index_scan.resumes;
+    const size_t count = index_scan.full ? index_count : changes.count;
+    for (; index_scan.next < count; ++index_scan.next) {
         if (aborted(nullptr, session)) {
             index_failure = IndexFailure::Preempted;
-            index_ready = false;
             return false;
         }
-        const size_t i = full ? n : changes.indexes[n];
+        const size_t i = index_scan.full ? index_scan.next : changes.indexes[index_scan.next];
         index_error_entry = i;
         index_error = "catalog_index";
         if (i >= index_count) return false;
@@ -405,17 +703,23 @@ bool refresh_index(const SdStorage::Session &session) {
         index_error = "catalog_day";
         if (!catalog_day(next.entry.therapy_day, next.day)) return false;
         // STR/Identification readiness is not a detail-data revision.
+        index_scan.summary_changed |= index[i].entry.str_revision != next.entry.str_revision ||
+            ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_STR_READY);
         const bool changed = strcmp(index[i].entry.file_prefix, next.entry.file_prefix) ||
             strcmp(index[i].entry.therapy_day, next.entry.therapy_day) ||
             ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_LIVE_COMPLETE);
-        if (full || changed) {
+        if (index_scan.full || changed) {
             index_error = "source_fingerprint";
-            if (!fingerprint(session, next)) { index_ready = false; return false; }
+            if (!fingerprint(session, next)) return false;
             const bool key_changed = !(index[i].key == next.key);
-            index_error = "cache_retire";
-            if (index[i].entry.file_prefix[0] && index[i].key.present && (changed || key_changed) &&
-                !retire_cache(session, index[i])) { index_ready = false; return false; }
-            detail_changed |= changed || key_changed;
+            if (changed || key_changed) {
+                if (index[i].day) invalidate_day(index[i].day);
+                invalidate_day(next.day);
+            }
+            // A changed fingerprint is not proof that the sources can rebuild
+            // the old cache. Its header rejects mismatches; retain the bytes
+            // until a validated replacement is available.
+            index_scan.detail_changed |= changed || key_changed;
             if (!changed && !key_changed) {
                 next.start_ms = index[i].start_ms;
                 next.end_ms = index[i].end_ms;
@@ -433,22 +737,40 @@ bool refresh_index(const SdStorage::Session &session) {
         }
         index[i] = next;
     }
+    if (index_scan.full) {
+        cache_usage_known = false;
+        if (!migrate_cache(session)) {
+            index_error = "cache_migrate";
+            if (aborted(nullptr, session)) index_failure = IndexFailure::Preempted;
+            return false;
+        }
+    }
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (aborted(nullptr, session) || !current.ready || current.generation != index_scan.catalog ||
+        SdStorage::files_revision() != index_scan.files ||
+        __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != index_scan.invalidation) {
+        index_failure = IndexFailure::Preempted;
+        return false;
+    }
+    const bool detail_changed = index_scan.detail_changed, summary_changed = index_scan.summary_changed;
+    if (summary_changed) invalidate_str();
     catalog_generation = changes.catalog.generation;
     file_revision = files;
     indexed_invalidation = invalidation;
     index_ready = true;
-    if (full) {
-        cache_usage_known = false;
-        if (!prune_cache(session)) { index_ready = false; index_error = "cache_prune"; return false; }
-    }
-    if (detail_changed && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
+    if ((detail_changed || summary_changed) && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
     status.catalog_generation = catalog_generation;
     status.files_revision = file_revision;
     status.sessions = index_count;
     status.data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
-    if (detail_changed || invalidated) ++status.revision;
+    if (detail_changed || summary_changed || invalidated) ++status.revision;
     portEXIT_CRITICAL(&status_mux);
+    Log::logf(CAT_REPORT, LOG_DEBUG, "EDF index ready entries=%u checked=%u resumes=%lu elapsed=%lums\n",
+        unsigned(index_count), unsigned(count), static_cast<unsigned long>(index_scan.resumes),
+        static_cast<unsigned long>(millis() - index_scan.started_ms));
+    index_scan = {};
     return true;
 }
 
@@ -462,6 +784,7 @@ struct Input {
     char path[96] = {};
     const SdStorage::Session &session;
     const Job &job;
+    ReportArtifact::Producer *artifact = nullptr;
     Input(const SdStorage::Session &session, const Job &job) : session(session), job(job) {
         void *memory = aircannect::Memory::alloc_large(sizeof(ReportEdf::Header),
                                                       sizeof(ReportEdf::Header) <= INTERNAL_WORK);
@@ -471,11 +794,28 @@ struct Input {
         aircannect::Memory::free(header);
         aircannect::Memory::free(record);
     }
+    size_t read_source(uint8_t *out, size_t bytes) {
+        const uint32_t started = job.diagnostics ? micros() : 0;
+        const size_t count = file.read(out, bytes);
+        if (job.diagnostics) {
+            job.source_us += uint32_t(micros() - started);
+            job.source_bytes += count;
+            ++job.source_reads;
+        }
+        return count;
+    }
     bool open(const SdStorage::Session &session, const IndexedSession &entry, uint8_t kind) {
+        char source[96];
+        source_path(entry, kind, "edf", source);
+        if (!open_file(source)) return false;
+        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
+        return prepare_record();
+    }
+    bool open_file(const char *source) {
         if (!header) return note_issue(job, "header_alloc");
         record_offset = UINT64_MAX;
         *header = {};
-        source_path(entry, kind, "edf", path);
+        snprintf(path, sizeof(path), "%s", source);
         if (!file.open(session, path)) return note_issue(job, "source_open", path);
         reader = {[](void *ctx, uint64_t offset, uint8_t *out, size_t count) {
             auto &input = *static_cast<Input *>(ctx);
@@ -487,17 +827,7 @@ struct Input {
                 const uint64_t base = header.header_bytes +
                     ((offset - header.header_bytes) / header.record_bytes) * header.record_bytes;
                 if (offset + count <= base + header.record_bytes) {
-                    if (base != input.record_offset) {
-                        if (!file.seek(base)) return note_issue(input.job, "source_seek", input.path);
-                        for (size_t at = 0; at < header.record_bytes;) {
-                            const size_t take = std::min<size_t>(header.record_bytes - at,
-                                                                SdStorage::READ_CHUNK_BYTES);
-                            if (file.read(input.record + at, take) != take)
-                                return note_issue(input.job, "source_read", input.path);
-                            at += take;
-                        }
-                        input.record_offset = base;
-                    }
+                    if (!input.load_record((base - header.header_bytes) / header.record_bytes)) return false;
                     memcpy(out, input.record + (offset - base), count);
                     return true;
                 }
@@ -506,13 +836,15 @@ struct Input {
             size_t done = 0;
             while (done < count) {
                 const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
-                if (file.read(out + done, take) != take)
+                if (input.read_source(out + done, take) != take)
                     return note_issue(input.job, "source_read", input.path);
                 done += take;
             }
             return true;
         }, this, file.size()};
-        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
+        return true;
+    }
+    bool prepare_record() {
         if (header->record_bytes > record_capacity) {
             // One actual record, at most the reader's validated 64 KiB limit.
             void *grown = aircannect::Memory::realloc_large(record, header->record_bytes,
@@ -525,6 +857,264 @@ struct Input {
         if (record_capacity < header->record_bytes) return note_issue(job, "record_alloc", path);
         return true;
     }
+
+    bool load_record(uint32_t index) {
+        if (aborted(&job, session) || index >= header->records || !record ||
+            record_capacity < header->record_bytes) return false;
+        const uint64_t base = header->header_bytes + uint64_t(index) * header->record_bytes;
+        if (base == record_offset) return true;
+        record_offset = UINT64_MAX;
+        if (!file.seek(base)) return note_issue(job, "source_seek", path);
+        for (size_t at = 0; at < header->record_bytes;) {
+            if (aborted(&job, session)) return false;
+            const size_t take = std::min<size_t>(header->record_bytes - at, SdStorage::READ_CHUNK_BYTES);
+            if (read_source(record + at, take) != take) return note_issue(job, "source_read", path);
+            at += take;
+        }
+        record_offset = base;
+        return true;
+    }
+
+    template <typename Sink>
+    bool scan_records(const int *signals, size_t count, uint32_t first, uint32_t end, Sink consume) {
+        if (first > end || end > header->records) return false;
+        bool present = false;
+        for (size_t c = 0; c < count; ++c) present |= signals[c] >= 0;
+        if (!present) return true;
+        for (uint32_t n = first; n < end; ++n) {
+            if (!load_record(n)) return false;
+            if (artifact) {
+                const uint32_t started = job.diagnostics ? micros() : 0;
+                if (!artifact->record(*header, record, header->record_bytes)) {
+                    note_issue(job, artifact->error(), path);
+                    artifact = nullptr;
+                }
+                if (job.diagnostics) job.tiles_us += uint32_t(micros() - started);
+            }
+            for (size_t c = 0; c < count; ++c) {
+                if (signals[c] < 0) continue;
+                ReportEdf::RecordSamples samples;
+                if (aborted(&job, session) ||
+                    !ReportEdf::record_samples(*header, record, header->record_bytes, signals[c], samples) ||
+                    !consume(c, uint64_t(n) * samples.signal->samples_per_record, samples)) return false;
+            }
+        }
+        return true;
+    }
+
+};
+
+double chart_scale(size_t c, const ReportEdf::Signal &signal);
+
+bool artifact_identity(const IndexedSession &entry, uint8_t kind, char (&prefix)[96], uint8_t (&key)[32]) {
+    snprintf(prefix, sizeof(prefix), "%s/%s/%s_%s", CACHE_DIR, entry.entry.therapy_day,
+             entry.entry.file_prefix, SUFFIXES[kind]);
+    if (rebuild_generation) snprintf(prefix + strlen(prefix), sizeof(prefix) - strlen(prefix),
+        ".g%lu", static_cast<unsigned long>(rebuild_generation));
+    uint8_t identity[20] = {};
+    SdStorage::put_le16(identity, ReportArtifact::VERSION);
+    identity[2] = kind;
+    identity[3] = (entry.key.checksums >> kind) & 1;
+    SdStorage::put_le32(identity + 4, uint32_t(entry.key.sizes[kind]));
+    SdStorage::put_le32(identity + 8, uint32_t(entry.key.sizes[kind] >> 32));
+    memcpy(identity + 12, entry.key.sidecars[kind], 8);
+    return ReportArtifact::fingerprint(identity, sizeof(identity), key);
+}
+
+struct ArtifactBuild {
+    Input &input;
+    std::unique_ptr<ReportArtifact::Producer> producer;
+
+    ArtifactBuild(Input &input, const IndexedSession &entry, uint8_t kind, bool enabled) : input(input) {
+        if (!enabled) return;
+        char prefix[96];
+        uint8_t key[32];
+        if (!artifact_identity(entry, kind, prefix, key)) { note_issue(input.job, "artifact_digest"); return; }
+        ReportArtifact::Publication existing;
+        const auto lookup = ReportArtifact::lookup(input.session, prefix, key, existing);
+        if (lookup == ReportArtifact::Lookup::Ready) return;
+        if (lookup != ReportArtifact::Lookup::Missing) {
+            note_issue(input.job, lookup == ReportArtifact::Lookup::Invalid ? "artifact_invalid" : "artifact_lookup", prefix);
+            return;
+        }
+        ReportArtifact::Selection selection[ReportArtifact::MAX_TRACKS];
+        size_t count = 0;
+        for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+            if ((c ? CHANNELS[c - 1].file : 0) != kind) continue;
+            const int signal = ReportEdf::find_signal(*input.header, c ? CHANNELS[c - 1].signal : "Flow.40ms");
+            if (signal < 0) continue;
+            selection[count++] = {uint16_t(c ? CHANNELS[c - 1].artifact_id : SignalId::Flow),
+                uint16_t(signal), chart_scale(c, input.header->signals[signal]),
+                c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].unit : "L/min"};
+        }
+        if (!count) return;
+        producer.reset(new (std::nothrow) ReportArtifact::Producer(input.session, [](void *context) {
+            const auto &input = *static_cast<Input *>(context);
+            return aborted(&input.job, input.session);
+        }, &input));
+        if (!producer || !producer->begin(prefix, key, *input.header, selection, count)) {
+            note_issue(input.job, producer ? producer->error() : "artifact_alloc", prefix);
+            producer.reset();
+            return;
+        }
+        input.artifact = producer.get();
+    }
+    ~ArtifactBuild() { input.artifact = nullptr; }
+    bool needed() const { return producer != nullptr; }
+    void finish() {
+        input.artifact = nullptr;
+        ReportArtifact::Publication publication;
+        const uint32_t started = input.job.diagnostics ? micros() : 0;
+        if (producer && !producer->finish(publication) && !aborted(&input.job, input.session))
+            note_issue(input.job, producer->error(), input.path);
+        if (input.job.diagnostics) input.job.tiles_us += uint32_t(micros() - started);
+    }
+};
+
+struct StrLayoutCache {
+    ReportEdf::Layout layout;
+    ReportEdf::Signal *signals = nullptr;
+    uint64_t bytes = 0;
+
+    void reset() {
+        aircannect::Memory::free(signals);
+        signals = nullptr;
+        layout = {};
+        bytes = 0;
+    }
+    bool load(const ReportEdf::Reader &reader) {
+        if (signals && bytes == reader.size) return true;
+        reset();
+        if (!ReportEdf::read_layout(reader, layout) || layout.record_seconds != 86400 ||
+            layout.records > Air10StrTimeline::RECORD_LIMIT) return false;
+        const size_t size = layout.signal_count * sizeof(*signals);
+        signals = static_cast<ReportEdf::Signal *>(aircannect::Memory::alloc_large(size, size <= INTERNAL_WORK));
+        if (!signals || !ReportEdf::read_signals(reader, layout, signals, layout.signal_count, true) ||
+            layout.record_bytes > 4096) { reset(); return false; }
+        for (size_t i = 0; i < layout.signal_count; ++i) {
+            const auto &date = signals[i];
+            if (strcmp(date.label, "Date")) continue;
+            if (date.samples_per_record == 1 && date.digital_min == 0 &&
+                date.physical_min == 0 && date.physical_max == date.digital_max) {
+                bytes = reader.size;
+                return true;
+            }
+            break;
+        }
+        reset();
+        return false;
+    }
+} str_layout;
+
+void invalidate_str() { str_layout.reset(); }
+
+struct HistoricalStr {
+    Input input;
+    const ReportEdf::Signal *signals = nullptr;
+    bool present = false;
+
+    HistoricalStr(const SdStorage::Session &session, const Job &job) : input(session, job) {}
+
+    const ReportEdf::Signal *find(const char *label) const {
+        if (!signals || !input.header) return nullptr;
+        for (size_t i = 0; i < input.header->signal_count; ++i)
+            if (!strcmp(signals[i].label, label)) return &signals[i];
+        return nullptr;
+    }
+    double value(const char *label, double scale = 1) const {
+        const auto *signal = find(label);
+        if (!present || !signal || signal->samples_per_record != 1) return NAN;
+        const uint8_t *sample = input.record + signal->record_offset;
+        const uint16_t raw = sample[0] | uint16_t(sample[1]) << 8;
+        if (raw == UINT16_MAX) return NAN;
+        const int32_t digital = signal->digital_min < 0 ? int16_t(raw) : int32_t(raw);
+        return signal->valid(digital) ? signal->physical(digital) * scale : NAN;
+    }
+    bool load(uint16_t day) {
+        if (!input.open_file("/STR.edf") || !str_layout.load(input.reader)) return false;
+        auto &header = *input.header;
+        static_cast<ReportEdf::Layout &>(header) = str_layout.layout;
+        signals = str_layout.signals;
+        if (!input.prepare_record()) return false;
+        const auto *date = find("Date");
+        const int64_t guessed = int64_t(day) - header.start_seconds / 86400;
+        auto read = [&](uint32_t record) {
+            uint8_t bytes[2];
+            return input.reader.read(input.reader.context,
+                header.header_bytes + uint64_t(record) * header.record_bytes + date->record_offset,
+                bytes, sizeof(bytes));
+        };
+        // The current timeline is continuous. Older compact files are located
+        // by their Date samples, never by substituting a neighbouring record.
+        if (guessed >= 0 && guessed < header.records) {
+            if (!read(uint32_t(guessed))) return false;
+            present = true;
+            if (value("Date") == day) {
+                present = std::isfinite(value("Mode")) || std::isfinite(value("Duration"));
+                input.file.close(); return true;
+            }
+        }
+        for (uint32_t record = 0; record < header.records; ++record) {
+            if (!read(record)) return false;
+            present = true;
+            if (value("Date") == day) {
+                present = std::isfinite(value("Mode")) || std::isfinite(value("Duration"));
+                input.file.close(); return true;
+            }
+        }
+        present = false;
+        input.file.close();
+        return true;
+    }
+    void settings_json(Payload &body, uint16_t day) const {
+        body.print(",\"settings\":{\"day\":%u,\"available\":%s,\"fields\":[", day, present ? "true" : "false");
+        bool comma = false;
+        auto append = [&](const char *tag) {
+            const auto *def = var_lookup(tag);
+            if (!def) return;
+            const auto &schema = Air10Edf::str_schema();
+            for (size_t i = 0; i < schema.signal_count; ++i) {
+                if (strcmp(Air10Edf::str_signal_tag(i), tag)) continue;
+                const auto &spec = schema.signals[i];
+                const auto *signal = find(spec.label);
+                const double saved = value(spec.label);
+                if (!std::isfinite(saved) || !signal || strcmp(signal->unit, spec.dimension)) return;
+                char text[48];
+                if (def->type != SET_ENUM || saved < 0 || saved > INT32_MAX || saved != std::floor(saved) ||
+                    !setting_enum_label(def, int(saved), text, sizeof(text)))
+                    snprintf(text, sizeof(text), "%.8g", saved);
+                // Text and labels come only from the static Air10 catalog or
+                // numeric formatting, never live metadata or file strings.
+                body.print("%s{\"tag\":\"%s\",\"label\":\"%s\",\"value\":\"%s\",\"unit\":\"%s\"}",
+                           comma ? "," : "", tag, def->label, text, spec.dimension);
+                comma = true;
+                return;
+            }
+        };
+        append("MOP");
+        const double mode = value("Mode");
+        if (std::isfinite(mode) && mode >= 0 && mode < MODE_COUNT && mode == std::floor(mode)) {
+            for (const char *tag : MODE_LAYOUT[int(mode)]) { if (!tag) break; append(tag); }
+            for (const char *tag : COMFORT_LAYOUT[int(mode)]) { if (!tag) break; append(tag); }
+        }
+        for (const char *tag : EPR_VARS) { if (!tag) break; append(tag); }
+        append("SST");
+        for (const char *tag : ACCESSORY_VARS) { if (!tag) break; append(tag); }
+        body.print("]}");
+    }
+    double statistic(size_t channel, const char *suffix) const {
+        const char *base = channel == 0 ? "TgtIPAP" : channel == 1 ? "TgtEPAP" : CHANNELS[channel].id;
+        char label[32];
+        snprintf(label, sizeof(label), "%s.%s", base, suffix);
+        const auto *signal = find(label);
+        if (!signal) return NAN;
+        double scale = 1;
+        if (channel == 3 && !strcmp(signal->unit, "L/s")) scale = 60;
+        else if (channel == 6 && !strcmp(signal->unit, "L")) scale = 1000;
+        else if (channel == 12 && !strcmp(signal->unit, "seconds")) scale = 1;
+        else if (strcmp(signal->unit, CHANNELS[channel].unit)) return NAN;
+        return value(label, scale);
+    }
 };
 
 size_t total_bins(const CacheHeader &header) {
@@ -532,7 +1122,7 @@ size_t total_bins(const CacheHeader &header) {
     for (const auto &channel : header.channels) count += channel.bins;
     return count;
 }
-bool allocate_data(SessionData &out) {
+bool allocate_data(SessionData &out, bool events = true) {
     const size_t count = total_bins(out.header);
     if (count > MAX_BINS || out.header.events > MAX_DISK_EVENTS) return false;
     if (count) {
@@ -541,7 +1131,7 @@ bool allocate_data(SessionData &out) {
         if (!out.bins) return false;
         memset(out.bins, 0, bytes);
     }
-    if (out.header.events) {
+    if (events && out.header.events) {
         const size_t bytes = std::min<size_t>(out.header.events, MAX_EVENTS) * sizeof(Event);
         out.events = static_cast<Event *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
         if (!out.events) return false;
@@ -557,6 +1147,8 @@ bool sane_header(const CacheHeader &h, const IndexedSession &entry, uint64_t byt
         h.chart_start_ms < 0 || h.chart_end_ms < h.chart_start_ms ||
         h.event_from_ms < 0 || h.event_to_ms < h.event_from_ms ||
         !std::isfinite(h.used_seconds) || h.used_seconds < 0 || h.used_seconds > 86400 ||
+        !std::isfinite(h.csr_seconds) || h.csr_seconds < 0 || h.csr_seconds > h.used_seconds ||
+        !std::isfinite(h.leak_high_seconds) || h.leak_high_seconds < 0 || h.leak_high_seconds > 86400 ||
         bytes != sizeof(h) + total_bins(h) * sizeof(uint64_t) + h.events * sizeof(Event) ||
         h.bytes != bytes) return false;
     for (const auto &channel : h.channels) {
@@ -578,23 +1170,15 @@ bool load_cache(const SdStorage::Session &session, const IndexedSession &entry,
     SdStorage::Reader reader;
     if (!reader.open(session, path) || reader.read(reinterpret_cast<uint8_t *>(&out.header),
         sizeof(out.header)) != sizeof(out.header) || !sane_header(out.header, entry, reader.size()) ||
-        !allocate_data(out)) return false;
+        !allocate_data(out, false)) return false;
     const size_t bin_bytes = total_bins(out.header) * sizeof(uint64_t);
-    const size_t event_bytes = std::min<size_t>(out.header.events, MAX_EVENTS) * sizeof(Event);
-    for (auto range : {std::make_pair(reinterpret_cast<uint8_t *>(out.bins), bin_bytes),
-                       std::make_pair(reinterpret_cast<uint8_t *>(out.events), event_bytes)}) {
-        for (size_t offset = 0; offset < range.second;) {
-            const size_t take = std::min(range.second - offset, SdStorage::READ_CHUNK_BYTES);
-            if (reader.read(range.first + offset, take) != take) return false;
-            offset += take;
-        }
+    for (size_t offset = 0; offset < bin_bytes;) {
+        const size_t take = std::min(bin_bytes - offset, SdStorage::READ_CHUNK_BYTES);
+        if (reader.read(reinterpret_cast<uint8_t *>(out.bins) + offset, take) != take) return false;
+        offset += take;
     }
     return true;
 }
-
-bool start_part(const SdStorage::Session &, const char *, const uint8_t *, size_t);
-bool append_part(const SdStorage::Session &, const char *, const uint8_t *, size_t);
-bool finish_part(const SdStorage::Session &, const char *, const char *, uint64_t);
 
 bool read_event(Input &input, uint32_t record, Event &event) {
     ReportEdf::Annotation annotation;
@@ -609,13 +1193,18 @@ bool read_event(Input &input, uint32_t record, Event &event) {
 struct PartGuard {
     const SdStorage::Session &session;
     const char *path;
+    SdStorage::Writer writer;
     bool complete = false;
     ~PartGuard() {
+        writer.close();
         if (complete) return;
         cache_usage_known = false;
         (void)session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
     }
 };
+
+bool start_part(PartGuard &, const uint8_t *, size_t);
+bool finish_part(PartGuard &, const char *, uint64_t);
 
 bool store_cache(const SdStorage::Session &session, const Job &job, const IndexedSession &entry,
                  SessionData &data) {
@@ -625,14 +1214,14 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
     cache_path(entry, "stats.part", part);
     data.header.bytes = sizeof(data.header) + total_bins(data.header) * sizeof(uint64_t) +
         data.header.events * sizeof(Event);
-    if (!prune_cache(session, data.header.bytes, path)) return false;
+    if (!artifact_headroom(session, entry.day)) return false;
     PartGuard part_guard{session, part};
-    if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
-        !append_part(session, part, reinterpret_cast<const uint8_t *>(data.bins),
-                     total_bins(data.header) * sizeof(uint64_t))) return false;
+    if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
+        !part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.bins),
+                                 total_bins(data.header) * sizeof(uint64_t))) return false;
     if (data.header.events <= MAX_EVENTS) {
-        if (!append_part(session, part, reinterpret_cast<const uint8_t *>(data.events),
-                         data.header.events * sizeof(Event))) return false;
+        if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.events),
+                                     data.header.events * sizeof(Event))) return false;
     } else {
         // Persist all events with a bounded block, not just the in-RAM prefix.
         Input input(session, job);
@@ -649,16 +1238,20 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
                 block[used++] = event;
                 ++events;
                 if (used == 32) {
-                    if (!append_part(session, part, reinterpret_cast<uint8_t *>(block), sizeof(block))) return false;
+                    if (!part_guard.writer.write(reinterpret_cast<uint8_t *>(block), sizeof(block))) return false;
                     used = 0;
                 }
             }
             input.file.close();
         }
-        if (events != data.header.events || !append_part(session, part,
+        if (events != data.header.events || !part_guard.writer.write(
             reinterpret_cast<uint8_t *>(block), used * sizeof(Event))) return false;
     }
-    part_guard.complete = finish_part(session, part, path, data.header.bytes);
+    part_guard.complete = finish_part(part_guard, path, data.header.bytes);
+    if (part_guard.complete) {
+        invalidate_day(entry.day);
+        __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    }
     return part_guard.complete;
 }
 
@@ -693,32 +1286,39 @@ bool prepare_channels(Input &input, uint8_t file, SessionData &data) {
     return true;
 }
 
-bool scan_channels(const SdStorage::Session &session, const Job &job,
-                   Input &input, uint8_t file, SessionData &data) {
-    size_t offset = 0;
-    ReportEdf::Sample samples[32];
+bool scan_channels(Input &input, uint8_t file, SessionData &data) {
+    int signals[CHANNEL_COUNT];
+    size_t offsets[CHANNEL_COUNT], offset = 0;
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
-        auto &channel = data.header.channels[c];
-        if (CHANNELS[c].file == file && channel.bins) {
-            const int signal = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
-            auto hist = histogram(channel, data.bins + offset);
-            const uint64_t count = ReportEdf::sample_count(*input.header, signal);
-            for (uint64_t first = 0; first < count;) {
-                if (aborted(&job, session)) return false;
-                const size_t take = std::min<uint64_t>(32, count - first);
-                if (!ReportEdf::read_samples(input.reader, *input.header, signal,
-                                             first, take, samples)) return false;
-                for (size_t i = 0; i < take; ++i)
-                    if (!ReportEdf::add_sample(hist, samples[i].raw, samples[i].valid)) return false;
-                first += take;
+        offsets[c] = offset;
+        offset += data.header.channels[c].bins;
+        signals[c] = -1;
+        if (CHANNELS[c].file != file || !data.header.channels[c].bins) continue;
+        signals[c] = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
+        if (signals[c] < 0) return false;
+    }
+    if (!input.scan_records(signals, CHANNEL_COUNT, 0, input.header->records,
+        [&](size_t c, uint64_t, const ReportEdf::RecordSamples &samples) {
+            auto &channel = data.header.channels[c];
+            auto hist = histogram(channel, data.bins + offsets[c]);
+            const uint32_t count = samples.signal->samples_per_record;
+            for (uint32_t slot = 0; slot < count; ++slot) {
+                const auto sample = samples[slot];
+                if (!ReportEdf::add_sample(hist, sample.raw, sample.valid)) return false;
+                if (c == 3 && sample.valid && channel.signal.physical(sample.raw) > LEAK_THRESHOLD)
+                    data.header.leak_high_seconds += input.header->record_seconds / count;
             }
             channel.count = hist.count;
             channel.missing = hist.missing;
             channel.sum = hist.sum;
-            channel.coverage_seconds = hist.count * input.header->record_seconds /
+            return true;
+        })) return false;
+    for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+        if (signals[c] >= 0) {
+            auto &channel = data.header.channels[c];
+            channel.coverage_seconds = channel.count * input.header->record_seconds /
                 channel.signal.samples_per_record;
         }
-        offset += channel.bins;
     }
     return true;
 }
@@ -754,15 +1354,39 @@ bool numeric_extent(const ReportEdf::Header &header, int64_t &start, int64_t &en
     return true;
 }
 
+struct CsrPairing {
+    Event start;
+    bool active = false, unmatched = false;
+
+    template <typename Sink>
+    void consume(const Event &event, Sink emit) {
+        if (event.kind == ReportEdf::EventKind::CsrStart) {
+            if (active) { emit(start, false); unmatched = true; }
+            start = event;
+            active = true;
+        } else if (event.kind == ReportEdf::EventKind::CsrEnd) {
+            if (active && event.time_ms > start.time_ms) {
+                Event interval = event;
+                interval.duration_ms = event.time_ms - start.time_ms;
+                emit(interval, true);
+            } else {
+                if (active) emit(start, false);
+                emit(event, false);
+                unmatched = true;
+            }
+            active = false;
+        } else emit(event, false);
+    }
+};
+
 bool build_session(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, SessionData &out) {
+                   const IndexedSession &entry, SessionData &out, bool artifacts = false) {
     out.header.key = entry.key;
     out.header.day = entry.day;
     out.header.partial = entry.key.present != 31 || entry.key.checksums != 31;
     Input input(session, job);
     uint8_t readable_numeric = 0;
-    // BRP contributes its header extent only. Its samples and overview cache
-    // remain lazy, independent of the PLD/SAD summary statistics.
+    // Gather descriptors before allocating the bounded exact histograms.
     for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
@@ -820,13 +1444,23 @@ bool build_session(const SdStorage::Session &session, const Job &job,
     }
     out.header.events = event_capacity;
     if (!allocate_data(out)) return false;
-    for (uint8_t kind : {uint8_t(1), uint8_t(2)}) {
+    for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
         if (!(readable_numeric & (1u << kind))) continue;
-        if (!input.open(session, entry, kind) || !scan_channels(session, job, input, kind, out))
-            return false;
+        if (!kind && !artifacts) continue;
+        if (!input.open(session, entry, kind)) return false;
+        ArtifactBuild artifact(input, entry, kind, artifacts);
+        if (kind) {
+            if (!scan_channels(input, kind, out)) return false;
+        } else if (artifact.needed()) {
+            const int flow = ReportEdf::find_signal(*input.header, "Flow.40ms");
+            if (!input.scan_records(&flow, 1, 0, input.header->records,
+                [](size_t, uint64_t, const ReportEdf::RecordSamples &) { return true; })) return false;
+        }
         input.file.close();
+        artifact.finish();
     }
     uint32_t events = 0;
+    CsrPairing csr;
     for (uint8_t kind : {uint8_t(3), uint8_t(4)}) {
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
@@ -836,16 +1470,24 @@ bool build_session(const SdStorage::Session &session, const Job &job,
             input.file.close();
             continue;
         }
+        if (kind == 4) out.header.csr_known = true;
         for (uint32_t i = 0; i < input.header->records; ++i) {
             if (aborted(&job, session)) return false;
             Event event;
             if (!read_event(input, i, event)) {
                 if (aborted(&job, session)) return false;
                 if (kind == 3) out.header.events_known = false;
+                if (kind == 4) out.header.csr_known = false;
                 out.header.partial = true;
                 break;
             }
             if (event.kind == ReportEdf::EventKind::Unknown) continue;
+            if (kind == 4) csr.consume(event, [&](const Event &interval, bool paired) {
+                if (!paired || !out.header.recorded) return;
+                const int64_t begin = std::max(out.header.start_ms, interval.time_ms - interval.duration_ms);
+                const int64_t end = std::min(out.header.end_ms, interval.time_ms);
+                if (end > begin) out.header.csr_seconds += (end - begin) / 1000.0;
+            });
             const int64_t begin = event.time_ms - event.duration_ms;
             if (!events) {
                 out.header.event_from_ms = begin;
@@ -865,6 +1507,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
         input.file.close();
     }
     out.header.events = events;
+    out.header.csr_known &= !csr.active && !csr.unmatched && out.header.usage_known;
     if (events) std::sort(out.events, out.events + std::min<uint32_t>(events, event_capacity), [](const Event &a, const Event &b) {
         return a.time_ms < b.time_ms;
     });
@@ -872,19 +1515,19 @@ bool build_session(const SdStorage::Session &session, const Job &job,
 }
 
 bool session_data(const SdStorage::Session &session, const Job &job,
-                  const IndexedSession &entry, SessionData &out) {
-    if (load_cache(session, entry, out)) {
+                  const IndexedSession &entry, SessionData &out, bool artifacts = false) {
+    if (!artifacts && load_cache(session, entry, out)) {
         if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
         return true;
     }
     out.~SessionData();
-    new (&out) SessionData;
-    if (!build_session(session, job, entry, out))
+    ::new (&out) SessionData;
+    if (!build_session(session, job, entry, out, artifacts))
         return note_issue(job, "session_build", entry.entry.file_prefix);
     if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    if (!store_cache(session, job, entry, out) && !aborted(&job, session))
+    if (!out.header.partial && !store_cache(session, job, entry, out) && !aborted(&job, session))
         note_issue(job, "cache_write", entry.entry.file_prefix);
     return !aborted(&job, session);
 }
@@ -893,8 +1536,8 @@ uint16_t last_day(const Request &request) {
     if (request.day) return request.day;
     uint16_t day = 0;
     for (size_t i = 0; i < index_count; ++i)
-        if ((index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE) &&
-            index[i].key.present) day = std::max(day, index[i].day);
+        if (index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE)
+            day = std::max(day, index[i].day);
     return day;
 }
 uint16_t first_day(const Request &request, uint16_t last) {
@@ -910,6 +1553,295 @@ void start_json(Payload &body, uint32_t publication, uint32_t dataset) {
     body.print("{\"source\":\"edf\",\"revision\":%u,\"data_revision\":%u,",
                publication, dataset);
 }
+
+bool summary_json(const SdStorage::Session &session, Job &job);
+bool history_json(const SdStorage::Session &session, Job &job, bool build);
+bool window_events(const SdStorage::Session &session, const Job &job,
+                   const IndexedSession &entry, const CacheHeader &header,
+                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated);
+
+bool dataset(const SdStorage::Session &session) {
+    if (*dataset_id) return true;
+    constexpr const char *prefix = "/airbridge/report/dataset";
+    ReportArtifact::Document document;
+    Payload bytes;
+    const auto found = ReportArtifact::document_lookup(session, prefix, nullptr, document);
+    if (found == ReportArtifact::Lookup::Missing) {
+        uint8_t id[32], key[32] = {};
+        esp_fill_random(id, sizeof(id));
+        if (!ReportArtifact::document_publish(session, prefix, key, id, sizeof(id), document)) return false;
+    } else if (found != ReportArtifact::Lookup::Ready) return false;
+    if (!ReportArtifact::document_read(session, prefix, document, bytes, nullptr) || bytes.length() != 32) return false;
+    ReportArtifact::Document rebuild;
+    const auto generation = ReportArtifact::document_lookup(session, "/airbridge/report/rebuild", nullptr, rebuild);
+    rebuild_generation = 0;
+    if (generation == ReportArtifact::Lookup::Ready) {
+        Payload value;
+        if (!ReportArtifact::document_read(session, "/airbridge/report/rebuild", rebuild, value, nullptr) || value.length() != 4) return false;
+        rebuild_generation = SdStorage::get_le32(reinterpret_cast<const uint8_t *>(value.c_str()));
+    } else if (generation != ReportArtifact::Lookup::Missing) return false;
+    return aircannect::hex_encode(reinterpret_cast<const uint8_t *>(bytes.c_str()), 32,
+        dataset_id, sizeof(dataset_id), aircannect::HexCase::Lower);
+}
+
+void publication_prefix(uint16_t day, char (&path)[96], uint16_t period = 0) {
+    const time_t civil = int64_t(day) * 86400;
+    tm date = {};
+    gmtime_r(&civil, &date);
+    char directory[9];
+    strftime(directory, sizeof(directory), "%Y%m%d", &date);
+    if (period) snprintf(path, sizeof(path), "%s/%s/period-%u", CACHE_DIR, directory, unsigned(period));
+    else snprintf(path, sizeof(path), "%s/%s/day", CACHE_DIR, directory);
+}
+
+void period_prefix(const Request &request, char (&path)[96]) {
+    publication_prefix(last_day(request), path, request.period);
+}
+
+bool publication_key(const Request &request, uint8_t (&key)[32]) {
+    Payload identity;
+    const uint16_t last = last_day(request);
+    const uint16_t first = request.view == View::Day ? (last > 13 ? last - 13 : 0) : first_day(request, last);
+    identity.print("publication-1:%s:%u:%u:%u:%lu", dataset_id, first, last, request.period,
+                   static_cast<unsigned long>(rebuild_generation));
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, first, last)) continue;
+        identity.print("/%u:%s:%s:%u:%u:%u:%u", unsigned(i), entry.entry.therapy_day,
+            entry.entry.file_prefix, entry.entry.flags, entry.entry.str_revision,
+            entry.key.present, entry.key.checksums);
+        for (size_t k = 0; k < 5; ++k) {
+            identity.print(":%llu:", static_cast<unsigned long long>(entry.key.sizes[k]));
+            identity.append(reinterpret_cast<const char *>(entry.key.sidecars[k]), 8);
+        }
+    }
+    return identity.good() && ReportArtifact::fingerprint(
+        reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key);
+}
+
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day) {
+    SdStorage::Status storage;
+    if (!session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; })) return false;
+    SdStorage::get_status(storage);
+    uint64_t needed = 128 * 1024;
+    for (size_t i = 0; i < index_count; ++i) if (selected(index[i], day, day))
+        for (size_t kind = 0; kind < 3; ++kind) needed += index[i].key.sizes[kind] * 3;
+    // Preserve room for another complete 24h numeric recording in the largest
+    // supported schema, plus STR. Artifacts are optional, source EDF is not.
+    const uint64_t reserve = 1440ull * (Air10Edf::record_size(Air10Edf::brp_schema(true)) +
+        Air10Edf::record_size(Air10Edf::pld_schema()) + Air10Edf::record_size(Air10Edf::sad_schema())) +
+        366ull * Air10Edf::record_size(Air10Edf::str_schema()) + 65536;
+    return storage.total_bytes > storage.used_bytes && storage.total_bytes - storage.used_bytes >= needed + reserve;
+}
+
+bool prepare_period(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
+    char prefix[96]; uint8_t key[32];
+    period_prefix(job.request, prefix);
+    if (!publication_key(job.request, key)) return note_issue(job, "publication_key");
+    ReportArtifact::Document document;
+    if (ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready)
+        return ReportArtifact::document_read(session, prefix, document, job.body, key);
+    if (!summary_json(session, job) || job.issue || aborted(&job, session)) return false;
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    if (!ReportArtifact::document_publish(session, prefix, key,
+        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), document))
+        return note_issue(job, "publication_write", prefix);
+    remember_publication(last_day(job.request), job.request.period, document);
+    portENTER_CRITICAL(&status_mux);
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return true;
+}
+
+bool publish_histograms(const SdStorage::Session &session, const IndexedSession &entry,
+                        const SessionData &data, ReportArtifact::Document &document) {
+    Payload bytes;
+    uint8_t header[16] = {};
+    memcpy(header, "ABHIST01", 8);
+    SdStorage::put_le16(header + 8, 1);
+    SdStorage::put_le16(header + 10, CHANNEL_COUNT);
+    const uint32_t length = sizeof(header) + CHANNEL_COUNT * 72 + total_bins(data.header) * 8;
+    SdStorage::put_le32(header + 12, length);
+    if (!bytes.reserve(length) || !bytes.append(reinterpret_cast<const char *>(header), sizeof(header))) return false;
+    const auto u64 = [](uint8_t *out, uint64_t value) {
+        SdStorage::put_le32(out, uint32_t(value));
+        SdStorage::put_le32(out + 4, uint32_t(value >> 32));
+    };
+    const auto real = [&](uint8_t *out, double value) {
+        static_assert(sizeof(value) == sizeof(uint64_t), "binary64 histogram values");
+        uint64_t bits; memcpy(&bits, &value, sizeof(bits)); u64(out, bits);
+    };
+    size_t offset = 0;
+    for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+        const auto &channel = data.header.channels[c];
+        uint8_t descriptor[72] = {};
+        SdStorage::put_le16(descriptor, uint16_t(CHANNELS[c].artifact_id));
+        SdStorage::put_le32(descriptor + 4, channel.bins);
+        SdStorage::put_le32(descriptor + 8, uint32_t(channel.signal.digital_min));
+        SdStorage::put_le32(descriptor + 12, uint32_t(channel.signal.digital_max));
+        real(descriptor + 16, channel.signal.physical_min);
+        real(descriptor + 24, channel.signal.physical_max);
+        u64(descriptor + 32, channel.count); u64(descriptor + 40, channel.missing);
+        real(descriptor + 48, channel.sum); real(descriptor + 56, channel.coverage_seconds);
+        SdStorage::put_le32(descriptor + 64, channel.signal.samples_per_record);
+        if (!bytes.append(reinterpret_cast<const char *>(descriptor), sizeof(descriptor))) return false;
+        for (uint32_t bin = 0; bin < channel.bins; ++bin) {
+            uint8_t value[8]; u64(value, data.bins[offset++]);
+            if (!bytes.append(reinterpret_cast<const char *>(value), sizeof(value))) return false;
+        }
+    }
+    char prefix[96]; uint8_t key[32];
+    cache_path(entry, "histograms", prefix);
+    return bytes.length() == length && ReportArtifact::fingerprint(
+        reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), key) &&
+        ReportArtifact::document_publish(session, prefix, key,
+            reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), document);
+}
+
+bool prepare_json(const SdStorage::Session &session, Job &job) {
+    if (job.request.view == View::Period) return prepare_period(session, job);
+    const uint16_t day = last_day(job.request);
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
+    char manifest[96], identity[65]; uint8_t manifest_key[32];
+    publication_prefix(day, manifest);
+    if (!publication_key(job.request, manifest_key)) return note_issue(job, "publication_key");
+    ReportArtifact::Document saved;
+    const auto known = ReportArtifact::document_lookup(session, manifest, manifest_key, saved);
+    if (known == ReportArtifact::Lookup::Ready) {
+        // Revalidate references only after a source/storage change or eviction.
+        // scan_index clears this owner cache when files_revision changes.
+        auto *cached = cached_day_entry(day, true);
+        const bool checked = cached && cached->artifacts_checked &&
+            !memcmp(cached->artifact_key, manifest_key, sizeof(manifest_key));
+        for (size_t i = 0; !checked && i < index_count; ++i) {
+            const auto &entry = index[i];
+            if (!selected(entry, day, day)) continue;
+            for (uint8_t kind = 0; kind < 3; ++kind) {
+                if (!(entry.key.present & (1u << kind))) continue;
+                char prefix[96]; uint8_t key[32];
+                ReportArtifact::Publication publication;
+                if (!artifact_identity(entry, kind, prefix, key) ||
+                    ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
+                    return note_issue(job, "artifact_lookup", entry.entry.file_prefix);
+            }
+        }
+        if (cached) {
+            memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
+            cached->artifacts_checked = true;
+        }
+        if (ReportArtifact::document_read(session, manifest, saved, job.body, manifest_key)) return true;
+        return note_issue(job, "publication_read", manifest);
+    }
+    if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
+        return note_issue(job, "publication_read", manifest);
+    if (!artifact_headroom(session, day)) return note_issue(job, "recording_headroom");
+    job.body.clear();
+    aircannect::hex_encode(manifest_key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
+    start_json(job.body, revision() + 1, job.data_revision);
+    job.body.print("\"dataset\":\"%s\",\"identity\":\"%s\",\"day\":%u,\"artifacts\":[", dataset_id, identity, day);
+    bool comma = false;
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, day, day)) continue;
+        bool missing = false;
+        for (uint8_t kind = 0; kind < 3; ++kind) {
+            if (!(entry.key.present & (1u << kind))) continue;
+            char prefix[96]; uint8_t key[32];
+            ReportArtifact::Publication publication;
+            if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
+            const auto found = ReportArtifact::lookup(session, prefix, key, publication);
+            if (found == ReportArtifact::Lookup::Missing) missing = true;
+            else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
+        }
+        if (missing) {
+            std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
+            if (!data) return note_issue(job, "artifact_alloc");
+            if (!session_data(session, job, entry, *data, true)) return false;
+        }
+        for (uint8_t kind = 0; kind < 3; ++kind) {
+            if (!(entry.key.present & (1u << kind))) continue;
+            char prefix[96], digest[65]; uint8_t key[32];
+            ReportArtifact::Publication publication;
+            if (!artifact_identity(entry, kind, prefix, key) ||
+                ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
+                return note_issue(job, "artifact_unavailable", entry.entry.file_prefix);
+            aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+            job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+                           comma ? "," : "", unsigned(i), entry.entry.therapy_day, SUFFIXES[kind], digest, publication.bytes);
+            comma = true;
+        }
+    }
+    job.body.print("],\"event_groups\":[");
+    comma = false;
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, day, day)) continue;
+        std::unique_ptr<SessionData> storage(new (std::nothrow) SessionData);
+        if (!storage) return note_issue(job, "session_alloc");
+        auto &data = *storage;
+        if (!session_data(session, job, entry, data)) return false;
+        ReportArtifact::Document histogram;
+        if (!publish_histograms(session, entry, data, histogram)) return note_issue(job, "histogram_publish");
+        Payload events;
+        bool event_comma = false, truncated = false;
+        events.print("{\"events\":[");
+        if (!window_events(session, job, entry, data.header, 0, INT64_MAX,
+                           events, event_comma, truncated) || truncated) return note_issue(job, "event_limit");
+        events.print("]}");
+        char prefix[96], digest[65];
+        cache_path(entry, "events", prefix);
+        uint8_t event_key[32];
+        ReportArtifact::Document publication;
+        if (!events.good() || !ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), event_key) ||
+            !ReportArtifact::document_publish(session, prefix, event_key,
+                reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), publication)) return note_issue(job, "events_publish");
+        aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u,",
+            comma ? "," : "", unsigned(i), entry.entry.therapy_day, digest, publication.bytes);
+        aircannect::hex_encode(histogram.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("\"histogram\":{\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}}",
+            entry.entry.therapy_day, digest, histogram.bytes);
+        comma = true;
+    }
+    job.body.print("],\"summary\":");
+    Payload envelope;
+    envelope.swap(job.body);
+    // History uses the same exact session statistics, never browser aggregates.
+    if (!history_json(session, job, true)) return false;
+    job.body.clear();
+    if (!summary_json(session, job)) return false;
+    envelope.append(job.body.c_str(), job.body.length());
+    envelope.print("}");
+    job.body.swap(envelope);
+    if (!job.body.good() || aborted(&job, session)) return false;
+    if (job.issue) {
+        ReportArtifact::Document previous;
+        const bool prior = ReportArtifact::document_lookup(session, manifest, nullptr, previous) == ReportArtifact::Lookup::Ready;
+        if (strcmp(job.issue, "partial_source") || prior) return false;
+    }
+    // A catalog/STR update during production must not become the current head.
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    if (!ReportArtifact::document_publish(session, manifest, manifest_key,
+        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved))
+        return note_issue(job, "publication_write", manifest);
+    remember_publication(day, 0, saved);
+    if (auto *cached = cached_day_entry(day, true)) {
+        memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
+        cached->artifacts_checked = true;
+    }
+    __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&status_mux);
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return true;
+}
 void append_event(Payload &body, const Event &event, bool &comma, const char *type = nullptr) {
     body.print("%s{\"time_ms\":%lld,\"duration_ms\":%lld,\"type\":\"%s\"}",
                comma ? "," : "", static_cast<long long>(event.time_ms),
@@ -917,7 +1849,8 @@ void append_event(Payload &body, const Event &event, bool &comma, const char *ty
     comma = true;
 }
 
-bool days_json(Job &job) {
+bool days_json(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
     const size_t bytes = index_count * sizeof(uint16_t);
     auto *days = bytes ? static_cast<uint16_t *>(aircannect::Memory::alloc_large(bytes,
                                                        bytes <= INTERNAL_WORK)) : nullptr;
@@ -926,31 +1859,233 @@ bool days_json(Job &job) {
     bool partial = false;
     for (size_t i = 0; i < index_count; ++i) {
         if (!(index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE)) continue;
-        if (index[i].key.present & 7) days[count++] = index[i].day;
+        days[count++] = index[i].day;
         if (index[i].key.present != 31 || index[i].key.checksums != 31) partial = true;
     }
     if (count) std::sort(days, days + count, std::greater<uint16_t>());
     start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"partial\":%s,\"days\":[", partial ? "true" : "false");
+    job.body.print("\"dataset\":\"%s\",\"partial\":%s,\"days\":[", dataset_id, partial ? "true" : "false");
     for (size_t n = 0; n < count;) {
         const uint16_t day = days[n];
         size_t end = n + 1;
         while (end < count && days[end] == day) ++end;
-        job.body.print("%s{\"day\":%u,\"session_count\":%u}", n ? "," : "", day,
+        job.body.print("%s{\"day\":%u,\"session_count\":%u", n ? "," : "", day,
                        static_cast<unsigned>(end - n));
+        char prefix[96]; uint8_t key[32];
+        publication_prefix(day, prefix);
+        Request request; request.day = day;
+        ReportArtifact::Document document;
+        if (publication_key(request, key) &&
+            lookup_publication(session, day, 0, prefix, document) == ReportArtifact::Lookup::Ready) {
+            char digest[65], identity[65];
+            aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+            aircannect::hex_encode(document.key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
+            job.body.print(",\"publication\":{\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u},\"identity\":\"%s\",\"stale\":%s",
+                prefix + strlen(CACHE_DIR) + 1, digest, document.bytes, identity, memcmp(key, document.key, 32) ? "true" : "false");
+        }
+        job.body.print("}");
         n = end;
+    }
+    job.body.print("],\"periods\":[");
+    bool period_comma = false;
+    for (uint16_t period : PERIODS) {
+        Request request; request.view = View::Period; request.period = period;
+        char prefix[96]; uint8_t key[32];
+        period_prefix(request, prefix);
+        ReportArtifact::Document document;
+        if (!publication_key(request, key) ||
+            lookup_publication(session, last_day(request), period, prefix, document) != ReportArtifact::Lookup::Ready) continue;
+        char digest[65];
+        aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("%s{\"period\":%u,\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
+            period_comma ? "," : "", period, prefix + strlen(CACHE_DIR) + 1,
+            digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
+        period_comma = true;
     }
     job.body.print("]}");
     aircannect::Memory::free(days);
     return job.body.good();
 }
 
+uint32_t foreground_wait() {
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t elapsed = millis() - foreground_at;
+    const uint32_t wait = foreground_seen && elapsed < FOREGROUND_QUIET_MS ? FOREGROUND_QUIET_MS - elapsed : 0;
+    portEXIT_CRITICAL(&status_mux);
+    return wait;
+}
+
+void foreground_activity() {
+    portENTER_CRITICAL(&status_mux);
+    foreground_at = millis();
+    foreground_seen = true;
+    portEXIT_CRITICAL(&status_mux);
+}
+
+bool cleanup_cancelled(void *context) {
+    return foreground_wait() || ExportSync::busy() ||
+        aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
+}
+
+bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
+    // SD ownership serializes unlink with the actual read, not its admission.
+    // A newly admitted reader waits for this session, then opens the file;
+    // retained heads are never candidates. Do not reject it during an unlink.
+    return !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && ReportArtifact::index_discard(session, digest);
+}
+
+bool retire_index(const SdStorage::Session &session) {
+    if (!retired_index.bytes) return true;
+    if (retired_index_files != SdStorage::files_revision()) {
+        retired_index = {};
+        return true; // External edits invalidate provenance; leave it for discovery.
+    }
+    if (!discard_index(session, retired_index.digest)) return false;
+    retired_index = {};
+    return true;
+}
+
+ReportArtifact::Lookup index_shape(const aircannect::LargeTextBuffer &body) {
+    // Old root documents have no kind tag. Recognize only the exact compact
+    // schema emitted by days_json; unknown/future documents are not garbage.
+    aircannect::JsonAllocator allocator(false);
+    JsonDocument parsed(&allocator);
+    const auto error = deserializeJson(parsed, body.c_str(), body.length());
+    if (error == DeserializationError::NoMemory) return ReportArtifact::Lookup::Failed;
+    const auto root = parsed.as<JsonObjectConst>();
+    if (error || root.size() != 7 || root["source"] != "edf" ||
+        !root["revision"].is<uint32_t>() || !root["data_revision"].is<uint32_t>() ||
+        !aircannect::sha256_text_valid(root["dataset"].as<const char *>()) ||
+        !root["partial"].is<bool>() || !root["days"].is<JsonArrayConst>() ||
+        !root["periods"].is<JsonArrayConst>() || measureJson(parsed) != body.length())
+        return ReportArtifact::Lookup::Invalid;
+    const auto publication = [](JsonObjectConst value) {
+        const char *day = value["day"];
+        return day && strlen(day) == 8 && strspn(day, "0123456789") == 8 &&
+            aircannect::sha256_text_valid(value["digest"].as<const char *>()) &&
+            value["bytes"].is<uint32_t>() && value["bytes"].as<uint32_t>() > 0;
+    };
+    for (JsonObjectConst day : root["days"].as<JsonArrayConst>()) {
+        if (!day["day"].is<uint16_t>() || !day["session_count"].is<uint32_t>() ||
+            (day.size() != 2 && day.size() != 5)) return ReportArtifact::Lookup::Invalid;
+        if (day.size() == 5 && (day["publication"].as<JsonObjectConst>().size() != 3 ||
+            !publication(day["publication"]) || !day["stale"].is<bool>() ||
+            !aircannect::sha256_text_valid(day["identity"].as<const char *>())))
+            return ReportArtifact::Lookup::Invalid;
+    }
+    if (root["periods"].size() > sizeof(PERIODS) / sizeof(PERIODS[0])) return ReportArtifact::Lookup::Invalid;
+    for (JsonObjectConst period : root["periods"].as<JsonArrayConst>()) {
+        const uint16_t length = period["period"];
+        if (period.size() != 5 || !publication(period) || !period["stale"].is<bool>() ||
+            std::find(std::begin(PERIODS), std::end(PERIODS), length) == std::end(PERIODS))
+            return ReportArtifact::Lookup::Invalid;
+    }
+    return ReportArtifact::Lookup::Ready;
+}
+
+bool index_cleanup_pending() {
+    return index_cleanup.files != SdStorage::files_revision() ||
+        !index_cleanup.discovered || index_cleanup.shard < 256;
+}
+
+bool cleanup_indexes(const SdStorage::Session &session) {
+    auto *context = const_cast<SdStorage::Session *>(&session);
+    if (cleanup_cancelled(context)) return false;
+    if (index_cleanup.files != SdStorage::files_revision()) {
+        index_cleanup = {};
+        index_cleanup.files = SdStorage::files_revision();
+    }
+    SdStorage::Reader directory;
+    SdStorage::Reader::Entry entry;
+    bool end = false;
+    if (!index_cleanup.discovered) {
+        memset(index_cleanup.present, 0, sizeof(index_cleanup.present));
+        if (!directory.open(session, CACHE_DIR, true)) return false;
+        while (!end) {
+            if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
+            if (end) break;
+            const char *name = strrchr(entry.name, '/');
+            name = name ? name + 1 : entry.name;
+            if (!entry.directory || strlen(name) != 2 || strspn(name, "0123456789abcdef") != 2) continue;
+            uint32_t shard;
+            if (aircannect::parse_hex(name, 2, shard)) index_cleanup.present[shard / 8] |= 1u << (shard % 8);
+        }
+        directory.close();
+        index_cleanup.discovered = true;
+    }
+    while (index_cleanup.shard < 256 && !(index_cleanup.present[index_cleanup.shard / 8] & (1u << (index_cleanup.shard % 8))))
+        ++index_cleanup.shard;
+    if (index_cleanup.shard == 256) return true;
+    char path[96];
+    snprintf(path, sizeof(path), "%s/%02x", CACHE_DIR, unsigned(index_cleanup.shard));
+    if (!directory.open(session, path, true)) return false;
+    end = false;
+    while (!end) {
+        if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
+        if (end) break;
+        const char *name = strrchr(entry.name, '/');
+        name = name ? name + 1 : entry.name;
+        if (entry.directory || strlen(name) != 68 || strcmp(name + 64, ".abp") ||
+            strspn(name, "0123456789abcdef") != 64 || !entry.size || entry.size > MAX_BODY) continue;
+        uint8_t digest[32]; size_t decoded = 0;
+        if (!aircannect::hex_decode(name, 64, digest, sizeof(digest), decoded) || digest[0] != index_cleanup.shard) continue;
+        aircannect::LargeTextBuffer body(MAX_BODY, 0);
+        auto state = ReportArtifact::index_candidate(session, digest, entry.size, body, cleanup_cancelled, context);
+        if (state == ReportArtifact::Lookup::Ready) {
+            // The only four-byte root document in v1 is the rebuild counter.
+            // Both live counter heads remain protected by index_candidate.
+            const uint32_t generation = body.length() == 4 ?
+                SdStorage::get_le32(reinterpret_cast<const uint8_t *>(body.c_str())) : 0;
+            if (!generation || generation >= rebuild_generation) state = index_shape(body);
+        }
+        if (state == ReportArtifact::Lookup::Failed) return false;
+        if (state != ReportArtifact::Lookup::Ready) continue;
+        if (cleanup_cancelled(context) || !discard_index(session, digest)) return false;
+    }
+    ++index_cleanup.shard;
+    return true;
+}
+
+bool publish_index(const SdStorage::Session &session) {
+    if (!retire_index(session)) return false;
+    const uint32_t artifacts = status.artifact_revision;
+    const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (published_index_data == data && published_index_artifacts == artifacts) {
+        index_commit_pending = false;
+        return true;
+    }
+    index_commit_pending = true;
+    Job snapshot;
+    snapshot.data_revision = data;
+    if (!days_json(session, snapshot)) return false;
+    ReportArtifact::Document document;
+    uint8_t key[32];
+    if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), key) ||
+        !ReportArtifact::index_publish(session, key,
+            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document, retired_index)) {
+        index_cleanup.files = UINT32_MAX; // A body may have committed without its head.
+        return false;
+    }
+    published_index_data = data;
+    published_index_artifacts = artifacts;
+    retired_index_files = SdStorage::files_revision();
+    index_commit_pending = false;
+    retire_index(session);
+    return true;
+}
+
 struct Aggregate {
-    ReportEdf::Histogram channels[CHANNEL_COUNT];
+    ReportEdf::Histogram *channels = nullptr;
     double coverage[CHANNEL_COUNT] = {};
     bool incompatible[CHANNEL_COUNT] = {};
+    Aggregate() {
+        const size_t bytes = CHANNEL_COUNT * sizeof(*channels);
+        channels = static_cast<ReportEdf::Histogram *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
+        if (channels) for (size_t c = 0; c < CHANNEL_COUNT; ++c) new (&channels[c]) ReportEdf::Histogram;
+    }
     ~Aggregate() {
-        for (auto &channel : channels) aircannect::Memory::free(channel.bins);
+        if (channels) for (size_t c = 0; c < CHANNEL_COUNT; ++c) aircannect::Memory::free(channels[c].bins);
+        aircannect::Memory::free(channels);
     }
     bool merge(const SessionData &data, bool &partial) {
         size_t offset = 0;
@@ -979,15 +2114,17 @@ struct Aggregate {
     }
 };
 
+bool history_json(const SdStorage::Session &session, Job &job, bool build);
+
 bool summary_json(const SdStorage::Session &session, Job &job) {
     Aggregate aggregate;
-    Payload events;
+    if (!aggregate.channels) return note_issue(job, "aggregate_alloc");
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
-    bool partial = false, event_comma = false, session_comma = false, events_truncated = false;
-    bool usage_known = true, events_known = true;
+    bool partial = false, session_comma = false;
+    bool usage_known = true, events_known = true, csr_known = true;
     uint32_t sessions = 0;
     uint64_t counts[5] = {};
-    double seconds = 0;
+    double seconds = 0, csr_seconds = 0, leak_high_seconds = 0;
     start_json(job.body, revision() + 1, job.data_revision);
     job.body.print("\"view\":\"%s\",\"day\":%u,\"first_day\":%u,\"last_day\":%u,\"sessions\":[",
                    job.request.view == View::Day ? "day" : "period", last, first, last);
@@ -998,25 +2135,29 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         if (!(entry.key.present & 7)) {
             note_issue(job, "numeric_files_missing", entry.entry.file_prefix);
             partial = true;
-            usage_known = events_known = false;
+            usage_known = events_known = csr_known = false;
             continue;
         }
-        SessionData data;
+        std::unique_ptr<SessionData> storage(new (std::nothrow) SessionData);
+        if (!storage) return note_issue(job, "session_alloc");
+        auto &data = *storage;
         if (!session_data(session, job, entry, data)) {
             if (aborted(&job, session)) return false;
             partial = true;
-            usage_known = events_known = false;
+            usage_known = events_known = csr_known = false;
             continue;
         }
         partial |= data.header.partial;
         usage_known &= data.header.usage_known;
         events_known &= data.header.usage_known;
+        csr_known &= data.header.csr_known;
+        csr_seconds += data.header.csr_seconds;
+        leak_high_seconds += data.header.leak_high_seconds;
         entry.bounds_known = data.header.chart_end_ms > data.header.chart_start_ms;
         entry.start_ms = data.header.chart_start_ms;
         entry.end_ms = data.header.chart_end_ms;
         entry.event_from_ms = data.header.event_from_ms;
         entry.event_to_ms = data.header.event_to_ms;
-        events_truncated |= data.header.events_truncated;
         if (!aggregate.merge(data, partial)) return false;
         if (data.header.recorded) {
             seconds += data.header.used_seconds;
@@ -1031,16 +2172,30 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         else job.body.print("null,\"end_ms\":null}");
         session_comma = true;
         ++sessions;
-        for (uint32_t e = 0; e < std::min<size_t>(data.header.events, MAX_EVENTS); ++e) {
-            // Keep the response bounded even for year periods, without losing
-            // event counts used by the independently accumulated AHI.
-            if (events.length() > MAX_BODY / 2 - 256) { events_truncated = true; break; }
-            append_event(events, data.events[e], event_comma);
-        }
+    }
+    HistoricalStr str(session, job);
+    bool str_expected = false;
+    if (job.request.view == View::Day)
+        for (size_t i = 0; i < index_count; ++i)
+            str_expected |= index[i].day == last && (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY);
+    if (str_expected && !str.load(last)) {
+        if (aborted(&job, session)) return false;
+        str.present = false;
+        partial = true;
+        note_issue(job, "str_read", "/STR.edf");
     }
     job.body.print("],\"present\":%s,\"partial\":%s,\"used_seconds\":",
-                   sessions ? "true" : "false", partial ? "true" : "false");
+                   sessions || str.present ? "true" : "false", partial ? "true" : "false");
     if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
+    else job.body.print("null");
+    job.body.print(",\"rdi\":");
+    if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3] + counts[4]) * 3600.0 / seconds);
+    else job.body.print("null");
+    job.body.print(",\"csr_seconds\":");
+    if (csr_known && seconds > 0) job.body.print("%.10g", csr_seconds);
+    else job.body.print("null");
+    job.body.print(",\"leak_threshold\":%.10g,\"leak_high_seconds\":", LEAK_THRESHOLD);
+    if (!aggregate.incompatible[3] && aggregate.coverage[3] > 0) job.body.print("%.10g", leak_high_seconds);
     else job.body.print("null");
     job.body.print(",\"session_count\":%u,\"ahi\":", sessions);
     if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3]) * 3600.0 / seconds);
@@ -1051,9 +2206,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]),
                    static_cast<unsigned long long>(counts[4]));
     else job.body.print("\"counts\":{\"oa\":null,\"ca\":null,\"ua\":null,\"h\":null,\"rera\":null},");
-    job.body.print("\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
-    if (events.length()) job.body.append(events.c_str(), events.length());
-    job.body.print("],\"channels\":[");
+    job.body.print("\"channels\":[");
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
         ReportEdf::Statistics stats;
         const bool present = !aggregate.incompatible[c] && aggregate.channels[c].bins &&
@@ -1062,88 +2215,59 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                        c ? "," : "", CHANNELS[c].id, CHANNELS[c].label, CHANNELS[c].unit,
                        static_cast<unsigned long long>(present ? stats.count : 0));
         job.body.print("\"coverage_seconds\":%.10g,", present ? aggregate.coverage[c] : 0);
-        if (present) job.body.print("\"mean\":%.10g,\"median\":%.10g,\"p95\":%.10g,\"max\":%.10g}",
-                                   stats.mean, stats.median, stats.p95, stats.max);
-        else job.body.print("\"mean\":null,\"median\":null,\"p95\":null,\"max\":null}");
+        const double values[] = {present ? stats.min : NAN, present ? stats.mean : NAN,
+            present ? stats.median : str.statistic(c, "50"),
+            present ? stats.p95 : str.statistic(c, "95"), present ? stats.max : str.statistic(c, "Max")};
+        constexpr const char *keys[] = {"min", "mean", "median", "p95", "max"};
+        bool str_value = false;
+        for (size_t n = 0; n < 5; ++n) {
+            job.body.print("\"%s\":", keys[n]);
+            if (std::isfinite(values[n])) { job.body.print("%.10g,", values[n]); str_value |= !present; }
+            else job.body.print("null,");
+        }
+        job.body.print("\"source\":\"%s\"}", present ? "edf" : str_value ? "str" : "");
     }
-    job.body.print("]}");
-    return job.body.good() && events.good();
+    job.body.print("]");
+    if (job.request.view == View::Day) str.settings_json(job.body, last);
+    if (job.request.view == View::Day && !history_json(session, job, false)) return false;
+    job.body.print("}");
+    return job.body.good();
 }
 
-struct Cell {
-    float low = INFINITY, high = -INFINITY;
-    uint32_t covered_ms = 0;
-};
-struct ReducedLevel {
-    int64_t start_ms = 0;
-    uint32_t count = 0;
-    uint64_t offset = 0;
-};
-struct ReducedChannel {
-    int64_t end_ms = 0;
-    ReducedLevel levels[LEVEL_COUNT];
-};
-struct ReducedHeader {
-    char magic[8] = {'A','B','S','E','R','0','1',0};
-    uint32_t version = SERIES_CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
-    uint64_t bytes = 0;
-    SourceKey key;
-    ReducedChannel channels[CHANNEL_COUNT + 1];
-};
-
-uint8_t chart_file(size_t c) { return c ? CHANNELS[c - 1].file : 0; }
-const char *chart_signal(size_t c) { return c ? CHANNELS[c - 1].signal : "Flow.40ms"; }
 double chart_scale(size_t c, const ReportEdf::Signal &signal) {
     if ((c == 0 || c == 4) && !strcmp(signal.unit, "L/s")) return 60;
     if (c == 7 && !strcmp(signal.unit, "L")) return 1000;
     return 1;
 }
 
-bool start_part(const SdStorage::Session &session, const char *path,
-                const uint8_t *header, size_t bytes) {
-    return session.run([&](fs::FS &fs) {
+bool start_part(PartGuard &part, const uint8_t *header, size_t bytes) {
+    if (!part.session.run([&](fs::FS &fs) {
         if ((!fs.exists("/airbridge") && !fs.mkdir("/airbridge")) ||
             (!fs.exists(CACHE_DIR) && !fs.mkdir(CACHE_DIR))) return false;
-        if (fs.exists(path) && !fs.remove(path)) return false;
-        fs::File file = fs.open(path, FILE_WRITE);
-        const bool success = file && SdStorage::write_exact(file, header, bytes);
-        file.close();
-        return success;
-    });
+        char directory[96];
+        snprintf(directory, sizeof(directory), "%s", part.path);
+        *strrchr(directory, '/') = 0;
+        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
+        return !fs.exists(part.path) || fs.remove(part.path);
+    })) return false;
+    return part.writer.open(part.session, part.path) && part.writer.write(header, bytes);
 }
-bool append_part(const SdStorage::Session &session, const char *path,
-                 const uint8_t *data, size_t bytes) {
-    for (size_t at = 0; at < bytes;) {
-        const size_t take = std::min(bytes - at, SdStorage::READ_CHUNK_BYTES);
-        if (!session.run([&](fs::FS &fs) {
-            fs::File file = fs.open(path, FILE_APPEND);
-            const bool success = file && SdStorage::write_exact(file, data + at, take);
-            file.close();
-            return success;
-        })) return false;
-        at += take;
-    }
-    return true;
-}
-bool finish_part(const SdStorage::Session &session, const char *part,
-                 const char *path, uint64_t bytes) {
+
+bool finish_part(PartGuard &part, const char *path, uint64_t bytes) {
+    if (!part.writer.finish(bytes)) return false;
     uint64_t old_bytes = 0;
-    const bool success = session.run([&](fs::FS &fs) {
-        fs::File file = fs.open(part, FILE_APPEND);
-        if (!file || file.size() != bytes) return false;
-        file.flush();
-        file.close();
+    const bool success = part.session.run([&](fs::FS &fs) {
         fs::File old = fs.open(path, FILE_READ);
         if (old) old_bytes = old.size();
         old.close();
-        return (!fs.exists(path) || fs.remove(path)) && fs.rename(part, path);
+        return (!fs.exists(path) || fs.remove(path)) && fs.rename(part.path, path);
     });
     if (success && cache_usage_known) cache_bytes = cache_bytes - std::min(cache_bytes, old_bytes) + bytes;
     else cache_usage_known = false;
     return success;
 }
 
-bool cache_name(const char *input, char (&path)[96], const char *&base) {
+bool cache_name(const char *input, const char *&base) {
     base = strrchr(input, '/');
     base = base ? base + 1 : input;
     if (strlen(base) < 21 || strlen(base) > 32) return false;
@@ -1151,362 +2275,38 @@ bool cache_name(const char *input, char (&path)[96], const char *&base) {
         if (n == 8 ? base[n] != '_' : base[n] < '0' || base[n] > '9') return false;
     if (strcmp(base + 15, ".stats") && strcmp(base + 15, ".series") &&
         strcmp(base + 15, ".stats.part") && strcmp(base + 15, ".series.part")) return false;
-    snprintf(path, sizeof(path), "%s/%s", CACHE_DIR, base);
     return true;
 }
 
-bool prune_cache(const SdStorage::Session &session, uint64_t needed, const char *keep) {
-    if (needed > MAX_SD_CACHE) return false;
-    if (cache_usage_known && cache_bytes + needed <= MAX_SD_CACHE) return true;
-    while (true) {
-        SdStorage::Reader directory;
-        if (!directory.open(session, CACHE_DIR, true)) {
-            bool missing = false;
-            if (!session.run([&](fs::FS &fs) { missing = !fs.exists(CACHE_DIR); return true; })) return false;
-            if (missing) { cache_bytes = 0; cache_usage_known = true; return true; }
-            return false;
-        }
-        uint64_t total = 0, oldest_bytes = 0;
-        char oldest[96] = {};
-        bool end = false;
-        SdStorage::Reader::Entry file;
-        while (!end) {
-            if (!directory.next(file, end)) return false;
-            if (end || file.directory) continue;
-            char path[96];
-            const char *base = nullptr;
-            if (!cache_name(file.name, path, base)) continue;
-            bool live = false;
-            for (size_t i = 0; i < index_count; ++i)
-                if (index[i].key.present && !strncmp(base, index[i].entry.file_prefix, 15)) {
-                    live = true;
-                    break;
-                }
-            if (!live || strstr(base, ".part")) {
-                if (!session.run([&](fs::FS &fs) { return fs.remove(path); })) return false;
-                continue;
-            }
-            total += file.size;
-            if ((!keep || strcmp(path, keep)) && (!oldest[0] || strcmp(path, oldest) < 0)) {
-                snprintf(oldest, sizeof(oldest), "%s", path);
-                oldest_bytes = file.size;
-            }
-        }
-        directory.close();
-        cache_bytes = total;
-        cache_usage_known = true;
-        if (total + needed <= MAX_SD_CACHE) return true;
-        if (!oldest[0] || !session.run([&](fs::FS &fs) { return fs.remove(oldest); })) return false;
-        cache_bytes -= oldest_bytes;
-        // Retire oldest cache entries only. Missing cache is rebuilt from EDF.
-        if (cache_bytes + needed <= MAX_SD_CACHE) return true;
-    }
-}
-
-bool reduced_header(const SdStorage::Session &session, const IndexedSession &entry,
-                    ReducedHeader &out) {
-    char path[96];
-    cache_path(entry, "series", path);
-    SdStorage::Reader reader;
-    if (!reader.open(session, path) || reader.read(reinterpret_cast<uint8_t *>(&out), sizeof(out)) != sizeof(out) ||
-        memcmp(out.magic, "ABSER01", 8) || out.version != SERIES_CACHE_VERSION ||
-        out.header_bytes != sizeof(out) || !(out.key == entry.key) || out.bytes != reader.size()) return false;
-    uint64_t offset = sizeof(out);
-    for (const auto &channel : out.channels) {
-        if (channel.end_ms < 0) return false;
-        for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-            const auto &level = channel.levels[n];
-            if (level.offset != offset || level.count > uint64_t(86400000 / LEVEL_MS[n] + 2) ||
-                level.start_ms < 0 || level.start_ms % LEVEL_MS[n]) return false;
-            offset += uint64_t(level.count) * sizeof(Cell);
-        }
-    }
-    return offset == out.bytes;
-}
-
-void cell_sample(Cell *cells, uint32_t count, int64_t start_ms, int64_t step_ms,
-                 int64_t begin, int64_t end, double value, bool valid) {
-    if (!valid || end <= start_ms) return;
-    int64_t cell = std::max<int64_t>(0, (begin - start_ms) / step_ms);
-    while (cell < count && start_ms + cell * step_ms < end) {
-        const int64_t left = std::max(begin, start_ms + cell * step_ms);
-        const int64_t right = std::min(end, start_ms + (cell + 1) * step_ms);
-        if (right > left) {
-            cells[cell].low = std::min(cells[cell].low, static_cast<float>(value));
-            cells[cell].high = std::max(cells[cell].high, static_cast<float>(value));
-            cells[cell].covered_ms += right - left;
-        }
-        ++cell;
-    }
-}
-
-bool build_reduced(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, ReducedHeader &out) {
-    out = {};
-    out.key = entry.key;
-    Input input(session, job);
-    for (uint8_t kind = 0; kind < 3; ++kind) {
-        if (!(entry.key.present & (1u << kind))) continue;
-        if (!input.open(session, entry, kind)) return false;
-        int64_t start = 0, end = 0;
-        if (!numeric_extent(*input.header, start, end)) return false;
-        for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-            if (chart_file(c) != kind || ReportEdf::find_signal(*input.header, chart_signal(c)) < 0)
-                continue;
-            auto &channel = out.channels[c];
-            channel.end_ms = end;
-            for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-                auto &level = channel.levels[n];
-                level.start_ms = start / LEVEL_MS[n] * LEVEL_MS[n];
-                level.count = end > start ? (end - level.start_ms + LEVEL_MS[n] - 1) / LEVEL_MS[n] : 0;
-            }
-        }
-        input.file.close();
-    }
-    uint64_t offset = sizeof(out);
-    for (auto &channel : out.channels) {
-        for (auto &level : channel.levels) {
-            level.offset = offset;
-            offset += uint64_t(level.count) * sizeof(Cell);
-        }
-    }
-    out.bytes = offset;
-    char path[96], part[96];
-    cache_path(entry, "series", path);
-    cache_path(entry, "series.part", part);
-    if (!prune_cache(session, out.bytes, path)) return false;
-    PartGuard part_guard{session, part};
-    if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-        const auto &channel = out.channels[c];
-        size_t count = 0;
-        for (const auto &level : channel.levels) count += level.count;
-        const size_t bytes = count * sizeof(Cell);
-        if (!count) continue;
-        auto *cells = static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (!cells) return false;
-        for (size_t i = 0; i < count; ++i) new (&cells[i]) Cell;
-        bool success = input.open(session, entry, chart_file(c));
-        const int signal = success ? ReportEdf::find_signal(*input.header, chart_signal(c)) : -1;
-        success &= signal >= 0;
-        if (success) {
-            const auto &spec = input.header->signals[signal];
-            const double step = input.header->record_seconds * 1000 / spec.samples_per_record;
-            const int64_t origin = input.header->start_seconds * 1000;
-            const uint64_t samples = ReportEdf::sample_count(*input.header, signal);
-            const double scale = chart_scale(c, spec);
-            ReportEdf::Sample values[32];
-            for (uint64_t first = 0; success && first < samples;) {
-                const size_t take = std::min<uint64_t>(32, samples - first);
-                success = !aborted(&job, session) && ReportEdf::read_samples(input.reader,
-                    *input.header, signal, first, take, values);
-                for (size_t i = 0; success && i < take; ++i) {
-                    const int64_t begin = origin + llround((first + i) * step);
-                    const int64_t end = origin + llround((first + i + 1) * step);
-                    const double value = values[i].value * scale;
-                    size_t cell_offset = 0;
-                    for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-                        const auto &level = channel.levels[n];
-                        cell_sample(cells + cell_offset, level.count, level.start_ms, LEVEL_MS[n],
-                                    begin, end, value, values[i].valid);
-                        cell_offset += level.count;
-                    }
-                }
-                first += take;
-            }
-        }
-        input.file.close();
-        success = success && append_part(session, part, reinterpret_cast<uint8_t *>(cells), bytes);
-        aircannect::Memory::free(cells);
-        if (!success) return false;
-    }
-    part_guard.complete = finish_part(session, part, path, out.bytes);
-    return part_guard.complete;
-}
-
-struct Bucket {
-    float low = INFINITY, high = -INFINITY;
-    uint64_t covered_ms = 0;
-};
-struct Series {
-    Bucket *buckets = nullptr;
-    uint16_t px = 0;
-    int64_t from_ms = 0, to_ms = 0, step_ms = 0, level_ms = 0;
-    size_t level_index = 0;
-    bool partial = false;
-    explicit Series(const Request &request) {
-        from_ms = request.from_ms;
-        to_ms = request.to_ms;
-        step_ms = (to_ms - from_ms + request.px - 1) / request.px;
-        if (step_ms >= 10000) {
-            for (size_t n = 0; n < LEVEL_COUNT; ++n)
-                if (LEVEL_MS[n] <= step_ms) level_index = n;
-            level_ms = LEVEL_MS[level_index];
-            from_ms = from_ms / level_ms * level_ms;
-            step_ms = ((request.to_ms - from_ms + request.px - 1) / request.px + level_ms - 1) /
-                level_ms * level_ms;
-            px = (request.to_ms - from_ms + step_ms - 1) / step_ms;
-            to_ms = from_ms + px * step_ms;
-        } else px = (to_ms - from_ms + step_ms - 1) / step_ms;
-        const size_t count = px * (CHANNEL_COUNT + 1), bytes = count * sizeof(Bucket);
-        buckets = static_cast<Bucket *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (buckets) for (size_t i = 0; i < count; ++i) new (&buckets[i]) Bucket;
-    }
-    ~Series() { aircannect::Memory::free(buckets); }
-    void add(size_t c, int64_t begin, int64_t end, float low, float high, uint64_t covered) {
-        if (!covered || end <= from_ms || begin >= to_ms) return;
-        const int64_t cell = std::max<int64_t>(0, (begin - from_ms) / step_ms);
-        if (cell >= px) return;
-        Bucket &bucket = buckets[c * px + cell];
-        bucket.low = std::min(bucket.low, low);
-        bucket.high = std::max(bucket.high, high);
-        bucket.covered_ms += covered;
-    }
-};
-
-void series_channel_json(Payload &out, const Series &series, size_t channel) {
-    auto format_bucket = [&](size_t at, char *text) -> size_t {
-        const auto &bucket = series.buckets[channel * series.px + at];
-        if (!bucket.covered_ms || !std::isfinite(bucket.low) || !std::isfinite(bucket.high))
-            return 0;
-        const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
-            (series.from_ms + int64_t(at) * series.step_ms));
-        return snprintf(text, 64, "%.7g,%.7g,%llu", bucket.low, bucket.high,
-                        static_cast<unsigned long long>(std::min(bucket.covered_ms, expected)));
-    };
-    auto visit_runs = [&](auto &&visit) {
-        char value[64], next[64];
-        const auto *buckets = series.buckets + channel * series.px;
-        size_t begin = 0, length = format_bucket(0, value);
-        for (size_t at = 1; at <= series.px; ++at) {
-            if (at < series.px) {
-                const auto &bucket = buckets[at], &previous = buckets[at - 1];
-                const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
-                    (series.from_ms + int64_t(at) * series.step_ms));
-                // The preceding bucket cannot be the clipped tail. Bitwise
-                // float equality also distinguishes +0 from -0.
-                if (std::min(bucket.covered_ms, expected) ==
-                    std::min(previous.covered_ms, static_cast<uint64_t>(series.step_ms)) &&
-                    !memcmp(&bucket.low, &previous.low, sizeof(bucket.low)) &&
-                    !memcmp(&bucket.high, &previous.high, sizeof(bucket.high)))
-                    continue;
-            }
-            const size_t next_length = at < series.px ? format_bucket(at, next) : 0;
-            // Compare wire values, including tail-clipped coverage and the
-            // existing seven-significant-digit representation, not raw floats.
-            if (at < series.px && length == next_length && !memcmp(value, next, length))
-                continue;
-            visit(at - begin, value, length);
-            begin = at;
-            length = next_length;
-            if (length) memcpy(value, next, length + 1);
-        }
-    };
-
-    size_t dense_bytes = sizeof("\"buckets\":[]") - 1 + series.px - 1;
-    size_t run_bytes = sizeof("\"runs\":[]") - 1, run_count = 0;
-    visit_runs([&](size_t count, const char *, size_t length) {
-        dense_bytes += count * (length ? length + 2 : 4);
-        run_bytes += snprintf(nullptr, 0, "%zu", count) + 2 +
-            (length ? length + 1 : 0) + (run_count++ ? 1 : 0);
-    });
-    const bool compact = run_bytes < dense_bytes;
-    out.print("\"%s\":[", compact ? "runs" : "buckets");
-    bool comma = false;
-    visit_runs([&](size_t count, const char *value, size_t length) {
-        if (compact) {
-            if (length) out.print("%s[%zu,%s]", comma ? "," : "", count, value);
-            else out.print("%s[%zu]", comma ? "," : "", count);
-            comma = true;
-        } else {
-            for (size_t i = 0; i < count; ++i) {
-                if (length) out.print("%s[%s]", comma ? "," : "", value);
-                else out.print("%snull", comma ? "," : "");
-                comma = true;
-            }
-        }
-    });
-    out.print("]");
-}
-
-bool cached_series(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, Series &series) {
-    ReducedHeader header;
-    if (!reduced_header(session, entry, header) && !build_reduced(session, job, entry, header))
-        return note_issue(job, "series_cache_build", entry.entry.file_prefix);
-    char path[96];
-    cache_path(entry, "series", path);
-    SdStorage::Reader reader;
-    if (!reader.open(session, path)) return false;
-    Cell cells[64];
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-        const auto &channel = header.channels[c];
-        const auto &level = channel.levels[series.level_index];
-        const uint32_t count = level.count;
-        const int64_t start = level.start_ms;
-        const uint64_t offset = level.offset;
-        if (!count || channel.end_ms <= series.from_ms || start >= series.to_ms) continue;
-        const uint32_t first = std::max<int64_t>(0, (series.from_ms - start) / series.level_ms);
-        const uint32_t last = std::min<int64_t>(count, (series.to_ms - start) / series.level_ms);
-        if (!reader.seek(offset + first * sizeof(Cell))) return false;
-        for (uint32_t n = first; n < last;) {
-            const size_t take = std::min<uint32_t>(64, last - n);
-            if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(cells),
-                take * sizeof(Cell)) != take * sizeof(Cell)) return false;
-            for (size_t i = 0; i < take; ++i) {
-                const int64_t begin = start + (n + i) * series.level_ms;
-                if (cells[i].covered_ms > series.level_ms ||
-                    (cells[i].covered_ms && (!std::isfinite(cells[i].low) ||
-                     !std::isfinite(cells[i].high) || cells[i].low > cells[i].high))) return false;
-                series.add(c, begin, begin + series.level_ms, cells[i].low,
-                           cells[i].high, cells[i].covered_ms);
-            }
-            n += take;
+bool migrate_cache(const SdStorage::Session &session) {
+    if (rebuild_generation) return true;
+    SdStorage::Reader directory;
+    if (!directory.open(session, CACHE_DIR, true))
+        return session.run([&](fs::FS &fs) { return !fs.exists(CACHE_DIR); });
+    bool end = false;
+    SdStorage::Reader::Entry file;
+    while (!end) {
+        if (aborted(nullptr, session)) return false;
+        if (!directory.next(file, end)) return false;
+        const char *base = nullptr;
+        if (end || file.directory || !cache_name(file.name, base) || strstr(base, ".part")) continue;
+        for (size_t i = 0; i < index_count; ++i) {
+            const auto &entry = index[i];
+            if (strncmp(base, entry.entry.file_prefix, 15)) continue;
+            char old[96], path[96], parent[96];
+            snprintf(old, sizeof(old), "%s/%s", CACHE_DIR, base);
+            cache_path(entry, base + 16, path);
+            snprintf(parent, sizeof(parent), "%s/%s", CACHE_DIR, entry.entry.therapy_day);
+            // A rename is restart-safe. Never overwrite an independently existing copy.
+            if (!session.run([&](fs::FS &fs) {
+                return fs.exists(path) || ((!fs.exists(parent) ? fs.mkdir(parent) : true) && fs.rename(old, path));
+            })) return false;
+            break;
         }
     }
     return true;
 }
 
-bool window_series(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, Series &series) {
-    Input input(session, job);
-    ReportEdf::Sample values[32];
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-        if (!(entry.key.present & (1u << chart_file(c)))) { series.partial = true; continue; }
-        if (!input.open(session, entry, chart_file(c))) return false;
-        const int signal = ReportEdf::find_signal(*input.header, chart_signal(c));
-        if (signal < 0) { input.file.close(); continue; }
-        const auto &spec = input.header->signals[signal];
-        const double step = input.header->record_seconds * 1000 / spec.samples_per_record;
-        const int64_t origin = input.header->start_seconds * 1000;
-        const uint64_t count = ReportEdf::sample_count(*input.header, signal);
-        const uint64_t first = std::min<uint64_t>(count,
-            std::max<double>(0, std::floor((series.from_ms - origin) / step)));
-        const uint64_t last = std::min<uint64_t>(count,
-            std::max<double>(0, std::ceil((series.to_ms - origin) / step)));
-        const double scale = chart_scale(c, spec);
-        for (uint64_t n = first; n < last;) {
-            const size_t take = std::min<uint64_t>(32, last - n);
-            if (aborted(&job, session) || !ReportEdf::read_samples(input.reader, *input.header,
-                signal, n, take, values)) return false;
-            for (size_t i = 0; i < take; ++i) {
-                if (!values[i].valid) continue;
-                int64_t begin = std::max<int64_t>(series.from_ms, origin + llround((n + i) * step));
-                const int64_t end = std::min<int64_t>(series.to_ms, origin + llround((n + i + 1) * step));
-                while (begin < end) {
-                    const int64_t cell = (begin - series.from_ms) / series.step_ms;
-                    const int64_t right = std::min(end, series.from_ms + (cell + 1) * series.step_ms);
-                    const float value = values[i].value * scale;
-                    series.add(c, begin, right, value, value, right - begin);
-                    begin = right;
-                }
-            }
-            n += take;
-        }
-        input.file.close();
-    }
-    return true;
-}
 
 bool cached_summary_header(const SdStorage::Session &session, const IndexedSession &entry,
                            CacheHeader &header) {
@@ -1518,10 +2318,77 @@ bool cached_summary_header(const SdStorage::Session &session, const IndexedSessi
 }
 bool build_summary_header(const SdStorage::Session &session, const Job &job,
                           const IndexedSession &entry, CacheHeader &header) {
-    SessionData data;
-    if (!session_data(session, job, entry, data)) return false;
-    header = data.header;
+    std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
+    if (!data) return note_issue(job, "session_alloc");
+    if (!session_data(session, job, entry, *data)) return false;
+    header = data->header;
     return true;
+}
+
+bool history_json(const SdStorage::Session &session, Job &job, bool build) {
+    constexpr size_t DAYS = 14, METRICS = 6;
+    constexpr size_t channels[] = {0, 3, 6, 4};
+    constexpr const char *names[] = {"usage", "ahi", "pressure", "leak", "vt", "mv"};
+    struct Work { DailyValues days[DAYS]; bool cached[DAYS] = {}; CacheHeader header; };
+    void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
+    if (!memory) return false;
+    std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
+    const uint16_t last = last_day(job.request), first = last > DAYS - 1 ? last - DAYS + 1 : 0;
+    bool complete = true;
+    for (size_t d = 0; d < DAYS; ++d) {
+        work->cached[d] = cached_day(first + d, work->days[d], build);
+        complete &= work->days[d].ready;
+    }
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, first, last) || entry.day - first >= DAYS) continue;
+        if (work->cached[entry.day - first]) continue;
+        if (aborted(&job, session)) return false;
+        auto &day = work->days[entry.day - first];
+        day.present = true;
+        auto &header = work->header;
+        if (!cached_summary_header(session, entry, header) &&
+            (!build || !build_summary_header(session, job, entry, header))) {
+            day.ready = complete = false;
+            continue;
+        }
+        day.usage &= header.usage_known;
+        day.event_count &= header.events_known || !header.recorded;
+        day.seconds += header.used_seconds;
+        for (size_t c = 0; c < 4; ++c) {
+            day.events += header.counts[c];
+            day.count[c] += header.channels[channels[c]].count;
+            day.sum[c] += header.channels[channels[c]].sum;
+        }
+    }
+    if (aborted(&job, session)) return false;
+    for (size_t d = 0; d < DAYS; ++d)
+        if (!work->cached[d]) remember_day(first + d, work->days[d]);
+    job.body.print(",\"history\":{\"first_day\":%u,\"last_day\":%u,\"complete\":%s,\"metrics\":[",
+                   first, last, complete ? "true" : "false");
+    for (size_t m = 0; m < METRICS; ++m) {
+        double sum = 0;
+        unsigned count = 0;
+        for (size_t d = DAYS - 8; d < DAYS - 1; ++d) {
+            const double value = work->days[d].value(m);
+            if (std::isfinite(value)) { sum += value; ++count; }
+        }
+        const double current = work->days[DAYS - 1].value(m);
+        job.body.print("%s{\"id\":\"%s\",\"baseline_count\":%u,\"baseline\":", m ? "," : "", names[m], count);
+        if (count) job.body.print("%.10g", sum / count); else job.body.print("null");
+        job.body.print(",\"delta\":");
+        if (count && std::isfinite(current)) job.body.print("%.10g", current - sum / count);
+        else job.body.print("null");
+        job.body.print(",\"points\":[");
+        for (size_t d = 0; d < DAYS; ++d) {
+            const double value = work->days[d].value(m);
+            if (d) job.body.print(",");
+            if (std::isfinite(value)) job.body.print("%.10g", value); else job.body.print("null");
+        }
+        job.body.print("]}");
+    }
+    job.body.print("]}");
+    return job.body.good();
 }
 
 bool window_events(const SdStorage::Session &session, const Job &job,
@@ -1541,26 +2408,9 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     };
     // Pair before viewport filtering, retaining only one pending start per
     // session. A repeated start leaves the preceding boundary unmatched.
-    Event csr_start;
-    bool csr_active = false;
+    CsrPairing csr;
     auto consume = [&](const Event &event) {
-        if (event.kind == ReportEdf::EventKind::CsrStart) {
-            if (csr_active) append(csr_start);
-            csr_start = event;
-            csr_active = true;
-        } else if (event.kind == ReportEdf::EventKind::CsrEnd) {
-            if (csr_active && event.time_ms > csr_start.time_ms) {
-                Event interval = event;
-                interval.duration_ms = event.time_ms - csr_start.time_ms;
-                append(interval, "csr");
-            } else {
-                if (csr_active) append(csr_start);
-                append(event);
-            }
-            csr_active = false;
-        } else {
-            append(event);
-        }
+        csr.consume(event, [&](const Event &value, bool paired) { append(value, paired ? "csr" : nullptr); });
     };
     char path[96];
     cache_path(entry, "stats", path);
@@ -1576,7 +2426,7 @@ bool window_events(const SdStorage::Session &session, const Job &job,
             if (truncated) return out.good();
             n += take;
         }
-        if (csr_active) append(csr_start);
+        if (csr.active) append(csr.start);
         return out.good();
     }
     reader.close();
@@ -1594,86 +2444,8 @@ bool window_events(const SdStorage::Session &session, const Job &job,
         }
         input.file.close();
     }
-    if (csr_active) append(csr_start);
+    if (csr.active) append(csr.start);
     return out.good();
-}
-
-bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing) {
-    uint32_t started = timing.stamp();
-    Series series(job.request);
-    timing.numeric_us += timing.stamp() - started;
-    if (!series.buckets) return false;
-    Payload events;
-    bool event_comma = false, events_truncated = false;
-    const uint16_t last = last_day(job.request), first = first_day(job.request, last);
-    for (size_t i = 0; i < index_count; ++i) {
-        auto &entry = index[i];
-        if (job.request.excludes(i) || !selected(entry, first, last)) continue;
-        const int64_t noon = int64_t(entry.day) * 86400000 + 43200000;
-        if (noon + 86400000 <= series.from_ms || noon >= series.to_ms ||
-            (entry.bounds_known && (entry.end_ms <= series.from_ms || entry.start_ms >= series.to_ms) &&
-             (entry.event_to_ms < series.from_ms || entry.event_from_ms >= series.to_ms))) continue;
-        if (aborted(&job, session)) return false;
-        if (!(entry.key.present & 7)) { series.partial = true; continue; }
-        started = timing.stamp();
-        CacheHeader header;
-        if (!cached_summary_header(session, entry, header) && !build_summary_header(session, job, entry, header)) {
-            timing.numeric_us += timing.stamp() - started;
-            if (aborted(&job, session)) return false;
-            series.partial = true;
-            continue;
-        }
-        series.partial |= header.partial;
-        entry.bounds_known = header.chart_end_ms > header.chart_start_ms;
-        entry.start_ms = header.chart_start_ms;
-        entry.end_ms = header.chart_end_ms;
-        entry.event_from_ms = header.event_from_ms;
-        entry.event_to_ms = header.event_to_ms;
-        // Non-overlapping sessions need neither BRP cache construction nor a
-        // source window. Their summaries remain reusable for later requests.
-        const bool numeric_overlap = !entry.bounds_known ||
-            (entry.end_ms > series.from_ms && entry.start_ms < series.to_ms);
-        const bool success = !numeric_overlap || (series.level_ms ? cached_series(session, job, entry, series)
-                                                                  : window_series(session, job, entry, series));
-        timing.numeric_us += timing.stamp() - started;
-        if (!success) {
-            if (aborted(&job, session)) return false;
-            series.partial = true;
-        }
-        started = timing.stamp();
-        if (!window_events(session, job, entry, header, series.from_ms, series.to_ms,
-                           events, event_comma, events_truncated)) series.partial = true;
-        timing.events_us += timing.stamp() - started;
-    }
-    started = timing.stamp();
-    start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"excluded\":\"");
-    size_t mask_bytes = sizeof(job.request.excluded);
-    while (mask_bytes && !job.request.excluded[mask_bytes - 1]) --mask_bytes;
-    for (size_t i = 0; i < mask_bytes; ++i) {
-        const char pair[] = {
-            aircannect::hex_digit(job.request.excluded[i] >> 4, aircannect::HexCase::Lower),
-            aircannect::hex_digit(job.request.excluded[i], aircannect::HexCase::Lower)};
-        job.body.append(pair, sizeof(pair));
-    }
-    job.body.print("\",\"day\":%u,\"from_ms\":%lld,\"to_ms\":%lld,\"bucket_ms\":%lld,\"px\":%u,",
-                   last, static_cast<long long>(series.from_ms), static_cast<long long>(series.to_ms),
-                   static_cast<long long>(series.step_ms), series.px);
-    job.body.print("\"requested_from_ms\":%lld,\"requested_to_ms\":%lld,\"partial\":%s,\"channels\":[",
-                   static_cast<long long>(job.request.from_ms), static_cast<long long>(job.request.to_ms),
-                   series.partial ? "true" : "false");
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
-        job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",", c ? "," : "",
-                       c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].label : "Flow",
-                       c ? CHANNELS[c - 1].unit : "L/min");
-        series_channel_json(job.body, series, c);
-        job.body.print("}");
-    }
-    job.body.print("],\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
-    if (events.length()) job.body.append(events.c_str(), events.length());
-    job.body.print("]}");
-    timing.encode_us += timing.stamp() - started;
-    return job.body.good() && events.good();
 }
 
 void error_body(Job &job, int code, const char *error) {
@@ -1684,12 +2456,561 @@ void error_body(Job &job, int code, const char *error) {
     job.body.print("{\"source\":\"edf\",\"error\":\"%s\"}", error);
 }
 
+// A collection proof lives for one SD lease. Only small publication documents
+// are traversed; numeric payloads are never rehashed to decide reachability.
+struct DayCleanup {
+    struct File {
+        char name[128] = {};
+        uint32_t bytes = 0;
+        bool keep = false, discard = false, leaf = false, legacy = false;
+        uint16_t period = 0;
+        bool replacement = false;
+    };
+    const SdStorage::Session &session;
+    uint16_t day;
+    uint32_t epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    char directory[96] = {};
+    File *files = nullptr;
+    size_t count = 0, capacity = 0;
+    uint32_t removed = 0;
+    uint64_t removed_bytes = 0;
+    uint8_t empty_shards[32] = {};
+
+    DayCleanup(const SdStorage::Session &session, uint16_t day) : session(session), day(day) {
+        publication_prefix(day, directory);
+        *strrchr(directory, '/') = 0;
+    }
+    ~DayCleanup() { aircannect::Memory::free(files); }
+    File *append() {
+        if (count == capacity) {
+            const size_t next = capacity ? capacity * 2 : 32;
+            if (next > SIZE_MAX / sizeof(File)) return nullptr;
+            auto *grown = static_cast<File *>(aircannect::Memory::realloc_large(files, next * sizeof(File), false));
+            if (!grown) return nullptr;
+            files = grown; capacity = next;
+        }
+        return new (files + count++) File;
+    }
+    bool active() const {
+        return !cleanup_cancelled(const_cast<SdStorage::Session *>(&session)) &&
+            epoch == __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    }
+    bool inventory(const char *relative = "") {
+        char path[192];
+        snprintf(path, sizeof(path), "%s%s%s", directory, *relative ? "/" : "", relative);
+        SdStorage::Reader reader;
+        if (!reader.open(session, path, true)) return false;
+        SdStorage::Reader::Entry entry;
+        bool end = false;
+        bool empty = true;
+        uint8_t shards[32] = {};
+        while (!end) {
+            if (!active() || !reader.next(entry, end)) return false;
+            if (end) break;
+            empty = false;
+            const char *name = strrchr(entry.name, '/');
+            name = name ? name + 1 : entry.name;
+            if (entry.directory) {
+                uint32_t shard;
+                if (!*relative && strlen(name) == 2 && strspn(name, "0123456789abcdef") == 2 &&
+                    aircannect::parse_hex(name, 2, shard)) shards[shard / 8] |= 1u << (shard % 8);
+                continue;
+            }
+            if (entry.size > UINT32_MAX || strlen(name) + strlen(relative) + 2 > sizeof(File::name)) continue;
+            auto *added = append();
+            if (!added) return false;
+            auto &file = *added;
+            snprintf(file.name, sizeof(file.name), "%s%s%s", relative, *relative ? "/" : "", name);
+            file.bytes = entry.size;
+        }
+        reader.close();
+        uint32_t empty_shard;
+        if (empty && *relative && aircannect::parse_hex(relative, 2, empty_shard))
+            empty_shards[empty_shard / 8] |= 1u << (empty_shard % 8);
+        for (unsigned i = 0; i < 256; ++i) if (shards[i / 8] & (1u << (i % 8))) {
+            char shard[3]; snprintf(shard, sizeof(shard), "%02x", i);
+            if (!inventory(shard)) return false;
+        }
+        return true;
+    }
+    File *find(const char *name) {
+        size_t lo = 0, hi = count;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (strcmp(files[mid].name, name) < 0) lo = mid + 1; else hi = mid;
+        }
+        return lo < count && !strcmp(files[lo].name, name) ? files + lo : nullptr;
+    }
+    bool content(const uint8_t digest[32], uint32_t bytes, bool document, bool keep) {
+        char text[65], name[80];
+        aircannect::hex_encode(digest, 32, text, sizeof(text), aircannect::HexCase::Lower);
+        snprintf(name, sizeof(name), "%.*s%s%s.%s", document ? 2 : 0, text,
+            document ? "/" : "", text, document ? "abp" : "abt");
+        auto *file = find(name);
+        if (!file || file->bytes != bytes) return !keep;
+        file->keep |= keep;
+        file->discard |= !keep;
+        return true;
+    }
+    bool reference(JsonObjectConst value, bool document, bool keep) {
+        const char *date = value["day"], *text = value["digest"];
+        uint16_t parsed;
+        uint8_t digest[32]; size_t decoded;
+        return date && catalog_day(date, parsed) && parsed == day &&
+            aircannect::sha256_text_valid(text) && value["bytes"].is<uint32_t>() &&
+            aircannect::hex_decode(text, 64, digest, sizeof(digest), decoded) &&
+            content(digest, value["bytes"], document, keep);
+    }
+    bool read(const File &file, uint8_t *out, size_t length) {
+        char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
+        SdStorage::Reader reader;
+        return active() && length <= file.bytes && reader.open(session, path) &&
+            reader.size() == file.bytes && reader.read(out, length) == length;
+    }
+    const IndexedSession *source(const char *name, uint16_t source_day = 0) const {
+        if (strlen(name) < 15 || (name[15] && name[15] != '.' && name[15] != '_')) return nullptr;
+        if (!source_day) source_day = day;
+        for (size_t i = 0; i < index_count; ++i)
+            if (selected(index[i], source_day, source_day) && !strncmp(index[i].entry.file_prefix, name, 15)) return index + i;
+        return nullptr;
+    }
+    // Recognize only filenames produced by the known cache/producer versions.
+    // An unknown session or future suffix is preserved, not guessed away.
+    bool obsolete(const File &file) const {
+        const auto *entry = source(file.name);
+        if (!entry) return false;
+        const char *tail = file.name + 15;
+        int kind = -1;
+        if (*tail == '_') {
+            for (int k = 0; k < 3; ++k) if (!strncmp(tail + 1, SUFFIXES[k], 3) && tail[4] == '.') kind = k;
+            if (kind < 0 || !(entry->key.present & (1u << kind))) return false;
+            tail += 4;
+        }
+        uint32_t generation = 0;
+        if (!strncmp(tail, ".g", 2)) {
+            const char *digits = tail + 2, *end = digits;
+            while (*end >= '0' && *end <= '9') ++end;
+            if (end == digits || *end != '.' || end - digits > 10) return false;
+            uint64_t value = 0;
+            for (const char *p = digits; p != end; ++p) value = value * 10 + unsigned(*p - '0');
+            if (value > UINT32_MAX) return false;
+            generation = value; tail = end;
+        }
+        if (kind < 0) {
+            if (!strcmp(tail, ".series") || !strcmp(tail, ".series.part") || !strcmp(tail, ".stats.part")) return true;
+            if (!strcmp(tail, ".stats") || !strcmp(tail, ".events.head0") || !strcmp(tail, ".events.head1") ||
+                !strcmp(tail, ".histograms.head0") || !strcmp(tail, ".histograms.head1")) return file.legacy || generation != rebuild_generation;
+            return !strcmp(tail, ".events.document.part") || !strcmp(tail, ".histograms.document.part");
+        }
+        if (!strcmp(tail, ".checkpoint.head0") || !strcmp(tail, ".checkpoint.head1") ||
+            !strcmp(tail, ".checkpoint.document.part") || !strcmp(tail, ".samples.part") ||
+            !strcmp(tail, ".tiles.part") || !strcmp(tail, ".resume.part")) return true;
+        if (strlen(tail) != 69 || tail[0] != '.' || strcmp(tail + 65, ".ref") ||
+            strspn(tail + 1, "0123456789abcdef") != 64) return false;
+        char prefix[96], text[65]; uint8_t key[32];
+        if (!artifact_identity(*entry, kind, prefix, key)) return false;
+        aircannect::hex_encode(key, 32, text, sizeof(text), aircannect::HexCase::Lower);
+        return generation != rebuild_generation || strncmp(text, tail + 1, 64);
+    }
+    bool covered(JsonObjectConst summary, bool period = false) const {
+        if (!summary["sessions"].is<JsonArrayConst>() || !summary["partial"].is<bool>() || summary["partial"].as<bool>()) return false;
+        for (JsonObjectConst item : summary["sessions"].as<JsonArrayConst>()) {
+            const char *prefix = item["prefix"];
+            const uint16_t source_day = period ? item["day"].as<uint16_t>() : day;
+            if (!prefix || strlen(prefix) != 15 || !source_day) return false;
+            const auto *entry = source(prefix, source_day);
+            if (!entry || !(entry->key.present & 7)) return false;
+        }
+        return true;
+    }
+    bool covered_manifest(JsonObjectConst manifest) const {
+        const auto summary = manifest["summary"].as<JsonObjectConst>();
+        if (!covered(summary)) return false;
+        for (JsonObjectConst artifact : manifest["artifacts"].as<JsonArrayConst>()) {
+            const IndexedSession *entry = nullptr;
+            for (JsonObjectConst item : summary["sessions"].as<JsonArrayConst>())
+                if (item["id"] == artifact["session"]) entry = source(item["prefix"]);
+            int kind = -1;
+            for (int k = 0; k < 3; ++k) if (artifact["kind"] == SUFFIXES[k]) kind = k;
+            if (!entry || kind < 0 || !(entry->key.present & (1u << kind))) return false;
+        }
+        return true;
+    }
+    ReportArtifact::Lookup collect() {
+        using ReportArtifact::Lookup;
+        char prefix[96]; uint8_t key[32];
+        publication_prefix(day, prefix);
+        Request request; request.day = day;
+        ReportArtifact::Document current;
+        if (!publication_key(request, key) ||
+            ReportArtifact::document_lookup(session, prefix, key, current) != Lookup::Ready) return Lookup::Invalid;
+        // A complete replacement must already exist. Cleanup never builds one,
+        // scans EDF, or removes the only surviving legacy cache on speculation.
+        std::unique_ptr<CacheHeader> header(new (std::nothrow) CacheHeader);
+        if (!header) return Lookup::Failed;
+        size_t sources = 0;
+        for (size_t i = 0; i < index_count; ++i) if (selected(index[i], day, day)) {
+            if (!active()) return Lookup::Failed;
+            ++sources;
+            if (!(index[i].key.present & 7) || !cached_summary_header(session, index[i], *header) || header->partial)
+                return active() ? Lookup::Invalid : Lookup::Failed;
+            for (uint8_t kind = 0; kind < 3; ++kind) if (index[i].key.present & (1u << kind)) {
+                if (!active()) return Lookup::Failed;
+                char name[96]; uint8_t identity[32]; ReportArtifact::Publication publication;
+                if (!artifact_identity(index[i], kind, name, identity) ||
+                    ReportArtifact::lookup(session, name, identity, publication) != Lookup::Ready)
+                    return active() ? Lookup::Invalid : Lookup::Failed;
+            }
+        }
+        if (!sources) return Lookup::Invalid;
+        header.reset();
+        if (!inventory()) return Lookup::Failed;
+        for (size_t at = 0; at < artifact_cleanup.legacy.length(); at += sizeof(CleanupLegacy)) {
+            CleanupLegacy legacy; memcpy(&legacy, artifact_cleanup.legacy.c_str() + at, sizeof(legacy));
+            if (legacy.day != day) continue;
+            auto *file = append();
+            if (!file) return Lookup::Failed;
+            strcpy(file->name, legacy.name); file->bytes = legacy.bytes; file->legacy = true;
+        }
+        std::sort(files, files + count, [](const File &a, const File &b) { return strcmp(a.name, b.name) < 0; });
+        // Heads and references are parsed once before any deletion. Retained
+        // manifests may still reference bodies whose named heads are obsolete.
+        for (size_t i = 0; i < count; ++i) {
+            if (!active()) return Lookup::Failed;
+            auto &file = files[i];
+            file.discard = obsolete(file);
+            file.discard |= !strcmp(file.name, "day.document.part") ||
+                !strcmp(file.name, "day.refused.head0") || !strcmp(file.name, "day.refused.head1") ||
+                !strcmp(file.name, "day.refused.document.part");
+            const size_t n = strlen(file.name);
+            if (file.discard && n > 6 && (!strcmp(file.name + n - 6, ".stats") || !strcmp(file.name + n - 7, ".series"))) {
+                uint8_t header[20];
+                if (file.bytes < sizeof(header)) return Lookup::Invalid;
+                if (!read(file, header, sizeof(header))) return active() ? Lookup::Invalid : Lookup::Failed;
+                // Native v7 cache layouts are the only legacy formats this
+                // owner understands. Future/foreign cache files are untouched.
+                const bool stats = !strcmp(file.name + n - 6, ".stats");
+                file.discard = stats ? SdStorage::get_le32(header) == STATS_CACHE_VERSION && !memcmp(header + 12, "ABRPT01", 8) :
+                    SdStorage::get_le32(header + 8) == 7 && !memcmp(header, "ABSER01", 8);
+            }
+            if (n > 6 && (!strcmp(file.name + n - 6, ".head0") || !strcmp(file.name + n - 6, ".head1"))) {
+                char name[224]; snprintf(name, sizeof(name), "%s/%.*s", directory, int(n - 6), file.name);
+                ReportArtifact::Document document;
+                const auto state = ReportArtifact::document_slot(session, name, file.name[n - 1] - '0', document);
+                if (state != Lookup::Ready) return state == Lookup::Failed ? state : Lookup::Invalid;
+                if (!content(document.digest, document.bytes, true, !file.discard)) return Lookup::Invalid;
+                if (!strncmp(file.name, "period-", 7)) {
+                    unsigned period = 0; int end = 0;
+                    if (sscanf(file.name, "period-%u%n", &period, &end) == 1 && size_t(end) == n - 6) {
+                        Request request; request.view = View::Period; request.day = day; request.period = period;
+                        uint8_t current_key[32];
+                        if (period <= UINT16_MAX && valid(request) && publication_key(request, current_key) &&
+                            !memcmp(document.key, current_key, 32)) {
+                            char digest[65], body[80];
+                            aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+                            snprintf(body, sizeof(body), "%.2s/%s.abp", digest, digest);
+                            if (auto *replacement = find(body)) { replacement->period = period; replacement->replacement = true; }
+                        }
+                    }
+                }
+                if (strstr(file.name, ".refused.head")) {
+                    char digest[65], body[80];
+                    aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+                    snprintf(body, sizeof(body), "%.2s/%s.abp", digest, digest);
+                    if (auto *leaf = find(body)) leaf->leaf = true;
+                }
+            } else if (n > 69 && !strcmp(file.name + n - 4, ".ref") && file.name[n - 69] == '.') {
+                uint8_t identity[32]; size_t decoded;
+                if (!aircannect::hex_decode(file.name + n - 68, 64, identity, sizeof(identity), decoded)) return Lookup::Invalid;
+                char name[224]; snprintf(name, sizeof(name), "%s/%.*s", directory, int(n - 69), file.name);
+                ReportArtifact::Publication publication;
+                const auto state = ReportArtifact::lookup(session, name, identity, publication);
+                if (state != Lookup::Ready) return state == Lookup::Failed ? state : Lookup::Invalid;
+                if (!content(publication.digest, publication.bytes, false, !file.discard)) return Lookup::Invalid;
+            }
+        }
+        for (size_t at = 0; at < artifact_cleanup.anchors.length(); at += sizeof(CleanupAnchor)) {
+            CleanupAnchor anchor; memcpy(&anchor, artifact_cleanup.anchors.c_str() + at, sizeof(anchor));
+            if (anchor.day == day && !content(anchor.digest, anchor.bytes, true, true)) return Lookup::Invalid;
+        }
+        bool current_checked = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (!active()) return Lookup::Failed;
+            auto &file = files[i];
+            if (file.leaf) { file.discard = true; continue; }
+            if (strlen(file.name) == 68 && !strcmp(file.name + 64, ".abt") &&
+                strspn(file.name, "0123456789abcdef") == 64 && file.bytes >= ReportArtifact::HEADER_BYTES) {
+                uint8_t header[ReportArtifact::HEADER_BYTES];
+                if (!read(file, header, sizeof(header))) return Lookup::Failed;
+                if (!memcmp(header, "ABTILE01", 8) && SdStorage::get_le16(header + 8) == ReportArtifact::VERSION &&
+                    SdStorage::get_le32(header + 12) == file.bytes) file.discard = true;
+                continue;
+            }
+            if (strlen(file.name) != 71 || file.name[2] != '/' || strcmp(file.name + 67, ".abp") ||
+                strspn(file.name + 3, "0123456789abcdef") != 64 || strncmp(file.name, file.name + 3, 2)) continue;
+            uint8_t first[16];
+            memset(first, 0, sizeof(first));
+            if (file.bytes < 11) return Lookup::Invalid;
+            if (!read(file, first, std::min<size_t>(file.bytes, sizeof(first)))) return Lookup::Failed;
+            if (!memcmp(first, "ABHIST01", 8) && SdStorage::get_le16(first + 8) == 1 &&
+                SdStorage::get_le32(first + 12) == file.bytes) { file.discard = true; continue; }
+            if (!memcmp(first, "ABCHK001", 8) && file.bytes == 48) {
+                // Unheaded checkpoint bodies have no live resume point.
+                file.discard = true; continue;
+            }
+            if (memcmp(first, "{\"source\":\"edf\",", 16) && memcmp(first, "{\"events\":[", 11)) {
+                uint8_t reason[32] = {};
+                if (file.bytes >= sizeof(reason) || !read(file, reason, file.bytes)) return Lookup::Invalid;
+                bool refused = false;
+                for (const char *known : {"partial_source", "source_header", "artifact_lookup", "numeric_files_missing"})
+                    refused |= file.bytes == strlen(known) && !memcmp(reason, known, file.bytes);
+                if (!refused) return Lookup::Invalid;
+                file.discard = true; continue;
+            }
+            if (file.bytes > MAX_BODY) return Lookup::Invalid;
+            ReportArtifact::Document document;
+            size_t decoded;
+            if (!aircannect::hex_decode(file.name + 3, 64, document.digest, 32, decoded)) return Lookup::Invalid;
+            document.bytes = file.bytes;
+            aircannect::LargeTextBuffer body(MAX_BODY, 0);
+            if (!ReportArtifact::document_read(session, prefix, document, body, nullptr, false,
+                cleanup_cancelled, const_cast<SdStorage::Session *>(&session))) return Lookup::Failed;
+            aircannect::JsonAllocator allocator(false);
+            JsonDocument json(&allocator);
+            const auto error = deserializeJson(json, body.c_str(), body.length());
+            if (error) return error == DeserializationError::NoMemory ? Lookup::Failed : Lookup::Invalid;
+            const auto root = json.as<JsonObjectConst>();
+            if (root.size() == 1 && root["events"].is<JsonArrayConst>()) { file.discard = true; continue; }
+            if (root["source"] != "edf" || !root["day"].is<uint16_t>() || root["day"].as<uint16_t>() != day) return Lookup::Invalid;
+            if (!root["artifacts"].is<JsonArrayConst>()) {
+                if (root.size() == 20 && root["view"] == "period" && root["first_day"].is<uint16_t>() &&
+                    root["last_day"].as<uint16_t>() == day && root["first_day"].as<uint16_t>() <= day) {
+                    const unsigned period = day - root["first_day"].as<uint16_t>() + 1;
+                    const bool complete = covered(root, true);
+                    file.replacement &= complete && file.period == period;
+                    file.period = period;
+                    file.discard = complete;
+                } else return Lookup::Invalid;
+                continue;
+            }
+            if (root.size() != 9 || !root["event_groups"].is<JsonArrayConst>() ||
+                !root["summary"].is<JsonObjectConst>() || root["dataset"] != dataset_id) return Lookup::Invalid;
+            const bool replacement = !memcmp(document.digest, current.digest, 32);
+            if (replacement && (!covered_manifest(root) || root["summary"]["sessions"].size() != sources)) return Lookup::Invalid;
+            current_checked |= replacement;
+            file.keep |= replacement || !covered_manifest(root);
+            file.discard = true;
+            for (JsonObjectConst item : root["artifacts"].as<JsonArrayConst>())
+                if (!reference(item, false, file.keep)) return Lookup::Invalid;
+            for (JsonObjectConst item : root["event_groups"].as<JsonArrayConst>())
+                if (!reference(item, true, file.keep) || !reference(item["histogram"], true, file.keep)) return Lookup::Invalid;
+        }
+        if (!current_checked) return Lookup::Invalid;
+        for (size_t i = 0; i < count; ++i) if (files[i].period && files[i].discard) {
+            bool replacement = false;
+            for (size_t n = 0; n < count; ++n)
+                replacement |= files[n].period == files[i].period && files[n].replacement;
+            files[i].discard = replacement;
+        }
+        // Remove obsolete roots first. A reset at any following unlink leaves
+        // both retained publication graphs intact; the next pass rediscovers.
+        for (bool bodies : {false, true}) for (size_t i = 0; i < count; ++i) {
+            const auto &file = files[i];
+            const char *ext = strrchr(file.name, '.');
+            const bool body = ext && (!strcmp(ext, ".abp") || !strcmp(ext, ".abt"));
+            if (!file.discard || file.keep || body != bodies) continue;
+            if (!active()) return Lookup::Failed;
+            char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
+            const bool ok = session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+            if (!ok) return Lookup::Failed;
+            ++removed; removed_bytes += file.bytes;
+            uint32_t shard;
+            if (file.name[2] == '/' && aircannect::parse_hex(file.name, 2, shard)) empty_shards[shard / 8] |= 1u << (shard % 8);
+        }
+        for (unsigned shard = 0; shard < 256; ++shard) if (empty_shards[shard / 8] & (1u << (shard % 8))) {
+            if (!active()) return Lookup::Failed;
+            bool retained = false;
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t prefix;
+                if (files[i].name[2] == '/' && aircannect::parse_hex(files[i].name, 2, prefix) && prefix == shard)
+                    retained |= files[i].keep || !files[i].discard;
+            }
+            if (retained) continue;
+            char path[100]; snprintf(path, sizeof(path), "%s/%02x", directory, shard);
+            // rmdir succeeds only if empty; unknown files/subdirectories survive.
+            if (!session.run([&](fs::FS &fs) { fs.rmdir(path); return true; })) return Lookup::Failed;
+        }
+        return Lookup::Ready;
+    }
+};
+
+bool artifact_cleanup_pending() {
+    return !artifact_cleanup.complete || artifact_cleanup.files != SdStorage::files_revision() ||
+        artifact_cleanup.data != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
+        artifact_cleanup.artifacts != status.artifact_revision;
+}
+
+bool cleanup_artifacts(const SdStorage::Session &session) {
+    auto *context = const_cast<SdStorage::Session *>(&session);
+    if (cleanup_cancelled(context)) return false;
+    // Result bodies can contain selectors into older graphs. Never invalidate
+    // a pinned or not-yet-delivered response while collecting its dependencies.
+    bool busy = false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    for (auto &job : jobs) {
+        if (job.state == JobState::Free) continue;
+        if (!evictable(job)) busy = true;
+    }
+    if (!busy) for (auto &job : jobs) if (job.state != JobState::Free) reset_job(job);
+    xSemaphoreGive(mutex);
+    if (busy) return false;
+    const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (artifact_cleanup.files != SdStorage::files_revision() || artifact_cleanup.data != data ||
+        artifact_cleanup.artifacts != status.artifact_revision) {
+        if (artifact_cleanup.files != SdStorage::files_revision())
+            for (size_t i = 0; i < daily_capacity; ++i) daily_cache[i].cleanup_checked = false;
+        artifact_cleanup.~ArtifactCleanup();
+        new (&artifact_cleanup) ArtifactCleanup;
+        artifact_cleanup.files = SdStorage::files_revision();
+        artifact_cleanup.data = data;
+        artifact_cleanup.artifacts = status.artifact_revision;
+    }
+    if (!artifact_cleanup.discovered) {
+        artifact_cleanup.days.clear(); artifact_cleanup.anchors.clear(); artifact_cleanup.legacy.clear();
+        // Read the two small root documents once per sweep, not once per day.
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            ReportArtifact::Document document;
+            const auto found = ReportArtifact::document_slot(session, "/airbridge/report/index", slot, document);
+            if (found == ReportArtifact::Lookup::Missing) continue;
+            aircannect::LargeTextBuffer body(MAX_BODY, 0);
+            if (found != ReportArtifact::Lookup::Ready ||
+                !ReportArtifact::document_read(session, "/airbridge/report/index", document, body, nullptr, false,
+                    cleanup_cancelled, context) ||
+                index_shape(body) != ReportArtifact::Lookup::Ready) return false;
+            aircannect::JsonAllocator allocator(false); JsonDocument json(&allocator);
+            if (deserializeJson(json, body.c_str(), body.length())) return false;
+            for (const char *name : {"days", "periods"}) for (JsonObjectConst item : json[name].as<JsonArrayConst>()) {
+                const auto ref = !strcmp(name, "days") ? item["publication"].as<JsonObjectConst>() : item;
+                if (ref.isNull()) continue;
+                CleanupAnchor anchor; size_t decoded;
+                if (!catalog_day(ref["day"], anchor.day) ||
+                    !aircannect::hex_decode(ref["digest"], 64, anchor.digest, 32, decoded)) return false;
+                anchor.bytes = ref["bytes"];
+                if (!artifact_cleanup.anchors.append(reinterpret_cast<const char *>(&anchor), sizeof(anchor))) return false;
+            }
+        }
+        SdStorage::Reader directory;
+        if (!directory.open(session, CACHE_DIR, true)) return false;
+        SdStorage::Reader::Entry entry; bool end = false;
+        while (!end) {
+            if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
+            if (end) break;
+            const char *name = strrchr(entry.name, '/'); name = name ? name + 1 : entry.name;
+            uint16_t day;
+            if (entry.directory && catalog_day(name, day) &&
+                !artifact_cleanup.days.append(reinterpret_cast<const char *>(&day), sizeof(day))) return false;
+            const char *base;
+            if (!entry.directory && entry.size <= UINT32_MAX && cache_name(name, base)) {
+                for (size_t i = 0; i < index_count; ++i) if (!strncmp(base, index[i].entry.file_prefix, 15)) {
+                    CleanupLegacy legacy;
+                    legacy.day = index[i].day; legacy.bytes = entry.size;
+                    strcpy(legacy.name, base);
+                    if (!artifact_cleanup.legacy.append(reinterpret_cast<const char *>(&legacy), sizeof(legacy))) return false;
+                    break;
+                }
+            }
+        }
+        artifact_cleanup.discovered = true;
+    }
+    if (artifact_cleanup.next < artifact_cleanup.days.length()) {
+        uint16_t day; memcpy(&day, artifact_cleanup.days.c_str() + artifact_cleanup.next, sizeof(day));
+        // A new night's publication must not rescan every old day. Source
+        // identity, root dependencies and owner publication invalidate this
+        // proof; external edits/remount clear it for every cached day above.
+        Request request; request.day = day;
+        uint8_t key[32];
+        aircannect::LargeTextBuffer identity(MAX_BODY, INTERNAL_WORK);
+        if (!publication_key(request, key) || !identity.append(reinterpret_cast<const char *>(key), sizeof(key))) return false;
+        for (size_t at = 0; at < artifact_cleanup.anchors.length(); at += sizeof(CleanupAnchor)) {
+            CleanupAnchor anchor; memcpy(&anchor, artifact_cleanup.anchors.c_str() + at, sizeof(anchor));
+            if (anchor.day != day) continue;
+            bool duplicate = false;
+            for (size_t n = sizeof(key); n < identity.length(); n += sizeof(anchor.digest))
+                duplicate |= !memcmp(identity.c_str() + n, anchor.digest, sizeof(anchor.digest));
+            if (!duplicate && !identity.append(reinterpret_cast<const char *>(anchor.digest), sizeof(anchor.digest))) return false;
+        }
+        if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key)) return false;
+        const auto *cached = cached_day_entry(day, false);
+        const bool checked = cached && cached->cleanup_checked && !memcmp(cached->cleanup_key, key, sizeof(key));
+        DayCleanup cleanup(session, day);
+        const uint32_t started = millis();
+        if (!checked) Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup scanning day=%.8s\n",
+            cleanup.directory + strlen(CACHE_DIR) + 1);
+        const auto result = checked ? ReportArtifact::Lookup::Ready : cleanup.collect();
+        if (cleanup.removed) {
+            cache_usage_known = false;
+            Log::logf(CAT_REPORT, LOG_INFO, "Report cleanup day=%.8s removed=%lu bytes=%llu\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1, static_cast<unsigned long>(cleanup.removed),
+                static_cast<unsigned long long>(cleanup.removed_bytes));
+        }
+        if (result == ReportArtifact::Lookup::Failed) {
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup deferred day=%.8s elapsed=%lums foreground=%u\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1, static_cast<unsigned long>(millis() - started),
+                unsigned(foreground_wait() || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)));
+            return false;
+        }
+        if (auto *entry = cached_day_entry(day, true)) {
+            memcpy(entry->cleanup_key, key, sizeof(key));
+            entry->cleanup_checked = true;
+        }
+        if (result == ReportArtifact::Lookup::Invalid)
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup preserved day=%.8s; replacement or references not verified\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1);
+        artifact_cleanup.next += sizeof(day);
+    }
+    if (artifact_cleanup.next == artifact_cleanup.days.length()) {
+        if (cleanup_cancelled(context)) return false;
+        aircannect::LargeTextBuffer days(MAX_SESSION_COUNT * sizeof(uint16_t), 0), anchors(2 * MAX_BODY, 0);
+        aircannect::LargeTextBuffer legacy(MAX_SESSION_COUNT * sizeof(CleanupLegacy), 0);
+        days.swap(artifact_cleanup.days); anchors.swap(artifact_cleanup.anchors); legacy.swap(artifact_cleanup.legacy);
+        artifact_cleanup.complete = true;
+        if (session.valid()) session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; });
+    }
+    return true;
+}
+
 bool dirty() {
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     return !index_ready || __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != indexed_invalidation ||
         catalog.generation != catalog_generation ||
         SdStorage::files_revision() != file_revision;
+}
+
+bool reindex(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session) || rebuild_generation == UINT32_MAX) return note_issue(job, "rebuild_generation");
+    uint8_t value[4], key[32] = {};
+    SdStorage::put_le32(value, rebuild_generation + 1);
+    ReportArtifact::Document document;
+    if (!ReportArtifact::document_publish(session, "/airbridge/report/rebuild", key, value, sizeof(value), document))
+        return note_issue(job, "rebuild_publish");
+    ++rebuild_generation;
+    index_cleanup.files = UINT32_MAX;
+    invalidate_day(); invalidate_str();
+    backfill_revision = 0; backfill_before = UINT16_MAX; backfill_period = 0;
+    indexed_invalidation = __atomic_add_fetch(&invalidation_generation, 1, __ATOMIC_RELEASE);
+    job.data_revision = __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
+    published_index_data = 0;
+    portENTER_CRITICAL(&status_mux);
+    status.data_revision = job.data_revision;
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    job.body.print("{\"source\":\"edf\",\"rebuilding\":true,\"data_revision\":%lu}",
+        static_cast<unsigned long>(job.data_revision));
+    Log::logf(CAT_REPORT, LOG_INFO, "Report rebuild queued generation=%lu; previous publications preserved\n",
+        static_cast<unsigned long>(rebuild_generation));
+    return job.body.good();
 }
 
 void defer_job(Job *job) {
@@ -1700,36 +3021,124 @@ void defer_job(Job *job) {
     xSemaphoreGive(mutex);
 }
 
+bool enqueue_backfill(const SdStorage::Session &session) {
+    if (!backfill_enabled || ExportSync::busy()) return false;
+    if (background_retry && int32_t(millis() - background_retry) < 0) return false;
+    if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; backfill_period = 0; }
+    const uint32_t current = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (backfill_revision != current) { backfill_revision = current; backfill_before = UINT16_MAX; backfill_period = 0; }
+    uint16_t day = 0;
+    for (size_t i = 0; i < index_count; ++i)
+        if (selected(index[i], 1, backfill_before - (backfill_before != 0))) day = std::max(day, index[i].day);
+    if (!day) backfill_before = 0;
+    if (!day && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) return false;
+    if (!dataset(session)) return false;
+    Request request; request.action = Action::Prepare; request.day = day;
+    char prefix[96]; uint8_t key[32];
+    if (day) publication_prefix(day, prefix);
+    else {
+        request.view = View::Period; request.period = PERIODS[backfill_period];
+        period_prefix(request, prefix);
+    }
+    if (!publication_key(request, key)) return false;
+    ReportArtifact::Document document;
+    const bool ready = lookup_publication(session, last_day(request), day ? 0 : request.period,
+        prefix, document) == ReportArtifact::Lookup::Ready && !memcmp(key, document.key, sizeof(key));
+    bool refused = false;
+    if (!ready) {
+        strcat(prefix, ".refused");
+        refused = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
+    }
+    if (ready || refused) {
+        if (day) backfill_before = day; else ++backfill_period;
+        return true;
+    }
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    Job *slot = nullptr;
+    for (auto &candidate : jobs) if (reusable(candidate) || evictable(candidate)) { slot = &candidate; break; }
+    if (slot) {
+        reset_job(*slot);
+        slot->request = request;
+        slot->id = next_id++;
+        if (!next_id) next_id = 1;
+        slot->state = JobState::Queued;
+        slot->background = true;
+        slot->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+        slot->consumers = 0;
+    }
+    xSemaphoreGive(mutex);
+    return slot != nullptr;
+}
+
 bool work_once() {
     static const char *reported_index_error = nullptr;
     Job *job = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
     for (auto &candidate : jobs) {
-        if (reusable(candidate)) reset_job(candidate);
-        if (candidate.state == JobState::Queued &&
-            (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
+        if (candidate.state != JobState::Free && reusable(candidate)) reset_job(candidate);
+        if (candidate.state == JobState::Queued && (!job ||
+            (job->background && !candidate.background) || (job->background == candidate.background &&
+            int32_t(candidate.id - job->id) < 0))) job = &candidate;
     }
     if (job) job->state = JobState::Running;
     xSemaphoreGive(mutex);
     if (!AirSenseState::local_background_allowed()) {
         defer_job(job); publish(State::Blocked, "not_idle"); return false;
     }
+    if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
-    if (!job && !dirty()) { publish(State::Ready); return false; }
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
+        defer_job(job); publish(State::WaitingStorage, "artifact_read"); return false;
+    }
+    if ((!job || job->background) && foreground_wait()) {
+        defer_job(job); publish(State::Ready); return false;
+    }
+    if (job && job->background && ExportSync::busy()) {
+        defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
+    }
+    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && !artifact_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
+        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
+        (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
+    if (job) {
+        job->files_revision = SdStorage::files_revision();
+        job->recovered_index = false;
+    }
     JobTiming timing(job);
     publish(State::Building);
     const uint32_t index_started = timing.stamp();
-    const bool indexed = refresh_index(session);
+    bool recovered_index = false;
+    if (job && job->request.action == Action::Days && !index_ready) {
+        ReportArtifact::Document document;
+        Payload saved;
+        if (ReportArtifact::document_lookup(session, "/airbridge/report/index", nullptr, document) == ReportArtifact::Lookup::Ready &&
+            ReportArtifact::document_read(session, "/airbridge/report/index", document, saved, nullptr) &&
+            saved.length()) {
+            aircannect::JsonAllocator allocator(false);
+            JsonDocument parsed(&allocator);
+            if (!deserializeJson(parsed, saved.c_str(), saved.length()) && parsed["source"] == "edf" &&
+                parsed["days"].is<JsonArrayConst>() && parsed["periods"].is<JsonArrayConst>() &&
+                aircannect::sha256_text_valid(parsed["dataset"].as<const char *>())) {
+                parsed["stale"] = true;
+                parsed["revision"] = revision() + 1;
+                parsed["data_revision"] = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+                const size_t written = serializeJson(parsed, job->body);
+                recovered_index = job->body.good() && written == measureJson(parsed);
+            }
+            if (!recovered_index) job->body.clear();
+        }
+    }
+    const bool indexed = recovered_index || refresh_index(session);
     timing.index_us = timing.stamp() - index_started;
     if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
         session.end();
-        if (preempted || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
+        const bool reading = __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE);
+        if (preempted || reading || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
             defer_job(job);
             publish(preempted ? State::Blocked : State::WaitingStorage,
-                    preempted ? "not_idle" : "catalog_not_ready");
+                    preempted ? "not_idle" : reading ? "artifact_read" : "catalog_not_ready");
         } else {
             Log::logf(CAT_REPORT, reported_index_error == index_error ? LOG_DEBUG : LOG_WARN,
                 "EDF index failed: %s entry=%ld\n", index_error,
@@ -1743,11 +3152,11 @@ bool work_once() {
                 job->completed_ms = millis();
                 const int code = job->code;
                 const size_t bytes = job->body.length();
+                timing.log(code, bytes);
                 xSemaphoreGive(mutex);
                 portENTER_CRITICAL(&status_mux);
                 ++status.revision;
                 portEXIT_CRITICAL(&status_mux);
-                timing.log(code, bytes);
             }
             publish(State::Error, "index_unavailable");
             return job != nullptr;
@@ -1759,9 +3168,21 @@ bool work_once() {
         reported_index_error = nullptr;
     }
     if (!job) {
+        const bool checkpoint = index_commit_pending && !ExportSync::busy();
+        if (checkpoint && !publish_index(session))
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+        const bool more = enqueue_backfill(session);
+        // Backfill publishes each day independently. Persist the derived list
+        // only when this run finishes or safely pauses, not after every day.
+        if (!more && !checkpoint && !ExportSync::busy() && !publish_index(session))
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+        const bool cleaning = !more && !ExportSync::busy() && !retired_index.bytes &&
+            published_index_artifacts == status.artifact_revision && index_cleanup_pending() && cleanup_indexes(session);
+        const bool collecting = !more && !ExportSync::busy() && !retired_index.bytes && !index_cleanup_pending() &&
+            published_index_artifacts == status.artifact_revision && artifact_cleanup_pending() && cleanup_artifacts(session);
         session.end();
         publish(State::Ready);
-        return false;
+        return more || (cleaning && index_cleanup_pending()) || (collecting && artifact_cleanup_pending());
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     job->state = JobState::Running;
@@ -1769,44 +3190,80 @@ bool work_once() {
     job->code = 0;
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
+    job->artifact_preempted = false;
+    job->recovered_index = recovered_index;
+    job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
     bool success = false;
     if (__atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) error_body(*job, 410, "cancelled");
     else if (job->request.revision && job->request.revision != job->data_revision)
         error_body(*job, 409, "stale_revision");
     else {
-        success = job->request.action == Action::Days ? days_json(*job) :
-            job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
+        if (recovered_index) success = true;
+        else if (job->request.action == Action::Reindex) success = reindex(session, *job);
+        else if (job->request.action == Action::History) {
+            start_json(job->body, revision() + 1, job->data_revision);
+            job->body.print("\"day\":%u", last_day(job->request));
+            success = history_json(session, *job, true);
+            job->body.print("}");
+        } else if (job->request.action == Action::Prepare) success = prepare_json(session, *job);
+        else success = job->request.action == Action::Days ? days_json(session, *job) : summary_json(session, *job);
         if (success) job->code = 200;
     }
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
-    const bool changed = catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
-        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    const bool changed = SdStorage::files_revision() != job->files_revision ||
+        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
+        (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
+    const bool yielded = job->artifact_preempted || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) ||
+        (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
+    if (success && !job->background && job->request.action == Action::Prepare &&
+        !interrupted && !changed && !yielded) {
+        // Includes post-therapy preparation before export. Failure to checkpoint
+        // must not invalidate an independently committed day publication.
+        index_commit_pending = true;
+        if (!publish_index(session)) Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+    }
+    if (job->background && !interrupted && !changed && !yielded) {
+        if (job->request.view == View::Period) ++backfill_period;
+        else backfill_before = job->request.day;
+        if (!success && job->issue && (!strcmp(job->issue, "partial_source") ||
+            !strcmp(job->issue, "source_header") || !strcmp(job->issue, "artifact_lookup") ||
+            !strcmp(job->issue, "numeric_files_missing"))) {
+            char prefix[96]; uint8_t key[32]; ReportArtifact::Document refused;
+            if (job->request.view == View::Period) period_prefix(job->request, prefix);
+            else publication_prefix(job->request.day, prefix);
+            strcat(prefix, ".refused");
+            if (publication_key(job->request, key)) ReportArtifact::document_publish(session, prefix, key,
+                reinterpret_cast<const uint8_t *>(job->issue), strlen(job->issue), refused);
+        } else if (!success && (!job->issue || strcmp(job->issue, "recording_headroom"))) background_retry = millis() + 30000;
+    }
     session.end();
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (job->cancelled) error_body(*job, 410, "cancelled");
-    else if (interrupted || changed) {
+    else if (interrupted || changed || yielded) {
         job->body.~Payload();
         new (&job->body) Payload;
         job->state = JobState::Queued;
         job->code = 0;
         xSemaphoreGive(mutex);
         publish(interrupted ? State::Blocked : State::Building, interrupted ? "not_idle" : "");
-        return false;
+        return yielded;
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
     job->state = JobState::Complete;
     job->completed_ms = millis();
+    job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);
+    job->artifact_revision = status.artifact_revision;
     const int code = job->code;
     const size_t bytes = job->body.length();
     log_result(*job);
+    timing.log(code, bytes);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
     publish(State::Ready);
-    timing.log(code, bytes);
     return true;
 }
 
@@ -1815,15 +3272,32 @@ void worker(void *) {
         if (work_once()) continue;
         Status publication;
         get_status(publication);
-        xSemaphoreTake(wake, publication.state == State::WaitingStorage || publication.state == State::Blocked
-            ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
+        const uint32_t quiet = foreground_wait();
+        xSemaphoreTake(wake, quiet ? pdMS_TO_TICKS(quiet) :
+            background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
+                ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
     }
+}
+
+void artifact_read_released() {
+    foreground_activity();
+    __atomic_sub_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
+    if (wake) xSemaphoreGive(wake);
 }
 
 }  // namespace
 
 void init() {
     if (mutex) return;
+    const auto memory = aircannect::Memory::status();
+    if (memory.psram_available) {
+        auto *storage = static_cast<Job *>(aircannect::Memory::alloc_large(RETAINED_SLOTS * sizeof(Job), false));
+        if (storage) {
+            for (size_t i = 0; i < RETAINED_SLOTS; ++i) new (&storage[i]) Job;
+            jobs.data = storage;
+            jobs.count = RETAINED_SLOTS;
+        }
+    }
     mutex = xSemaphoreCreateMutex();
     wake = xSemaphoreCreateBinary();
     portENTER_CRITICAL(&status_mux);
@@ -1836,6 +3310,7 @@ void init() {
         publish(State::Error, "worker_unavailable");
         return;
     }
+    aircannect::Memory::set_reclaimer(reclaim_result);
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(worker, "edf_report", 8192, nullptr, 1,
@@ -1853,12 +3328,14 @@ void init() {
 
 void tick() {
     static uint32_t observed_catalog = 0, observed_files = 0;
+    const bool local = SdStorage::local_access_allowed();
     const bool mounted = SdStorage::mounted();
-    const bool available = mounted && worker_task && AirSenseState::local_background_allowed();
+    const bool available = local && mounted && worker_task && AirSenseState::local_background_allowed();
     const uint32_t catalog = EdfCatalog::revision(), files = SdStorage::files_revision();
     bool changed = false, invalidated = false;
     portENTER_CRITICAL(&status_mux);
-    if (status.mounted != mounted) {
+    // A deliberate USB unmount pauses reports, not a request to rebuild metadata.
+    if (local && status.mounted != mounted) {
         status.mounted = mounted;
         invalidated = true;
         changed = true;
@@ -1871,14 +3348,15 @@ void tick() {
     }
     if (changed) ++status.revision;
     portEXIT_CRITICAL(&status_mux);
-    if (!mounted) publish(State::Blocked, "no_sd");
+    if (!local) publish(State::Blocked, "usb_storage");
+    else if (!mounted) publish(State::Blocked, "no_sd");
     else if (!available && worker_task) publish(State::Blocked, "not_idle");
     if (wake && (changed || observed_catalog != catalog)) {
         observed_catalog = catalog;
         xSemaphoreGive(wake);
     }
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
-    for (auto &job : jobs) if (reusable(job)) reset_job(job);
+    for (auto &job : jobs) if (job.state != JobState::Free && reusable(job)) reset_job(job);
     xSemaphoreGive(mutex);
 }
 
@@ -1903,6 +3381,8 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     if (!publication.mounted) return reject("no_sd");
     if (!publication.available) return reject("not_idle");
     if (request.revision && request.revision != publication.data_revision) return reject("stale_revision");
+    foreground_activity();
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return reject("busy");
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -1910,9 +3390,13 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
         catalog.generation == publication.catalog_generation &&
         SdStorage::files_revision() == publication.files_revision;
     Job *slot = nullptr, *delivered = nullptr;
+    size_t active = 0;
     for (auto &job : jobs) {
-        if (current_index && !job.cancelled && job.state == JobState::Complete && job.code == 200 &&
+        if (current_index && !job.recovered_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
+            (request.action != Action::Days || job.artifact_revision == publication.artifact_revision) &&
+            ((request.action != Action::Summary && request.action != Action::History && request.action != Action::Days) ||
+             job.cache_generation == __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE)) &&
             uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
             ++job.consumers;
@@ -1930,21 +3414,22 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
             ++job.consumers;
             job.shared = true;
+            if (job.state == JobState::Queued) job.background = false;
             id = job.id;
             xSemaphoreGive(mutex);
             return true;
         }
+        if (job.state == JobState::Queued || job.state == JobState::Running) ++active;
         if (reusable(job)) slot = &job;
         if (job.state == JobState::Complete && !job.readers && job.data_revision != publication.data_revision)
             slot = &job;
-        if (job.state == JobState::Complete && !job.readers && job.delivered &&
-            job.deliveries >= job.consumers && (!delivered ||
-            int32_t(job.id - delivered->id) < 0)) delivered = &job;
+        if (evictable(job) && (!delivered ||
+            int32_t(job.completed_ms - delivered->completed_ms) < 0)) delivered = &job;
     }
     // Retention is opportunistic: routine days->summary->series and repeated
     // zooms can reclaim delivered/unpinned slots without a browser delay timer.
     if (!slot) slot = delivered;
-    if (!slot) { xSemaphoreGive(mutex); return reject("busy"); }
+    if (!slot || active >= SLOT_COUNT) { xSemaphoreGive(mutex); return reject("busy"); }
     reset_job(*slot);
     slot->request = request;
     slot->id = next_id++;
@@ -1959,6 +3444,22 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     return true;
 }
 
+uint32_t prepare_before_export(const char *therapy_day) {
+    Request request; request.action = Action::Prepare;
+    if (!therapy_day || !catalog_day(therapy_day, request.day)) return 0;
+    uint32_t id = 0;
+    return submit(request, id) ? id : 0;
+}
+
+bool preparation_pending(uint32_t id) {
+    if (!id || !mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    bool pending = false;
+    for (const auto &job : jobs) if (job.id == id)
+        pending = job.state == JobState::Queued || job.state == JobState::Running;
+    xSemaphoreGive(mutex);
+    return pending;
+}
+
 void cancel(uint32_t id) {
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
     for (auto &job : jobs) {
@@ -1971,6 +3472,31 @@ void cancel(uint32_t id) {
     if (wake) xSemaphoreGive(wake);
 }
 
+StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
+    bool document, StorageBrowser::Request &operation, StorageBrowser::Ready ready,
+    std::weak_ptr<StorageBrowser::Transfer> &active) {
+    uint16_t parsed = 0;
+    const bool root = day && !strcmp(day, "index");
+    if ((!root && (!day || !catalog_day(day, parsed))) || !digest || strlen(digest) != 64)
+        return StorageBrowser::StartResult::BadRequest;
+    for (const char *p = digest; *p; ++p)
+        if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return StorageBrowser::StartResult::BadRequest;
+    if (root && !document) return StorageBrowser::StartResult::BadRequest;
+    // Keep priority until the reader releases SD, not just until backfill
+    // observes an epoch change and immediately starts its next attempt.
+    foreground_activity();
+    __atomic_add_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
+    operation.kind = StorageBrowser::Kind::Immutable;
+    operation.selection[0] = 0;
+    snprintf(operation.path, sizeof(operation.path), "%s/%s%s%.*s%s%s.%s", CACHE_DIR,
+        root ? "" : day, root ? "" : "/", document ? 2 : 0, digest,
+        document ? "/" : "", digest, document ? "abp" : "abt");
+    const auto result = StorageBrowser::start(operation, std::move(ready), active, artifact_read_released);
+    if (result != StorageBrowser::StartResult::Started) artifact_read_released();
+    return result;
+}
+
 int poll(uint32_t id, Result &out) {
     out.reset();
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
@@ -1980,12 +3506,14 @@ int poll(uint32_t id, Result &out) {
         if (job.state != JobState::Complete) { code = 202; break; }
         Status publication;
         get_status(publication);
-        if (job.code == 200 && (!SdStorage::mounted() || !publication.mounted ||
+        if (job.code == 200 && (!SdStorage::local_access_allowed() || !SdStorage::mounted() || !publication.mounted ||
             job.data_revision != publication.data_revision ||
-            SdStorage::files_revision() != publication.files_revision)) { code = 409; break; }
+            SdStorage::files_revision() != job.files_revision)) { code = 409; break; }
         EdfCatalog::Status catalog;
         EdfCatalog::get_status(catalog);
-        if (job.code == 200 && catalog.generation != publication.catalog_generation) { code = 202; break; }
+        // A saved index is explicitly stale, but usable before the RAM index
+        // exists. Validate its own read generation, not uninitialized metadata.
+        if (job.code == 200 && !job.recovered_index && catalog.generation != publication.catalog_generation) { code = 202; break; }
         if (!job.body.length() || job.readers == UINT16_MAX) { code = 503; break; }
         code = job.code;
         ++job.readers;
@@ -2012,6 +3540,9 @@ void Result::reset() {
     id_ = 0;
     data_ = nullptr;
     length_ = 0;
+    // Collection may be asleep solely because this response pinned selectors.
+    foreground_activity();
+    if (wake) xSemaphoreGive(wake);
 }
 
 }  // namespace EdfReport
@@ -2029,6 +3560,12 @@ bool submit(const Request &, uint32_t &, const char **error) {
     return false;
 }
 void cancel(uint32_t) {}
+uint32_t prepare_before_export(const char *) { return 0; }
+bool preparation_pending(uint32_t) { return false; }
+StorageBrowser::StartResult open_artifact(const char *, const char *, bool, StorageBrowser::Request &,
+    StorageBrowser::Ready, std::weak_ptr<StorageBrowser::Transfer> &) {
+    return StorageBrowser::StartResult::Unavailable;
+}
 int poll(uint32_t, Result &out) { out.reset(); return 422; }
 void Result::reset() { id_ = 0; data_ = nullptr; length_ = 0; }
 }  // namespace EdfReport

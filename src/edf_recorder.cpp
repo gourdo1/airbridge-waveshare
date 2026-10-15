@@ -148,9 +148,12 @@ static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
 static bool pending_scanned = false;
 static bool clock_write_active = false;
+static uint32_t clock_write_generation = 0;
+static bool routine_processing = false;
 static const char *pending_scan_error = nullptr;
 static uint32_t synced_device_generation = 0;
 static uint32_t synced_str_generation = 0;
+static uint32_t synced_files_revision = 0;
 static uint16_t synced_saved_day = 0;
 static bool have_synced_generation = false;
 static bool summary_export_pending = false;
@@ -222,7 +225,8 @@ static void post_error(const char *message) {
 }
 
 static bool post_processing_cancelled() {
-    return !AirSenseState::device_standby() ||
+    return !SdStorage::local_access_allowed() || !AirSenseState::device_standby() ||
+           (routine_processing && (Air10Clock::background_work_pending() || Air10Stream::requested_pending())) ||
            __atomic_load_n(&therapy_start_pending, __ATOMIC_ACQUIRE) ||
            __atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE);
 }
@@ -676,7 +680,7 @@ static bool write_identification(const uint8_t *content, size_t content_len) {
 }
 
 static bool ensure_identification(const AirSenseState::Identity &identity) {
-    if (!SdStorage::try_acquire()) return false;
+    if (!SdStorage::try_acquire(true)) return false;
     const bool current = identification_verified && identification_device == identity.generation &&
         storage->exists("/Identification.tgt") && storage->exists("/Identification.crc");
     SdStorage::release();
@@ -687,7 +691,7 @@ static bool ensure_identification(const AirSenseState::Identity &identity) {
     bool success = collect_identification(identity, content, size) &&
         !post_processing_cancelled() &&
         identity.generation == AirSenseState::identity_generation();
-    if (success && SdStorage::try_acquire()) {
+    if (success && SdStorage::try_acquire(true)) {
         success = write_identification(content, size);
         SdStorage::release();
         if (success) {
@@ -702,30 +706,44 @@ static bool ensure_identification(const AirSenseState::Identity &identity) {
     return success;
 }
 
-static bool fetch_str_record(uint8_t *record, size_t capacity) {
+struct StrReadCursor {
+    Air10Stored::Value date = {}, mask_events = {}, duration = {};
+    bool date_read = false, mask_events_read = false, duration_read = false;
+    bool compared = false, unchanged = false;
+    int16_t *samples = nullptr;
+    size_t offset = 0;
+    uint8_t signal = 0;
+};
+
+static bool fetch_str_record(uint8_t *record, size_t capacity, StrReadCursor &cursor,
+                              const Air10Stored::Value *date = nullptr,
+                              const Air10Stored::Value *mask_events = nullptr) {
     const Air10Edf::Schema &schema = Air10Edf::str_schema();
     const size_t sample_count = Air10Edf::numeric_sample_count(schema);
-    int16_t *samples = static_cast<int16_t *>(
-        aircannect::Memory::alloc_large(sample_count * sizeof(int16_t)));
+    auto &samples = cursor.samples;
+    if (!samples) {
+        samples = static_cast<int16_t *>(aircannect::Memory::alloc_large(sample_count * sizeof(int16_t)));
+        if (samples) memset(samples, 0xFF, sample_count * sizeof(int16_t));
+    }
     if (!samples) {
         post_error("STR sample allocation failed");
         return false;
     }
-    memset(samples, 0xFF, sample_count * sizeof(int16_t));
-
-    Air10Stored::Value therapy_duration = {};
-    if (!read_stored_value("THD", session_native_day, therapy_duration) ||
+    auto &therapy_duration = cursor.duration;
+    if (!cursor.duration_read)
+        cursor.duration_read = read_stored_value("THD", session_native_day, therapy_duration);
+    if (!cursor.duration_read ||
         !therapy_duration.present || therapy_duration.sample_count != 1) {
-        aircannect::Memory::free(samples);
-        post_error("STR duration unavailable");
+        cursor.duration_read = false;
+        if (!post_processing_cancelled()) post_error("STR duration unavailable");
         return false;
     }
 
-    size_t offset = 0;
+    auto &offset = cursor.offset;
     bool complete = true;
     const char *failed_tag = "";
     const char *failure = "render failed";
-    for (uint8_t signal = 0; signal + 1 < schema.signal_count; signal++) {
+    for (auto &signal = cursor.signal; signal + 1 < schema.signal_count; signal++) {
         if (post_processing_cancelled()) {
             complete = false;
             break;
@@ -735,6 +753,10 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         Air10Stored::Value value = {};
         if (strcmp(tag, "THD") == 0) {
             value = therapy_duration;
+        } else if (date && !strcmp(tag, "LSD")) {
+            value = *date;
+        } else if (mask_events && !strcmp(tag, "MSE")) {
+            value = *mask_events;
         } else if (!read_stored_value(tag, session_native_day, value)) {
             failure = "read failed";
             Log::logf(CAT_EDF, LOG_DEBUG,
@@ -789,7 +811,6 @@ static bool fetch_str_record(uint8_t *record, size_t capacity) {
         Air10Edf::render_numeric_record(schema, samples, sample_count,
                                         record, capacity, written) &&
         written == Air10Edf::record_size(schema);
-    aircannect::Memory::free(samples);
     if (!rendered && !post_processing_cancelled()) {
         char error[96];
         snprintf(error, sizeof(error), "STR day=%04X tag=%s: %s",
@@ -922,6 +943,70 @@ static bool str_contains_day(const char *therapy_day) {
     return present;
 }
 
+enum class LocalStrRead : uint8_t { Missing, Ready, Failed };
+
+static uint16_t str_scalar(const uint8_t *record, const char *tag) {
+    const auto &schema = Air10Edf::str_schema();
+    size_t offset = 0;
+    for (uint8_t i = 0; i + 1 < schema.signal_count; ++i) {
+        if (!strcmp(Air10Edf::str_signal_tag(i), tag)) return SdStorage::get_le16(record + offset);
+        offset += schema.signals[i].samples_per_record * 2;
+    }
+    return UINT16_MAX;
+}
+
+// Read the persisted source, not catalog readiness: STR also has days without EDF.
+// The caller owns SD. Unknown layouts/identity and damaged records are preserved.
+static LocalStrRead read_local_str(const AirSenseState::Identity &identity,
+                                   uint16_t wanted, uint8_t *record,
+                                   uint16_t &last, uint16_t &gap) {
+    last = 0;
+    gap = UINT16_MAX;
+    errno = 0;
+    fs::File file = storage->open("/STR.edf", FILE_READ);
+    if (!file) return errno == ENOENT ? LocalStrRead::Missing : LocalStrRead::Failed;
+    const auto &schema = Air10Edf::str_schema();
+    const size_t header_size = Air10Edf::header_size(schema);
+    const size_t record_size = Air10Edf::record_size(schema);
+    uint8_t fixed[256];
+    uint32_t bytes = 0, records = 0, signals = 0;
+    uint16_t first = 0;
+    bool valid = file.read(fixed, sizeof(fixed)) == sizeof(fixed) &&
+        parse_decimal_field(fixed + 184, 8, bytes) && bytes == header_size &&
+        parse_decimal_field(fixed + 236, 8, records) && records &&
+        parse_decimal_field(fixed + 252, 4, signals) && signals == schema.signal_count &&
+        parse_edf_start_day(fixed + 168, first) &&
+        uint32_t(first) + records <= UINT16_MAX &&
+        file.size() == header_size + records * record_size;
+    uint8_t *expected = valid ? static_cast<uint8_t *>(aircannect::Memory::alloc_large(header_size)) : nullptr;
+    uint8_t *work = valid ? static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size)) : nullptr;
+    valid = valid && expected && work &&
+        render_str_header(first, records, expected, header_size, identity) &&
+        !memcmp(fixed, expected, sizeof(fixed));
+    for (size_t offset = sizeof(fixed); valid && offset < header_size;) {
+        if (post_processing_cancelled()) { valid = false; break; }
+        const size_t length = min(record_size, header_size - offset);
+        valid = file.read(work, length) == length && !memcmp(work, expected + offset, length);
+        offset += length;
+    }
+    bool found = false;
+    for (uint32_t i = 0; valid && i < records; ++i) {
+        if (post_processing_cancelled()) { valid = false; break; }
+        const uint16_t day = first + i;
+        valid = file.read(work, record_size) == record_size && valid_str_record(work, record_size, day);
+        if (!valid) break;
+        const bool filled = str_scalar(work, "THD") != UINT16_MAX;
+        if (filled) last = day;
+        else if (day <= wanted && gap == UINT16_MAX) gap = day;
+        if (record && day == wanted && filled) { memcpy(record, work, record_size); found = true; }
+    }
+    aircannect::Memory::free(expected);
+    aircannect::Memory::free(work);
+    file.close();
+    if (!valid) return LocalStrRead::Failed;
+    return !record || found ? LocalStrRead::Ready : LocalStrRead::Missing;
+}
+
 static bool set_str_record_day(uint16_t epoch_day, uint8_t *record,
                                size_t size) {
     if (!record || size < 4 || epoch_day == UINT16_MAX) return false;
@@ -942,7 +1027,9 @@ static bool render_empty_str_record(uint16_t epoch_day, uint8_t *record,
 
 static bool update_str_file(const uint8_t *incoming_record,
                             const EdfCatalog::Entry &latest,
-                            const AirSenseState::Identity &identity) {
+                            const AirSenseState::Identity &identity,
+                            bool *changed = nullptr) {
+    if (changed) *changed = false;
     constexpr const char *FINAL = "/STR.edf";
     constexpr const char *PART = "/STR.edf.part";
     constexpr const char *BACKUP = "/STR.edf.bak";
@@ -991,6 +1078,8 @@ static bool update_str_file(const uint8_t *incoming_record,
             !render_str_header(header_start_day, existing_records, header, header_size, identity)) {
             valid = false;
         }
+        // A pending journal must not relabel an unrelated device's history.
+        if (valid && memcmp(fixed + 88, header + 88, 80)) valid = false;
         if (valid) same_header = memcmp(fixed, header, sizeof(fixed)) == 0;
 
         size_t compared = 256;
@@ -1060,10 +1149,12 @@ static bool update_str_file(const uint8_t *incoming_record,
 
     const size_t timeline_size =
         static_cast<size_t>(plan.record_count) * record_size;
-    uint8_t *timeline = static_cast<uint8_t *>(aircannect::Memory::alloc_large(timeline_size));
-    uint8_t *present = static_cast<uint8_t *>(
-        aircannect::Memory::alloc_large(plan.record_count));
-    if (!timeline || !present || post_processing_cancelled()) {
+    // Canonical files stream one record at a time, including multi-year history.
+    // The old sparse-layout repair stays bounded to its original 365-day format.
+    const bool repair = !scan.continuous && plan.record_count <= 365;
+    uint8_t *timeline = repair ? static_cast<uint8_t *>(aircannect::Memory::alloc_large(timeline_size)) : nullptr;
+    uint8_t *present = repair ? static_cast<uint8_t *>(aircannect::Memory::alloc_large(plan.record_count)) : nullptr;
+    if ((!scan.continuous && (!repair || !timeline || !present)) || post_processing_cancelled()) {
         if (input) input.close();
         aircannect::Memory::free(timeline);
         aircannect::Memory::free(present);
@@ -1073,14 +1164,14 @@ static bool update_str_file(const uint8_t *incoming_record,
             post_error("STR timeline allocation failed");
         return false;
     }
-    memset(present, 0, plan.record_count);
+    if (present) memset(present, 0, plan.record_count);
     Air10StrTimeline::Buffer timeline_buffer = {
         timeline, present, plan.record_count,
     };
     Air10StrTimeline::BuildStats build_stats;
 
-    if (input && !input.seek(header_size)) valid = false;
-    for (uint32_t i = 0; valid && i < existing_records; i++) {
+    if (repair && input && !input.seek(header_size)) valid = false;
+    for (uint32_t i = 0; repair && valid && i < existing_records; i++) {
         if (post_processing_cancelled()) {
             valid = false;
             cancelled = true;
@@ -1096,7 +1187,7 @@ static bool update_str_file(const uint8_t *incoming_record,
             valid = false;
         }
     }
-    if (valid &&
+    if (repair && valid &&
         (!Air10StrTimeline::place_record(
              plan, timeline_buffer, session_native_day, incoming_record,
              record_size, build_stats) ||
@@ -1106,8 +1197,9 @@ static bool update_str_file(const uint8_t *incoming_record,
         valid = false;
     }
 
-    if (input) input.close();
+    if (repair && input) input.close();
     if (post_processing_cancelled()) {
+        if (input) input.close();
         aircannect::Memory::free(timeline);
         aircannect::Memory::free(present);
         aircannect::Memory::free(header);
@@ -1125,13 +1217,31 @@ static bool update_str_file(const uint8_t *incoming_record,
             cancelled = true;
             break;
         }
-        const uint8_t *record = timeline + static_cast<size_t>(i) * record_size;
+        const uint16_t day = plan.start_day + i;
+        const uint8_t *record = repair ? timeline + static_cast<size_t>(i) * record_size : work;
+        if (!repair) {
+            if (day == session_native_day) {
+                record = incoming_record;
+                if (input && day >= scan.header_start_day &&
+                    uint32_t(day - scan.header_start_day) < existing_records)
+                    build_stats.replaced_records++;
+            } else if (input && day >= scan.header_start_day &&
+                       uint32_t(day - scan.header_start_day) < existing_records) {
+                valid = input.seek(header_size + size_t(day - scan.header_start_day) * record_size) &&
+                    input.read(work, record_size) == record_size && valid_str_record(work, record_size, day);
+            } else {
+                valid = render_empty_str_record(day, work, record_size);
+                if (valid) build_stats.filler_records++;
+            }
+            if (!valid) break;
+        }
         if (!SdStorage::write_exact(output, record, record_size)) valid = false;
     }
     if (output) {
         output.flush();
         output.close();
     }
+    if (input) input.close();
 
     if (cancelled) {
         storage->remove(PART);
@@ -1144,9 +1254,11 @@ static bool update_str_file(const uint8_t *incoming_record,
 
     // Preserve the day across a reset between STR publication and catalog commit.
     char pending[80];
-    pending_path(latest.file_prefix, pending, sizeof(pending));
-    if (valid && !storage->exists(pending))
-        valid = save_pending(identity, latest.file_prefix, latest.therapy_day);
+    if (latest.file_prefix[0]) {
+        pending_path(latest.file_prefix, pending, sizeof(pending));
+        if (valid && !storage->exists(pending))
+            valid = save_pending(identity, latest.file_prefix, latest.therapy_day);
+    }
     if (!valid || !publish_single_file(PART, FINAL, BACKUP)) {
         storage->remove(PART);
         aircannect::Memory::free(timeline);
@@ -1169,6 +1281,7 @@ static bool update_str_file(const uint8_t *incoming_record,
     portENTER_CRITICAL(&status_mux);
     status.str_records = plan.record_count;
     portEXIT_CRITICAL(&status_mux);
+    if (changed) *changed = true;
     return true;
 }
 
@@ -1179,28 +1292,69 @@ struct StrReadTrace {
 };
 
 static bool collect_str_summary(uint8_t *&record, uint32_t generation,
-                                StrReadTrace &trace) {
-    record = nullptr;
+                                StrReadTrace &trace, StrReadCursor &cursor, bool compare_saved,
+                                const AirSenseState::Identity &identity) {
     trace.result = "read_failed";
-    Air10Stored::Value date = {};
-    if (!read_stored_value("LSD", session_native_day, date)) return false;
+    auto &date = cursor.date;
+    if (!cursor.date_read) cursor.date_read = read_stored_value("LSD", session_native_day, date);
+    if (!cursor.date_read) return false;
     if (date.present) {
+        if (date.sample_count != 1 || uint16_t(date.samples[0]) != session_native_day) {
+            cursor.date_read = false;
+            trace.result = "date_mismatch";
+            return false;
+        }
         const size_t record_size =
             Air10Edf::record_size(Air10Edf::str_schema());
-        record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
+        if (!record) record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
         if (!record) {
             trace.result = "no_memory";
             post_error("STR record allocation failed");
             return false;
         }
-        if (!fetch_str_record(record, record_size)) return false;
+        auto &mask_events = cursor.mask_events;
+        auto &duration = cursor.duration;
+        auto &unchanged = cursor.unchanged;
+        if (compare_saved && !cursor.compared) {
+            if (!cursor.mask_events_read)
+                cursor.mask_events_read = read_stored_value("MSE", session_native_day, mask_events);
+            if (!cursor.mask_events_read) return false;
+            if (!SdStorage::try_acquire(true)) { trace.result = "storage_busy"; return false; }
+            uint16_t last = 0, gap = 0;
+            const auto local = read_local_str(identity, session_native_day, record, last, gap);
+            SdStorage::release();
+            if (local == LocalStrRead::Failed) {
+                if (!post_processing_cancelled()) post_error("existing STR validation failed");
+                return false;
+            }
+            // Saturated or odd MSE cannot confirm a completed unchanged day.
+            unchanged = local == LocalStrRead::Ready && mask_events.present &&
+                mask_events.sample_count == 1 && uint16_t(mask_events.samples[0]) < 255 &&
+                !(mask_events.samples[0] & 1) && str_scalar(record, "THD") != UINT16_MAX &&
+                str_scalar(record, "MSE") == uint16_t(mask_events.samples[0]);
+            // EEPROM keeps settings on zero-therapy days with missing MSE.
+            // A filler has missing THD too; never mistake it for that record.
+            if ((!mask_events.present || (mask_events.sample_count == 1 &&
+                    uint16_t(mask_events.samples[0]) == UINT16_MAX)) &&
+                local == LocalStrRead::Ready && str_scalar(record, "THD") == 0 &&
+                str_scalar(record, "MSE") == UINT16_MAX) {
+                if (!cursor.duration_read)
+                    cursor.duration_read = read_stored_value("THD", session_native_day, duration);
+                if (!cursor.duration_read) return false;
+                unchanged = duration.present && duration.sample_count == 1 && duration.samples[0] == 0;
+            }
+            cursor.compared = true;
+        }
+        if (!unchanged && !fetch_str_record(record, record_size, cursor, &date,
+                                             compare_saved ? &mask_events : nullptr)) return false;
+        if (unchanged) trace.result = "unchanged";
     }
     trace.generation_read = read_u32_variable("ZEN", trace.generation);
     if (!trace.generation_read) trace.result = "ZEN_read_failed";
     else if (trace.generation != generation) trace.result = "ZEN_changed";
     else if (post_processing_cancelled()) trace.result = "interrupted";
     else {
-        trace.result = date.present ? "ready" : "absent";
+        if (strcmp(trace.result, "unchanged")) trace.result = date.present ? "ready" : "absent";
         return true;
     }
     return false;
@@ -2448,14 +2602,14 @@ static void reset_session_state(bool rollover = false) {
 static void start_session(const ControlEvent &event) {
     __atomic_store_n(&therapy_start_pending, false, __ATOMIC_RELEASE);
     next_start_ms = millis() + 5000;
-    if (status.active || !storage_ready || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
+    if (!SdStorage::local_access_allowed() || status.active || !storage_ready || !__atomic_load_n(&therapy_wanted, __ATOMIC_ACQUIRE) ||
         Arbiter::get_state() != SYS_THERAPY || AirSenseState::rop() != 1) return;
     portENTER_CRITICAL(&status_mux);
     const uint32_t mask_on_ms = therapy_on_capture_ms;
     portEXIT_CRITICAL(&status_mux);
     if (int32_t(event.captured_ms - mask_on_ms) < 0) return;
     if (!SdStorage::acquire()) {
-        status_error("storage busy at recording start");
+        if (SdStorage::local_access_allowed()) status_error("storage busy at recording start");
         return;
     }
     recording_storage_owned = true;
@@ -2634,9 +2788,26 @@ static void stop_session(const ControlEvent &event) {
     next_start_ms = 0;
 }
 
+struct StrCollected {
+    uint16_t day = 0;
+    uint32_t device = 0, generation = 0, files = 0;
+    uint32_t clock = 0;
+    uint8_t *record = nullptr;
+    StrReadTrace trace;
+    StrReadCursor cursor;
+    bool ready = false;
+};
+static StrCollected str_collected;
+
+static void clear_str_collection() {
+    aircannect::Memory::free(str_collected.record);
+    aircannect::Memory::free(str_collected.cursor.samples);
+    str_collected = {};
+}
+
 static bool refresh_str_day(uint16_t day, uint32_t generation,
                              const AirSenseState::Identity &identity,
-                             bool required, const char *reason) {
+                             bool required, const char *reason, bool compare_saved = false) {
     const time_t civil = int64_t(day) * 86400;
     struct tm date;
     gmtime_r(&civil, &date);
@@ -2645,42 +2816,65 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
              date.tm_year + 1900, date.tm_mon + 1, date.tm_mday);
 
     const uint32_t snapshot_started = millis();
-    if (!SdStorage::try_acquire()) return false;
+    if (!SdStorage::try_acquire(true)) return false;
     EdfCatalog::Entry *entries = nullptr;
     uint32_t count = 0;
     const bool valid = EdfCatalog::snapshot_day(day_text, entries, count);
     SdStorage::release();
     const uint32_t snapshot_ms = millis() - snapshot_started;
-    if (!valid || !count) {
+    if (!valid || (required && !count)) {
         aircannect::Memory::free(entries);
-        return valid && !required;
+        if (valid) post_error("STR pending recording missing from catalog");
+        return false;
     }
     uint32_t latest_index = 0;
     for (uint32_t i = 1; i < count; i++)
         if (strcmp(entries[i].file_prefix, entries[latest_index].file_prefix) > 0)
             latest_index = i;
-    EdfCatalog::Entry &latest = entries[latest_index];
+    EdfCatalog::Entry standalone = {};
+    memcpy(standalone.therapy_day, day_text, sizeof(day_text));
+    EdfCatalog::Entry &latest = count ? entries[latest_index] : standalone;
 
     session_native_day = day;
-    uint8_t *record = nullptr;
-    StrReadTrace trace;
+    if (str_collected.day != day || str_collected.device != identity.generation ||
+        str_collected.generation != generation || str_collected.files != SdStorage::files_revision() ||
+        str_collected.clock != __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE))
+        clear_str_collection();
+    auto &trace = str_collected.trace;
+    auto &record = str_collected.record;
     const uint32_t read_started = millis();
     bool success = ensure_identification(identity);
-    const bool read_attempted = success;
-    bool summary_ready = success && collect_str_summary(record, generation, trace);
+    const bool read_attempted = success && !str_collected.ready;
+    if (read_attempted) {
+        str_collected.day = day;
+        str_collected.device = identity.generation;
+        str_collected.generation = generation;
+        str_collected.files = SdStorage::files_revision();
+        str_collected.clock = __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE);
+        str_collected.ready = collect_str_summary(record, generation, trace,
+                                                  str_collected.cursor, compare_saved && !required, identity);
+    }
+    bool summary_ready = success && str_collected.ready;
+    if (summary_ready && !read_attempted) {
+        trace.generation_read = read_u32_variable("ZEN", trace.generation);
+        summary_ready = trace.generation_read && trace.generation == generation;
+        if (!summary_ready) clear_str_collection();
+        else trace.result = record ? "retained" : "absent";
+    }
     const uint32_t read_ms = millis() - read_started;
     const uint32_t publish_started = millis();
     bool identification_changed = false, ready_changed = false, content_changed = false;
+    bool file_changed = false;
     if (identity.generation != AirSenseState::identity_generation())
         trace.result = "device_changed";
     if (post_processing_cancelled()) trace.result = "interrupted";
     success = success && !post_processing_cancelled() &&
         identity.generation == AirSenseState::identity_generation();
-    if (success && SdStorage::try_acquire()) {
+    if (success && SdStorage::try_acquire(true)) {
         uint32_t revision = 0;
         bool catalog_changed = false;
         if (summary_ready && record) {
-            summary_ready = update_str_file(record, latest, identity);
+            summary_ready = update_str_file(record, latest, identity, &file_changed);
             if (!summary_ready) trace.result = "publish_failed";
             // A content token survives retries after STR was published but the
             // catalog was not. Consumers compare revisions, never order them.
@@ -2702,7 +2896,11 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
             entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY;
             if (summary_ready && record) {
                 entry.flags |= EdfCatalog::ENTRY_STR_READY;
-                if (i == latest_index) entry.str_revision = revision;
+                // An old token may include older Identification metadata.
+                // Do not invalidate reports/exports merely by checking a day.
+                // Pending intent still repairs a reset between STR and catalog.
+                if (i == latest_index && (file_changed || required ||
+                    !(old_flags & EdfCatalog::ENTRY_STR_READY))) entry.str_revision = revision;
             }
             if (old_flags != entry.flags || old_revision != entry.str_revision) {
                 success = EdfCatalog::commit(entry);
@@ -2732,7 +2930,11 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
             }
         }
         SdStorage::release();
-        if (catalog_changed && summary_ready && record) {
+        if (file_changed && !count) {
+            SdStorage::notify_files_changed();
+            ExportSync::request_backlog_refresh(true);
+        }
+        if (summary_ready && record && (catalog_changed || file_changed)) {
             summary_export_entry = latest;
             summary_export_pending = true;
         }
@@ -2745,20 +2947,22 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
         snprintf(after, sizeof(after), "%lu", (unsigned long)trace.generation);
     const bool interrupted = post_processing_cancelled();
     if (interrupted) trace.result = "interrupted";
-    const bool unchanged = success && summary_ready &&
-        !identification_changed && !ready_changed && !content_changed;
-    Log::logf(CAT_EDF, read_attempted && !interrupted && !unchanged ? LOG_INFO : LOG_DEBUG,
-              "STR %s %s ZEN=%lu>%s %s "
-              "ident+=%u ready+=%u token=%u read=%lu sd=%lums\n",
-              day_text, reason, (unsigned long)generation, after, trace.result,
-              unsigned(identification_changed), unsigned(ready_changed), unsigned(content_changed),
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "STR refresh day=%.4s-%.2s-%.2s source=%s result=%s read=%lums sd=%lums\n",
+              day_text, day_text + 4, day_text + 6, reason, trace.result,
               (unsigned long)read_ms,
               (unsigned long)(snapshot_ms + millis() - publish_started));
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "STR changes day=%.4s-%.2s-%.2s ZEN=%lu->%s identification=%u ready=%u revision=%u file=%u\n",
+              day_text, day_text + 4, day_text + 6, (unsigned long)generation, after,
+              unsigned(identification_changed), unsigned(ready_changed), unsigned(content_changed),
+              unsigned(file_changed));
     aircannect::Memory::free(entries);
-    aircannect::Memory::free(record);
+    if (trace.generation_read && trace.generation != generation) clear_str_collection();
     if (success && summary_ready && post_error_active) {
         post_error_active = false;
-        Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered day=%04X\n", day);
+        Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered for %.4s-%.2s-%.2s\n",
+                  day_text, day_text + 4, day_text + 6);
     }
     return success && summary_ready;
 }
@@ -2828,80 +3032,115 @@ static void request_summary_export() {
         summary_export_pending = false;
 }
 
-static void sync_pending() {
+struct RoutineStrPass {
+    bool active = false;
+    bool compare_saved = false;
+    uint32_t device = 0, generation = 0, files = 0;
+    uint16_t next_day = 0, saved_day = 0;
+};
+static RoutineStrPass routine_str;
+
+static bool sync_pending() {
     EdfPending::Record selected;
     if (!pending_scanned || status.pending_str) {
-        if (!SdStorage::try_acquire()) return;
+        if (!SdStorage::try_acquire(true)) return false;
         const bool scanned = scan_pending(&selected);
         SdStorage::release();
-        if (!scanned) return;
+        if (!scanned) return false;
     }
     AirSenseState::Identity identity;
-    if (!AirSenseState::identity(identity)) return;
-    const uint32_t device = identity.generation;
-    uint32_t generation = 0, saved_day = 0, after = 0;
-    if (!read_u32_variable("ZEN", generation)) return;
-    const bool changed = !have_synced_generation || device != synced_device_generation ||
-                         generation != synced_str_generation;
-    if (!changed && !status.pending_str) {
-        request_summary_export();
-        return;
-    }
-    if (!read_u32_variable("SSD", saved_day) ||
-        !read_u32_variable("ZEN", after) || after != generation) return;
-
-    bool success = true;
+    if (!AirSenseState::identity(identity)) return false;
     if (selected.prefix[0]) {
-        memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
         if (strcmp(identity.srn, selected.srn)) {
+            memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
             char error[128];
             snprintf(error, sizeof(error), "STR pending %s SRN mismatch: recorded=%s current=%s",
                      selected.prefix, selected.srn, identity.srn);
             post_error(error);
-            success = false;
-        } else {
-            success = refresh_str_day(selected.native_day, generation, identity, true, "pending");
+            return false;
         }
+        uint32_t generation = 0;
+        if (read_u32_variable("ZEN", generation) &&
+            refresh_str_day(selected.native_day, generation, identity, true, "pending")) {
+            memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
+            return true;
+        }
+        return false;
     } else if (status.pending_str) {
         pending_cursor[0] = 0;
+        return true;
     }
-    if (success && changed && saved_day >= 0x1000 && saved_day < 0xffff) {
-        // SSD names the completed write. Revisit the preceding day only after
-        // startup/restart, a day change or saves missed while UART was busy.
-        const bool catch_up = !have_synced_generation || device != synced_device_generation ||
-            saved_day != synced_saved_day || uint32_t(generation - synced_str_generation) != 1;
-        const uint16_t days[] = {uint16_t(saved_day), uint16_t(saved_day - 1)};
-        for (unsigned i = 0; i < (catch_up ? 2u : 1u); i++) {
-            const uint16_t day = days[i];
-            if (selected.prefix[0] && day == selected.native_day) continue;
-            if (!refresh_str_day(day, generation, identity, false,
-                                 i ? "previous_day" : "saved_day")) {
-                success = false;
-                break;
+    routine_processing = true;
+    if (post_processing_cancelled()) return false;
+
+    // SD contention must not cause a ZEN/SSD probe loop before any useful work.
+    const bool catch_up_pending = routine_str.active || !have_synced_generation ||
+        synced_device_generation != identity.generation || synced_files_revision != SdStorage::files_revision();
+    if (!SdStorage::try_acquire(catch_up_pending)) return false;
+    SdStorage::release();
+    const uint32_t device = identity.generation;
+    uint32_t generation = 0, saved_day = 0, after = 0;
+    if (!read_u32_variable("ZEN", generation) || device != AirSenseState::identity_generation()) return false;
+    if (routine_str.active && (routine_str.device != device ||
+        routine_str.generation != generation || routine_str.files != SdStorage::files_revision())) {
+        routine_str = {};
+        clear_str_collection();
+    }
+    const bool same_device = have_synced_generation && device == synced_device_generation &&
+        synced_files_revision == SdStorage::files_revision();
+    if (!routine_str.active && same_device && generation == synced_str_generation) {
+        request_summary_export();
+        return false;
+    }
+    if (!routine_str.active) {
+        if (!read_u32_variable("SSD", saved_day) ||
+            !read_u32_variable("ZEN", after) || after != generation) return false;
+        if (saved_day >= 0x1000 && saved_day < UINT16_MAX) {
+            if (!SdStorage::try_acquire(true)) return false;
+            uint16_t last = 0, gap = UINT16_MAX;
+            const auto local = read_local_str(identity, saved_day, nullptr, last, gap);
+            SdStorage::release();
+            if (local == LocalStrRead::Failed) {
+                if (!post_processing_cancelled()) post_error("existing STR validation failed");
+                return false;
             }
+            const uint16_t oldest = max(uint32_t(0x1000), saved_day - min(saved_day, uint32_t(364)));
+            uint16_t first = same_device ? min(uint32_t(synced_saved_day), saved_day)
+                : last ? min(uint32_t(last), saved_day) : oldest;
+            if (!same_device && gap != UINT16_MAX) first = min(first, gap);
+            if (same_device && (saved_day != synced_saved_day ||
+                uint32_t(generation - synced_str_generation) != 1)) first = min(first, uint16_t(saved_day - 1));
+            first = max(first, oldest);
+            routine_str = {true, !same_device, device, generation,
+                           SdStorage::files_revision(), first, uint16_t(saved_day)};
         }
     }
-    if (success) {
-        const bool generation_read = read_u32_variable("ZEN", after);
-        if (generation_read && after != generation)
-            Log::logf(CAT_EDF, LOG_INFO, "STR pass superseded ZEN=%lu->%lu; retry\n",
-                      (unsigned long)generation, (unsigned long)after);
-        success = generation_read && after == generation &&
-                  device == AirSenseState::identity_generation() &&
-                  !post_processing_cancelled();
+    if (routine_str.active) {
+        if (!refresh_str_day(routine_str.next_day, generation, identity, false,
+                             "catch_up", routine_str.compare_saved ||
+                             uint32_t(routine_str.next_day) + 1 < routine_str.saved_day)) return false;
+        routine_str.files = SdStorage::files_revision();
+        if (routine_str.next_day++ < routine_str.saved_day) return true;
+        saved_day = routine_str.saved_day;
+        routine_str.active = false;
     }
-    if (success) {
+    if (read_u32_variable("ZEN", after) && after == generation &&
+        device == AirSenseState::identity_generation() && !post_processing_cancelled()) {
         synced_str_generation = generation;
         synced_device_generation = device;
         synced_saved_day = saved_day;
+        synced_files_revision = SdStorage::files_revision();
         have_synced_generation = true;
+        clear_str_collection();
+        request_summary_export();
     }
-    if (success) request_summary_export();
+    return false;
 }
 
 static void process_pending() {
     if (status.active || post_processing_cancelled() ||
-        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0)) return;
+        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0) ||
+        !SdStorage::maintenance_ready()) return;
     portENTER_CRITICAL(&status_mux);
     if (clock_write_active) {
         portEXIT_CRITICAL(&status_mux);
@@ -2909,15 +3148,34 @@ static void process_pending() {
     }
     status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
-    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
-    sync_pending();
+    routine_processing = false;
+    const bool more = sync_pending();
+    const bool yielded = post_processing_cancelled();
+    SdStorage::finish_maintenance();
+    routine_processing = false;
+    // Poll only when caught up or after a failure. Continuations use the
+    // existing recorder loop; an SD reservation waits for owner availability.
+    next_pending_ms = more || yielded || SdStorage::maintenance_pending()
+        ? 0 : millis() + STR_GENERATION_POLL_MS;
     portENTER_CRITICAL(&status_mux);
     status.post_processing = false;
     portEXIT_CRITICAL(&status_mux);
 }
 
 static bool prepare_storage() {
-    if (storage_ready) return true;
+    if (!SdStorage::local_access_allowed() || (storage_ready && !SdStorage::mounted())) return false;
+    if (storage_ready) {
+        EdfCatalog::Status catalog;
+        EdfCatalog::get_status(catalog);
+        if (catalog.ready) return true;
+        if (next_storage_ms && int32_t(millis() - next_storage_ms) < 0) return false;
+        if (!SdStorage::try_acquire()) return false;
+        next_storage_ms = millis() + 5000;
+        EdfCatalog::init();
+        EdfCatalog::get_status(catalog);
+        SdStorage::release();
+        return catalog.ready;
+    }
     if (next_storage_ms && int32_t(millis() - next_storage_ms) < 0) return false;
     const system_state_t state = Arbiter::get_state();
     if (state != SYS_IDLE && state != SYS_THERAPY) return false;
@@ -2979,6 +3237,29 @@ static void poll_recording_state() {
 
 static void recorder_task(void *) {
     while (true) {
+        if (post_processing_cancelled() || (!status.pending_str &&
+            (Air10Clock::background_work_pending() || Air10Stream::requested_pending())))
+            SdStorage::cancel_acquire();
+        if (str_collected.day && !AirSenseState::device_standby()) clear_str_collection();
+        if (!SdStorage::local_access_allowed()) {
+            clear_str_collection();
+            routine_str = {};
+            have_synced_generation = false;
+            request_stop();
+            if (status.active) {
+                ControlEvent stop;
+                portENTER_CRITICAL(&status_mux);
+                stop = latest_stop;
+                portEXIT_CRITICAL(&status_mux);
+                stop_session(stop);
+            }
+            portENTER_CRITICAL(&status_mux);
+            status.post_processing = false;
+            portEXIT_CRITICAL(&status_mux);
+            // No normal work or automatic remount while the host owns the card.
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         const bool have_storage = prepare_storage();
         if (have_storage) poll_recording_state();
         ControlEvent control;
@@ -3003,7 +3284,8 @@ static void recorder_task(void *) {
             portEXIT_CRITICAL(&status_mux);
             if (restarted) stop_session(control);
         }
-        retry_recording();
+        if (!SdStorage::local_access_allowed()) continue;
+        if (have_storage) retry_recording();
 
         drain_raw_frames(pdMS_TO_TICKS(20));
         if (uxQueueMessagesWaiting(raw_queue) == 0) {
@@ -3129,6 +3411,7 @@ bool begin_clock_write(const char **reason) {
 
 void end_clock_write() {
     portENTER_CRITICAL(&status_mux);
+    __atomic_add_fetch(&clock_write_generation, 1, __ATOMIC_RELEASE);
     clock_write_active = false;
     portEXIT_CRITICAL(&status_mux);
 }

@@ -24,12 +24,14 @@ static constexpr uint32_t CLOCK_POST_THERAPY_DELAY_MS = 60000;
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
 static std::atomic<uint8_t> clock_sync_requests{CLOCK_SYNC_AUTO};
+static std::atomic<bool> priority_work{false};
 static bool clock_sync_pending = false;
 static bool clock_sync_manual = false;
 static bool clock_sync_settling = false;
 static uint32_t clock_sync_therapy_end_ms = 0;
 static uint32_t clock_sync_attempt_ms = 0;
 static bool clock_sync_attempted = false;
+static uint8_t clock_sync_window_retries = 0;
 static uart_transaction_t *clock_sync_ticket = nullptr;
 static time_t clock_sync_target = 0;
 static int64_t clock_sync_edge_us = 0;
@@ -37,8 +39,8 @@ static char clock_sync_tic[16];
 static portMUX_TYPE device_time_mux = portMUX_INITIALIZER_UNLOCKED;
 static char device_time[20] = "--";
 static uint32_t device_time_ms = 0;
-// Last calendar read; status_time() advances it by the time since the read
-// so the displayed seconds stay correct between the 60 s polls.
+// Fork: last calendar read as civil seconds; status_time() advances it by
+// the time since the read so the displayed seconds stay correct between polls.
 static bool device_time_valid = false;
 static int64_t device_time_civil = 0;
 
@@ -46,6 +48,7 @@ struct ClockObservation {
     int64_t civil = 0;
     uint32_t sent_ms = 0;
     uint32_t received_ms = 0;
+    char date[9] = {};
 };
 
 // Shared clock observations; only handle() owns probe tickets.
@@ -93,13 +96,11 @@ void Air10Clock::status_time(char (&out)[20]) {
              t.tm_hour % 100, t.tm_min % 100, t.tm_sec % 100);
 }
 
-static void publish_device_time(const char *text,
-                                const Air10Clock::Calendar *value = nullptr) {
+static void publish_device_time(const char *text) {
     portENTER_CRITICAL(&device_time_mux);
     snprintf(device_time, sizeof(device_time), "%s", text);
     device_time_ms = millis();
-    device_time_valid = value != nullptr;
-    if (value) device_time_civil = Air10Clock::civil_seconds(*value);
+    device_time_valid = false;
     portEXIT_CRITICAL(&device_time_mux);
 }
 
@@ -132,6 +133,10 @@ bool Air10Clock::phase_unchanged(const PhaseAnchor &anchor) {
 static void observe_clock_read(const Air10Clock::Calendar &value,
                                 const Arbiter::VarReadTrace &trace) {
     const int64_t civil = Air10Clock::civil_seconds(value);
+    char date[9] = {}, text[20] = {};
+    snprintf(date, sizeof(date), "%02d%02d%04d", value.day, value.month, value.year);
+    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+             value.year, value.month, value.day, value.hour, value.minute);
     portENTER_CRITICAL(&device_time_mux);
     if (device_phase.generation &&
         (device_phase.native_at_ms(trace.received_ms) + device_phase.uncertainty_ms < civil * 1000 ||
@@ -140,6 +145,11 @@ static void observe_clock_read(const Air10Clock::Calendar &value,
         phase_generation++;
     }
     last_clock_read = {civil, trace.sent_ms, trace.received_ms};
+    memcpy(last_clock_read.date, date, sizeof(date));
+    memcpy(device_time, text, sizeof(text));
+    device_time_ms = trace.received_ms;
+    device_time_civil = civil;
+    device_time_valid = true;
     portEXIT_CRITICAL(&device_time_mux);
 }
 
@@ -186,6 +196,20 @@ static void stop_calendar_read() {
     calendar_step = 0;
 }
 
+static bool start_phase_from_observation() {
+    portENTER_CRITICAL(&device_time_mux);
+    const bool fresh = last_clock_read.date[0] &&
+        millis() - last_clock_read.sent_ms <= PHASE_MAX_BRACKET_MS;
+    if (fresh) {
+        phase_previous = last_clock_read;
+        phase_probe_generation = phase_generation;
+        memcpy(phase_date, last_clock_read.date, sizeof(phase_date));
+    }
+    portEXIT_CRITICAL(&device_time_mux);
+    phase_measuring = fresh;
+    return fresh;
+}
+
 static void handle_calendar_read() {
     const auto state = Arbiter::get_state();
     portENTER_CRITICAL(&device_time_mux);
@@ -203,6 +227,11 @@ static void handle_calendar_read() {
     }
     if (phase_measuring) return;
     if (!calendar_step) {
+        // A fallback, session read or write verification may have satisfied it.
+        portENTER_CRITICAL(&device_time_mux);
+        if (device_time[0] != '-' && millis() - device_time_ms < DEVICE_TIME_POLL_INTERVAL_MS)
+            status_read_requested = false;
+        portEXIT_CRITICAL(&device_time_mux);
         calendar_for_phase = AB_STORAGE_HAS_SDCARD && phase_due &&
             AirSenseState::device_standby() &&
             (!phase_attempted || millis() - phase_attempt_ms >= PHASE_RETRY_INTERVAL_MS);
@@ -214,6 +243,10 @@ static void handle_calendar_read() {
         if (calendar_for_phase) {
             phase_attempted = true;
             phase_started_ms = phase_attempt_ms = millis();
+            if (start_phase_from_observation()) {
+                calendar_step = 0;
+                return;
+            }
         }
     }
     if (!calendar_ticket) {
@@ -250,18 +283,7 @@ static void handle_calendar_read() {
                 if (!strcmp(calendar_date, response) &&
                     Air10Clock::parse_calendar(calendar_date, calendar_tic, value)) {
                     observe_clock_read(value, calendar_trace);
-                    char text[20];
-                    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
-                             value.year, value.month, value.day, value.hour, value.minute);
-                    publish_device_time(text, &value);
-                    if (calendar_for_phase) {
-                        portENTER_CRITICAL(&device_time_mux);
-                        phase_previous = last_clock_read;
-                        phase_probe_generation = phase_generation;
-                        portEXIT_CRITICAL(&device_time_mux);
-                        memcpy(phase_date, calendar_date, sizeof(phase_date));
-                        phase_measuring = true;
-                    }
+                    if (calendar_for_phase) start_phase_from_observation();
                     calendar_step = 0;
                     return;
                 }
@@ -358,9 +380,13 @@ static bool clock_write_applied(const char *command, bool ok, const char *respon
 
     const bool rejected = !ok && response[0];
     if (rejected) clock_sync_pending = false;
-    Log::logf(CAT_TIME, LOG_WARN, "ResMed clock write %s: %s -> %s\n",
-              rejected ? "rejected (use TIMESYNC to retry)" : "not applied; will retry",
-              command, response[0] ? response : "timeout");
+    Log::logf(CAT_TIME, LOG_WARN, "ResMed clock %s write %s\n",
+              strncmp(command, "P S #DAC ", 9) == 0 ? "date" : "time",
+              rejected ? "rejected; use TIMESYNC to retry" :
+              !ok ? "failed without a response; will retry" :
+              value ? "not applied; will retry" : "not confirmed; will retry");
+    Log::logf(CAT_TIME, LOG_DEBUG, "Clock write request=%s response=%s\n",
+              command, response[0] ? response : "none");
     if (ok && value && Log::get_cat_level(CAT_TIME) >= LOG_DEBUG) {
         // Native setters may leave the value unchanged despite an R reply.
         // Observe their state guards after refusal, without inferring a cause.
@@ -433,7 +459,10 @@ static bool finish_clock_sync() {
     bool ok = Arbiter::finish_cmd(clock_sync_ticket, response, &length, &result, &trace);
     clock_sync_ticket = nullptr;
     if (result.send_window_missed) {
-        Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock TX window missed; will retry\n");
+        const bool retry_edge = clock_sync_window_retries++ < 2;
+        if (retry_edge) clock_sync_attempted = false;
+        Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock TX window missed; retry=%s\n",
+                  retry_edge ? "next edge" : "backoff");
         return false;
     }
     Log::logf(CAT_TIME, LOG_DEBUG,
@@ -463,7 +492,6 @@ static bool finish_clock_sync() {
     char text[20];
     snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
              observed.year, observed.month, observed.day, observed.hour, observed.minute);
-    publish_device_time(text, &observed);
     // A wall-clock step while the ticket waited also requires a fresh attempt.
     struct timeval wall;
     gettimeofday(&wall, nullptr);
@@ -490,16 +518,14 @@ bool Air10Clock::pull_time(bool force) {
     return true;
 }
 
-void Air10Clock::handle() {
-    handle_calendar_read();
-    handle_phase_measurement();
+static void handle_clock_sync() {
     if (clock_sync_settling &&
         millis() - clock_sync_therapy_end_ms >= CLOCK_POST_THERAPY_DELAY_MS)
         clock_sync_settling = false;
 
     const bool auto_enabled = Config::get().resmed_time;
     static bool was_auto_enabled = true;
-    if (auto_enabled && !was_auto_enabled) request_sync();
+    if (auto_enabled && !was_auto_enabled) Air10Clock::request_sync();
     was_auto_enabled = auto_enabled;
 
     const uint8_t requests = clock_sync_requests.exchange(0);
@@ -513,6 +539,7 @@ void Air10Clock::handle() {
                             (clock_sync_pending && clock_sync_manual);
         clock_sync_pending = true;
         clock_sync_attempted = false;
+        clock_sync_window_retries = 0;
     }
     if (!clock_sync_pending) return;
     const bool disabled = !auto_enabled && !clock_sync_manual;
@@ -535,6 +562,7 @@ void Air10Clock::handle() {
         return;
     }
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
+    if (clock_sync_attempted) clock_sync_window_retries = 0;
     static const char *last_blocked = nullptr;
     const char *blocked = nullptr;
     if (!EdfRecorder::begin_clock_write(&blocked)) {
@@ -549,3 +577,20 @@ void Air10Clock::handle() {
     push_time_to_resmed();
     if (!clock_sync_ticket) EdfRecorder::end_clock_write();
 }
+
+void Air10Clock::handle() {
+    // An eligible write invalidates phase: do it before acquiring that phase.
+    // A deferred/refused write must not prevent independent RTC observation.
+    priority_work = (clock_sync_requests.load() || clock_sync_pending) &&
+        (Config::get().resmed_time || clock_sync_manual ||
+         (clock_sync_requests.load() & CLOCK_SYNC_MANUAL)) &&
+        !clock_sync_settling && AirSenseState::device_standby() &&
+        AirSenseState::present_recently() && WiFiSetup::time_synced() &&
+        (!clock_sync_attempted || millis() - clock_sync_attempt_ms >= 30000);
+    handle_clock_sync();
+    handle_calendar_read();
+    handle_phase_measurement();
+    priority_work = priority_work.load() || clock_sync_ticket || calendar_step || phase_measuring;
+}
+
+bool Air10Clock::background_work_pending() { return priority_work.load(); }

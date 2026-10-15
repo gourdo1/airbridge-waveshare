@@ -9,6 +9,8 @@
 #include "debug_log.h"
 #include "crash_diagnostics.h"
 #include "app_config.h"
+#include "auth_utils.h"
+#include "async_deferred_response.h"
 #include "build_info.h"
 #include "wifi_setup.h"
 #include "network_hints.h"
@@ -109,6 +111,8 @@ static bool checkAuth(AsyncWebServerRequest *request) {
     if (request->getResponse()) return false;
     auto &cfg = Config::get();
     if (cfg.http_user.isEmpty() && cfg.http_pass.isEmpty()) return true;
+    if (request->client() && aircannect::auth_whitelist_matches(
+            request->client()->remoteIP(), cfg.auth_whitelist.c_str())) return true;
     if (!request->authenticate(cfg.http_user.c_str(), cfg.http_pass.c_str())) {
         request->requestAuthentication();
         return false;
@@ -137,14 +141,14 @@ static bool json_foreach_kv(const String &body, json_kv_fn fn, void *ctx) {
 
 
 static bool writeSetting(const char *cmd, int value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout) return false;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining) return false;
     char req[32];
     snprintf(req, sizeof(req), "P S #%s %04X", cmd, (uint16_t)value);
     char resp[64] = {};
     uint16_t resp_len = sizeof(resp);
     return Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                              resp, &resp_len, timeout);
+                              resp, &resp_len, 0, remaining);
 }
 
 static void jsonQuote(String &out, const char *val) {
@@ -357,7 +361,8 @@ static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
 
 enum StatusFields : uint8_t {
     STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
-    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_REPORT = 32, STATUS_ALL = 63,
+    STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_REPORT = 32,
+    STATUS_STORAGE = 64, STATUS_ALL = 127,
 };
 
 template<class Output>
@@ -386,22 +391,22 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         statusClocks(esp_time, resmed_time);
         jsonAddString(json, "esp_time", esp_time);
         jsonAddString(json, "resmed_time", resmed_time);
-#if AB_STORAGE_HAS_SDCARD
-        SdStorage::Status sd;
-        SdStorage::get_status(sd);
-        jsonAddString(json, "sd", !sd.supported ? "unsupported" :
-                       sd.mounted ? "mounted" : "unavailable");
-        jsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
-        jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
-#else
-        jsonAddString(json, "sd", "unsupported");
-#endif
         jsonAddInt(json, "heap", ESP.getFreeHeap());
         jsonAddInt(json, "psram_free", aircannect::Memory::psram_available() ?
                    static_cast<int>(ESP.getFreePsram()) : -1);
         jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
         jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
         jsonAddInt(json, "uptime", millis() / 1000);
+    }
+    if (fields & STATUS_STORAGE) {
+        const auto &sd = status.storage;
+        jsonAddString(json, "sd", SdStorage::state_name(sd));
+#if AB_STORAGE_HAS_SDCARD
+        jsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
+        jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
+        jsonAddBool(json, "sd_usb_supported", sd.usb_supported);
+        jsonAddString(json, "sd_error", sd.error);
+#endif
     }
     if (fields & STATUS_OXI) {
         const auto &r = status.reading;
@@ -421,6 +426,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
         jsonAddUInt32(json, "report_revision", status.report_revision);
         jsonAddUInt32(json, "report_data_revision", status.report_data_revision);
+        jsonAddUInt32(json, "report_artifact_revision", status.report_artifact_revision);
         jsonAddString(json, "report_state", EdfReport::state_name(status.report_state));
         jsonAddString(json, "report_error", status.report_error);
         jsonAddBool(json, "report_available", status.report_available);
@@ -838,7 +844,7 @@ private:
 
 static bool reportQueryKeys(AsyncWebServerRequest *request) {
     const char *keys[] = {"source", "action", "view", "day", "period", "job",
-                          "from_ms", "to_ms", "px", "revision", "exclude"};
+                          "revision"};
     const size_t count = request->params();
     if (count > sizeof(keys) / sizeof(keys[0])) return false;
     for (size_t i = 0; i < count; i++) {
@@ -865,19 +871,6 @@ static bool reportNumber(AsyncWebServerRequest *request, const char *key,
     return true;
 }
 
-static bool reportExclusions(AsyncWebServerRequest *request, SleepReport::LocalRequest &local) {
-    const auto *param = request->getParam("exclude");
-    if (!param) return true;
-#if AB_STORAGE_HAS_SDCARD
-    const auto &text = param->value();
-    size_t decoded = 0;
-    return aircannect::hex_decode(text.c_str(), text.length(), local.excluded,
-                                  sizeof(local.excluded), decoded);
-#else
-    (void)local;
-    return false;
-#endif
-}
 
 static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &source,
                        uint32_t &id, bool &qualified) {
@@ -897,6 +890,22 @@ static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &sourc
         !aircannect::parse_uint32_decimal(text, id) || !id) return false;
     source = tagged;
     return true;
+}
+
+static void sendReportResult(AsyncWebServerRequest *request, SleepReport::Source source,
+                             uint32_t id, bool pending = false) {
+    SleepReport::Result result;
+    const int code = SleepReport::poll(id, result);
+    if (result.available()) {
+        auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
+        if (response) request->send(response);
+        else request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
+    } else if (code == 202 || (!pending && code == 503)) {
+        // Admission succeeded; a contended result lock is still an accepted job.
+        sendReportJob(request, source, id, pending);
+    } else {
+        request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
+    }
 }
 
 static void handleReport(AsyncWebServerRequest *request) {
@@ -938,20 +947,7 @@ static void handleReport(AsyncWebServerRequest *request) {
             handleClinicalJob(request, ClinicalJobs::Kind::Report, {}, id);
             return;
         }
-        SleepReport::Result result;
-        int code = SleepReport::poll(id, result);
-        if (result.available()) {
-            auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
-            if (!response) {
-                request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
-                return;
-            }
-            request->send(response);
-        } else if (code == 202) {
-            sendReportJob(request, source, id, true);
-        } else {
-            request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
-        }
+        sendReportResult(request, source, id, true);
         return;
     }
 
@@ -960,7 +956,9 @@ static void handleReport(AsyncWebServerRequest *request) {
     SleepReport::LocalRequest local;
     if (const auto *param = request->getParam("action")) {
         if (param->value() == "days") local.action = EdfReport::Action::Days;
-        else if (param->value() == "series") local.action = EdfReport::Action::Series;
+        else if (param->value() == "reindex") local.action = EdfReport::Action::Reindex;
+        else if (param->value() == "history") local.action = EdfReport::Action::History;
+        else if (param->value() == "prepare") local.action = EdfReport::Action::Prepare;
         else if (param->value() != "summary") { invalid(); return; }
     }
     if (const auto *param = request->getParam("view")) {
@@ -968,26 +966,16 @@ static void handleReport(AsyncWebServerRequest *request) {
         else if (param->value() != "day") { invalid(); return; }
     }
     const bool period_view = local.view == EdfReport::View::Period;
-    const bool series = local.action == EdfReport::Action::Series;
-    uint64_t day = 0, period = 0, from = 0, to = 0, px = local.px, revision = 0;
+    uint64_t day = 0, period = 0, revision = 0;
     if (!reportNumber(request, "day", UINT16_MAX, day) ||
         !reportNumber(request, "period", 5, period) ||
-        !reportNumber(request, "from_ms", INT64_MAX, from) ||
-        !reportNumber(request, "to_ms", INT64_MAX, to) ||
-        !reportNumber(request, "px", 1600, px) ||
         !reportNumber(request, "revision", UINT32_MAX, revision) ||
-        (!period_view && request->hasParam("period")) ||
-        (!series && (request->hasParam("from_ms") || request->hasParam("to_ms") ||
-                     request->hasParam("px") || request->hasParam("exclude")))) {
+        (!period_view && request->hasParam("period"))) {
         invalid(); return;
     }
     local.day = static_cast<uint16_t>(day);
     local.period = SleepReport::period_days(static_cast<uint16_t>(period));
-    local.from_ms = static_cast<int64_t>(from);
-    local.to_ms = static_cast<int64_t>(to);
-    local.px = static_cast<uint16_t>(px);
     local.revision = static_cast<uint32_t>(revision);
-    if (!reportExclusions(request, local)) { invalid(); return; }
 
     if (source == SleepReport::Source::Device) {
         if (local.action != EdfReport::Action::Summary || request->hasParam("revision") ||
@@ -1006,8 +994,10 @@ static void handleReport(AsyncWebServerRequest *request) {
         return;
     }
 
-    if (request->method() != HTTP_GET) {
-        request->send(405, "application/json", "{\"error\":\"report_edf_requires_GET\"}");
+    if (request->method() != (local.action == EdfReport::Action::Reindex ? HTTP_POST : HTTP_GET)) {
+        request->send(405, "application/json", local.action == EdfReport::Action::Reindex
+            ? "{\"error\":\"report_reindex_requires_POST\"}"
+            : "{\"error\":\"report_edf_requires_GET\"}");
         return;
     }
     if (!EdfReport::valid(local)) { invalid(); return; }
@@ -1022,7 +1012,7 @@ static void handleReport(AsyncWebServerRequest *request) {
         request->send(code, "application/json", body);
         return;
     }
-    sendReportJob(request, source, id);
+    sendReportResult(request, source, id);
 }
 
 
@@ -1113,8 +1103,9 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
     }
     if ((fields & EXPORT_META) && (smb || full)) jsonAddString(json, "endpoint", endpoint);
     if (fields & EXPORT_ACTIONS) {
-        jsonAddString(json, "sync_blocked", ExportSync::action_blocked(smb, false));
-        jsonAddString(json, "check_blocked", ExportSync::action_blocked(smb, true));
+        const auto engine = smb ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq;
+        jsonAddString(json, "sync_blocked", ExportSync::action_blocked(engine, ExportSync::Action::Sync));
+        jsonAddString(json, "check_blocked", ExportSync::action_blocked(engine, ExportSync::Action::Check));
     }
     if (fields & EXPORT_RUN) {
         jsonAddBool(json, "has_files", status.has_files);
@@ -1197,8 +1188,11 @@ static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL
             jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
         }
         if (shq_fields & EXPORT_RUN) {
+            jsonAddUInt32(json, "files_attached", sleephq.files_attached);
             jsonAddUInt32(json, "import_id", sleephq.import_id);
             jsonAddString(json, "import_status", sleephq.import_status);
+            jsonAddBool(json, "retry_pending", sleephq.retry_pending);
+            jsonAddUInt32(json, "retry_at_epoch", sleephq.retry_at_epoch);
         }
         json += '}';
     }
@@ -1231,7 +1225,9 @@ static void publishExports() {
         ExportSync::get_status(smb);
         ExportSync::get_sleephq_status(shq);
         uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
-        if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status))
+        if (shq.files_attached != last->shq.files_attached ||
+            shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status) ||
+            shq.retry_pending != last->shq.retry_pending || shq.retry_at_epoch != last->shq.retry_at_epoch)
             fields[1] |= EXPORT_RUN;
         const auto &cfg = Config::get();
         if (last->endpoint != cfg.smb_endpoint) {
@@ -1244,7 +1240,9 @@ static void publishExports() {
             fields[1] |= EXPORT_META;
         }
         for (uint8_t i = 0; i < 4; ++i) {
-            const char *reason = ExportSync::action_blocked(i < 2, i % 2);
+            const char *reason = ExportSync::action_blocked(
+                i < 2 ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq,
+                i % 2 ? ExportSync::Action::Check : ExportSync::Action::Sync);
             if (reason == last->blocked[i]) continue;
             last->blocked[i] = reason;
             fields[i / 2] |= EXPORT_ACTIONS;
@@ -1280,8 +1278,10 @@ static void handleExportRequest(AsyncWebServerRequest *request, bool smb) {
         return;
     }
     const char *error = nullptr;
-    const bool queued = smb ? ExportSync::request_manual_smb(action == "check", &error)
-                            : ExportSync::request_manual_sleephq(action == "check", &error);
+    const bool queued = ExportSync::request_manual(
+        smb ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq,
+        action == "check" ? ExportSync::Action::Check : ExportSync::Action::Sync,
+        nullptr, nullptr, &error);
     if (queued) {
         request->send(202, "application/json", "{\"ok\":true,\"state\":\"pending\"}");
     } else {
@@ -1336,7 +1336,15 @@ static bool claimUpload(AsyncWebServerRequest *request) {
         if (uploadOwner == request) uploadOk = false;
         return false;
     }
-    if (!OtaManager::begin_manual_upload()) return false;
+    const char *error = nullptr;
+    if (!OtaManager::begin_manual_upload(&error)) {
+        String json = "{\"ok\":false";
+        jsonAddString(json, "error", error);
+        json += '}';
+        request->send(409, "application/json", json);
+        Log::logf(CAT_OTA, LOG_WARN, "HTTP upload rejected: %s\n", error);
+        return false;
+    }
     uploadOwner = request;
     uploadNextIndex = 0;
     uploadErased = 0;
@@ -1698,8 +1706,22 @@ static void handleBleAction(AsyncWebServerRequest *request) {
 
 extern void dispatch_command(const char *line, String &response);
 
+using aircannect::AsyncDeferredResponse;
+
+static std::shared_ptr<AsyncDeferredResponse::State> deferResponse(AsyncWebServerRequest *request) {
+    auto state = std::shared_ptr<AsyncDeferredResponse::State>(new(std::nothrow) AsyncDeferredResponse::State);
+    auto *response = state ? new(std::nothrow) AsyncDeferredResponse(state) : nullptr;
+    if (!response) {
+        request->send(503);
+        return nullptr;
+    }
+    request->client()->setRxTimeout(0);
+    request->send(response);
+    return state;
+}
+
 struct WebCommand {
-    AsyncWebServerRequestPtr request;
+    std::shared_ptr<AsyncDeferredResponse::State> response;
     uart_transaction_t *transaction = nullptr;
     bool refresh_therapy = false;
 };
@@ -1716,7 +1738,12 @@ static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
     auto *transaction = slot ? Arbiter::begin_cmd(cmd.c_str(), CMD_SRC_TCP,
                                                   CMD_PRIO_NORMAL, uint16_t(128)) : nullptr;
     if (transaction) {
-        slot->request = request->pause();
+        slot->response = deferResponse(request);
+        if (!slot->response) {
+            xSemaphoreGive(command_mutex);
+            Arbiter::cancel_transaction(transaction);
+            return;
+        }
         slot->transaction = transaction;
         slot->refresh_therapy = cmd.startsWith("P S #ROP ");
     }
@@ -1729,7 +1756,7 @@ static void serviceWebCommands() {
     if (!command_mutex) return;
     for (auto &slot : web_commands) {
         if (xSemaphoreTake(command_mutex, 0) != pdTRUE) return;
-        if (!slot.transaction || (!slot.request.expired() &&
+        if (!slot.transaction || (!slot.response->cancelled() &&
             !Arbiter::transaction_done(slot.transaction) &&
             !Arbiter::transaction_expired(slot.transaction))) {
             xSemaphoreGive(command_mutex);
@@ -1739,19 +1766,19 @@ static void serviceWebCommands() {
         slot.transaction = nullptr;
         xSemaphoreGive(command_mutex);
 
-        auto request = pending.request.lock();
+        const bool connected = !pending.response->cancelled();
         char response[128] = {};
         uint16_t length = sizeof(response);
         bool ok = false;
         Arbiter::VarReadTrace trace;
-        if (request && Arbiter::transaction_done(pending.transaction)) {
+        if (connected && Arbiter::transaction_done(pending.transaction)) {
             ok = Arbiter::finish_cmd(pending.transaction, response, &length, nullptr, &trace);
         } else {
             Arbiter::cancel_transaction(pending.transaction);
             length = 0;
             trace.outcome = "deadline";
         }
-        if (!request) continue;
+        if (!connected) continue;
 
         if (ok && pending.refresh_therapy) AirSenseState::request_refresh();
         String json = "{";
@@ -1760,7 +1787,8 @@ static void serviceWebCommands() {
             jsonAddString(json, "error", strcmp(trace.outcome, "ok") ? trace.outcome : "command_failed");
         if (length) jsonAddString(json, "response", response);
         json += '}';
-        request->send(200, "application/json", json);
+        pending.response->publish(std::unique_ptr<AsyncWebServerResponse>(
+            new(std::nothrow) AsyncBasicResponse(200, "application/json", json)));
     }
 }
 
@@ -1883,10 +1911,7 @@ static void abortEspOtaUpload(AsyncWebServerRequest *request) {
 static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
     if (index == 0) {
-        if (!claimUpload(request)) {
-            Log::logf(CAT_OTA, LOG_WARN, "ESP OTA rejected: OTA busy\n");
-            return;
-        }
+        if (!claimUpload(request)) return;
         Log::logf(CAT_OTA, LOG_DEBUG, "ESP OTA start: %s\n", filename.c_str());
         uploadKind = UPLOAD_ESP;
         resmed_part = nullptr;
@@ -1955,6 +1980,7 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
              status.state != OtaManager::State::Disabled)
         jsonAddString(json, "blocked", status.blocked);
     if (full) {
+        jsonAddString(json, "upload_blocked", status.upload_blocked ? status.upload_blocked : "");
         jsonAddString(json, "version", airbridge_version());
         jsonAddUInt32(json, "uptime", millis() / 1000);
         jsonAddString(json, "release_target", AB_OTA_RELEASE_TARGET);
@@ -2192,8 +2218,8 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
 class StorageResponse : public AsyncAbstractResponse {
 public:
     StorageResponse(std::shared_ptr<StorageBrowser::Transfer> transfer,
-                    StorageBrowser::Kind kind, uint64_t size) : transfer_(std::move(transfer)) {
-        _code = 200;
+                    StorageBrowser::Kind kind, uint64_t size, int code = 200) : transfer_(std::move(transfer)) {
+        _code = code;
         _contentType = kind == StorageBrowser::Kind::List ? "application/json" :
             kind == StorageBrowser::Kind::Archive ? "application/zip" : "application/octet-stream";
         _contentLength = size;
@@ -2209,6 +2235,106 @@ public:
 private:
     std::shared_ptr<StorageBrowser::Transfer> transfer_;
 };
+
+static bool reportRanges(const String &text, StorageBrowser::Request &out) {
+    if (!text.startsWith("bytes=")) return false;
+    const char *at = text.c_str() + 6;
+    while (*at) {
+        if (out.range_count == 8 || *at < '0' || *at > '9') return false;
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long first = strtoull(at, &end, 10);
+        if (errno || *end != '-' || first > UINT32_MAX) return false;
+        at = end + 1;
+        if (*at < '0' || *at > '9') return false;
+        const unsigned long long last = strtoull(at, &end, 10);
+        if (errno || last > UINT32_MAX || last < first || (*end && *end != ',')) return false;
+        out.ranges[out.range_count++] = {uint32_t(first), uint32_t(last)};
+        at = *end ? end + 1 : end;
+        if (*end && !*at) return false;
+    }
+    return out.range_count != 0;
+}
+
+static void handleReportArtifact(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    if (request->params() != 3 || !request->hasParam("day") || !request->hasParam("hash") || !request->hasParam("kind")) {
+        request->send(400); return;
+    }
+    const String kind = request->getParam("kind")->value();
+    if (kind != "tiles" && kind != "document") { request->send(400); return; }
+    StorageBrowser::Request operation = {};
+    operation.head = request->method() == HTTP_HEAD;
+    const String tag = "\"" + request->getParam("hash")->value() + "\"";
+    operation.unchanged = request->hasHeader("If-None-Match") && request->getHeader("If-None-Match")->value() == tag;
+    if (request->hasHeader("Range") && !reportRanges(request->getHeader("Range")->value(), operation)) {
+        request->send(416); return;
+    }
+    // If-Range mismatch requests the complete representation, never another
+    // generation's byte offsets. Content identities are strong validators.
+    if (request->hasHeader("If-Range") && request->getHeader("If-Range")->value() != tag) operation.range_count = 0;
+    const auto range = operation.ranges[0];
+    const uint8_t count = operation.range_count;
+    const bool head = operation.head;
+    auto deferred = deferResponse(request);
+    if (!deferred) return;
+    std::weak_ptr<StorageBrowser::Transfer> active;
+    const auto result = EdfReport::open_artifact(request->getParam("day")->value().c_str(),
+        request->getParam("hash")->value().c_str(), kind == "document", operation,
+        [deferred, range, count, head, tag, kind](int code, const char *error,
+            std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
+            if (deferred->cancelled()) { if (transfer) transfer->cancel(); return; }
+            if (error) {
+                String body = "{";
+                jsonAddString(body, "error", error, false); body += '}';
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
+                return;
+            }
+            AsyncWebServerResponse *response = nullptr;
+            if (transfer) response = new(std::nothrow) StorageResponse(transfer, StorageBrowser::Kind::Immutable, size, code);
+            else response = new(std::nothrow) AsyncBasicResponse(code);
+            if (!response) { if (transfer) transfer->cancel(); deferred->publish(nullptr); return; }
+            response->setContentType(count > 1 && code == 206
+                ? "multipart/byteranges; boundary=ab-range" : kind == "document" ? "application/json" : "application/octet-stream");
+            if (head && code != 304) response->setContentLength(size);
+            response->addHeader("ETag", tag);
+            response->addHeader("Cache-Control", "private, max-age=31536000, immutable");
+            response->addHeader("Accept-Ranges", "bytes");
+            if (code == 206 && count == 1) {
+                char text[96];
+                snprintf(text, sizeof(text), "bytes %lu-%lu/%llu", static_cast<unsigned long>(range.first),
+                    static_cast<unsigned long>(range.last), static_cast<unsigned long long>(transfer->representation_size()));
+                response->addHeader("Content-Range", text);
+            }
+            deferred->publish(std::unique_ptr<AsyncWebServerResponse>(response));
+        }, active);
+    if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
+        if (auto transfer = active.lock()) transfer->cancel();
+    });
+    else deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow) AsyncBasicResponse(
+        result == StorageBrowser::StartResult::BadRequest ? 400 :
+        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json", "{\"error\":\"artifact_unavailable\"}")));
+}
+
+static void handleStorageUsb(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    const String enabled = request->hasParam("enabled", true)
+        ? request->getParam("enabled", true)->value() : "";
+    if (enabled != "0" && enabled != "1") {
+        request->send(400, "application/json", "{\"error\":\"enabled must be 0 or 1\"}");
+        return;
+    }
+    const char *error = nullptr;
+    if (!SdStorage::request_usb(enabled == "1", &error)) {
+        String json = "{";
+        jsonAddString(json, "error", error, false);
+        json += '}';
+        request->send(409, "application/json", json);
+        return;
+    }
+    request->send(202, "application/json", "{\"ok\":true}");
+}
 
 static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind) {
     if (!checkAuth(request)) return;
@@ -2266,47 +2392,49 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
             disposition += encoded;
         }
     }
-    auto paused = request->pause();
+    auto deferred = deferResponse(request);
+    if (!deferred) return;
     std::weak_ptr<StorageBrowser::Transfer> active;
     const auto result = StorageBrowser::start(operation,
-        [paused, kind, disposition, mutation](int code, const char *error,
+        [deferred, kind, disposition, mutation](int code, const char *error,
                                   std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
-            auto request = paused.lock();
-            if (!request) { if (transfer) transfer->cancel(); return; }
+            if (deferred->cancelled()) { if (transfer) transfer->cancel(); return; }
             if (mutation) {
                 String body = "{\"ok\":";
                 body += error ? "false" : "true";
                 jsonAddUInt32(body, "changed", size);
                 if (error) jsonAddString(body, "error", error);
                 body += '}';
-                request->send(code, "application/json", body);
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
                 return;
             }
             if (error) {
                 String body = "{\"error\":";
                 jsonQuote(body, error);
                 body += '}';
-                request->send(code, "application/json", body);
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
                 return;
             }
             auto *response = new(std::nothrow) StorageResponse(transfer, kind, size);
             if (!response) {
                 Log::logf(CAT_WEB, LOG_WARN, "Storage response allocation failed\n");
                 transfer->cancel();
-                request->send(503);
+                deferred->publish(nullptr);
                 return;
             }
             if (disposition.length()) response->addHeader("Content-Disposition", disposition);
-            request->send(response);
+            deferred->publish(std::unique_ptr<AsyncWebServerResponse>(response));
         }, active);
     if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
         if (auto transfer = active.lock()) transfer->cancel();
     });
-    else if (result == StorageBrowser::StartResult::BadRequest)
-        request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
-    else if (result == StorageBrowser::StartResult::Busy)
-        request->send(409, "application/json", "{\"error\":\"storage_busy\"}");
-    else request->send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    else deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow) AsyncBasicResponse(
+        result == StorageBrowser::StartResult::BadRequest ? 400 :
+        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json",
+        result == StorageBrowser::StartResult::BadRequest ? "{\"error\":\"invalid_path\"}" :
+        result == StorageBrowser::StartResult::Busy ? "{\"error\":\"storage_busy\"}" : "{\"error\":\"storage_unavailable\"}")));
 }
 #endif
 
@@ -2348,6 +2476,7 @@ void WebUI::init(uint16_t port) {
     http->on("/api/export/smb", HTTP_POST, [](AsyncWebServerRequest *r) { handleExportRequest(r, true); });
     http->on("/api/export/sleephq", HTTP_POST, [](AsyncWebServerRequest *r) { handleExportRequest(r, false); });
 #if AB_STORAGE_HAS_SDCARD
+    http->on("/api/storage/usb", HTTP_POST, handleStorageUsb);
     http->on("/api/storage/list", HTTP_GET, [](AsyncWebServerRequest *r) {
         handleStorage(r, StorageBrowser::Kind::List);
     });
@@ -2373,9 +2502,12 @@ void WebUI::init(uint16_t port) {
     http->on("/api/flash", HTTP_POST, handleFlashStart, NULL, handleJsonBody);
     http->on("/api/flash/cancel", HTTP_POST, handleFlashCancel);
     http->on("/api/time", HTTP_POST, handleTimeAction, NULL, handleJsonBody);
-    http->on("/api/report", HTTP_GET, handleReport);
-    http->on("/api/report", HTTP_POST, handleReport);
-    http->on("/api/report", HTTP_DELETE, handleReport);
+#if AB_STORAGE_HAS_SDCARD
+    http->on(AsyncURIMatcher::exact("/api/report/artifact"), HTTP_GET | HTTP_HEAD, handleReportArtifact);
+#endif
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_GET, handleReport);
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_POST, handleReport);
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_DELETE, handleReport);
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
@@ -2403,9 +2535,16 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         fields |= STATUS_OXI;
     if (a.report_source != b.report_source || a.report_revision != b.report_revision ||
         a.report_data_revision != b.report_data_revision ||
+        a.report_artifact_revision != b.report_artifact_revision ||
         a.report_state != b.report_state || strcmp(a.report_error, b.report_error) ||
         a.report_available != b.report_available)
         fields |= STATUS_REPORT;
+    if (a.storage.mode != b.storage.mode || a.storage.mounted != b.storage.mounted ||
+        a.storage.supported != b.storage.supported ||
+        a.storage.card_bytes != b.storage.card_bytes || a.storage.used_bytes != b.storage.used_bytes ||
+        a.storage.usb_supported != b.storage.usb_supported ||
+        strcmp(a.storage.error, b.storage.error))
+        fields |= STATUS_STORAGE;
     return fields;
 }
 

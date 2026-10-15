@@ -20,6 +20,7 @@
 #include "live_tce.h"
 #include "live_web_consumer.h"
 #include "sd_storage.h"
+#include "usb_storage.h"
 #include "edf_recorder.h"
 #include "export_sync.h"
 #include "custom_settings.h"
@@ -29,7 +30,7 @@
 #include "air10_clock.h"
 #include "board.h"
 #include "status_screen.h"
-#if defined(AB_BOARD_WROOM_S3)
+#if defined(AB_BOARD_WROOM_S3) && !AB_USB_MSC_ENABLED
 #include "hal/usb_serial_jtag_ll.h"
 
 // Rev D senses VBUS through 100k/150k. Disconnect the self-powered USB
@@ -46,6 +47,10 @@ static char serial_line[SERIAL_LINE_MAX];
 static int serial_pos = 0;
 
 static void serial_poll() {
+    if (!UsbStorage::serial_available()) {
+        serial_pos = 0;
+        return;
+    }
     while (Serial.available()) {
         char c = Serial.read();
 
@@ -102,8 +107,10 @@ void setup() {
     digitalWrite(AB_TOUCH_RST_GPIO, LOW);     // off the shared I2C bus
 #endif
 
+    UsbStorage::begin();
     Serial.begin(115200);
-#if defined(AB_BOARD_WROOM_S3)
+    UsbStorage::poll();
+#if defined(AB_BOARD_WROOM_S3) && !AB_USB_MSC_ENABLED
     pinMode(14, INPUT);
     attachInterrupt(digitalPinToInterrupt(14), usb_vbus_changed, CHANGE);
     usb_vbus_changed();
@@ -133,11 +140,12 @@ void setup() {
     Log::logf(CAT_CONFIG, LOG_DEBUG, "Configuration loaded\n");
     OtaManager::init();
 
-    SdStorage::init();
-    CustomSettings::init();
-
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX);
     Log::logf(CAT_ARB, LOG_DEBUG, "Initialization returned\n");
+    AirSenseState::poll();
+
+    SdStorage::init();
+    CustomSettings::init();
     LiveStream::init();
     LiveTce::register_parser();
 
@@ -220,6 +228,7 @@ static void check_time_triggers() {
 }
 
 void loop() {
+    UsbStorage::poll();
     serial_poll();
     ClinicalJobs::tick();
     SleepReport::tick();
@@ -261,15 +270,14 @@ void loop() {
     prev_ota_active = ota_active;
 
     check_time_triggers();
+    AirSenseState::poll();
+    Air10Stream::poll();
     Air10Clock::handle();
 
     LiveWebConsumer::tick();
     StatusScreen::tick();
 
     OxiArbiter::poll();
-
-    AirSenseState::poll();
-    Air10Stream::poll();
 
     delay(10);
 }

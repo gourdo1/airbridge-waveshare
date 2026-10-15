@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build patched WebResponses.cpp without changing the installed library."""
+"""Build patched HTTP/TCP sources without changing installed libraries."""
 
 from pathlib import Path
 import shutil
@@ -10,11 +10,19 @@ import tempfile
 from library_patches import apply_patches, patch_files
 
 
-TARGET = ("espasyncwebserver", "src", "webresponses.cpp")
+# (library folder, source name) -> patches/<dir>
+TARGETS = {
+    ("espasyncwebserver", "webresponses.cpp"): "espasyncwebserver",
+    ("asynctcp", "asynctcp.cpp"): "asynctcp",
+}
 
 
-def is_target(path: Path) -> bool:
-    return tuple(part.lower() for part in path.parts[-3:]) == TARGET
+def patch_dir(path: Path):
+    # .../<Library>/src/<File>.cpp; None for any other source.
+    parts = [part.lower() for part in path.parts[-3:]]
+    if len(parts) != 3 or parts[1] != "src":
+        return None
+    return TARGETS.get((parts[0], parts[2]))
 
 
 def patch_in_place(original: Path, patches: list[Path]) -> None:
@@ -39,17 +47,18 @@ def patch_in_place(original: Path, patches: list[Path]) -> None:
 def build_source(env, node):
     original = Path(node.srcnode().get_abspath())
     # The middleware pattern is not honoured on Windows (see patch_in_place).
-    if not is_target(original):
+    library = patch_dir(original)
+    if library is None:
         return node
-    patches = patch_files(Path(env["PROJECT_DIR"]) / "patches" / "espasyncwebserver")
+    patches = patch_files(Path(env["PROJECT_DIR"]) / "patches" / library)
     if not patches:
-        raise RuntimeError("ESPAsyncWebServer patches are missing")
+        raise RuntimeError(f"{library} patches are missing")
 
     if sys.platform == "win32":
         patch_in_place(original, patches)
         return node
 
-    output = Path(env.subst("$BUILD_DIR")) / "generated" / "WebResponses.cpp"
+    output = Path(env.subst("$BUILD_DIR")) / "generated" / original.name
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
@@ -67,3 +76,4 @@ def build_source(env, node):
 if "Import" in globals():
     Import("env")
     env.AddBuildMiddleware(build_source, "*/ESPAsyncWebServer/src/WebResponses.cpp")
+    env.AddBuildMiddleware(build_source, "*/AsyncTCP/src/AsyncTCP.cpp")

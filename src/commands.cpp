@@ -21,6 +21,7 @@
 #include "board.h"
 #include "storage_browser.h"
 #include "sd_storage.h"
+#include "edf_report.h"
 #include "memory_manager.h"
 #include "crash_diagnostics.h"
 #include "status_screen.h"
@@ -107,7 +108,7 @@ void dispatch_command(const char *line, String &response) {
             SdStorage::Status sd;
             SdStorage::get_status(sd);
             response = "state: ";
-            response += !sd.supported ? "unsupported" : sd.mounted ? "mounted" : "unavailable";
+            response += SdStorage::state_name(sd);
             response += '\n';
             if (sd.mounted) {
                 if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
@@ -134,7 +135,45 @@ void dispatch_command(const char *line, String &response) {
 #endif
             return;
         }
+        if (action == "USB") {
+            String value = path;
+            value.toUpperCase();
+            if ((value != "ON" && value != "OFF") || !parse_quoted_token(cmd, &position).isEmpty()) {
+                response = "ERR: usage: $STORAGE USB ON|OFF\n";
+                return;
+            }
+            const char *error = nullptr;
+            response = SdStorage::request_usb(value == "ON", &error)
+                ? "OK: USB handoff requested; $STORAGE STATUS for result\n"
+                : "ERR: " + String(error) + "\n";
+            return;
+        }
+        if (action == "FORMAT") {
+            String confirmation = path;
+            confirmation.toUpperCase();
+            if (confirmation != "CONFIRM" || position != static_cast<int>(cmd.length())) {
+                response = "ERR: usage: $STORAGE FORMAT CONFIRM\n"
+                           "Replaces the SD partition table and formats FAT32, erasing ALL SD data. "
+                           "Restarts; AirBridge configuration is preserved.\n";
+                return;
+            }
+            const char *error = nullptr;
+            response = FactoryReset::request(&error, FactoryReset::Scope::StorageOnly)
+                ? "OK: SD format queued; restarting; configuration preserved\n"
+                : "ERR: " + String(error) + "\n";
+            return;
+        }
 #if AB_STORAGE_HAS_SDCARD
+        if (action == "REINDEX") {
+            if (!path.isEmpty()) { response = "ERR: usage: $STORAGE REINDEX\n"; return; }
+            EdfReport::Request rebuild;
+            rebuild.action = EdfReport::Action::Reindex;
+            uint32_t id = 0; const char *error = nullptr;
+            response = EdfReport::submit(rebuild, id, &error)
+                ? "OK: report rebuild queued for catalogued sessions; source files preserved\n"
+                : "ERR: " + String(error ? error : "report_unavailable") + "\n";
+            return;
+        }
         const String name = parse_quoted_token(cmd, &position);
         const String extra = parse_quoted_token(cmd, &position);
         StorageBrowser::Request request = {};
@@ -143,7 +182,7 @@ void dispatch_command(const char *line, String &response) {
             path.length() >= sizeof(request.path) ||
             (rename ? name.isEmpty() || name.length() >= 256 : !name.isEmpty()) ||
             !extra.isEmpty()) {
-            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS\n";
+            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS | FORMAT CONFIRM\n";
             return;
         }
         request.kind = rename ? StorageBrowser::Kind::Rename : StorageBrowser::Kind::Delete;
@@ -328,6 +367,7 @@ void dispatch_command(const char *line, String &response) {
             response += " files=" + String(sleephq_status.files_uploaded);
             response += "/" + String(sleephq_status.files_seen);
             response += " skipped=" + String(sleephq_status.files_skipped);
+            response += " attached=" + String(sleephq_status.files_attached);
             response += " bytes=" + String(static_cast<unsigned long long>(
                 sleephq_status.bytes_uploaded));
             if (sleephq_status.import_id)
@@ -340,16 +380,28 @@ void dispatch_command(const char *line, String &response) {
             if (sleephq_status.last_error[0])
                 response += " error=" + String(sleephq_status.last_error);
             response += "\n";
-        } else if (sub == "SMB" || sub == "SLEEPHQ") {
-            const char *error = nullptr;
-            const bool smb = sub == "SMB";
-            const bool queued = smb ? ExportSync::request_manual_smb(false, &error)
-                                    : ExportSync::request_manual_sleephq(false, &error);
-            response = queued ? (smb ? "OK: SMB sync queued\n" : "OK: SleepHQ sync queued\n")
-                              : String("ERR: ") + error + "\n";
         } else {
-            response = "ERR: use EXPORT STATUS, EXPORT SMB, or "
-                       "EXPORT SLEEPHQ\n";
+            int position = 0;
+            const String name = parse_quoted_token(sub, &position);
+            const String verb = parse_quoted_token(sub, &position);
+            const String from = parse_quoted_token(sub, &position);
+            const String to = parse_quoted_token(sub, &position);
+            String extra = sub.substring(position);
+            extra.trim();
+            ExportSync::Engine engine;
+            if (!ExportSync::parse_engine(name.c_str(), engine)) {
+                response = "ERR: unknown export engine\n";
+            } else if ((!verb.isEmpty() && verb != "SYNC" && verb != "CHECK" && verb != "REPAIR") ||
+                       !extra.isEmpty() || (verb != "REPAIR" && (!from.isEmpty() || !to.isEmpty()))) {
+                response = "ERR: use EXPORT <engine> [SYNC|CHECK|REPAIR [YYYYMMDD [YYYYMMDD]]]\n";
+            } else {
+                const auto action = verb == "REPAIR" ? ExportSync::Action::Repair :
+                    verb == "CHECK" ? ExportSync::Action::Check : ExportSync::Action::Sync;
+                const char *error = nullptr;
+                const bool queued = ExportSync::request_manual(engine, action, from.c_str(), to.c_str(), &error);
+                response = queued ? String("OK: ") + ExportSync::engine_name(engine) + " " +
+                    (verb.isEmpty() ? "SYNC" : verb) + " queued\n" : String("ERR: ") + error + "\n";
+            }
         }
         return;
     }
@@ -712,12 +764,23 @@ void dispatch_command(const char *line, String &response) {
                    "  CONFIG [key [val]]  Get/set config\n"
                    "  CONFIG SAVE|RESET   Save/reset config\n"
                    "  CONFIG DUMP         Show all config\n"
-                   "  EXPORT STATUS|SMB|SLEEPHQ  Export status/manual sync\n"
+                   "  EXPORT STATUS  Export status\n"
+                   "  EXPORT <engine> [SYNC|CHECK|REPAIR [YYYYMMDD [YYYYMMDD]]]\n"
+                   "    Engines: ";
+        for (unsigned i = 0; i < static_cast<unsigned>(ExportSync::Engine::Count); ++i) {
+            if (i) response += ", ";
+            response += ExportSync::engine_name(static_cast<ExportSync::Engine>(i));
+        }
+        response += "; REPAIR requires engine support\n";
+        response +=
 #if AB_STORAGE_HAS_SDCARD
                    "  STORAGE RENAME path name  Rename a file or folder\n"
                    "  STORAGE RM path     Delete a file or folder recursively\n"
 #endif
                    "  STORAGE STATUS      SD state, space and last file operation\n"
+                   "  STORAGE FORMAT CONFIRM Erase all SD data, preserve config, restart\n"
+                   "  STORAGE REINDEX Rebuild reports after editing catalogued EDF files\n"
+                   "  STORAGE USB ON|OFF  Share SD over USB / return after disconnect\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
                    "  LOG                 Show all category log levels\n"

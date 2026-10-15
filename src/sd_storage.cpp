@@ -6,6 +6,7 @@
 
 #include "board.h"
 #include "debug_log.h"
+#include "usb_storage.h"
 
 #if AB_STORAGE_HAS_SDCARD
 #include <SD_MMC.h>
@@ -21,6 +22,7 @@
 #include "memory_manager.h"
 #include "uart_arbiter.h"
 #include "airsense_state.h"
+#include "airbridge_ota.h"
 #endif
 
 namespace SdStorage {
@@ -42,45 +44,90 @@ bool init_started = false;
 bool formatting = false;
 
 struct Request {
-    enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End } kind;
+    enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, Wake, UsbIo } kind;
     bool (*operation)(fs::FS &, void *);
     void *context;
     uint32_t generation;
     SemaphoreHandle_t done;
     bool success;
     TaskHandle_t caller;
-    uint32_t reader_id;
+    uint32_t file_id;
 };
+
+void mount_card();
+void advance_usb();
 
 QueueHandle_t requests = nullptr;
 uint32_t generation = 1;
 uint32_t active_session = 0;
 uint32_t recorder_waiting = 0;
+TaskHandle_t maintenance_waiter = nullptr;
+bool maintenance_granted = false;
 TaskHandle_t worker = nullptr;
 TaskHandle_t direct_owner = nullptr;
+Request wake_request = {};
+#if AB_USB_MSC_ENABLED
+sdmmc_card_t usb_card = {};
+bool usb_host_started = false;
+bool usb_io_pending = false;
+struct {
+    Request request;
+    bool write;
+    uint32_t sector;
+    uint8_t *buffer;
+    size_t size;
+    void (*done)(bool);
+} usb_io = {};
+#endif
+
+void wake_worker() {
+    if (!requests) return;
+    Request *pointer = &wake_request;
+    // A full queue already wakes the worker, which advances handoff after each request.
+    xQueueSend(requests, &pointer, 0);
+}
+
+void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
+    host.flags = AB_SDMMC_WIDTH == 1 ? SDMMC_HOST_FLAG_1BIT : SDMMC_HOST_FLAG_4BIT;
+    host.max_freq_khz = AB_SDMMC_FREQ_KHZ;
+    slot.width = AB_SDMMC_WIDTH;
+    slot.clk = static_cast<gpio_num_t>(AB_SDMMC_CLK_GPIO);
+    slot.cmd = static_cast<gpio_num_t>(AB_SDMMC_CMD_GPIO);
+    slot.d0 = static_cast<gpio_num_t>(AB_SDMMC_D0_GPIO);
+    slot.d1 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D1_GPIO);
+    slot.d2 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D2_GPIO);
+    slot.d3 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D3_GPIO);
+}
 
 struct OpenFile {
     fs::File file;
     uint32_t id = 0;
+    void close() { file.close(); id = 0; }
 };
 OpenFile readers[2];
-uint32_t next_reader = 0;
+OpenFile writer;
+uint32_t next_file = 0;
 
-void close_readers() {
-    for (OpenFile &reader : readers) {
-        reader.file.close();
-        reader.id = 0;
-    }
+void close_files() {
+    for (OpenFile &reader : readers) reader.close();
+    writer.close();
 }
 
-OpenFile *find_reader(uint32_t id) {
+OpenFile *find_file(uint32_t id) {
     for (OpenFile &reader : readers)
         if (reader.id == id) return &reader;
-    return nullptr;
+    return writer.id == id ? &writer : nullptr;
+}
+
+uint32_t retain_file(OpenFile &slot, const fs::File &file) {
+    if (++next_file == 0) ++next_file;
+    slot.id = next_file;
+    slot.file = file;
+    return slot.id;
 }
 
 bool background_allowed() {
-    return !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
+    return local_access_allowed() && !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
         AirSenseState::local_background_allowed();
 }
 
@@ -92,8 +139,29 @@ bool background_allowed(uint32_t expected) {
 void process_request(Request &value) {
     Request *request = &value;
     request->success = false;
-    if (request->kind == Request::Begin) {
-        if (!direct_owner && !active_session && mounted() && background_allowed()) {
+    if (request->kind == Request::Wake) {
+        return;
+    } else if (request->kind == Request::Mount) {
+        if (local_access_allowed() && !direct_owner && !active_session) mount_card();
+        request->success = mounted();
+#if AB_USB_MSC_ENABLED
+    } else if (request->kind == Request::UsbIo) {
+        // Already-admitted writes finish even if the host ejects/disconnects meanwhile.
+        const bool valid = usb_host_started && usb_io.size && !(usb_io.size % 512) &&
+            uint64_t(usb_io.sector) + usb_io.size / 512 <= usb_card.csd.capacity;
+        const esp_err_t result = !valid ? ESP_ERR_INVALID_STATE : usb_io.write
+            ? sdmmc_write_sectors(&usb_card, usb_io.buffer, usb_io.sector, usb_io.size / 512)
+            : sdmmc_read_sectors(&usb_card, usb_io.buffer, usb_io.sector, usb_io.size / 512);
+        if (result != ESP_OK)
+            Log::logf(CAT_STORAGE, LOG_WARN, "USB %s sector=%lu bytes=%u failed: %s\n",
+                      usb_io.write ? "write" : "read", (unsigned long)usb_io.sector,
+                      unsigned(usb_io.size), esp_err_to_name(result));
+        const auto done = usb_io.done;
+        __atomic_store_n(&usb_io_pending, false, __ATOMIC_RELEASE);
+        done(result == ESP_OK);
+#endif
+    } else if (request->kind == Request::Begin) {
+        if (!direct_owner && !active_session && !maintenance_pending() && mounted() && background_allowed()) {
             if (++generation == 0) ++generation;
             __atomic_store_n(&active_session, generation, __ATOMIC_RELEASE);
             request->generation = generation;
@@ -101,20 +169,21 @@ void process_request(Request &value) {
         }
     } else if (request->kind == Request::End) {
         if (active_session == request->generation) {
-            close_readers();
+            close_files();
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
         }
         request->success = true;
     } else if (request->kind == Request::Acquire || request->kind == Request::TryAcquire) {
-        if (!direct_owner && (request->kind == Request::Acquire || !active_session)) {
-            close_readers();
+        if (local_access_allowed() && mounted() && !direct_owner &&
+            (request->kind == Request::Acquire || !active_session)) {
+            close_files();
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&direct_owner, request->caller, __ATOMIC_RELEASE);
             request->success = true;
         }
     } else if (request->kind == Request::Close) {
-        OpenFile *reader = find_reader(request->reader_id);
-        if (reader) { reader->file.close(); reader->id = 0; }
+        OpenFile *file = find_file(request->file_id);
+        if (file) file->close();
         request->success = true;
     } else if (request->kind == Request::Release) {
         if (direct_owner == request->caller) {
@@ -131,7 +200,8 @@ void io_task(void *) {
     while (true) {
         if (xQueueReceive(requests, &request, portMAX_DELAY) != pdTRUE) continue;
         process_request(*request);
-        xSemaphoreGive(request->done);
+        if (request->done) xSemaphoreGive(request->done);
+        advance_usb();
     }
 }
 
@@ -139,6 +209,7 @@ bool init_worker() {
     if (worker) return true;
     if (!requests) requests = xQueueCreate(4, sizeof(Request *));
     if (!requests) return false;
+    wake_request.kind = Request::Wake;
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(io_task, "sd_io", 4096,
@@ -151,8 +222,9 @@ bool init_worker() {
 }
 
 bool direct_request(Request &request) {
-    // No executor means no auxiliary readers; keep the same ownership token.
+    // No executor means no auxiliary handles; keep the same ownership token.
     if (request.kind == Request::Acquire || request.kind == Request::TryAcquire) {
+        if (!local_access_allowed() || !mounted()) return false;
         TaskHandle_t expected = nullptr;
         return __atomic_compare_exchange_n(&direct_owner, &expected, request.caller,
             false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
@@ -177,6 +249,14 @@ bool dispatch(Request &request, bool control) {
     if (queued) xSemaphoreTake(request.done, portMAX_DELAY);
     vSemaphoreDelete(request.done);
     return queued && request.success;
+}
+
+void close_handle(uint32_t handle) {
+    if (!handle) return;
+    Request request = {};
+    request.kind = Request::Close;
+    request.file_id = handle;
+    (void)dispatch(request, true);
 }
 }  // namespace
 
@@ -209,16 +289,8 @@ bool factory_format() {
     constexpr size_t work_bytes = 4096;
     static_assert(FF_MAX_SS <= work_bytes, "SD format work buffer too small");
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.flags = AB_SDMMC_WIDTH == 1 ? SDMMC_HOST_FLAG_1BIT : SDMMC_HOST_FLAG_4BIT;
-    host.max_freq_khz = AB_SDMMC_FREQ_KHZ;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = AB_SDMMC_WIDTH;
-    slot.clk = static_cast<gpio_num_t>(AB_SDMMC_CLK_GPIO);
-    slot.cmd = static_cast<gpio_num_t>(AB_SDMMC_CMD_GPIO);
-    slot.d0 = static_cast<gpio_num_t>(AB_SDMMC_D0_GPIO);
-    slot.d1 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D1_GPIO);
-    slot.d2 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D2_GPIO);
-    slot.d3 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D3_GPIO);
+    configure_host(host, slot);
 
     sdmmc_card_t card = {};
     BYTE pdrv = FF_DRV_NOT_USED;
@@ -328,9 +400,27 @@ void init() {
         Log::logf(CAT_STORAGE, LOG_WARN, "mount deferred during factory format\n");
         return;
     }
-    if (mounted()) return;
-    if (!init_worker())
+    if (mounted() || !local_access_allowed()) return;
+    if (!init_worker()) {
         Log::logf(CAT_STORAGE, LOG_WARN, "auxiliary I/O unavailable; recorder only\n");
+        mount_card();
+        return;
+    }
+#if AB_USB_MSC_ENABLED
+    portENTER_CRITICAL(&status_mux);
+    status.usb_supported = true;
+    portEXIT_CRITICAL(&status_mux);
+#endif
+    Request request = {};
+    request.kind = Request::Mount;
+    dispatch(request, true);
+#endif
+}
+
+#if AB_STORAGE_HAS_SDCARD
+namespace {
+void mount_card() {
+    if (mounted()) return;
 
     bool pins_ok;
     if (AB_SDMMC_WIDTH == 1) {
@@ -368,12 +458,156 @@ void init() {
     status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
+    // Also covers a USB round trip missed by consumers observing mounted=true.
+    __atomic_add_fetch(&file_mutation_revision, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_STORAGE, LOG_INFO,
               "mounted width=%u freq=%ukHz size=%lluMB\n",
               AB_SDMMC_WIDTH, AB_SDMMC_FREQ_KHZ,
               static_cast<unsigned long long>(card_bytes / (1024 * 1024)));
+}
+
+void advance_usb() {
+#if AB_USB_MSC_ENABLED
+    bool usb_failed = false;
+    const Mode mode = __atomic_load_n(&status.mode, __ATOMIC_ACQUIRE);
+    if (mode == Mode::ToUsb) {
+        close_files();
+        __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE)) return;
+        // Covers an update/reboot admitted just before the handoff request.
+        if (OtaManager::busy()) {
+            mount_error("update or reboot active");
+            __atomic_store_n(&status.mode, Mode::Local, __ATOMIC_RELEASE);
+            return;
+        }
+        __atomic_store_n(&status.mounted, false, __ATOMIC_RELEASE);
+        SD_MMC.end();
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+        configure_host(host, slot);
+        esp_err_t result = sdmmc_host_init();
+        usb_host_started = result == ESP_OK;
+        if (result == ESP_OK) result = sdmmc_host_init_slot(host.slot, &slot);
+        if (result == ESP_OK) result = sdmmc_card_init(&host, &usb_card);
+        if (result == ESP_OK && (usb_card.csd.sector_size != 512 || !usb_card.csd.capacity))
+            result = ESP_ERR_NOT_SUPPORTED;
+        if (result == ESP_OK) {
+            __atomic_store_n(&status.mode, Mode::Usb, __ATOMIC_RELEASE);
+            result = UsbStorage::expose(usb_card.csd.capacity);
+        }
+        if (result == ESP_OK) {
+            Log::logf(CAT_STORAGE, LOG_INFO, "SD shared over USB; local recording paused\n");
+            if (__atomic_load_n(&status.mode, __ATOMIC_ACQUIRE) == Mode::Usb) return;
+        } else {
+            Log::logf(CAT_STORAGE, LOG_ERROR, "USB handoff failed: %s\n", esp_err_to_name(result));
+            usb_failed = true;
+            __atomic_store_n(&status.mode, Mode::ToLocal, __ATOMIC_RELEASE);
+        }
+    }
+    if (__atomic_load_n(&status.mode, __ATOMIC_ACQUIRE) == Mode::ToLocal) {
+        portENTER_CRITICAL(&status_mux);
+        const bool failed = status.error[0] != 0;
+        portEXIT_CRITICAL(&status_mux);
+        // Keep admission closed after failure until request_usb(false) retries.
+        if (failed) return;
+        if (__atomic_load_n(&usb_io_pending, __ATOMIC_ACQUIRE)) return;
+        const esp_err_t stopped = UsbStorage::stop();
+        if (stopped != ESP_OK) {
+            mount_error("USB shutdown failed");
+            Log::logf(CAT_STORAGE, LOG_ERROR, "USB shutdown failed: %s\n", esp_err_to_name(stopped));
+            return;
+        }
+        if (usb_host_started) {
+            const esp_err_t result = sdmmc_host_deinit();
+            if (result != ESP_OK) {
+                mount_error("USB card shutdown failed");
+                Log::logf(CAT_STORAGE, LOG_ERROR, "USB card shutdown failed: %s\n", esp_err_to_name(result));
+                return;
+            }
+            usb_host_started = false;
+        }
+        mount_card();
+        if (!mounted()) {
+            Log::logf(CAT_STORAGE, LOG_ERROR, "SD remount after USB failed\n");
+            return;
+        }
+        if (usb_failed) mount_error("USB handoff failed");
+        __atomic_store_n(&status.mode, Mode::Local, __ATOMIC_RELEASE);
+        Log::logf(CAT_STORAGE, LOG_INFO, "SD returned from USB\n");
+    }
+#endif
+}
+}  // namespace
+#endif
+
+bool local_access_allowed() {
+    return __atomic_load_n(&status.mode, __ATOMIC_ACQUIRE) == Mode::Local;
+}
+
+bool request_usb(bool enabled, const char **error) {
+    const char *rejected = nullptr;
+#if AB_USB_MSC_ENABLED
+    if (enabled && OtaManager::busy()) rejected = "update or reboot active";
+    portENTER_CRITICAL(&status_mux);
+    if (!rejected && !status.usb_supported) rejected = "USB storage unavailable";
+    if (!rejected) {
+        if (enabled && status.mode == Mode::Local) {
+            if (!status.mounted) rejected = "SD card unavailable";
+            else {
+                status.error[0] = 0;
+                __atomic_store_n(&status.mode, Mode::ToUsb, __ATOMIC_RELEASE);
+            }
+        } else if (!enabled && status.mode == Mode::Usb) {
+            __atomic_store_n(&status.mode, Mode::ToLocal, __ATOMIC_RELEASE);
+        } else if (!enabled && status.mode == Mode::ToLocal && status.error[0]) {
+            status.error[0] = 0;
+        } else if ((enabled && status.mode != Mode::Usb) ||
+                   (!enabled && status.mode != Mode::Local)) rejected = "USB handoff in progress";
+    }
+    portEXIT_CRITICAL(&status_mux);
+    if (!rejected) wake_worker();
+#else
+    (void)enabled;
+    rejected = "USB storage unsupported";
+#endif
+    if (error) *error = rejected;
+    return !rejected;
+}
+
+void usb_ejected() {
+#if AB_USB_MSC_ENABLED
+    portENTER_CRITICAL(&status_mux);
+    if (status.mode == Mode::Usb)
+        __atomic_store_n(&status.mode, Mode::ToLocal, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
+    wake_worker();
+#endif
+}
+
+bool usb_transfer(bool write, uint32_t sector, uint8_t *buffer, size_t size,
+                  void (*done)(bool)) {
+#if AB_USB_MSC_ENABLED
+    portENTER_CRITICAL(&status_mux);
+    const bool admitted = status.mode == Mode::Usb && worker && !usb_io_pending;
+    if (admitted) __atomic_store_n(&usb_io_pending, true, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
+    if (!admitted) return false;
+    usb_io.write = write;
+    usb_io.sector = sector;
+    usb_io.buffer = buffer;
+    usb_io.size = size;
+    usb_io.done = done;
+    usb_io.request.kind = Request::UsbIo;
+    Request *pointer = &usb_io.request;
+    if (xQueueSend(requests, &pointer, 0) == pdTRUE) return true;
+    __atomic_store_n(&usb_io_pending, false, __ATOMIC_RELEASE);
+    wake_worker();
+    return false;
+#else
+    (void)write; (void)sector; (void)buffer; (void)size; (void)done;
+    return false;
 #endif
 }
 
@@ -407,6 +641,16 @@ void get_status(Status &out) {
     portEXIT_CRITICAL(&status_mux);
 }
 
+const char *state_name(const Status &value) {
+    if (!value.supported) return "unsupported";
+    switch (value.mode) {
+    case Mode::ToUsb: return "usb_starting";
+    case Mode::Usb: return "usb";
+    case Mode::ToLocal: return "usb_stopping";
+    default: return value.mounted ? "mounted" : "unavailable";
+    }
+}
+
 uint32_t files_revision() {
     portENTER_CRITICAL(&status_mux);
     const uint32_t revision = file_mutation_revision;
@@ -426,6 +670,7 @@ bool acquire() {
     Request request = {};
     request.kind = Request::Acquire;
     const bool taken = dispatch(request, true);
+    cancel_acquire();
     __atomic_sub_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
     return taken;
 #else
@@ -433,11 +678,59 @@ bool acquire() {
 #endif
 }
 
-bool try_acquire() {
+bool try_acquire(bool reserve_next) {
 #if AB_STORAGE_HAS_SDCARD
+    const TaskHandle_t caller = xTaskGetCurrentTaskHandle();
+    const TaskHandle_t waiting = __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE);
+    if (waiting && waiting != caller) return false;
+    if (reserve_next) {
+        TaskHandle_t expected = nullptr;
+        if (!__atomic_compare_exchange_n(&maintenance_waiter, &expected, caller,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && expected != caller) return false;
+    }
     Request request = {};
     request.kind = Request::TryAcquire;
-    return dispatch(request, false);
+    const bool taken = dispatch(request, false);
+    if (taken && __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) == caller)
+        __atomic_store_n(&maintenance_granted, true, __ATOMIC_RELEASE);
+    if (!local_access_allowed() || !mounted()) cancel_acquire();
+    return taken;
+#else
+    (void)reserve_next;
+    return false;
+#endif
+}
+
+void finish_maintenance() {
+#if AB_STORAGE_HAS_SDCARD
+    if (__atomic_load_n(&maintenance_granted, __ATOMIC_ACQUIRE)) cancel_acquire();
+#endif
+}
+
+void cancel_acquire() {
+#if AB_STORAGE_HAS_SDCARD
+    TaskHandle_t expected = xTaskGetCurrentTaskHandle();
+    if (__atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) != expected) return;
+    __atomic_store_n(&maintenance_granted, false, __ATOMIC_RELEASE);
+    __atomic_compare_exchange_n(&maintenance_waiter, &expected, nullptr,
+        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+}
+
+bool maintenance_pending() {
+#if AB_STORAGE_HAS_SDCARD
+    return __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) != nullptr;
+#else
+    return false;
+#endif
+}
+
+bool maintenance_ready() {
+#if AB_STORAGE_HAS_SDCARD
+    const TaskHandle_t waiting = __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE);
+    return !waiting || (waiting == xTaskGetCurrentTaskHandle() &&
+        !__atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE));
 #else
     return false;
 #endif
@@ -509,9 +802,7 @@ bool Reader::open(const Session &session, const char *path, bool directory) {
         if (!file || file.isDirectory() != directory) return false;
         size_ = file.size();
         modified_ = file.getLastWrite();
-        if (++next_reader == 0) ++next_reader;
-        slot->id = handle_ = next_reader;
-        slot->file = file;
+        handle_ = retain_file(*slot, file);
         return true;
     });
     if (!opened) return false;
@@ -527,7 +818,7 @@ bool Reader::next(Entry &entry, bool &end) {
 #if AB_STORAGE_HAS_SDCARD
     if (!handle_) return false;
     return session_.run([&](fs::FS &) {
-        OpenFile *reader = find_reader(handle_);
+        OpenFile *reader = find_file(handle_);
         if (!reader || !reader->file.isDirectory()) return false;
         fs::File file = reader->file.openNextFile();
         if (!file) { end = true; return true; }
@@ -548,7 +839,7 @@ bool Reader::seek(uint64_t offset) {
 #if AB_STORAGE_HAS_SDCARD
     if (!handle_ || offset > size_ || offset > UINT32_MAX) return false;
     const bool sought = session_.run([&](fs::FS &) {
-        OpenFile *reader = find_reader(handle_);
+        OpenFile *reader = find_file(handle_);
         return reader && reader->file && !reader->file.isDirectory() &&
             reader->file.seek(static_cast<uint32_t>(offset));
     });
@@ -568,7 +859,7 @@ size_t Reader::read(uint8_t *data, size_t length) {
         const size_t count = std::min<size_t>(READ_CHUNK_BYTES,
             std::min<uint64_t>(length - total, size_ - offset_));
         const bool read = session_.run([&](fs::FS &) {
-            OpenFile *reader = find_reader(handle_);
+            OpenFile *reader = find_file(handle_);
             return reader && reader->file.read(data + total, count) == count;
         });
         if (!read) break;
@@ -581,15 +872,76 @@ size_t Reader::read(uint8_t *data, size_t length) {
 
 void Reader::close() {
 #if AB_STORAGE_HAS_SDCARD
-    if (handle_) {
-        Request request = {};
-        request.kind = Request::Close;
-        request.reader_id = handle_;
-        (void)dispatch(request, true);
-    }
+    close_handle(handle_);
 #endif
     handle_ = 0;
     size_ = offset_ = 0;
+}
+
+bool Writer::open(const Session &session, const char *path, uint64_t append_at) {
+    close();
+#if AB_STORAGE_HAS_SDCARD
+    if (!path || append_at > UINT32_MAX || !session.run([&](fs::FS &fs) {
+        if (writer.id) return false;
+        fs::File file = fs.open(path, append_at ? FILE_APPEND : FILE_WRITE);
+        if (!file || file.isDirectory() || (append_at && file.size() != append_at)) return false;
+        handle_ = retain_file(writer, file);
+        return true;
+    })) return false;
+    session_ = session;
+    size_ = append_at;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Writer::write(const uint8_t *data, size_t length) {
+#if AB_STORAGE_HAS_SDCARD
+    if (!handle_ || (!data && length) || length > UINT32_MAX - size_) return false;
+    for (size_t at = 0; at < length;) {
+        const size_t take = std::min(length - at, WRITE_CHUNK_BYTES);
+        if (!session_.run([&](fs::FS &) {
+            OpenFile *file = find_file(handle_);
+            return file && write_exact(file->file, data + at, take);
+        })) {
+            close();
+            return false;
+        }
+        at += take;
+        size_ += take;
+    }
+    return session_.valid();
+#else
+    return false;
+#endif
+}
+
+bool Writer::flush(uint64_t expected_size) {
+#if AB_STORAGE_HAS_SDCARD
+    return handle_ && size_ == expected_size && session_.run([&](fs::FS &) {
+        OpenFile *file = find_file(handle_);
+        if (!file) return false;
+        file->file.flush();
+        return file->file.size() == expected_size;
+    });
+#else
+    return false;
+#endif
+}
+
+bool Writer::finish(uint64_t expected_size) {
+    const bool complete = flush(expected_size);
+    close();
+    return complete;
+}
+
+void Writer::close() {
+#if AB_STORAGE_HAS_SDCARD
+    close_handle(handle_);
+#endif
+    handle_ = 0;
+    size_ = 0;
 }
 
 }  // namespace SdStorage

@@ -36,11 +36,11 @@ void Snapshot::reset() {
 }
 
 bool read_raw(const char *cmd, int &value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout) return false;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining) return false;
     uint32_t raw;
     if (Arbiter::read_var_hex(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL, raw,
-                             timeout, nullptr, timeout) !=
+                             0, nullptr, remaining) !=
         Arbiter::VarResult::Ok || raw > INT_MAX) return false;
     value = static_cast<int>(raw);
     return true;
@@ -49,13 +49,7 @@ bool read_raw(const char *cmd, int &value) {
 bool known_stock(const char *cmd) { return var_lookup(cmd) != nullptr; }
 
 void mode_label(int mode, char *out, size_t capacity) {
-    const char *label = var_lookup("MOP")->enum_options;
-    if (mode < 0 || mode >= MODE_COUNT) {
-        snprintf(out, capacity, "%s", "");
-        return;
-    }
-    while (mode-- > 0) label = strchr(label, ',') + 1;
-    snprintf(out, capacity, "%.*s", static_cast<int>(strcspn(label, ",")), label);
+    if (capacity && !setting_enum_label(var_lookup("MOP"), mode, out, capacity)) out[0] = 0;
 }
 
 int collect(Snapshot &snapshot) {

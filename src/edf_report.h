@@ -2,12 +2,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "storage_browser.h"
 
 // Local EDF ownership is independent of the UART/ClinicalJobs report path.
 namespace EdfReport {
 
 enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
-enum class Action : uint8_t { Days, Summary, Series };
+enum class Action : uint8_t { Days = 0, Summary = 1, History = 3, Prepare = 4, Reindex = 5 };
 enum class View : uint8_t { Day, Period };
 
 constexpr size_t MAX_SESSION_COUNT = 8192;
@@ -17,23 +18,14 @@ struct Request {
     View view = View::Day;
     uint16_t day = 0;       // Native epoch day; zero selects latest catalog day.
     uint16_t period = 1;    // Actual days: 1/7/30/90/180/365, ending at day.
-    int64_t from_ms = 0, to_ms = 0;
-    uint16_t px = 800;      // Shared aligned min/max buckets, at most 1600.
     uint32_t revision = 0;  // Dataset revision, NOT status.revision; zero accepts latest.
-    // Summary session IDs are catalog indexes valid only for that data revision.
-    // Bit n excludes session n from series values and events, never statistics.
-    uint8_t excluded[MAX_SESSION_COUNT / 8] = {};
-
-    bool excludes(size_t id) const {
-        return id < MAX_SESSION_COUNT && (excluded[id / 8] & (1u << (id % 8)));
-    }
     bool operator==(const Request &other) const;
 };
 
 struct Status {
     bool supported = false, mounted = false, available = false;
     State state = State::Blocked;
-    uint32_t revision = 0, data_revision = 0;
+    uint32_t revision = 0, data_revision = 0, artifact_revision = 0;
     uint32_t catalog_generation = 0, files_revision = 0;
     uint32_t sessions = 0;
     char error[48] = {};
@@ -46,10 +38,18 @@ uint32_t revision();
 const char *state_name(State state);
 bool valid(const Request &request);
 
-// Two slots, coalesced identical requests, bounded retained payloads. Admission
+// Immutable selectors, not user filesystem paths. The shared bounded file
+// producer serves bytes; no report computation or SD access in HTTP callbacks.
+StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
+    bool document, StorageBrowser::Request &ranges, StorageBrowser::Ready ready,
+    std::weak_ptr<StorageBrowser::Transfer> &active);
+
+// Two active jobs, coalesced identical requests, bounded PSRAM result retention. Admission
 // and polling do no SD work. Completion changes status.revision only; source
 // invalidation also changes status.data_revision. JSON carries both revisions.
 bool submit(const Request &request, uint32_t &id, const char **error = nullptr);
+uint32_t prepare_before_export(const char *therapy_day);
+bool preparation_pending(uint32_t id);
 void cancel(uint32_t id);
 // Cancellation is best-effort for sole requests; coalesced jobs are not cancelled
 // by one consumer. Pinned results remain valid until their last lease releases.

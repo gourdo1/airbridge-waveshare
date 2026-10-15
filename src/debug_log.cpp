@@ -2,6 +2,7 @@
 #include "memory_manager.h"
 #include "build_info.h"
 #include "wifi_setup.h"
+#include "usb_storage.h"
 #include <esp_system.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
@@ -24,7 +25,10 @@ static SemaphoreHandle_t log_mutex = nullptr;
 static portMUX_TYPE queue_mux = portMUX_INITIALIZER_UNLOCKED;
 static log_level_t cat_levels[CAT_COUNT];
 
-static constexpr size_t SYSLOG_QUEUE_DEPTH = 8;
+static constexpr size_t LOCAL_QUEUE_DEPTH = 8;
+// Network startup/reconnect can outlast several local sink drains.
+static constexpr size_t SYSLOG_QUEUE_PSRAM_DEPTH = 32;
+static constexpr size_t SYSLOG_QUEUE_INTERNAL_DEPTH = 16;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
 static constexpr uint32_t SYSLOG_RETRY_MS = 100;
 
@@ -43,6 +47,7 @@ static size_t local_head = 0;
 static size_t local_count = 0;
 
 static SyslogRecord *syslog_queue = nullptr;
+static size_t syslog_capacity = 0;
 static size_t syslog_head = 0;
 static size_t syslog_count = 0;
 static sockaddr_in syslog_remote = {};
@@ -84,7 +89,7 @@ static SyslogRecord boot_record() {
 void Log::init() {
     log_mutex = xSemaphoreCreateMutex();
     local_queue = static_cast<SyslogRecord *>(aircannect::Memory::alloc_large(
-        SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
+        LOCAL_QUEUE_DEPTH * sizeof(SyslogRecord)));
     bool stored = open_optional_preferences(log_prefs, "log_levels");
     for (int i = 0; i < CAT_COUNT; i++) {
         log_level_t fallback = LOG_INFO;
@@ -99,28 +104,28 @@ void Log::init() {
 }
 
 // Count both rejected arrivals and lower-priority records evicted for them.
-static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
+static unsigned enqueue(SyslogRecord *queue, size_t capacity, size_t &head, size_t &count,
                     const SyslogRecord &record) {
     if (!queue) return !record.loss_report;
     unsigned dropped = 0;
-    if (count == SYSLOG_QUEUE_DEPTH) {
+    if (count == capacity) {
         size_t victim = count;
         uint8_t lowest_priority = record.level;
         for (size_t i = 0; i < count; i++) {
-            uint8_t level = queue[(head + i) % SYSLOG_QUEUE_DEPTH].level;
+            uint8_t level = queue[(head + i) % capacity].level;
             if (level > lowest_priority) {
                 victim = i;
                 lowest_priority = level;
             }
         }
         if (victim == count) return !record.loss_report;
-        dropped = !queue[(head + victim) % SYSLOG_QUEUE_DEPTH].loss_report;
+        dropped = !queue[(head + victim) % capacity].loss_report;
         for (size_t i = victim; i + 1 < count; i++)
-            queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
-                queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
+            queue[(head + i) % capacity] =
+                queue[(head + i + 1) % capacity];
         count--;
     }
-    SyslogRecord &slot = queue[(head + count++) % SYSLOG_QUEUE_DEPTH];
+    SyslogRecord &slot = queue[(head + count++) % capacity];
     slot = record;
     slot.queue_id = ++next_queue_id;
     return dropped;
@@ -131,7 +136,7 @@ void Log::boot() {
     SyslogRecord record = boot_record();
     xSemaphoreTake(log_mutex, portMAX_DELAY);
     portENTER_CRITICAL(&queue_mux);
-    local_drops += enqueue(local_queue, local_head, local_count, record);
+    local_drops += enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, record);
     boot_pending = true;
     portEXIT_CRITICAL(&queue_mux);
     xSemaphoreGive(log_mutex);
@@ -148,7 +153,7 @@ static void poll_local() {
     static char serial_pending[162];
     static size_t serial_pos = 0, serial_len = 0;
     for (size_t i = 0; i < SYSLOG_SEND_BUDGET; i++) {
-        const bool serial_ready = (bool)Serial;
+        const bool serial_ready = UsbStorage::serial_available() && (bool)Serial;
         // An absent USB receiver is not a stalled sink; discard its pending tail.
         if (!serial_ready) serial_pos = serial_len = 0;
         int room = serial_ready ? Serial.availableForWrite() : 0;
@@ -166,7 +171,7 @@ static void poll_local() {
             return;
         }
         SyslogRecord record = local_queue[local_head];
-        local_head = (local_head + 1) % SYSLOG_QUEUE_DEPTH;
+        local_head = (local_head + 1) % LOCAL_QUEUE_DEPTH;
         local_count--;
         portEXIT_CRITICAL(&queue_mux);
         // CRLF so line-oriented terminals (telnet, PuTTY, Windows consoles)
@@ -254,11 +259,12 @@ static void report_losses() {
                 (unsigned long)udp_failure.largest, (unsigned long)udp_failure.at_ms);
         }
         portENTER_CRITICAL(&queue_mux);
-        if (local_count + slots <= SYSLOG_QUEUE_DEPTH &&
-            (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH)) {
+        if (local_count + slots <= LOCAL_QUEUE_DEPTH &&
+            (!syslog_queue || syslog_count + slots <= syslog_capacity)) {
             for (size_t i = 0; i < slots; ++i) {
-                enqueue(local_queue, local_head, local_count, records[i]);
-                if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, records[i]);
+                enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, records[i]);
+                if (syslog_queue)
+                    enqueue(syslog_queue, syslog_capacity, syslog_head, syslog_count, records[i]);
             }
             if (level == LOG_WARN) {
                 local_drops -= lost_local;
@@ -311,21 +317,30 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
         portENTER_CRITICAL(&queue_mux);
         SyslogRecord *retired = syslog_queue;
         syslog_queue = nullptr;
+        syslog_capacity = 0;
         syslog_head = syslog_count = 0;
         portEXIT_CRITICAL(&queue_mux);
         aircannect::Memory::free(retired);
     } else {
         SyslogRecord *queue = syslog_queue;
+        size_t capacity = syslog_capacity;
         if (!queue) {
+            capacity = SYSLOG_QUEUE_PSRAM_DEPTH;
             queue = static_cast<SyslogRecord *>(
                 aircannect::Memory::alloc_large(
-                    SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
+                    capacity * sizeof(SyslogRecord), false));
+            if (!queue) {
+                capacity = SYSLOG_QUEUE_INTERNAL_DEPTH;
+                queue = static_cast<SyslogRecord *>(
+                    aircannect::Memory::alloc_large(capacity * sizeof(SyslogRecord)));
+            }
         }
         const bool changed = syslog_remote.sin_addr.s_addr != remote.sin_addr.s_addr ||
             syslog_remote.sin_port != remote.sin_port ||
             strcmp(syslog_hostname, name) != 0;
         portENTER_CRITICAL(&queue_mux);
         syslog_queue = queue;
+        syslog_capacity = queue ? capacity : 0;
         if (changed) syslog_head = syslog_count = 0;
         portEXIT_CRITICAL(&queue_mux);
         syslog_remote = remote;
@@ -430,7 +445,7 @@ void Log::poll() {
         } else if (syslog_queue && syslog_count &&
                    syslog_queue[syslog_head].queue_id == record.queue_id) {
             // Enqueue eviction or reconfiguration may have replaced the head.
-            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
+            syslog_head = (syslog_head + 1) % syslog_capacity;
             syslog_count--;
         }
         portEXIT_CRITICAL(&queue_mux);
@@ -541,9 +556,9 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
 
     // Only bounded queue copies here, never formatting, allocation or sink I/O.
     portENTER_CRITICAL(&queue_mux);
-    local_drops += enqueue(local_queue, local_head, local_count, record);
+    local_drops += enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, record);
     if (syslog_queue)
-        syslog_drops += enqueue(syslog_queue, syslog_head, syslog_count, record);
+        syslog_drops += enqueue(syslog_queue, syslog_capacity, syslog_head, syslog_count, record);
     portEXIT_CRITICAL(&queue_mux);
 }
 
