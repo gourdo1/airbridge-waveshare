@@ -4,6 +4,9 @@
 #include "oxi_arbiter.h"
 #include "tcp_bridge.h"
 #include "resmed_ota.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
+#include "string_util.h"
 #include "debug_log.h"
 #include "app_config.h"
 #include "device_status.h"
@@ -110,6 +113,30 @@ void dispatch_command(const char *line, String &response) {
             response = "state: ";
             response += SdStorage::state_name(sd);
             response += '\n';
+            if (sd.supported) {
+                response += "bus: " + String(SdStorage::bus_name(sd.bus)) + "\nbus_width: ";
+                response += sd.bus_width ? String(sd.bus_width) + " bit\n" : "unavailable\n";
+                response += "bus_clock: ";
+                response += sd.bus_clock_khz ? String(sd.bus_clock_khz) + " kHz\n" : "unavailable\n";
+                response += "bus_clock_limit: ";
+                response += sd.bus_clock_limit_khz ? String(sd.bus_clock_limit_khz) + " kHz\n" : "unavailable\n";
+                response += "card_type: " + String(SdStorage::card_type_name(sd.card_type)) + '\n';
+                if (sd.spi_error.valid) {
+                    const auto &error = sd.spi_error;
+                    char detail[288];
+                    snprintf(detail, sizeof(detail),
+                             "spi_first_error: %s drive=%u sector=%lu count=%lu "
+                             "CMD%u arg=0x%08lX phase=%.15s response=%d "
+                             "result=%d (%s) occurred=%lu ms elapsed=%lu ms\n",
+                             error.write ? "write" : "read", unsigned(error.drive),
+                             (unsigned long)error.sector, (unsigned long)error.count,
+                             unsigned(error.command), (unsigned long)error.argument,
+                             error.phase, error.response, error.disk_result,
+                             error.disk_result == 0 ? "recovered" : "failed",
+                             (unsigned long)error.occurred_ms, (unsigned long)error.elapsed_ms);
+                    response += detail;
+                }
+            }
             if (sd.mounted) {
                 if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
                     response += "capacity: " +
@@ -123,6 +150,10 @@ void dispatch_command(const char *line, String &response) {
                 }
             }
             if (sd.error[0]) response += "error: " + String(sd.error) + "\n";
+            if (sd.format_result != SdStorage::FormatResult::None) {
+                response += "format: " + String(SdStorage::format_result_name(sd.format_result)) + '\n';
+                if (sd.format_error[0]) response += "format_error: " + String(sd.format_error) + '\n';
+            }
 #if AB_STORAGE_HAS_SDCARD
             StorageBrowser::MutationStatus status;
             StorageBrowser::mutation_status(status);
@@ -182,7 +213,7 @@ void dispatch_command(const char *line, String &response) {
             path.length() >= sizeof(request.path) ||
             (rename ? name.isEmpty() || name.length() >= 256 : !name.isEmpty()) ||
             !extra.isEmpty()) {
-            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS | FORMAT CONFIRM\n";
+            response = "ERR: usage: $STORAGE RENAME /path destination | RM /path | STATUS | FORMAT CONFIRM\n";
             return;
         }
         request.kind = rename ? StorageBrowser::Kind::Rename : StorageBrowser::Kind::Delete;
@@ -431,6 +462,7 @@ void dispatch_command(const char *line, String &response) {
     if (upper == "VERSION") {
         response = "AirBridge " + String(airbridge_version()) + "\n";
         response += "Built: " + String(airbridge_build_date()) + "\n";
+        response += "Target: " + String(AB_OTA_RELEASE_TARGET) + "\n";
         response += "ESP32 SDK: " + String(ESP.getSdkVersion()) + "\n";
         response += "Chip: " + String(ESP.getChipModel()) + " rev" + String(ESP.getChipRevision()) + "\n";
         response += "Flash: " + String(ESP.getFlashChipSize() / 1024) + "KB\n";
@@ -650,101 +682,115 @@ void dispatch_command(const char *line, String &response) {
         sub.trim();
 
         if (sub == "STATUS") {
-            response = "active: " + String(ResmedOta::is_active() ? "yes" : "no") + "\n";
-            response += "phase: " + String(ResmedOta::get_phase()) + "\n";
-            response += "sent: " + String(ResmedOta::get_sent()) + "\n";
-            response += "total: " + String(ResmedOta::get_total()) + "\n";
-            const char *err = ResmedOta::last_error();
-            if (err && err[0]) response += "error: " + String(err) + "\n";
+            const auto status = DeviceStatus::snapshot();
+            const auto &flash = status.resmed;
+            response = "operation: " + String(flash.id) + "\n";
+            response += "active: " + String(flash.active ? "yes" : "no") + "\n";
+            response += "phase: " + String(flash.phase) + "\n";
+            response += "sent: " + String(flash.sent) + "/" + String(flash.total) + "\n";
+            if (*flash.source_path) response += "source: " + String(flash.source_path) + "\n";
+            if (*flash.device_bid) response += "device: " + String(flash.device_bid) + "\n";
+            if (*flash.error) response += "error: " + String(flash.error) + "\n";
+            if (flash.confirmation_required)
+                response += "confirmation required: " + String(flash.recovery_path) + "\n";
+            response += "upload: " + String(status.firmware_upload.id) + " " +
+                String(status.firmware_upload.written) + " bytes\n";
         } else if (sub == "CANCEL") {
             ResmedOta::cancel();
-            response = "OK: flash cancelled\n";
+            ResmedFirmwareUpload::Status upload;
+            ResmedFirmwareUpload::get_status(upload);
+            ResmedFirmwareUpload::cancel(upload.id);
+            response = "OK: cancellation requested; see FLASH STATUS\n";
+        } else if (sub == "LIST" || sub.startsWith("LIST ")) {
+            int position = 10;
+            String path = parse_quoted_token(cmd, &position);
+            const String offset_text = parse_quoted_token(cmd, &position);
+            uint32_t offset = 0;
+            if (path.isEmpty()) path = ResmedFirmwareRepository::ROOT;
+            if (!ResmedFirmwareRepository::valid_directory(path.c_str()) ||
+                (!offset_text.isEmpty() && !aircannect::parse_uint32_decimal(offset_text.c_str(), offset)) ||
+                !parse_quoted_token(cmd, &position).isEmpty()) {
+                response = "ERR: FLASH LIST [directory] [offset]\n";
+                return;
+            }
+            ResmedFirmwareRepository::request_listing(path.c_str(), offset);
+            ResmedFirmwareRepository::Status status;
+            const auto listing = ResmedFirmwareRepository::snapshot(status);
+            if (!status.ready || !listing || listing->offset() != offset || strcmp(listing->path(), path.c_str())) {
+                response = status.refreshing ? "Listing requested; repeat FLASH LIST for result\n" :
+                    "ERR: " + String(*status.error ? status.error : "repository unavailable") + "\n";
+            } else {
+                response = "Firmware repository:\n";
+                for (size_t i = 0; i < listing->size(); ++i) {
+                    ResmedFirmwareRepository::EntryView entry;
+                    if (!listing->entry(i, entry)) break;
+                    response += String(entry.path) + (entry.directory ? "/\n" :
+                        " " + String(uint32_t(entry.size)) + " bytes\n");
+                }
+                if (listing->more()) response += "Next: FLASH LIST \"" + path + "\" " +
+                    String(offset + ResmedFirmwareRepository::PAGE_SIZE) + "\n";
+            }
+        } else if (sub == "REFRESH") {
+            ResmedFirmwareRepository::request_refresh();
+            response = "OK: repository refresh requested\n";
+        } else if (sub == "DUMP") {
+            const char *error = nullptr;
+            response = ResmedOta::start_dump(&error)
+                ? "OK: dump accepted; see FLASH STATUS\n" : "ERR: " + String(error) + "\n";
+        } else if (sub.startsWith("CONFIRM ")) {
+            int pos = 8;
+            const String id_text = parse_quoted_token(sub, &pos);
+            const String consent = parse_quoted_token(sub, &pos);
+            uint32_t id = 0;
+            if (!aircannect::parse_uint32_decimal(id_text.c_str(), id) || !id ||
+                consent != "INSTALL_PATCHED_BOOTLOADER" || parse_quoted_token(sub, &pos).length()) {
+                response = "ERR: FLASH CONFIRM <operation> INSTALL_PATCHED_BOOTLOADER\n";
+                return;
+            }
+            const char *error = nullptr;
+            response = ResmedOta::confirm_dump(id, &error)
+                ? "OK: confirmed; see FLASH STATUS\n" : "ERR: " + String(error) + "\n";
         } else if (sub.length() == 0) {
             response = "Usage: FLASH [FULL|CMX|CDX|CCX|BLX] [BLX] [FORCE]\n"
+                       "       FLASH FILE \"/airbridge/resmed-firmware/name.bin\" [block] [BLX] [FORCE]\n"
+                       "       FLASH LIST | REFRESH\n"
+                       "       FLASH DUMP\n"
+                       "       FLASH CONFIRM <operation> INSTALL_PATCHED_BOOTLOADER\n"
                        "       FLASH STATUS | CANCEL\n"
-                       "Upload firmware first via HTTP, then flash.\n";
+                       "Without FILE, use the current completed staging upload.\n";
         } else {
-            if (ResmedOta::is_active()) {
-                response = "ERR: flash already in progress\n";
-                return;
-            }
-
-            // Parse: FLASH [block] [BLX] [FORCE]
-            String block = "";
-            bool flash_blx = false;
-            bool force_blx = false;
-
+            ResmedOta::InstallRequest install;
+            String args = cmd.substring(5);
             int pos = 0;
-            while (pos < (int)sub.length()) {
-                int sp = sub.indexOf(' ', pos);
-                if (sp < 0) sp = sub.length();
-                String tok = sub.substring(pos, sp);
-                tok.trim();
-
-                if (tok == "BLX" && block.length() > 0) {
-                    flash_blx = true;
-                } else if (tok == "FORCE") {
-                    force_blx = true;
-                } else if (block.length() == 0) {
-                    block = tok;
-                }
-                pos = sp + 1;
-            }
-
-            extern size_t uploadSize;
-            size_t fw_size = uploadSize;
-            if (fw_size == 0) {
-                const esp_partition_t *part = ResmedOta::get_staging_partition();
-                if (!part) {
-                    response = "ERR: no staging partition found\n";
+            while (pos < int(args.length())) {
+                String token = parse_quoted_token(args, &pos);
+                token.toUpperCase();
+                if (!token.length()) break;
+                if (token == "FILE" && !*install.path) {
+                    const String path = parse_quoted_token(args, &pos);
+                    if (!path.length() || path.length() >= sizeof(install.path)) {
+                        response = "ERR: invalid repository path\n";
+                        return;
+                    }
+                    strcpy(install.path, path.c_str());
+                } else if (token == "FORCE") install.force_blx = true;
+                else if (token == "BLX" && *install.block) install.flash_blx = true;
+                else if (!*install.block && ResmedFirmwareImage::parse_block(token.c_str()) !=
+                         ResmedFirmwareImage::Block::Unknown) {
+                    strcpy(install.block, token.c_str());
+                } else {
+                    response = "ERR: unknown FLASH argument\n";
                     return;
                 }
-                fw_size = part->size;
             }
-
-            if (block == "BLX") {
-                flash_blx = false;  // not relevant, standalone BLX
+            if (!*install.path) {
+                ResmedFirmwareUpload::Status upload;
+                ResmedFirmwareUpload::get_status(upload);
+                install.upload_id = upload.id;
             }
-
-            // safety checks
-            bool has_warnings = false;
-            const esp_partition_t *staging = ResmedOta::get_staging_partition();
-            if (staging) {
-                fw_verify_result_t v = ResmedOta::verify_image(staging, fw_size);
-                if (v.has_blx && !v.bid_ok) {
-                    response += "WARN: Unknown BID: " + String(v.bid) + " (expected SX577-0200)\n";
-                    has_warnings = true;
-                }
-                if (v.has_blx && !v.blx_crc_ok) { response += "WARN: BLX CRC mismatch\n"; has_warnings = true; }
-                if (v.has_ccx && !v.ccx_crc_ok) { response += "WARN: CCX CRC mismatch\n"; has_warnings = true; }
-                if (v.has_cdx && !v.cdx_crc_ok) { response += "WARN: CDX CRC mismatch\n"; has_warnings = true; }
-                if (v.blx_patch == BLX_PATCH_A_DANGEROUS) {
-                    response += "!!! DANGER: Bootloader disables serial flash — needs SWD to recover !!!\n";
-                    has_warnings = true;
-                } else if (v.blx_patch == BLX_PATCH_B_SAFE) {
-                    response += "INFO: Bootloader integrity check disabled (safe method)\n";
-                }
-            }
-
-            if (has_warnings && !force_blx) {
-                response += "ERR: safety checks failed. Add FORCE to override.\n";
-                return;
-            }
-
-            ResmedOta::start_flash(
-                block.length() > 0 ? block.c_str() : nullptr,
-                fw_size,
-                flash_blx,
-                force_blx
-            );
-
-            const char *detected = block.length() > 0 ? block.c_str()
-                                    : ResmedOta::detect_block(fw_size);
-            response += "OK: flashing " + String(detected ? detected : "auto") +
-                       " (" + String(fw_size) + " bytes)";
-            if (flash_blx) response += " +BLX";
-            if (force_blx) response += " FORCE";
-            response += "\nUse $FLASH STATUS to monitor progress.\n";
+            const char *error = nullptr;
+            response = ResmedOta::start_install(install, &error)
+                ? "OK: accepted; see FLASH STATUS\n" : "ERR: " + String(error) + "\n";
         }
         return;
     }
@@ -774,7 +820,7 @@ void dispatch_command(const char *line, String &response) {
         response += "; REPAIR requires engine support\n";
         response +=
 #if AB_STORAGE_HAS_SDCARD
-                   "  STORAGE RENAME path name  Rename a file or folder\n"
+                   "  STORAGE RENAME path target  Rename/move; creates missing folders\n"
                    "  STORAGE RM path     Delete a file or folder recursively\n"
 #endif
                    "  STORAGE STATUS      SD state, space and last file operation\n"
@@ -782,7 +828,10 @@ void dispatch_command(const char *line, String &response) {
                    "  STORAGE REINDEX Rebuild reports after editing catalogued EDF files\n"
                    "  STORAGE USB ON|OFF  Share SD over USB / return after disconnect\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
-                   "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
+                   "  FLASH STATUS|CANCEL Monitor/cancel flash or dump\n"
+                   "  FLASH LIST [directory] [offset]  Firmware directory page\n"
+                   "  FLASH REFRESH       Refresh firmware repository\n"
+                   "  FLASH DUMP          Save firmware to SD\n"
                    "  LOG                 Show all category log levels\n"
                    "  LOG [cat] level     Set log level (use LOG to list categories, or ALL)\n"
                    "  WIFI                WiFi status/management\n"

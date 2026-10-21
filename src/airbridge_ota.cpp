@@ -26,6 +26,8 @@ namespace OtaManager {
 namespace {
 
 static constexpr size_t MANIFEST_MAX_BYTES = 4 * 1024;
+static constexpr size_t RELEASE_NOTES_MAX_BYTES = 32 * 1024;
+static constexpr size_t RELEASE_NOTES_INTERNAL_BYTES = 4 * 1024;
 static constexpr uint32_t INITIAL_CHECK_DELAY_MS = 60 * 1000;
 static constexpr uint32_t CHECK_INTERVAL_MS = 24UL * 60 * 60 * 1000;
 static constexpr uint32_t RETRY_INTERVAL_MS = 60UL * 60 * 1000;
@@ -52,12 +54,12 @@ struct RuntimeStatus {
     uint32_t last_check_ms = 0;
     uint32_t next_check_ms = 0;
     uint32_t reboot_at_ms = 0;
-    uint32_t resmed_claimed_at_ms = 0;
-    bool resmed_started = false;
     bool manual_image_started = false;
     Operation operation = OP_NONE;
     char update_version[OtaRelease::VERSION_MAX] = {};
     char error[64] = {};
+    bool version_comparable = true;
+    uint32_t release_notes_id = 0;
 };
 
 static RuntimeStatus runtime;
@@ -68,6 +70,11 @@ static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
 static OtaImage::Writer image_writer;
+static uint32_t check_generation = 0;
+static uint32_t notes_generation = 0;
+static std::shared_ptr<const ReleaseNotes> published_notes;
+// A slow HTTP reader may retain one older publication, never unbounded history.
+static std::weak_ptr<const ReleaseNotes> notes_slots[2];
 
 bool lock(TickType_t timeout = portMAX_DELAY) {
     return !mutex || xSemaphoreTakeRecursive(mutex, timeout) == pdTRUE;
@@ -99,20 +106,27 @@ const char *reboot_image_blocked() {
     return running->address != boot->address ? "different_boot_image_selected" : nullptr;
 }
 
-bool operation_allowed() {
+bool operation_allowed(void *context) {
     if (!lock(pdMS_TO_TICKS(50))) return false;
-    bool allowed = runtime.operation == OP_CHECK;
+    bool allowed = runtime.operation == OP_CHECK &&
+                   *static_cast<uint32_t *>(context) == check_generation;
     unlock();
     return allowed;
 }
 
-void finish_check(const OtaRelease::Manifest *manifest,
+void finish_check(uint32_t generation, const OtaRelease::Manifest *manifest,
                   const OtaRelease::Artifact *artifact,
                   bool update_available,
-                  const char *error) {
+                  const char *error, bool version_comparable = true,
+                  std::shared_ptr<const ReleaseNotes> notes = {}) {
     if (!lock()) return;
     if (runtime.operation != OP_CHECK) {
         unlock();
+        return;
+    }
+    if (generation != check_generation) {
+        runtime.operation = OP_NONE;
+        unlock(true);
         return;
     }
     runtime.result = update_available ? State::Available : State::Current;
@@ -123,11 +137,14 @@ void finish_check(const OtaRelease::Manifest *manifest,
     available_artifact = {};
     runtime.update_version[0] = '\0';
     runtime.error[0] = '\0';
+    runtime.version_comparable = version_comparable;
+    published_notes = !error ? std::move(notes) : nullptr;
+    runtime.release_notes_id = published_notes ? published_notes->id : 0;
     if (manifest) {
         snprintf(runtime.update_version, sizeof(runtime.update_version), "%s",
                  manifest->version);
     }
-    if (artifact && update_available && !error) available_artifact = *artifact;
+    if (artifact && !error) available_artifact = *artifact;
     if (error) set_error_locked(error);
     unlock(true);
     if (error) {
@@ -138,25 +155,62 @@ void finish_check(const OtaRelease::Manifest *manifest,
     }
 }
 
-void check_task(void *) {
+std::shared_ptr<ReleaseNotes> fetch_release_notes(const char *manifest_url,
+                                                const OtaRelease::Manifest &manifest,
+                                                uint32_t &generation) {
+    if (!operation_allowed(&generation)) return {};
+    char url[OtaRelease::URL_MAX];
+    if (!OtaRelease::resolve_release_notes_url(manifest_url, manifest, AB_OTA_RELEASE_TARGET,
+                                               url, sizeof(url))) return {};
+    std::shared_ptr<ReleaseNotes> notes;
+    if (!lock()) return {};
+    for (auto &slot : notes_slots) {
+        if (!slot.expired()) continue;
+        notes.reset(new(std::nothrow) ReleaseNotes);
+        if (notes) {
+            if (++notes_generation == 0) ++notes_generation;
+            notes->id = notes_generation;
+            slot = notes;
+        }
+        break;
+    }
+    unlock();
+    if (!notes) return {};
+
+    OtaUrl::Error error;
+    if (!OtaUrl::fetch(url, notes->text, RELEASE_NOTES_MAX_BYTES, notes->size,
+                       error, operation_allowed, &generation, RELEASE_NOTES_INTERNAL_BYTES)) {
+        Log::logf(CAT_OTA, LOG_DEBUG, "Release notes unavailable: %s\n", error.code);
+        return {};
+    }
+    return notes;
+}
+
+void check_task(void *argument) {
+    uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(argument));
     char url[sizeof(work_url)] = {};
     if (lock()) {
         snprintf(url, sizeof(url), "%s", work_url);
         unlock();
+    }
+    if (!operation_allowed(&generation)) {
+        finish_check(generation, nullptr, nullptr, false, nullptr);
+        vTaskDelete(nullptr);
+        return;
     }
 
     uint8_t *buffer = nullptr;
     size_t length = 0;
     OtaUrl::Error transport_error;
     if (!OxiBle::release_memory(BLE_PAUSE_TIMEOUT_MS)) {
-        finish_check(nullptr, nullptr, false, "ble_memory_busy");
+        finish_check(generation, nullptr, nullptr, false, "ble_memory_busy");
         vTaskDelete(nullptr);
         return;
     }
 
     bool fetched = OtaUrl::fetch(url, buffer, MANIFEST_MAX_BYTES, length,
                                 transport_error,
-                                [](void *) { return operation_allowed(); }, nullptr);
+                                operation_allowed, &generation);
     OtaRelease::Manifest manifest;
     char manifest_error[OtaRelease::ERROR_MAX] = {};
     bool parsed = fetched && OtaRelease::parse_manifest(
@@ -164,10 +218,21 @@ void check_task(void *) {
         manifest, manifest_error);
     heap_caps_free(buffer);
 
-    // TLS and the manifest buffer are gone before BLE allocates again.
+    bool newer = false;
+    const bool comparable = parsed && OtaRelease::is_newer(airbridge_version(), manifest.version, newer);
+    // Unknown local versions permit an explicit install, never an automatic one.
+    const bool available = parsed && (newer || !comparable);
+    auto notes = parsed ? fetch_release_notes(url, manifest, generation) : nullptr;
+
+    // Both HTTP clients and the manifest buffer are gone before BLE allocates again.
     bool restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
+    if (!restored && notes) {
+        notes.reset();
+        restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
+    }
     if (!fetched || !restored) {
-        finish_check(nullptr, nullptr, false,
+        notes.reset();
+        finish_check(generation, nullptr, nullptr, false,
                      !restored ? "ble_restore_failed" :
                      transport_error.code[0] ? transport_error.code
                                              : "manifest_fetch_failed");
@@ -176,15 +241,8 @@ void check_task(void *) {
     }
 
     if (!parsed) {
-        finish_check(nullptr, nullptr, false, manifest_error);
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    bool newer = false;
-    if (!OtaRelease::is_newer(airbridge_version(), manifest.version, newer)) {
-        finish_check(&manifest, nullptr, false,
-                     "current_version_invalid");
+        notes.reset();
+        finish_check(generation, nullptr, nullptr, false, manifest_error);
         vTaskDelete(nullptr);
         return;
     }
@@ -192,16 +250,18 @@ void check_task(void *) {
     OtaRelease::Artifact resolved = manifest.artifact;
     if (!OtaRelease::resolve_artifact_url(
             url, manifest.artifact.url, resolved.url, sizeof(resolved.url))) {
-        finish_check(&manifest, nullptr, false,
+        notes.reset();
+        finish_check(generation, &manifest, nullptr, false,
                      "artifact_url_invalid");
         vTaskDelete(nullptr);
         return;
     }
 
     const esp_partition_t *partition = esp_ota_get_next_update_partition(nullptr);
-    bool installable = newer && partition && resolved.image_size <= partition->size;
-    finish_check(&manifest, &resolved, newer,
-                 newer && !installable ? "artifact_too_large" : nullptr);
+    bool installable = partition && resolved.image_size <= partition->size;
+    finish_check(generation, &manifest, &resolved, available,
+                 !installable ? "artifact_too_large" : nullptr,
+                 comparable, std::move(notes));
     vTaskDelete(nullptr);
 }
 
@@ -216,7 +276,7 @@ void abort_install(const char *error) {
         unlock(true);
     }
     Arbiter::set_state(SYS_IDLE);
-    Log::logf(CAT_OTA, LOG_ERROR, "Release install failed: %s\n",
+    Log::logf(CAT_OTA, LOG_ERROR, "Firmware install failed: %s\n",
               error ? error : "install_failed");
 }
 
@@ -228,8 +288,10 @@ bool install_continue(void *) {
     return allowed;
 }
 
-bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
+bool install_write(void *context, size_t offset, const uint8_t *data, size_t len) {
     if (!lock(pdMS_TO_TICKS(100))) return false;
+    if (runtime.operation == OP_INSTALL && !runtime.total_size && context)
+        runtime.total_size = *static_cast<size_t *>(context);
     bool expected = runtime.operation == OP_INSTALL && offset == runtime.bytes &&
                     runtime.bytes <= runtime.total_size &&
                     len <= runtime.total_size - runtime.bytes;
@@ -248,8 +310,13 @@ bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
 
 void install_task(void *) {
     OtaRelease::Artifact artifact;
+    bool direct_url = false;
     if (lock()) {
-        artifact = available_artifact;
+        direct_url = work_url[0];
+        if (direct_url) {
+            artifact = {};
+            snprintf(artifact.url, sizeof(artifact.url), "%s", work_url);
+        } else artifact = available_artifact;
         unlock();
     }
 
@@ -262,6 +329,7 @@ void install_task(void *) {
     }
 
     if (!begin_image(artifact.size, artifact.image_size,
+                     direct_url ? OtaImage::Encoding::Auto :
                      artifact.zlib ? OtaImage::Encoding::Zlib : OtaImage::Encoding::Plain)) {
         abort_install(image_status().error);
         vTaskDelete(nullptr);
@@ -269,8 +337,9 @@ void install_task(void *) {
     }
 
     OtaUrl::Error transport_error;
+    size_t response_size = artifact.size;
     if (!OtaUrl::stream(artifact.url, artifact.size, install_write,
-                        install_continue, nullptr, transport_error)) {
+                        install_continue, &response_size, transport_error, &response_size)) {
         abort_install(image_status().error ? image_status().error :
                       transport_error.code[0] ? transport_error.code
                                               : "firmware_fetch_failed");
@@ -295,14 +364,13 @@ void install_task(void *) {
         unlock(true);
     }
     Log::logf(CAT_OTA, LOG_INFO,
-              "Release %s installed to '%s', rebooting\n",
-              runtime.update_version, partition_name);
+              "Firmware installed to '%s', rebooting\n", partition_name);
     vTaskDelete(nullptr);
 }
 
-bool start_worker(TaskFunction_t function, const char *name) {
+bool start_worker(TaskFunction_t function, const char *name, void *argument = nullptr) {
     BaseType_t result = xTaskCreatePinnedToCore(
-        function, name, TASK_STACK_BYTES, nullptr, 1, nullptr, 0);
+        function, name, TASK_STACK_BYTES, argument, 1, nullptr, 0);
     return result == pdPASS;
 }
 
@@ -314,7 +382,7 @@ const char *manual_start_blocked() {
     if (!runtime.initialized) return "ota_unavailable";
     if (runtime.operation != OP_NONE || runtime.reboot_pending) return "ota_busy";
     if (!SdStorage::local_access_allowed()) return "usb_storage_active";
-    if (!AirSenseState::system_idle()) return "device_not_idle";
+    if (!AirSenseState::esp_update_allowed()) return "device_not_idle";
     if (ResmedOta::is_active()) return "resmed_ota_active";
     if (!background_work_idle()) return "background_work_active";
     return nullptr;
@@ -328,11 +396,11 @@ const char *start_blocked() {
 
 struct BlockedInputs {
     uint32_t network;
-    bool initialized, ota_busy, device_idle, resmed_active, background_idle, storage_local;
+    bool initialized, ota_busy, esp_update_allowed, resmed_active, background_idle, storage_local;
 
     bool operator==(const BlockedInputs &other) const {
         return network == other.network && initialized == other.initialized &&
-            ota_busy == other.ota_busy && device_idle == other.device_idle &&
+            ota_busy == other.ota_busy && esp_update_allowed == other.esp_update_allowed &&
             resmed_active == other.resmed_active && background_idle == other.background_idle &&
             storage_local == other.storage_local;
     }
@@ -344,13 +412,13 @@ const char *cached_start_blocked() {
     static bool observed = false;
     const BlockedInputs inputs = {WiFiSetup::revision(), runtime.initialized,
         runtime.operation != OP_NONE || runtime.reboot_pending,
-        AirSenseState::system_idle(), ResmedOta::is_active(), background_work_idle(),
+        AirSenseState::esp_update_allowed(), ResmedOta::is_active(), background_work_idle(),
         SdStorage::local_access_allowed()};
     if (!observed || !(inputs == previous)) {
+        const char *previous_upload_blocked = last_upload_blocked;
         last_upload_blocked = manual_start_blocked();
         const char *blocked = start_blocked();
-        if (blocked != last_blocked && runtime.enabled &&
-            runtime.operation == OP_NONE && !runtime.reboot_pending)
+        if (blocked != last_blocked || last_upload_blocked != previous_upload_blocked)
             status_revision.fetch_add(1);
         last_blocked = blocked;
         previous = inputs;
@@ -360,6 +428,15 @@ const char *cached_start_blocked() {
 }
 
 }  // namespace
+
+ReleaseNotes::~ReleaseNotes() { heap_caps_free(text); }
+
+std::shared_ptr<const ReleaseNotes> release_notes(uint32_t id) {
+    if (!id || !lock(pdMS_TO_TICKS(50))) return {};
+    auto result = published_notes && published_notes->id == id ? published_notes : nullptr;
+    unlock();
+    return result;
+}
 
 void init() {
     auto &cfg = Config::get();
@@ -412,26 +489,12 @@ void handle() {
     const char *blocked = "ota_unavailable";
     if (lock(pdMS_TO_TICKS(10))) {
         initialized = runtime.initialized;
-        reboot = runtime.reboot_pending &&
+        reboot = runtime.operation == OP_NONE && runtime.reboot_pending &&
                  deadline_due(millis(), runtime.reboot_at_ms);
         if (reboot) prepare = runtime.reboot_prepare;
         auto_check = runtime.enabled && runtime.operation == OP_NONE &&
                      !runtime.reboot_pending &&
                      deadline_due(millis(), runtime.next_check_ms);
-        if (runtime.operation == OP_RESMED) {
-            if (ResmedOta::is_active()) runtime.resmed_started = true;
-            bool release_claim =
-                (runtime.resmed_started && !ResmedOta::is_active()) ||
-                (!runtime.resmed_started &&
-                 millis() - runtime.resmed_claimed_at_ms >= 5000);
-            if (release_claim) {
-                runtime.operation = OP_NONE;
-                if (!runtime.resmed_started)
-                    Log::logf(CAT_OTA, LOG_WARN, "ResMed OTA claim expired before start\n");
-                runtime.resmed_started = false;
-                status_revision.fetch_add(1);
-            }
-        }
         blocked = cached_start_blocked();
         unlock();
     }
@@ -480,8 +543,9 @@ bool request_check(const char **error) {
         snprintf(work_url, sizeof(work_url), "%s", cfg.update_url.c_str());
         runtime.operation = OP_CHECK;
         runtime.error[0] = '\0';
+        const uint32_t generation = ++check_generation;
         unlock(true);
-        if (start_worker(check_task, "ota_check")) return true;
+        if (start_worker(check_task, "ota_check", reinterpret_cast<void *>(uintptr_t(generation)))) return true;
         if (lock()) {
             runtime.operation = OP_NONE;
             set_error_locked("update_task_alloc_failed");
@@ -495,19 +559,23 @@ bool request_check(const char **error) {
     return false;
 }
 
-bool request_install(const char **error) {
+bool request_install(const char **error, const char *url) {
     if (error) *error = nullptr;
     if (!mutex || !lock()) {
         if (error) *error = "ota_unavailable";
         return false;
     }
     const char *rejected = start_blocked();
-    if (!rejected && (runtime.result != State::Available || !available_artifact.size))
+    if (!rejected && url && (strlen(url) >= sizeof(work_url) || !OtaUrl::supported(url)))
+        rejected = "update_url_invalid";
+    if (!rejected && !url && ((runtime.result != State::Available && runtime.result != State::Current) ||
+                     !available_artifact.size))
         rejected = "update_not_available";
     if (!rejected) {
+        snprintf(work_url, sizeof(work_url), "%s", url ? url : "");
         runtime.operation = OP_INSTALL;
         runtime.bytes = 0;
-        runtime.total_size = available_artifact.size;
+        runtime.total_size = url ? 0 : available_artifact.size;
         runtime.error[0] = '\0';
         Arbiter::set_state(SYS_OTA_ESP);
         unlock(true);
@@ -529,11 +597,15 @@ bool request_install(const char **error) {
 void config_changed() {
     auto &cfg = Config::get();
     if (!lock()) return;
-    if (runtime.operation == OP_CHECK) runtime.operation = OP_NONE;
+    // Keep the worker's lease until it exits; invalidation cancels its fetch.
+    ++check_generation;
     runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
     runtime.result = State::Idle;
     runtime.update_version[0] = '\0';
     runtime.error[0] = '\0';
+    runtime.version_comparable = true;
+    published_notes.reset();
+    runtime.release_notes_id = 0;
     available_artifact = {};
     runtime.next_check_ms = millis() + INITIAL_CHECK_DELAY_MS;
     unlock(true);
@@ -572,6 +644,10 @@ bool get_status(Status &status) {
     status.progress = progress_percent(runtime.bytes, runtime.total_size);
     status.last_check_age_ms = runtime.last_check_ms
         ? millis() - runtime.last_check_ms : 0;
+    status.version_comparable = runtime.version_comparable;
+    status.release_installable = available_artifact.size &&
+        (runtime.result == State::Available || runtime.result == State::Current);
+    status.release_notes_id = runtime.release_notes_id;
     snprintf(status.update_version, sizeof(status.update_version), "%s",
              runtime.update_version);
     if (status.state == State::Error)
@@ -631,24 +707,43 @@ bool finish_image() { return image_writer.finish(); }
 void abort_image() { image_writer.abort(); }
 const OtaImage::Status &image_status() { return image_writer.status(); }
 
-bool begin_resmed_flash() {
+const char *resmed_flash_blocked(bool from_manual_upload) {
+    if (!lock(pdMS_TO_TICKS(20))) return "ota_busy";
+    const char *blocked = nullptr;
+    if (!mutex || !runtime.initialized) blocked = "ota_unavailable";
+    else if (runtime.operation != (from_manual_upload ? OP_MANUAL : OP_NONE) ||
+             runtime.reboot_pending) blocked = "ota_busy";
+    else if (!SdStorage::local_access_allowed()) blocked = "usb_storage_active";
+    else if (!AirSenseState::system_idle()) blocked = "device_not_idle";
+    else if (ResmedOta::is_active()) blocked = "resmed_ota_active";
+    else if (!background_work_idle()) blocked = "background_work_active";
+    unlock();
+    return blocked;
+}
+
+bool begin_resmed_flash(const char **error, bool from_manual_upload) {
+    if (error) *error = "ota_unavailable";
     if (!lock()) return false;
-    const bool allowed = !manual_start_blocked();
+    const char *blocked = resmed_flash_blocked(from_manual_upload);
+    const bool allowed = !blocked;
     if (allowed) {
         runtime.operation = OP_RESMED;
-        runtime.resmed_claimed_at_ms = millis();
-        runtime.resmed_started = false;
     }
     unlock(allowed);
+    if (error) *error = blocked;
     return allowed;
 }
 
-void cancel_resmed_flash_claim() {
+void end_resmed_flash() {
     if (!lock()) return;
-    bool cancelled = runtime.operation == OP_RESMED && !runtime.resmed_started;
-    if (cancelled)
-        runtime.operation = OP_NONE;
-    unlock(cancelled);
+    const bool ended = runtime.operation == OP_RESMED;
+    if (ended) runtime.operation = OP_NONE;
+    unlock(ended);
+}
+
+void cancel_resmed_flash_claim() {
+    // Compatibility for old admission callers; an active worker owns cleanup.
+    if (!ResmedOta::is_active()) end_resmed_flash();
 }
 
 bool busy() {

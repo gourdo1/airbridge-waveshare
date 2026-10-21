@@ -7,14 +7,17 @@
 
 namespace StorageBrowser {
 
+constexpr uint32_t LIST_PAGE_SIZE = 32;
+
 enum class Kind { List, File, Archive, Rename, Delete, Immutable };
 enum class StartResult { Started, BadRequest, Busy, Unavailable };
 
 struct Request {
     Kind kind;
     char path[256];
-    char selection[2048]; // Child names separated by newlines, or new name for Rename.
+    char selection[2048]; // Child names separated by newlines, or destination for Rename.
     uint32_t offset;
+    bool firmware_repository = false;
     struct Range { uint32_t first = 0, last = 0; } ranges[8];
     uint8_t range_count = 0;
     bool head = false, unchanged = false;
@@ -33,6 +36,10 @@ public:
 using Ready = std::function<void(int code, const char *error,
     std::shared_ptr<Transfer> transfer, uint64_t size)>;
 using Released = void (*)();
+// Optional metadata consumer instead of a JSON transfer. A null path marks the
+// end of the page; more then indicates another page. Runs in the list worker.
+using ListSink = std::function<bool(const char *path, uint64_t size,
+    int64_t modified, bool directory, bool more)>;
 
 struct MutationStatus {
     bool active;
@@ -41,14 +48,19 @@ struct MutationStatus {
     char error[48];
 };
 
-// One SD operation. Immutable reads admit one bounded waiting successor while
-// the previous response is being released. Ready runs outside the SD executor.
+// At most two active read responses and four FIFO waiting descriptors. Waiting
+// reads have no worker, transfer buffers or SD admission. Started includes
+// queued work; activation failures are delivered through Ready. Cancellation
+// removes a waiting descriptor immediately. Mutations are not queued.
+// Ready runs outside the SD executor, including immediate activation failure.
 // Size zero for archives denotes HTTP chunked transfer.
-// Mutations return no Transfer; completion is also retained for the CLI.
-// Released runs once in the producer after ending its SD session, including
-// cancellation/failure. It is not called if start returns other than Started.
+// Mutations return no Transfer; Ready runs after releasing SD and admission.
+// Completion is also retained for the CLI.
+// Released runs once after ending SD access, or without a session for work
+// cancelled/failed before activation. It is not called unless start returns
+// Started. An active slot outlives the producer until its response is released.
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
-                  Released released = nullptr);
+                  Released released = nullptr, ListSink listing = {});
 void mutation_status(MutationStatus &out);
 
 }  // namespace StorageBrowser

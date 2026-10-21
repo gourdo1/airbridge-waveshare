@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <memory>
 #include "ota_image_writer.h"
 
 namespace OtaManager {
@@ -19,6 +20,19 @@ namespace OtaManager {
         uint32_t last_check_age_ms;
         char update_version[48];
         char error[64];
+        bool version_comparable;
+        bool release_installable;
+        uint32_t release_notes_id;
+    };
+
+    struct ReleaseNotes {
+        ReleaseNotes() = default;
+        ~ReleaseNotes();
+        ReleaseNotes(const ReleaseNotes &) = delete;
+        ReleaseNotes &operator=(const ReleaseNotes &) = delete;
+        uint32_t id = 0;
+        uint8_t *text = nullptr;
+        size_t size = 0;
     };
 
     void init();
@@ -29,11 +43,14 @@ namespace OtaManager {
     bool request_reboot(bool (*prepare)() = nullptr);
 
     bool request_check(const char **error = nullptr);
-    bool request_install(const char **error = nullptr);
+    // No URL installs the checked release; a URL is a one-time image source.
+    bool request_install(const char **error = nullptr, const char *url = nullptr);
     void config_changed();
     uint32_t revision();
     bool get_status(Status &status);
     const char *state_name(State state);
+    // Pins the exact published description; never fetches or reads storage.
+    std::shared_ptr<const ReleaseNotes> release_notes(uint32_t id);
 
     bool begin_manual_upload(const char **error = nullptr);
     void end_manual_upload(bool success, const char *error = nullptr);
@@ -46,7 +63,12 @@ namespace OtaManager {
     void abort_image();
     const OtaImage::Status &image_status();
 
-    bool begin_resmed_flash();
+    // Only the ResMed owner/claimed upload source may use these. Promotion
+    // transfers OP_MANUAL atomically; no gap in the update/USB reservation.
+    const char *resmed_flash_blocked(bool from_manual_upload = false);
+    bool begin_resmed_flash(const char **error = nullptr,
+                            bool from_manual_upload = false);
+    void end_resmed_flash();
     void cancel_resmed_flash_claim();
     bool busy();
 }

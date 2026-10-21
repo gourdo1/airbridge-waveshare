@@ -10,6 +10,9 @@
 #include "oxi_udp.h"
 #include "oxi_arbiter.h"
 #include "airbridge_ota.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
+#include "resmed_ota.h"
 #include "factory_reset.h"
 #include "tls_memory.h"
 #include "web_ui.h"
@@ -145,6 +148,8 @@ void setup() {
     AirSenseState::poll();
 
     SdStorage::init();
+    ResmedFirmwareRepository::init();
+    ResmedFirmwareUpload::init();
     CustomSettings::init();
     LiveStream::init();
     LiveTce::register_parser();
@@ -242,6 +247,8 @@ void loop() {
 #endif
 
     OtaManager::handle();
+    ResmedOta::poll();
+    ResmedFirmwareRepository::poll();
     WiFiSetup::check();
     Log::poll();
     TcpBridge::poll_debug_clients();
@@ -273,6 +280,7 @@ void loop() {
     AirSenseState::poll();
     Air10Stream::poll();
     Air10Clock::handle();
+    CustomSettings::poll();
 
     LiveWebConsumer::tick();
     StatusScreen::tick();

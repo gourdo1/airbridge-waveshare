@@ -6,6 +6,8 @@
 #include "oxi_ble.h"
 #include "oxi_arbiter.h"
 #include "resmed_ota.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
 #include "debug_log.h"
 #include "crash_diagnostics.h"
 #include "app_config.h"
@@ -40,6 +42,7 @@
 #include <new>
 #include <errno.h>
 #include <utility>
+#include <memory>
 #include <mutex>
 
 static AsyncWebServer *http = nullptr;
@@ -346,6 +349,71 @@ static void jsonAddBool(FixedJson &json, const char *key, bool val,
     fixedJsonPrintf(json, "%s\"%s\":%s", comma ? "," : "", key, val ? "true" : "false");
 }
 
+static void jsonAppend(String &json, const char *text) { json += text; }
+static void jsonAppend(FixedJson &json, const char *text) { fixedJsonAppend(json, text); }
+
+template<class Output>
+static void appendFirmwareImage(Output &json, const ResmedFirmwareImage::Result &image) {
+    using namespace ResmedFirmwareImage;
+    jsonAddString(json, "detected_block", block_name(image.target));
+    jsonAddBool(json, "crc_ok", image.crc_ok());
+    if (image.bid_present) {
+        jsonAddString(json, "bid", image.bid);
+        jsonAddBool(json, "bid_ok", image.bid_supported && image.bid_matches);
+        jsonAddString(json, "blx_patch", image.integrity_patch == IntegrityPatch::Unsafe ?
+            "method_a" : image.integrity_patch == IntegrityPatch::Safe ? "method_b" :
+            image.integrity_patch == IntegrityPatch::Partial ? "partial" : "none");
+    }
+    for (size_t i = 0; i < image.block_count; ++i) {
+        const auto &block = image.blocks[i];
+        const char *key = block.range.block == Block::BLX ? "blx_crc" :
+                          block.range.block == Block::CCX ? "ccx_crc" : "cdx_crc";
+        jsonAddString(json, key, block.crc_ok ? "ok" : "fail");
+    }
+}
+
+template<class Output>
+static void appendFirmwareUpload(Output &json, const ResmedFirmwareUpload::Status &status) {
+    using State = ResmedFirmwareUpload::State;
+    jsonAddUInt32(json, "revision", status.revision, false);
+    jsonAddUInt32(json, "id", status.id);
+    jsonAddBool(json, "active", status.state == State::Receiving || status.state == State::Finalizing);
+    jsonAddBool(json, "ready", status.source_ready);
+    jsonAddBool(json, "cancel_allowed", status.cancel_allowed);
+    jsonAddBool(json, "repository", status.destination == ResmedFirmwareUpload::Destination::Repository);
+    jsonAddUInt32(json, "size", status.size);
+    jsonAddUInt32(json, "received", status.received);
+    jsonAddUInt32(json, "written", status.written);
+    jsonAddString(json, "path", status.path);
+    jsonAddString(json, "error", status.error);
+    if (status.bootloader) appendFirmwareImage(json, status.image);
+}
+
+template<class Output>
+static void appendResmedOperation(Output &json, const ResmedOta::Status &status) {
+    jsonAddUInt32(json, "revision", status.revision, false);
+    jsonAddUInt32(json, "id", status.id);
+    jsonAddBool(json, "active", status.active);
+    jsonAddString(json, "phase", status.phase);
+    jsonAddUInt32(json, "sent", status.sent);
+    jsonAddUInt32(json, "total", status.total);
+    jsonAddString(json, "error", status.error);
+    jsonAddString(json, "source_path", status.source_path);
+    jsonAddString(json, "block", status.block);
+    jsonAddString(json, "device_bid", status.device_bid);
+    jsonAddBool(json, "prepared", status.prepared);
+    jsonAddBool(json, "cancel_allowed", status.cancel_allowed);
+    jsonAddBool(json, "install_allowed", status.install_allowed);
+    jsonAddBool(json, "upload_allowed", status.upload_allowed);
+    jsonAddBool(json, "dump_allowed", status.dump_allowed);
+    jsonAddString(json, "blocked", status.blocked);
+    jsonAddString(json, "dump_blocked", status.dump_blocked);
+    jsonAddBool(json, "recovery_available", status.recovery_available);
+    jsonAddString(json, "recovery_path", status.recovery_path);
+    jsonAddBool(json, "confirmation_required", status.confirmation_required);
+    appendFirmwareImage(json, status.image);
+}
+
 static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
     strcpy(esp_time, "--");
     time_t now = time(nullptr);
@@ -359,10 +427,11 @@ static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
     Air10Clock::status_time(resmed_time);
 }
 
-enum StatusFields : uint8_t {
+enum StatusFields : uint16_t {
     STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
     STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_REPORT = 32,
-    STATUS_STORAGE = 64, STATUS_ALL = 127,
+    STATUS_STORAGE = 64, STATUS_CLINICAL = 128,
+    STATUS_FIRMWARE = 256, STATUS_ALL = 511,
 };
 
 template<class Output>
@@ -371,13 +440,20 @@ static void appendStatusIdentity(Output &json, bool comma = true) {
     AirSenseState::identity(identity);
     jsonAddString(json, "version", airbridge_version(), comma);
     jsonAddString(json, "built", airbridge_build_date());
+    jsonAddString(json, "target", AB_OTA_RELEASE_TARGET);
     jsonAddString(json, "pna", identity.pna);
     jsonAddString(json, "srn", identity.srn);
 }
 
 template<class Output>
+static void appendWifiAddresses(Output &json, uint32_t sta, uint32_t ap) {
+    jsonAddString(json, "ip", sta ? IPAddress(sta).toString().c_str() : "");
+    jsonAddString(json, "ap_ip", ap ? IPAddress(ap).toString().c_str() : "");
+}
+
+template<class Output>
 static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &status,
-                                uint8_t fields) {
+                                uint16_t fields) {
     if (fields & STATUS_THERAPY) {
         jsonAddString(json, "system", system_state_name(status.sys));
         jsonAddInt(json, "rop", status.rop);
@@ -396,16 +472,40 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
                    static_cast<int>(ESP.getFreePsram()) : -1);
         jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
         jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
+        appendWifiAddresses(json, status.ip, status.ap_ip);
         jsonAddInt(json, "uptime", millis() / 1000);
     }
     if (fields & STATUS_STORAGE) {
         const auto &sd = status.storage;
         jsonAddString(json, "sd", SdStorage::state_name(sd));
 #if AB_STORAGE_HAS_SDCARD
+        jsonAddString(json, "sd_bus", SdStorage::bus_name(sd.bus));
+        jsonAddBool(json, "sd_bus_active", sd.bus_active);
+        jsonAddInt(json, "sd_bus_width", sd.bus_width);
+        jsonAddUInt32(json, "sd_bus_clock_khz", sd.bus_clock_khz);
+        jsonAddUInt32(json, "sd_bus_clock_limit_khz", sd.bus_clock_limit_khz);
+        jsonAddString(json, "sd_card_type", SdStorage::card_type_name(sd.card_type));
         jsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
         jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
         jsonAddBool(json, "sd_usb_supported", sd.usb_supported);
         jsonAddString(json, "sd_error", sd.error);
+        jsonAddString(json, "sd_format_result", SdStorage::format_result_name(sd.format_result));
+        jsonAddString(json, "sd_format_error", sd.format_error);
+        const auto &error = sd.spi_error;
+        jsonAddBool(json, "sd_spi_error", error.valid);
+        if (error.valid) {
+            jsonAddBool(json, "sd_spi_write", error.write);
+            jsonAddInt(json, "sd_spi_drive", error.drive);
+            jsonAddInt(json, "sd_spi_command", error.command);
+            jsonAddUInt32(json, "sd_spi_argument", error.argument);
+            jsonAddUInt32(json, "sd_spi_sector", error.sector);
+            jsonAddUInt32(json, "sd_spi_count", error.count);
+            jsonAddUInt32(json, "sd_spi_occurred_ms", error.occurred_ms);
+            jsonAddUInt32(json, "sd_spi_elapsed_ms", error.elapsed_ms);
+            jsonAddInt(json, "sd_spi_response", error.response);
+            jsonAddInt(json, "sd_spi_disk_result", error.disk_result);
+            jsonAddString(json, "sd_spi_phase", error.phase);
+        }
 #endif
     }
     if (fields & STATUS_OXI) {
@@ -421,6 +521,8 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
     if (fields & STATUS_CONFIG) {
         jsonAddUInt32(json, "config_revision", Config::revision());
         jsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
+        jsonAddString(json, "ui_language", status.ui_language);
+        jsonAddString(json, "ui_theme", status.ui_theme);
     }
     if (fields & STATUS_REPORT) {
         jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
@@ -430,6 +532,19 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "report_state", EdfReport::state_name(status.report_state));
         jsonAddString(json, "report_error", status.report_error);
         jsonAddBool(json, "report_available", status.report_available);
+    }
+    if (fields & STATUS_CLINICAL)
+        jsonAddUInt32(json, "clinical_revision", status.clinical_revision);
+    if (fields & STATUS_FIRMWARE) {
+        jsonAddUInt32(json, "firmware_repository_revision", status.firmware_repository.revision);
+        jsonAddBool(json, "firmware_repository_supported", status.firmware_repository.supported);
+        jsonAddBool(json, "firmware_repository_available", status.firmware_repository.available);
+        jsonAppend(json, ",\"firmware_upload\":{");
+        appendFirmwareUpload(json, status.firmware_upload);
+        jsonAppend(json, "}");
+        jsonAppend(json, ",\"resmed\":{");
+        appendResmedOperation(json, status.resmed);
+        jsonAppend(json, "}");
     }
     if (fields & STATUS_IDENTITY) appendStatusIdentity(json);
 }
@@ -500,22 +615,32 @@ static size_t buildStatusJson(char *out, size_t cap) {
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
-// and both uint32 report revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2304 : 1344;
+// and uint32 owner revisions/SPI diagnostics.
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 6144 : 4096;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
+static uint32_t status_cache_config_revision = 0;
 
 static bool refreshStatusCacheIfNeeded() {
     uint32_t now = millis();
-    if (status_cache.length() > 0 && now - status_cache_built_at < STATUS_CACHE_TTL_MS)
+    const uint32_t revision = Config::revision();
+    if (status_cache.length() > 0 && status_cache_config_revision == revision &&
+        now - status_cache_built_at < STATUS_CACHE_TTL_MS)
         return true;
 
-    char body[STATUS_JSON_MAX];
-    size_t len = buildStatusJson(body, sizeof(body));
+    // Keep bounded serialization scratch off the AsyncTCP task stack.
+    std::unique_ptr<char, decltype(&aircannect::Memory::free)> body(
+        static_cast<char *>(aircannect::Memory::alloc_large(STATUS_JSON_MAX)),
+        aircannect::Memory::free);
+    if (!body) return false;
+    size_t len = buildStatusJson(body.get(), STATUS_JSON_MAX);
     if (len == 0) return false;
 
-    status_cache = body;
+    if (!status_cache.reserve(len)) return false;
+    status_cache = body.get();
+    if (status_cache.length() != len) return false;
     status_cache_built_at = millis();
+    status_cache_config_revision = revision;
     return true;
 }
 
@@ -900,8 +1025,7 @@ static void sendReportResult(AsyncWebServerRequest *request, SleepReport::Source
         auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
         if (response) request->send(response);
         else request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
-    } else if (code == 202 || (!pending && code == 503)) {
-        // Admission succeeded; a contended result lock is still an accepted job.
+    } else if (code == 202) {
         sendReportJob(request, source, id, pending);
     } else {
         request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
@@ -1078,7 +1202,8 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
 
 enum ExportFields : uint8_t {
     EXPORT_RUN = 1, EXPORT_CHECK = 2, EXPORT_BACKLOG = 4,
-    EXPORT_META = 8, EXPORT_ACTIONS = 16, EXPORT_ALL = 31,
+    EXPORT_META = 8, EXPORT_ACTIONS = 16, EXPORT_ACTIVITY = 32,
+    EXPORT_LAST_RUN = 64, EXPORT_ALL = 127,
 };
 
 #if AB_STORAGE_HAS_SDCARD
@@ -1095,7 +1220,6 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddUInt32(json, "files_seen", status.files_seen);
         jsonAddString(json, "current_day", status.current_day);
         jsonAddBool(json, "backlog_known", status.backlog.known);
-        jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         char bytes[48];
         snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
                  static_cast<unsigned long long>(status.bytes_uploaded));
@@ -1114,6 +1238,31 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
         jsonAddString(json, "error", status.last_error);
     }
+    if (fields & EXPORT_ACTIVITY) {
+        json += ",\"activity\":{";
+        jsonAddString(json, "phase", status.activity.phase, false);
+        jsonAddString(json, "wait", status.activity.wait);
+        jsonAddString(json, "file", status.activity.file);
+        json += '}';
+    }
+    if (fields & EXPORT_LAST_RUN) {
+        const auto &last = status.last_run;
+        json += ",\"last_run\":{";
+        jsonAddBool(json, "available", last.available, false);
+        jsonAddBool(json, "success", last.success);
+        jsonAddUInt32(json, "finished_epoch", last.finished_epoch);
+        jsonAddUInt32(json, "files_uploaded", last.files_uploaded);
+        jsonAddUInt32(json, "files_skipped", last.files_skipped);
+        jsonAddUInt32(json, "files_attached", last.files_attached);
+        char bytes[48];
+        snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
+                 static_cast<unsigned long long>(last.bytes_uploaded));
+        json += bytes;
+        jsonAddUInt32(json, "import_id", last.import_id);
+        jsonAddString(json, "import_status", last.import_status);
+        jsonAddString(json, "error", last.error);
+        json += '}';
+    }
     if (fields & EXPORT_CHECK) {
         jsonAddString(json, "check_state", ExportSync::check_state_name(status.check.state));
         jsonAddString(json, "check_error", status.check.error);
@@ -1121,6 +1270,7 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
     if (fields & EXPORT_BACKLOG) {
         jsonAddString(json, "backlog_state", ExportSync::backlog_state(status.backlog, smb));
         jsonAddUInt32(json, "backlog_files", status.backlog.files);
+        jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         jsonAddUInt32(json, "backlog_waiting", status.backlog.waiting_sessions);
         jsonAddString(json, "backlog_error", status.backlog.error);
     }
@@ -1145,9 +1295,21 @@ static uint8_t exportChanges(const T &a, const T &b) {
         a.files_uploaded != b.files_uploaded || a.files_skipped != b.files_skipped ||
         a.last_sync_epoch != b.last_sync_epoch ||
         strcmp(a.last_error, b.last_error)) fields |= EXPORT_RUN;
+    if (strcmp(a.activity.phase, b.activity.phase) ||
+        strcmp(a.activity.wait, b.activity.wait) || strcmp(a.activity.file, b.activity.file))
+        fields |= EXPORT_ACTIVITY;
+    const auto &x = a.last_run;
+    const auto &y = b.last_run;
+    if (x.available != y.available || x.success != y.success ||
+        x.finished_epoch != y.finished_epoch || x.files_uploaded != y.files_uploaded ||
+        x.files_skipped != y.files_skipped || x.files_attached != y.files_attached ||
+        x.bytes_uploaded != y.bytes_uploaded || x.import_id != y.import_id ||
+        strcmp(x.import_status, y.import_status) || strcmp(x.error, y.error))
+        fields |= EXPORT_LAST_RUN;
     if (a.check.state != b.check.state || strcmp(a.check.error, b.check.error))
         fields |= EXPORT_CHECK;
     if (a.backlog.files != b.backlog.files ||
+        a.backlog.sessions != b.backlog.sessions ||
         a.backlog.waiting_sessions != b.backlog.waiting_sessions ||
         strcmp(a.backlog.error, b.backlog.error)) fields |= EXPORT_BACKLOG;
     return fields;
@@ -1293,14 +1455,11 @@ static void handleExportRequest(AsyncWebServerRequest *request, bool smb) {
 }
 
 
-static const esp_partition_t *resmed_part = nullptr;
-size_t uploadSize = 0;
+static size_t uploadSize = 0;
 static bool uploadOk = false;
-static uint16_t uploadCrc = 0xFFFF;
 
 typedef enum {
     UPLOAD_NONE,
-    UPLOAD_RESMED,
     UPLOAD_ESP,
 } upload_kind_t;
 
@@ -1309,8 +1468,6 @@ static AsyncWebServerRequest *uploadOwner = nullptr;
 static size_t uploadNextIndex = 0;
 static bool uploadComplete = false;
 static bool uploadOwnsUart = false;
-static constexpr size_t UPLOAD_ERASE_BLOCK = 64 * 1024;
-static size_t uploadErased = 0;
 
 static void finishUpload(AsyncWebServerRequest *request, bool success,
                          const char *error) {
@@ -1320,7 +1477,6 @@ static void finishUpload(AsyncWebServerRequest *request, bool success,
         uploadOk = false;
         uploadComplete = false;
         uploadKind = UPLOAD_NONE;
-        resmed_part = nullptr;
     }
     if (uploadOwnsUart && Arbiter::get_state() == SYS_OTA_ESP)
         Arbiter::set_state(SYS_IDLE);
@@ -1347,7 +1503,6 @@ static bool claimUpload(AsyncWebServerRequest *request) {
     }
     uploadOwner = request;
     uploadNextIndex = 0;
-    uploadErased = 0;
     uploadComplete = false;
     uploadOwnsUart = false;
     request->onDisconnect([request]() {
@@ -1375,121 +1530,179 @@ static bool ownsUpload(AsyncWebServerRequest *request) {
     return false;
 }
 
-static bool hasValidResmedUpload() {
-    return !uploadOwner && uploadComplete && uploadKind == UPLOAD_RESMED &&
-           uploadOk && uploadSize > 0 && resmed_part;
-}
+struct FirmwareUploadRequest {
+    uint32_t id;
+    bool final;
+    bool chunked;
+    bool last;
+    uint32_t base;
+    uint32_t end;
+    uint32_t received;
+};
 
-static bool eraseUploadThrough(const esp_partition_t *part, size_t end) {
-    // ResMed staging checks capacity before erasing ahead of its next write.
-    while (uploadErased < end) {
-        const size_t size = min(UPLOAD_ERASE_BLOCK, size_t(part->size - uploadErased));
-        esp_err_t err = esp_partition_erase_range(part, uploadErased, size);
-        if (err != ESP_OK) {
-            Log::logf(CAT_OTA, LOG_ERROR, "Upload erase failed in '%s' at %u: %s\n",
-                      part->label, uploadErased, esp_err_to_name(err));
-            return false;
-        }
-        uploadErased += size;
+static std::shared_ptr<aircannect::AsyncDeferredResponse::State>
+deferResponse(AsyncWebServerRequest *request);
+
+static void handleFirmwareBody(AsyncWebServerRequest *request, uint8_t *data,
+                               size_t len, size_t index, size_t total) {
+    if (request->getResponse() || !checkAuth(request)) return;
+    if (!total || total > ResmedFirmwareUpload::MAX_CHUNK_BYTES || index > total ||
+        !len || len > total - index || !request->hasParam("offset") ||
+        !request->hasParam("final")) {
+        request->send(400, "application/json", "{\"error\":\"invalid_chunk\"}");
+        return;
     }
-    return true;
+    auto *input = static_cast<FirmwareUploadRequest *>(request->_tempObject);
+    if (!input && !index) {
+        uint32_t offset = 0, id = 0, size = 0;
+        const String last = request->getParam("final")->value();
+        if (!aircannect::parse_uint32_decimal(request->getParam("offset")->value().c_str(), offset) ||
+            offset > ResmedFirmwareUpload::MAX_IMAGE_BYTES - total ||
+            (last != "0" && last != "1") ||
+            (request->hasParam("id") && !aircannect::parse_uint32_decimal(
+                request->getParam("id")->value().c_str(), id))) {
+            request->send(400, "application/json", "{\"error\":\"invalid_chunk\"}");
+            return;
+        }
+        if (!id && (offset || !request->hasParam("name") || !request->hasParam("size") ||
+            !aircannect::parse_uint32_decimal(request->getParam("size")->value().c_str(), size) || !size)) {
+            request->send(400, "application/json", "{\"error\":\"invalid_source\"}");
+            return;
+        }
+        input = static_cast<FirmwareUploadRequest *>(calloc(1, sizeof(*input)));
+        if (!input) {
+            request->send(503, "application/json", "{\"error\":\"no_memory\"}");
+            return;
+        }
+        request->_tempObject = input;
+        input->id = id;
+        input->chunked = true;
+        input->last = last == "1";
+        input->base = offset;
+        input->end = offset + total;
+        if (!id) {
+            const bool repository = request->hasParam("repository") && request->getParam("repository")->value() == "1";
+            const bool bootloader = request->hasParam("bootloader") && request->getParam("bootloader")->value() == "1";
+            const auto result = ResmedFirmwareUpload::begin_upload(
+                repository ? ResmedFirmwareUpload::Destination::Repository : ResmedFirmwareUpload::Destination::Staging,
+                request->getParam("name")->value().c_str(), size, input->id, bootloader);
+            if (result != ResmedFirmwareUpload::Result::Accepted) {
+                String json = "{\"ok\":false";
+                jsonAddString(json, "error", ResmedFirmwareUpload::result_name(result));
+                json += '}';
+                request->send(409, "application/json", json);
+                return;
+            }
+        }
+        request->onDisconnect([request]() {
+            const auto *pending = static_cast<FirmwareUploadRequest *>(request->_tempObject);
+            if (!pending) return;
+            const auto *response = request->getResponse();
+            if (!pending->final || (!pending->last && (!response || !response->_finished())))
+                ResmedFirmwareUpload::cancel_input(pending->id);
+        });
+    }
+    if (!input || !input->chunked || input->received != index || input->end != input->base + total) {
+        if (input) ResmedFirmwareUpload::cancel_input(input->id);
+        request->send(400, "application/json", "{\"error\":\"invalid_chunk\"}");
+        return;
+    }
+    const bool complete = index + len == total;
+    const auto result = ResmedFirmwareUpload::submit_chunk(input->id, input->base + index,
+        data, len, input->last && complete);
+    if (result != ResmedFirmwareUpload::Result::Accepted) {
+        ResmedFirmwareUpload::cancel_input(input->id);
+        String json = "{\"ok\":false";
+        jsonAddString(json, "error", ResmedFirmwareUpload::result_name(result));
+        json += '}';
+        request->send(409, "application/json", json);
+        return;
+    }
+    input->received += len;
+    input->final = complete;
 }
 
 static void handleUploadChunk(AsyncWebServerRequest *request, const String& filename,
                                size_t index, uint8_t *data, size_t len, bool final) {
+    if (request->getResponse() || !checkAuth(request)) return;
+    auto *input = static_cast<FirmwareUploadRequest *>(request->_tempObject);
     if (index == 0) {
-        if (!claimUpload(request)) return;
-        Log::logf(CAT_OTA, LOG_INFO, "ResMed upload started: %s\n", filename.c_str());
-        uploadKind = UPLOAD_RESMED;
-        uploadSize = 0;
-        uploadOk = false;
-        uploadCrc = 0xFFFF;
-
-        resmed_part = ResmedOta::get_staging_partition();
-        if (!resmed_part) {
-            Log::logf(CAT_OTA, LOG_ERROR, "No staging partition found\n");
-            uploadKind = UPLOAD_NONE;
-            finishUpload(request, false, "staging_partition_missing");
+        if (input) {
+            ResmedFirmwareUpload::cancel(input->id);
+            request->send(400, "application/json", "{\"error\":\"one_file_required\"}");
             return;
         }
-        Log::logf(CAT_OTA, LOG_DEBUG, "Staging to '%s' (0x%X, %u bytes)\n",
-                     resmed_part->label, resmed_part->address, resmed_part->size);
-
-        uploadOk = true;
+        uint32_t size = 0;
+        if (request->hasParam("size") && !aircannect::parse_uint32_decimal(
+                request->getParam("size")->value().c_str(), size)) {
+            request->send(400, "application/json", "{\"error\":\"invalid_size\"}");
+            return;
+        }
+        input = static_cast<FirmwareUploadRequest *>(calloc(1, sizeof(*input)));
+        if (!input) {
+            request->send(503, "application/json", "{\"error\":\"no_memory\"}");
+            return;
+        }
+        request->_tempObject = input;
+        const bool repository = request->hasParam("repository") &&
+            request->getParam("repository")->value() == "1";
+        const auto result = ResmedFirmwareUpload::begin_upload(
+            repository ? ResmedFirmwareUpload::Destination::Repository :
+                         ResmedFirmwareUpload::Destination::Staging,
+            filename.c_str(), size, input->id);
+        if (result != ResmedFirmwareUpload::Result::Accepted) {
+            String json = "{\"ok\":false";
+            jsonAddString(json, "error", ResmedFirmwareUpload::result_name(result));
+            json += '}';
+            request->send(409, "application/json", json);
+            return;
+        }
+        request->onDisconnect([request]() {
+            auto *pending = static_cast<FirmwareUploadRequest *>(request->_tempObject);
+            if (pending && !pending->final) ResmedFirmwareUpload::cancel(pending->id);
+        });
     }
-
-    if (!acceptUploadChunk(request, index, len, final)) return;
-    if (uploadKind == UPLOAD_RESMED && resmed_part && uploadOk && len > 0) {
-        // reject ESP32 binaries uploaded to resmed slot
-        if (uploadSize == 0 && len > 0 && data[0] == 0xE9) {
-            Log::logf(CAT_OTA, LOG_WARN, "Rejected: ESP32 binary uploaded to ResMed slot\n");
-            uploadOk = false;
-            return;
-        }
-        if (len > resmed_part->size - uploadSize) {
-            Log::logf(CAT_OTA, LOG_WARN, "File too large for partition!\n");
-            uploadOk = false;
-            return;
-        }
-        if (!eraseUploadThrough(resmed_part, uploadSize + len)) {
-            uploadOk = false;
-            return;
-        }
-        esp_err_t err = esp_partition_write(resmed_part, uploadSize, data, len);
-        if (err != ESP_OK) {
-            Log::logf(CAT_OTA, LOG_ERROR, "Write failed at offset %u: %s\n",
-                         uploadSize, esp_err_to_name(err));
-            uploadOk = false;
-            return;
-        }
-        uploadCrc = crc16_ccitt(data, len, uploadCrc);
-        uploadSize += len;
+    if (!input || !input->id) return;
+    const auto result = ResmedFirmwareUpload::submit_chunk(input->id, index, data, len, final);
+    if (result != ResmedFirmwareUpload::Result::Accepted) {
+        ResmedFirmwareUpload::cancel(input->id);
+        String json = "{\"ok\":false";
+        jsonAddString(json, "error", ResmedFirmwareUpload::result_name(result));
+        json += '}';
+        request->send(409, "application/json", json);
+        return;
     }
-
-    if (final) {
-        if (uploadOk) {
-            Log::logf(CAT_OTA, LOG_INFO, "ResMed upload complete: %u bytes\n", uploadSize);
-        }
-    }
+    input->final = final;
 }
 
 static void handleUploadDone(AsyncWebServerRequest *request) {
-    if (!checkAuth(request)) {
-        finishUpload(request, false, "upload_unauthorized");
+    if (request->getResponse() || !checkAuth(request)) return;
+    const auto *input = static_cast<FirmwareUploadRequest *>(request->_tempObject);
+    if (!input || !input->id || !input->final) {
+        request->send(400, "application/json", "{\"error\":\"upload_incomplete\"}");
         return;
     }
-    if (!ownsUpload(request)) return;
-
-    String json = "{";
-    bool validUpload = uploadComplete && uploadKind == UPLOAD_RESMED &&
-                       uploadOk && uploadSize > 0 && resmed_part;
-    jsonAddString(json, "ok", validUpload ? "true" : "false", false);
-    jsonAddInt(json, "size", uploadSize);
-
-    if (validUpload) {
-        char hexcrc[8];
-        snprintf(hexcrc, sizeof(hexcrc), "%04X", uploadCrc);
-        jsonAddString(json, "crc", hexcrc);
-
-        // Firmware verification
-        fw_verify_result_t v = ResmedOta::verify_image(resmed_part, uploadSize);
-        if (v.has_blx) {
-            jsonAddString(json, "bid", v.bid);
-            jsonAddString(json, "bid_ok", v.bid_ok ? "true" : "false");
-            jsonAddString(json, "blx_crc", v.blx_crc_ok ? "ok" : "fail");
-            const char *patch = "none";
-            if (v.blx_patch == BLX_PATCH_A_DANGEROUS) patch = "method_a";
-            else if (v.blx_patch == BLX_PATCH_B_SAFE) patch = "method_b";
-            jsonAddString(json, "blx_patch", patch);
-        }
-        if (v.has_ccx) jsonAddString(json, "ccx_crc", v.ccx_crc_ok ? "ok" : "fail");
-        if (v.has_cdx) jsonAddString(json, "cdx_crc", v.cdx_crc_ok ? "ok" : "fail");
-    }
-
-    finishUpload(request, validUpload,
-                  validUpload ? nullptr : "resmed_upload_failed");
+    String json = "{\"ok\":true";
+    jsonAddInt(json, "upload_id", input->id);
     json += '}';
-    request->send(200, "application/json", json);
+    if (input->chunked) {
+        const auto deferred = deferResponse(request);
+        if (!deferred) { ResmedFirmwareUpload::cancel_input(input->id); return; }
+        const auto result = ResmedFirmwareUpload::when_drained(input->id, input->end,
+            [deferred, json](bool success) {
+                if (deferred->cancelled()) return;
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow)
+                    AsyncBasicResponse(success ? 202 : 409, "application/json",
+                        success ? json : String("{\"ok\":false,\"error\":\"upload_write_failed\"}"))));
+            });
+        if (result != ResmedFirmwareUpload::Result::Accepted) {
+            ResmedFirmwareUpload::cancel_input(input->id);
+            deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow)
+                AsyncBasicResponse(409, "application/json", "{\"error\":\"upload_not_owned\"}")));
+        }
+        return;
+    }
+    request->send(202, "application/json", json);
 }
 
 
@@ -1822,22 +2035,9 @@ static void handleCmd(AsyncWebServerRequest *request) {
 
 static void handleFlashStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
-
+    const auto status = DeviceStatus::snapshot();
     String json = "{";
-    jsonAddString(json, "active", ResmedOta::is_active() ? "true" : "false", false);
-    jsonAddString(json, "phase", ResmedOta::get_phase());
-    jsonAddInt(json, "sent", ResmedOta::get_sent());
-    jsonAddInt(json, "total", ResmedOta::get_total());
-    const char *err = ResmedOta::last_error();
-    if (err && err[0]) {
-        jsonAddString(json, "error", err);
-    }
-
-    if (hasValidResmedUpload()) {
-        const char *detected = ResmedOta::detect_block(uploadSize);
-        jsonAddString(json, "detected_block", detected ? detected : "unknown");
-        jsonAddInt(json, "fw_size", uploadSize);
-    }
+    appendResmedOperation(json, status.resmed);
     json += '}';
     request->send(200, "application/json", json);
 }
@@ -1855,46 +2055,80 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
         return;
     }
 
-    if (ResmedOta::is_active()) {
-        request->send(409, "application/json", "{\"ok\":false,\"error\":\"flash already active\"}");
+    const char *action = doc["action"] | "";
+    if (*action) {
+        const char *error = "invalid_action";
+        bool accepted = false;
+        if (!strcmp(action, "dump")) accepted = ResmedOta::start_dump(&error);
+        else if (!strcmp(action, "confirm_dump")) {
+            if (strcmp(doc["confirm"] | "", "INSTALL_PATCHED_BOOTLOADER"))
+                error = "confirmation_required";
+            else accepted = ResmedOta::confirm_dump(doc["id"] | uint32_t(0), &error);
+        }
+        String json = "{";
+        jsonAddBool(json, "ok", accepted, false);
+        if (!accepted) jsonAddString(json, "error", error);
+        json += '}';
+        request->send(accepted ? 202 : 409, "application/json", json);
         return;
     }
 
-    if (!OtaManager::begin_resmed_flash()) {
-        request->send(409, "application/json",
-                      "{\"ok\":false,\"error\":\"another OTA is active\"}");
+    ResmedOta::InstallRequest install;
+    const char *path = doc["path"] | "";
+    const char *block = doc["block"] | "";
+    if (strlen(path) >= sizeof(install.path) || strlen(block) >= sizeof(install.block)) {
+        request->send(400, "application/json", "{\"error\":\"invalid_source\"}");
         return;
     }
-
-    if (!hasValidResmedUpload()) {
-        OtaManager::cancel_resmed_flash_claim();
-        request->send(400, "application/json", "{\"ok\":false,\"error\":\"no valid ResMed firmware uploaded\"}");
-        return;
-    }
-
-    String block = doc["block"] | "";
-    bool flash_blx = doc["flash_blx"] | false;
-    bool force_blx = doc["force_blx"] | false;
-
-    ResmedOta::start_flash(
-        block.length() > 0 ? block.c_str() : nullptr,
-        uploadSize,
-        flash_blx,
-        force_blx
-    );
-
+    strcpy(install.path, path);
+    strcpy(install.block, block);
+    install.upload_id = doc["upload_id"] | uint32_t(0);
+    install.flash_blx = doc["flash_blx"] | false;
+    install.force_blx = doc["force_blx"] | false;
+    const char *error = nullptr;
+    const bool accepted = ResmedOta::start_install(install, &error);
     String json = "{";
-    jsonAddString(json, "ok", "true", false);
-    jsonAddString(json, "block", block.length() > 0 ? block.c_str() :
-                  (ResmedOta::detect_block(uploadSize) ? ResmedOta::detect_block(uploadSize) : "auto"));
+    jsonAddBool(json, "ok", accepted, false);
+    if (!accepted) jsonAddString(json, "error", error);
     json += '}';
-    request->send(200, "application/json", json);
+    request->send(accepted ? 202 : 409, "application/json", json);
+}
+
+#if AB_STORAGE_HAS_SDCARD
+static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind,
+                          bool repository = false);
+#endif
+
+static void handleFirmwareRepository(AsyncWebServerRequest *request) {
+#if AB_STORAGE_HAS_SDCARD
+    handleStorage(request, StorageBrowser::Kind::List, true);
+#else
+    if (!checkAuth(request)) return;
+    request->send(200, "application/json", "{\"supported\":false,\"ready\":false,\"entries\":[]}");
+#endif
+}
+
+static void handleFirmwareRepositoryRefresh(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    String body;
+    if (!getBody(request, body)) return;
+    aircannect::JsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (!parseJsonObject(body, doc) || strcmp(doc["action"] | "", "refresh") != 0) {
+        request->send(400, "application/json", "{\"error\":\"invalid_action\"}");
+        return;
+    }
+    ResmedFirmwareRepository::request_refresh();
+    request->send(202, "application/json", "{\"ok\":true}");
 }
 
 
 static void handleFlashCancel(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
     ResmedOta::cancel();
+    ResmedFirmwareUpload::Status upload;
+    ResmedFirmwareUpload::get_status(upload);
+    ResmedFirmwareUpload::cancel(upload.id);
     request->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1914,7 +2148,6 @@ static void handleEspOtaChunk(AsyncWebServerRequest *request, const String& file
         if (!claimUpload(request)) return;
         Log::logf(CAT_OTA, LOG_DEBUG, "ESP OTA start: %s\n", filename.c_str());
         uploadKind = UPLOAD_ESP;
-        resmed_part = nullptr;
         uploadSize = 0;
         uploadOk = false;
 
@@ -1972,21 +2205,29 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     json.reserve(full ? 512 : 96);
     jsonAddString(json, "state", OtaManager::state_name(status.state), false);
     jsonAddUInt32(json, "revision", status.revision);
+    jsonAddUInt32(json, "release_notes_id", status.release_notes_id);
+    jsonAddBool(json, "version_comparable", status.version_comparable);
+    jsonAddBool(json, "release_installable", status.release_installable);
+    jsonAddString(json, "upload_blocked", status.upload_blocked ? status.upload_blocked : "");
     if (status.state == OtaManager::State::Installing ||
-        status.state == OtaManager::State::Rebooting)
+        status.state == OtaManager::State::Rebooting) {
         jsonAddInt(json, "progress", status.progress);
+        jsonAddInt(json, "bytes", status.bytes);
+        jsonAddInt(json, "total_size", status.total_size);
+    }
     else if (status.blocked && status.state != OtaManager::State::Busy &&
-             status.state != OtaManager::State::Checking &&
-             status.state != OtaManager::State::Disabled)
+             status.state != OtaManager::State::Checking)
         jsonAddString(json, "blocked", status.blocked);
     if (full) {
-        jsonAddString(json, "upload_blocked", status.upload_blocked ? status.upload_blocked : "");
         jsonAddString(json, "version", airbridge_version());
         jsonAddUInt32(json, "uptime", millis() / 1000);
         jsonAddString(json, "release_target", AB_OTA_RELEASE_TARGET);
         json += ",\"upload_encodings\":[\"auto\",\"plain\",\"zlib\"]";
-        jsonAddInt(json, "bytes", status.bytes);
-        jsonAddInt(json, "total_size", status.total_size);
+        if (status.state != OtaManager::State::Installing &&
+            status.state != OtaManager::State::Rebooting) {
+            jsonAddInt(json, "bytes", status.bytes);
+            jsonAddInt(json, "total_size", status.total_size);
+        }
         jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
     }
     if (status.update_version[0]) jsonAddString(json, "update_version", status.update_version);
@@ -2026,10 +2267,53 @@ static void handleOtaStatus(AsyncWebServerRequest *request) {
     sendOtaStatus(request, 200);
 }
 
+class ReleaseNotesResponse : public BufferedResponse {
+public:
+    explicit ReleaseNotesResponse(std::shared_ptr<const OtaManager::ReleaseNotes> notes)
+        : notes_(std::move(notes)) {
+        begin(200, notes_->size, "text/markdown; charset=utf-8");
+        addHeader("Cache-Control", "no-store");
+        addHeader("X-Content-Type-Options", "nosniff");
+    }
+
+    bool _sourceValid() const override { return bool(notes_); }
+
+protected:
+    size_t readBody(size_t offset, char *out, size_t capacity) override {
+        if (offset >= notes_->size) return 0;
+        const size_t count = min(capacity, notes_->size - offset);
+        memcpy(out, notes_->text + offset, count);
+        return count;
+    }
+
+private:
+    std::shared_ptr<const OtaManager::ReleaseNotes> notes_;
+};
+
+static void handleOtaReleaseNotes(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    uint32_t id = 0;
+    if (!request->hasParam("id") ||
+        !aircannect::parse_uint32_decimal(request->getParam("id")->value().c_str(), id) || !id) {
+        request->send(400, "text/plain", "invalid release notes id");
+        return;
+    }
+    auto notes = OtaManager::release_notes(id);
+    if (!notes) {
+        request->send(404, "text/plain", "release notes unavailable");
+        return;
+    }
+    auto response = new(std::nothrow) ReleaseNotesResponse(std::move(notes));
+    if (!response) request->send(503, "text/plain", "release notes response unavailable");
+    else request->send(response);
+}
+
 static void handleOtaRequest(AsyncWebServerRequest *request, bool install) {
     if (!checkAuth(request)) return;
     const char *error = nullptr;
-    bool accepted = install ? OtaManager::request_install(&error) : OtaManager::request_check(&error);
+    const auto *url = install && request->hasParam("url") ? request->getParam("url") : nullptr;
+    bool accepted = install ? OtaManager::request_install(&error, url ? url->value().c_str() : nullptr)
+                            : OtaManager::request_check(&error);
     if (accepted) sendOtaStatus(request, 202);
     else {
         String json = "{";
@@ -2058,7 +2342,9 @@ static void handleWifiGet(AsyncWebServerRequest *request) {
     jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
     jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
     jsonAddInt(json, "net_idx", WiFiSetup::connected_net_idx());
-    jsonAddString(json, "ip", WiFiSetup::is_connected() ? WiFi.localIP().toString().c_str() : "");
+    uint32_t sta, ap;
+    WiFiSetup::addresses(sta, ap);
+    appendWifiAddresses(json, sta, ap);
     jsonAddString(json, "roam", cfg.wifi_roam ? "1" : "0");
 
     json += ",\"networks\":[";
@@ -2336,13 +2622,14 @@ static void handleStorageUsb(AsyncWebServerRequest *request) {
     request->send(202, "application/json", "{\"ok\":true}");
 }
 
-static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind) {
+static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind, bool repository) {
     if (!checkAuth(request)) return;
     StorageBrowser::Request operation = {};
     operation.kind = kind;
+    operation.firmware_repository = repository;
     const bool mutation = kind == StorageBrowser::Kind::Rename || kind == StorageBrowser::Kind::Delete;
     const String path = request->hasParam("path", mutation)
-        ? request->getParam("path", mutation)->value() : "/";
+        ? request->getParam("path", mutation)->value() : repository ? ResmedFirmwareRepository::ROOT : "/";
     if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path) ||
         path.length() != strlen(path.c_str())) {
         request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
@@ -2464,6 +2751,15 @@ void WebUI::init(uint16_t port) {
 
     http->on("/", HTTP_GET, handleRoot);
     http->on("/wizard", HTTP_GET, handleRoot);
+    for (const auto &asset : UI_THEME_ASSETS) {
+        http->on(AsyncURIMatcher::exact(asset.url), HTTP_GET, [asset](AsyncWebServerRequest *request) {
+            if (!checkAuth(request)) return;
+            auto *response = request->beginResponse(200, "text/css; charset=utf-8", asset.data, asset.size);
+            response->addHeader("Content-Encoding", "gzip");
+            response->addHeader("Cache-Control", "private, max-age=31536000, immutable");
+            request->send(response);
+        });
+    }
     http->on("/api/onboarding", HTTP_POST, handleOnboardingComplete, NULL, handleJsonBody);
     http->on("/api/status", HTTP_GET, handleStatus);
     http->on(AsyncURIMatcher::exact("/api/crash"), HTTP_GET, handleCrashStatus);
@@ -2494,13 +2790,15 @@ void WebUI::init(uint16_t port) {
     });
 #endif
     http->on("/api/live", HTTP_GET, handleLive);
-    http->on("/api/upload", HTTP_POST, handleUploadDone, handleUploadChunk);
+    http->on(AsyncURIMatcher::exact("/api/upload"), HTTP_POST, handleUploadDone, handleUploadChunk, handleFirmwareBody);
+    http->on(AsyncURIMatcher::exact("/api/resmed/repository"), HTTP_GET, handleFirmwareRepository);
+    http->on(AsyncURIMatcher::exact("/api/resmed/repository"), HTTP_POST, handleFirmwareRepositoryRefresh, NULL, handleJsonBody);
     http->on("/api/ble", HTTP_GET, handleBleStatus);
     http->on("/api/ble", HTTP_POST, handleBleAction, NULL, handleJsonBody);
     http->on("/api/cmd", HTTP_POST, handleCmd, NULL, handleJsonBody);
-    http->on("/api/flash", HTTP_GET, handleFlashStatus);
-    http->on("/api/flash", HTTP_POST, handleFlashStart, NULL, handleJsonBody);
-    http->on("/api/flash/cancel", HTTP_POST, handleFlashCancel);
+    http->on(AsyncURIMatcher::exact("/api/flash"), HTTP_GET, handleFlashStatus);
+    http->on(AsyncURIMatcher::exact("/api/flash"), HTTP_POST, handleFlashStart, NULL, handleJsonBody);
+    http->on(AsyncURIMatcher::exact("/api/flash/cancel"), HTTP_POST, handleFlashCancel);
     http->on("/api/time", HTTP_POST, handleTimeAction, NULL, handleJsonBody);
 #if AB_STORAGE_HAS_SDCARD
     http->on(AsyncURIMatcher::exact("/api/report/artifact"), HTTP_GET | HTTP_HEAD, handleReportArtifact);
@@ -2511,7 +2809,8 @@ void WebUI::init(uint16_t port) {
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
-    http->on("/api/ota", HTTP_GET, handleOtaStatus);
+    http->on(AsyncURIMatcher::exact("/api/ota"), HTTP_GET, handleOtaStatus);
+    http->on(AsyncURIMatcher::exact("/api/ota/release-notes"), HTTP_GET, handleOtaReleaseNotes);
     http->on("/api/ota/check", HTTP_POST, handleOtaCheck);
     http->on("/api/ota/install", HTTP_POST, handleOtaInstall);
     http->on("/api/reboot", HTTP_POST, handleReboot);
@@ -2522,11 +2821,14 @@ void WebUI::init(uint16_t port) {
     Log::logf(CAT_WEB, LOG_INFO, "HTTP server on port %d\n", port);
 }
 
-static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
+static uint16_t statusChanges(const DeviceStatus::Snapshot &a,
                              const DeviceStatus::Snapshot &b) {
-    uint8_t fields = 0;
+    uint16_t fields = 0;
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
+    if (a.ip != b.ip || a.ap_ip != b.ap_ip) fields |= STATUS_HEALTH;
+    if (strcmp(a.ui_language, b.ui_language) || strcmp(a.ui_theme, b.ui_theme))
+        fields |= STATUS_CONFIG;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
         strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||
@@ -2539,17 +2841,33 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         a.report_state != b.report_state || strcmp(a.report_error, b.report_error) ||
         a.report_available != b.report_available)
         fields |= STATUS_REPORT;
+    if (a.clinical_revision != b.clinical_revision) fields |= STATUS_CLINICAL;
+    if (a.firmware_repository.revision != b.firmware_repository.revision ||
+        a.firmware_upload.revision != b.firmware_upload.revision ||
+        a.resmed.revision != b.resmed.revision)
+        fields |= STATUS_FIRMWARE;
+    // AirCANnect first-error semantics: the owner retains one immutable fault
+    // until reboot, so only its publication transition can change.
     if (a.storage.mode != b.storage.mode || a.storage.mounted != b.storage.mounted ||
         a.storage.supported != b.storage.supported ||
+        a.storage.bus != b.storage.bus ||
+        a.storage.spi_error.valid != b.storage.spi_error.valid ||
+        a.storage.bus_active != b.storage.bus_active ||
+        a.storage.bus_width != b.storage.bus_width ||
+        a.storage.bus_clock_khz != b.storage.bus_clock_khz ||
+        a.storage.bus_clock_limit_khz != b.storage.bus_clock_limit_khz ||
+        a.storage.card_type != b.storage.card_type ||
         a.storage.card_bytes != b.storage.card_bytes || a.storage.used_bytes != b.storage.used_bytes ||
         a.storage.usb_supported != b.storage.usb_supported ||
-        strcmp(a.storage.error, b.storage.error))
+        strcmp(a.storage.error, b.storage.error) ||
+        a.storage.format_result != b.storage.format_result ||
+        strcmp(a.storage.format_error, b.storage.format_error))
         fields |= STATUS_STORAGE;
     return fields;
 }
 
 static String build_status_payload(const DeviceStatus::Snapshot &status,
-                                   uint8_t fields = STATUS_ALL) {
+                                   uint16_t fields = STATUS_ALL) {
     String sj = "{";
     jsonAddUInt32(sj, "sample_ms", millis(), false);
     appendStatusFields(sj, status, fields);
@@ -2570,10 +2888,10 @@ void WebUI::push_status_event() {
 static void publishStatus() {
     static uint32_t revision = 1, health_at = 0, oxi_at = 0;
     static uint32_t ble_revision = 0, config_revision = 0, device_revision = 0;
-    static uint8_t pending_fields = STATUS_ALL;
+    static uint16_t pending_fields = STATUS_ALL;
     const auto status = DeviceStatus::snapshot();
     const uint32_t now = millis();
-    uint8_t fields = statusChanges(status, last_published);
+    uint16_t fields = statusChanges(status, last_published);
     if (status_requested) fields |= STATUS_THERAPY;
     if ((fields & STATUS_OXI) || OxiBle::revision() != ble_revision ||
         (now - oxi_at >= 2000 && live_events && live_events->count())) {

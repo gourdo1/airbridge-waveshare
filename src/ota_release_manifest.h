@@ -17,6 +17,7 @@ struct Artifact {
 
 struct Manifest {
     char version[VERSION_MAX] = {};
+    char release_notes_url[URL_MAX] = {};
     Artifact artifact;
 };
 
@@ -28,5 +29,9 @@ bool is_newer(const char *current_version, const char *release_version,
 
 bool resolve_artifact_url(const char *manifest_url, const char *artifact_url,
                           char *resolved_url, size_t resolved_capacity);
+
+bool resolve_release_notes_url(const char *manifest_url, const Manifest &manifest,
+                               const char *target, char *resolved_url,
+                               size_t resolved_capacity);
 
 }  // namespace OtaRelease

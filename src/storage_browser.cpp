@@ -1,4 +1,5 @@
 #include "storage_browser.h"
+#include "resmed_firmware_repository.h"
 #include "board.h"
 
 #if AB_STORAGE_HAS_SDCARD
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <new>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include "crc.h"
 #include "json_util.h"
@@ -16,6 +18,7 @@
 #include "sd_storage.h"
 #include "debug_log.h"
 #include "export_sync.h"
+#include "airsense_state.h"
 
 namespace StorageBrowser {
 namespace {
@@ -25,9 +28,19 @@ constexpr size_t INTERNAL_RING_BYTES = 4096;
 constexpr size_t INTERNAL_COPY_BYTES = 1024;
 static_assert(SdStorage::READ_CHUNK_BYTES <= UINT16_MAX, "ZIP stored block length");
 constexpr uint32_t CONSUMER_TIMEOUT_MS = 30000;
+constexpr unsigned MAX_ACTIVE_READS = 2;
+constexpr unsigned MAX_PENDING_READS = 4;
+class Job;
 std::atomic<unsigned> active_operations{0};
+std::shared_ptr<Job> pending_reads[MAX_PENDING_READS];
+unsigned pending_count = 0;
+bool exclusive_operation = false, dispatching = false;
+portMUX_TYPE admission_mux = portMUX_INITIALIZER_UNLOCKED;
 MutationStatus mutation = {};
 portMUX_TYPE mutation_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void release_slot();
+void cancel_pending(Job *job);
 
 bool mutating(Kind kind) { return kind == Kind::Rename || kind == Kind::Delete; }
 
@@ -73,12 +86,27 @@ bool rename_target(const Request &request, char (&out)[256]) {
     if (!slash || !slash[1]) return false;
     if (slash == parent) slash[1] = 0;
     else *slash = 0;
-    return child_path(parent, request.selection, strlen(request.selection), out);
+    const char *name = request.selection;
+    const int written = name[0] == '/'
+        ? snprintf(out, sizeof(out), "%s", name)
+        : snprintf(out, sizeof(out), "%s%s%s", parent, strcmp(parent, "/") ? "/" : "", name);
+    if (written <= 0 || size_t(written) >= sizeof(out) || !valid_path(out) || !out[1])
+        return false;
+    for (const char *p = out + 1; *p; ++p) {
+        if (strchr("\\:*?\"<>|", *p)) return false;
+        if ((!p[1] || p[1] == '/') && (*p == '.' || *p == ' ')) return false;
+    }
+    // FAT paths are case-insensitive: moving a directory into itself is invalid.
+    const size_t source_length = strlen(request.path);
+    return strncasecmp(out, request.path, source_length) ||
+           (out[source_length] && out[source_length] != '/');
 }
 
 bool valid_request(const Request &request) {
     if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
         !memchr(request.selection, 0, sizeof(request.selection))) return false;
+    if (request.firmware_repository && (request.kind != Kind::List ||
+        !ResmedFirmwareRepository::valid_directory(request.path))) return false;
     if (request.range_count > 8 || (request.kind != Kind::Immutable && request.range_count)) return false;
     uint64_t bytes = 0;
     for (unsigned i = 0; i < request.range_count; ++i) {
@@ -114,8 +142,10 @@ class Job final : public Transfer {
 public:
     Request request = {};
     Ready ready;
+    ListSink listing;
     Released released = nullptr;
     SdStorage::Session session;
+    SdStorage::Reader input;
     uint8_t *ring = nullptr;
     size_t capacity = 0;
     uint8_t *copy_buffer = nullptr;
@@ -140,12 +170,21 @@ public:
         free(entries);
         free(ring);
         free(copy_buffer);
-        if (registered) active_operations.fetch_sub(1);
+        if (registered) release_slot();
     }
 
     bool failed() const override { return error.load(); }
     bool finished() const override { return done.load() && produced.load() == consumed.load(); }
-    void cancel() override { cancelled.store(true); }
+    void cancel() override {
+        cancelled.store(true);
+        cancel_pending(this);
+    }
+
+    void release_owner() {
+        const auto notify = released;
+        released = nullptr;
+        if (notify) notify();
+    }
 
     void report(log_level_t level, const char *result) const {
         Log::logf(CAT_STORAGE, level, "%s %s made=%u out=%u ms=%u path=%s\n",
@@ -169,6 +208,44 @@ public:
         return false;
     }
 
+    bool admit_reader(const char *path) {
+        while (!cancelled.load() && SdStorage::mounted() && SdStorage::local_access_allowed() &&
+               AirSenseState::local_background_allowed()) {
+            if (session.begin(SdStorage::Access::ReadOnly, path)) return true;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        return fail("storage_wait_interrupted", path);
+    }
+
+    void close_input() {
+        input.close();
+        // Only the current file is protected. Keep the admission, not its old
+        // scope, while draining output or waiting for the next file's Writer.
+        if (!mutating(request.kind))
+            while (!cancelled.load() && session.valid() && !session.protect_read(nullptr))
+                vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    bool open_input(const char *path, bool directory = false) {
+        close_input();
+        if (!mutating(request.kind)) {
+            for (;;) {
+                if (!checkpoint()) return false;
+                if (session.protect_read(directory ? nullptr : path)) break;
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+        return input.open(session, path, directory);
+    }
+
+    bool checkpoint() {
+        return (!cancelled.load() && session.valid()) || fail("interrupted");
+    }
+
+    bool next_input(SdStorage::Reader::Entry &entry, bool &end) {
+        return checkpoint() && input.next(entry, end);
+    }
+
     size_t read(uint8_t *out, size_t length) override {
         const uint32_t tail = consumed.load();
         length = std::min<size_t>(length, produced.load() - tail);
@@ -182,7 +259,7 @@ public:
     bool emit(const uint8_t *data, size_t length) {
         uint32_t progress = millis();
         while (length) {
-            if (cancelled.load() || !session.valid()) return fail("interrupted");
+            if (!checkpoint()) return false;
             const uint32_t head = produced.load();
             const size_t room = capacity - (head - consumed.load());
             if (!room) {
@@ -230,39 +307,75 @@ public:
 };
 
 bool list(Job &job, aircannect::LargeTextBuffer &json) {
-    SdStorage::Reader dir;
-    if (!dir.open(job.session, job.request.path, true)) return job.fail("directory_open_failed");
+    const bool repository = job.request.firmware_repository;
+    bool end = false;
+    if (repository) {
+        bool exists = false;
+        if (!job.session.run([&](fs::FS &fs) { exists = fs.exists(job.request.path); return true; }))
+            return job.fail("directory_read_failed");
+        if (!exists && strcmp(job.request.path, ResmedFirmwareRepository::ROOT))
+            return job.fail("directory_not_found");
+        end = !exists;
+    }
+    if (!end && !job.open_input(job.request.path, true)) return job.fail("directory_open_failed");
     json = "{\"ok\":true";
     aircannect::json_add_string(json, "path", job.request.path);
+    aircannect::json_add_uint64(json, "offset", job.request.offset);
+    if (repository) {
+        aircannect::json_add_string(json, "root", ResmedFirmwareRepository::ROOT);
+        aircannect::json_add_bool(json, "supported", true);
+        aircannect::json_add_bool(json, "available", true);
+        aircannect::json_add_bool(json, "ready", true);
+    }
     json += ",\"entries\":[";
     uint32_t seen = 0, count = 0;
-    bool end = false;
     SdStorage::Reader::Entry entry;
     while (!end) {
-        if (job.cancelled.load() || !dir.next(entry, end)) return job.fail("directory_read_failed");
+        if (!job.next_input(entry, end)) return job.fail("directory_read_failed");
         if (end) break;
+        char path[256] = {};
+        if ((repository || job.listing) &&
+            !child_path(job.request.path, entry.name, strlen(entry.name), path))
+            return job.fail("invalid_path");
+        if (repository && !(entry.directory ? ResmedFirmwareRepository::valid_directory(path)
+                                            : ResmedFirmwareRepository::valid_path(path))) continue;
         if (seen++ < job.request.offset) continue;
-        if (count == 32) break;
+        if (count == LIST_PAGE_SIZE) break;
+        if (job.listing) {
+            if (!job.listing(path, entry.size, entry.modified, entry.directory, false))
+                return job.fail("listing_no_memory");
+            ++count;
+            continue;
+        }
         if (count++) json += ',';
         json += '{';
         aircannect::json_add_string(json, "name", entry.name, false);
         aircannect::json_add_uint64(json, "size", entry.size);
         aircannect::json_add_uint64(json, "modified", entry.modified > 0 ? entry.modified : 0);
         aircannect::json_add_bool(json, "directory", entry.directory);
+        if (repository) {
+            aircannect::json_add_string(json, "path", path);
+            aircannect::json_add_bool(json, "bootloader", !entry.directory &&
+                ResmedFirmwareRepository::is_bootloader(path));
+        }
         json += '}';
     }
     json += ']';
     aircannect::json_add_bool(json, "more", !end);
     json += '}';
+    job.close_input();
+    if (job.listing) return job.listing(nullptr, 0, 0, false, !end);
     return !json.overflowed() || job.fail("listing_no_memory");
 }
 
 bool collect(Job &job) {
     const char *selection = job.request.selection;
     if (!*selection) {
-        SdStorage::Reader file;
-        if (file.open(job.session, job.request.path))
-            return job.add(job.request.path, file.size(), false, file.modified());
+        if (job.open_input(job.request.path)) {
+            const bool added = job.add(job.request.path, job.input.size(), false, job.input.modified());
+            job.close_input();
+            return added;
+        }
         if (!job.add(job.request.path, 0, true)) return false;
     } else {
         while (*selection) {
@@ -270,10 +383,10 @@ bool collect(Job &job) {
             const size_t length = end ? size_t(end - selection) : strlen(selection);
             char path[256];
             if (!child_path(job.request.path, selection, length, path)) return job.fail("invalid_child_path");
-            SdStorage::Reader file;
-            const bool regular = file.open(job.session, path);
-            if (!job.add(path, regular ? file.size() : 0, !regular,
-                         regular ? file.modified() : 0)) return false;
+            const bool regular = job.open_input(path);
+            if (!job.add(path, regular ? job.input.size() : 0, !regular,
+                         regular ? job.input.modified() : 0)) return false;
+            job.close_input();
             selection = end ? end + 1 : selection + length;
         }
     }
@@ -282,18 +395,18 @@ bool collect(Job &job) {
         if (!job.entries[i].directory) continue;
         char parent[256];
         strcpy(parent, job.entries[i].path);
-        SdStorage::Reader dir;
-        if (!dir.open(job.session, parent, true)) return job.fail("directory_open_failed", parent);
+        if (!job.open_input(parent, true)) return job.fail("directory_open_failed", parent);
         bool end = false;
         SdStorage::Reader::Entry entry;
         while (!end) {
-            if (job.cancelled.load() || !dir.next(entry, end)) return job.fail("directory_read_failed", parent);
+            if (!job.next_input(entry, end)) return job.fail("directory_read_failed", parent);
             if (end) break;
             char path[256];
             if (!child_path(parent, entry.name, strlen(entry.name), path))
                 return job.fail("invalid_child_path", parent);
             if (!job.add(path, entry.size, entry.directory, entry.modified)) return false;
         }
+        job.close_input();
     }
     return true;
 }
@@ -304,13 +417,20 @@ const char *mutate(Job &job, uint32_t &changed) {
         char destination[256];
         if (!rename_target(job.request, destination)) return "invalid_name";
         const char *error = "storage_busy";
-        const bool renamed = job.session.run([&](fs::FS &fs) {
+        auto check = [&](fs::FS &fs) {
             if (job.cancelled.load()) { error = "cancelled"; return false; }
             if (!fs.exists(job.request.path)) { error = "not_found"; return false; }
             if (fs.exists(destination)) { error = "destination_exists"; return false; }
+            return true;
+        };
+        if (!job.session.run(check)) return error;
+        if (!job.session.ensure_parent(destination))
+            return job.session.valid() ? "directory_failed" : "cancelled";
+        const bool renamed = job.session.mutate(job.request.path, destination, [&](fs::FS &fs) {
+            if (!check(fs)) return false;
             error = "rename_failed";
             if (!fs.rename(job.request.path, destination)) return false;
-            SdStorage::notify_files_changed();
+            SdStorage::notify_files_changed(job.request.path, destination);
             return true;
         });
         if (!renamed) return error;
@@ -324,10 +444,10 @@ const char *mutate(Job &job, uint32_t &changed) {
     for (size_t i = job.entry_count; i > 0; i--) {
         if (job.cancelled.load() || !job.session.valid()) { error = "cancelled"; break; }
         const ZipEntry &entry = job.entries[i - 1];
-        const bool removed = job.session.run([&](fs::FS &fs) {
+        const bool removed = job.session.mutate(entry.path, [&](fs::FS &fs) {
             if (job.cancelled.load()) return false;
             if (!(entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path))) return false;
-            SdStorage::notify_files_changed();
+            SdStorage::notify_files_changed(entry.path);
             return true;
         });
         if (!removed) { error = job.session.valid() ? "delete_failed" : "cancelled"; break; }
@@ -341,8 +461,9 @@ uint64_t zip_data_size(uint32_t size, size_t block_bytes) {
     return uint64_t(size) + 5 * (size ? (uint64_t(size) + block_bytes - 1) / block_bytes : 1);
 }
 
-bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
+bool copy_file(Job &job, uint32_t *checksum = nullptr,
                const char *path = nullptr, uint64_t limit = UINT64_MAX) {
+    auto &file = job.input;
     uint8_t *buffer = job.copy_buffer;
     uint64_t remaining = std::min(file.size(), limit);
     uint32_t crc = crc32_ieee_initial();
@@ -356,7 +477,7 @@ bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
             SdStorage::put_le16(block + 3, uint16_t(~count));
             if (!job.emit(block, sizeof(block))) return false;
         }
-        if (file.read(buffer, count) != count) return job.fail("file_read_failed", path);
+        if (!job.checkpoint() || file.read(buffer, count) != count) return job.fail("file_read_failed", path);
         if (!job.emit(buffer, count)) return false;
         if (checksum) crc = crc32_ieee_update(crc, buffer, count);
         remaining -= count;
@@ -374,11 +495,11 @@ size_t range_header(const Job &job, unsigned index, char (&out)[160]) {
 
 bool immutable_file(const std::shared_ptr<Job> &transfer) {
     auto &job = *transfer;
-    SdStorage::Reader file;
-    if (!file.open(job.session, job.request.path)) {
+    if (!job.open_input(job.request.path)) {
         job.ready(404, "artifact_unavailable", nullptr, 0);
         return job.fail("file_open_failed");
     }
+    auto &file = job.input;
     job.representation = file.size();
     uint64_t length = 0;
     char header[160];
@@ -398,12 +519,12 @@ bool immutable_file(const std::shared_ptr<Job> &transfer) {
         return true;
     }
     job.ready(job.request.range_count ? 206 : 200, nullptr, transfer, length);
-    if (!job.request.range_count) return copy_file(job, file);
+    if (!job.request.range_count) return copy_file(job);
     for (unsigned i = 0; i < job.request.range_count; ++i) {
         const auto &range = job.request.ranges[i];
         if (job.request.range_count > 1 &&
             !job.emit(reinterpret_cast<const uint8_t *>(header), range_header(job, i, header))) return false;
-        if (!file.seek(range.first) || !copy_file(job, file, nullptr, nullptr,
+        if (!file.seek(range.first) || !copy_file(job, nullptr, nullptr,
             uint64_t(range.last) - range.first + 1)) return job.fail("range_read_failed");
         if (job.request.range_count > 1 && !job.emit(reinterpret_cast<const uint8_t *>("\r\n"), 2)) return false;
     }
@@ -433,10 +554,11 @@ bool archive(Job &job) {
         put_le16(header + 26, length);
         if (!job.emit(header, sizeof(header)) ||
             !job.emit(reinterpret_cast<const uint8_t *>(name), length)) return false;
-        SdStorage::Reader file;
-        if (!file.open(job.session, entry.path)) return job.fail("file_open_failed", entry.path);
+        if (!job.open_input(entry.path)) return job.fail("file_open_failed", entry.path);
+        auto &file = job.input;
         if (file.size() != entry.size) return job.fail("file_size_changed", entry.path);
-        if (!copy_file(job, file, &entry.crc, entry.path)) return false;
+        if (!copy_file(job, &entry.crc, entry.path)) return false;
+        job.close_input();
         uint8_t descriptor[16];
         put_le32(descriptor, 0x08074b50);
         put_le32(descriptor + 4, entry.crc);
@@ -482,29 +604,33 @@ void produce(void *context) {
     auto job = std::move(*static_cast<std::shared_ptr<Job> *>(context));
     delete static_cast<std::shared_ptr<Job> *>(context);
     bool success = false;
+    uint32_t changed = 0;
+    const char *mutation_error = nullptr;
     job->report(LOG_DEBUG, "started");
-    bool admitted = job->session.begin();
-    // A foreground artifact read has asked background preparation to yield.
-    // Wait only in this producer, never AsyncTCP or the SD executor.
-    while (!admitted && job->request.kind == Kind::Immutable && !job->cancelled.load() &&
+    const SdStorage::Access access = mutating(job->request.kind)
+        ? SdStorage::Access::Exclusive : SdStorage::Access::ReadOnly;
+    const char *read_root = access == SdStorage::Access::ReadOnly &&
+        (job->request.kind == Kind::File || job->request.kind == Kind::Immutable)
+        ? job->request.path : nullptr;
+    bool admitted = access == SdStorage::Access::ReadOnly ? job->admit_reader(read_root)
+        : job->session.begin(access);
+    // Mutation admission is bounded. Downloads wait behind existing background
+    // work until admitted or disconnected, never on the AsyncTCP callback.
+    while (access == SdStorage::Access::Exclusive && !admitted && !job->cancelled.load() &&
            SdStorage::local_access_allowed() && uint32_t(millis() - job->started_ms) < 2000) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        admitted = job->session.begin();
+        admitted = job->session.begin(access);
     }
     if (admitted && job->request.kind == Kind::Immutable)
         Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
             unsigned(uint32_t(millis() - job->started_ms)), job->request.path);
     if (mutating(job->request.kind)) {
-        uint32_t changed = 0;
+        const uint32_t exports = SdStorage::files_revision(SdStorage::FileScope::Export);
         const char *error = admitted ? mutate(*job, changed) : "storage_busy";
-        if (changed) ExportSync::request_backlog_refresh(true);
+        mutation_error = error;
+        if (exports != SdStorage::files_revision(SdStorage::FileScope::Export))
+            ExportSync::request_backlog_refresh(true);
         success = !error;
-        portENTER_CRITICAL(&mutation_mux);
-        mutation.active = false;
-        mutation.succeeded = success;
-        mutation.changed = changed;
-        snprintf(mutation.error, sizeof(mutation.error), "%s", error ? error : "");
-        portEXIT_CRITICAL(&mutation_mux);
         log_level_t level = success ? LOG_INFO : LOG_WARN;
         if (!success) {
             if (job->failure) level = job->failure_level;
@@ -514,23 +640,30 @@ void produce(void *context) {
             "%s %s: %s (%u changed)\n",
             job->request.kind == Kind::Rename ? "rename" : "delete",
             job->request.path, job->failure ? job->failure : error ? error : "done", changed);
-        job->ready(success ? 200 : 409, error, nullptr, changed);
     } else if (!admitted) {
         job->report(LOG_DEBUG, "storage_busy");
         job->ready(409, "storage_busy", nullptr, 0);
     } else if (job->request.kind == Kind::List) {
         aircannect::LargeTextBuffer json;
         if (list(*job, json)) {
-            job->ready(200, nullptr, job, json.length());
-            success = job->emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
-        } else job->ready(409, "listing_failed", nullptr, 0);
+            if (job->listing) {
+                job->session.end();
+                job->release_owner();
+                job->ready(200, nullptr, nullptr, 0);
+                success = true;
+            } else {
+                job->ready(200, nullptr, job, json.length());
+                success = job->emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
+            }
+        } else job->ready(409, job->failure ? job->failure : "listing_failed", nullptr, 0);
+        job->listing = nullptr;
     } else if (job->request.kind == Kind::Immutable) {
         success = immutable_file(job);
     } else if (job->request.kind == Kind::File) {
-        SdStorage::Reader file;
-        if (file.open(job->session, job->request.path)) {
+        if (job->open_input(job->request.path)) {
+            auto &file = job->input;
             job->ready(200, nullptr, job, file.size());
-            success = copy_file(*job, file);
+            success = copy_file(*job);
         } else {
             job->fail("file_open_failed");
             job->ready(409, "file_unavailable", nullptr, 0);
@@ -539,78 +672,60 @@ void produce(void *context) {
         job->ready(200, nullptr, job, 0);
         success = archive(*job);
     } else job->ready(409, "archive_unavailable", nullptr, 0);
-    job->ready = nullptr;
+    if (!mutating(job->request.kind)) job->ready = nullptr;
     if (!mutating(job->request.kind) && admitted)
         job->report(success ? LOG_DEBUG : job->failure_level,
             success ? "producer_done" : job->failure);
+    job->close_input();
     job->session.end();
-    if (job->released) job->released();
+    job->release_owner();
     free(job->copy_buffer);
     job->copy_buffer = nullptr;
     job->error.store(!success);
     job->done.store(true);
+    if (mutating(job->request.kind)) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation.active = false;
+        mutation.succeeded = success;
+        mutation.changed = changed;
+        snprintf(mutation.error, sizeof(mutation.error), "%s", mutation_error ? mutation_error : "");
+        portEXIT_CRITICAL(&mutation_mux);
+        // Completion permits the next operation, including from this callback.
+        if (job->registered) {
+            job->registered = false;
+            release_slot();
+        }
+        job->ready(success ? 200 : 409, mutation_error, nullptr, changed);
+        job->ready = nullptr;
+    }
     job.reset();
     vTaskDeleteWithCaps(nullptr);
 }
-}  // namespace
 
-StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
-                  Released released) {
-    if (!valid_request(request)) return StartResult::BadRequest;
-    if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
-    // The preceding response can outlive its last byte or an aborted fetch.
-    // Admit one bounded successor; its worker waits for the exclusive SD
-    // session. Other browser operations retain their single-operation limit.
-    const unsigned limit = request.kind == Kind::Immutable ? 2 : 1;
-    unsigned active_count = active_operations.load();
-    for (;;) {
-        if (active_count >= limit) {
-            Log::logf(CAT_STORAGE, LOG_DEBUG, "%s storage_busy path=%s\n", kind_name(request.kind), request.path);
-            return StartResult::Busy;
-        }
-        if (active_operations.compare_exchange_weak(active_count, active_count + 1)) break;
-    }
-    void *memory = aircannect::Memory::alloc_large(sizeof(Job));
-    if (!memory) {
-        Log::logf(CAT_STORAGE, LOG_WARN, "%s job_no_memory path=%s\n", kind_name(request.kind), request.path);
-        active_operations.fetch_sub(1);
-        return StartResult::Unavailable;
-    }
-    auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
-        value->~Job();
-        free(value);
-    });
-    job->registered = true;
-    job->request = request;
-    job->released = released;
-    active = job;
-    job->ready = std::move(ready);
-    if (!mutating(request.kind)) {
+const char *launch(const std::shared_ptr<Job> &job) {
+    if (job->cancelled.load()) return "cancelled";
+    if (!SdStorage::local_access_allowed() || !SdStorage::mounted() ||
+        !AirSenseState::local_background_allowed()) return "storage_unavailable";
+    if (!mutating(job->request.kind) && !job->listing) {
         job->capacity = RING_BYTES;
         job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RING_BYTES, false));
         if (!job->ring) {
             job->capacity = INTERNAL_RING_BYTES;
             job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
         }
-        if (!job->ring) { job->report(LOG_WARN, "ring_no_memory"); return StartResult::Unavailable; }
+        if (!job->ring) return "ring_no_memory";
     }
-    if (request.kind == Kind::File || request.kind == Kind::Archive || request.kind == Kind::Immutable) {
+    if (job->request.kind == Kind::File || job->request.kind == Kind::Archive || job->request.kind == Kind::Immutable) {
         job->copy_capacity = SdStorage::READ_CHUNK_BYTES;
         job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity, false));
         if (!job->copy_buffer) {
             job->copy_capacity = INTERNAL_COPY_BYTES;
             job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity));
         }
-        if (!job->copy_buffer) { job->report(LOG_WARN, "copy_no_memory"); return StartResult::Unavailable; }
+        if (!job->copy_buffer) return "copy_no_memory";
     }
     auto *context = new(std::nothrow) std::shared_ptr<Job>(job);
-    if (!context) { job->report(LOG_WARN, "context_no_memory"); return StartResult::Unavailable; }
-    if (mutating(request.kind)) {
-        portENTER_CRITICAL(&mutation_mux);
-        mutation = {};
-        mutation.active = true;
-        portEXIT_CRITICAL(&mutation_mux);
-    }
+    if (!context) return "context_no_memory";
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
@@ -619,16 +734,134 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
             context, 1, nullptr, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
-        job->report(LOG_WARN, "worker_unavailable");
         delete context;
-        if (mutating(request.kind)) {
-            portENTER_CRITICAL(&mutation_mux);
-            mutation.active = false;
-            strcpy(mutation.error, "worker_unavailable");
-            portEXIT_CRITICAL(&mutation_mux);
+        return "worker_unavailable";
+    }
+    return nullptr;
+}
+
+void activate(const std::shared_ptr<Job> &job) {
+    const char *error = launch(job);
+    if (!error) return;
+    if (mutating(job->request.kind)) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation.active = false;
+        snprintf(mutation.error, sizeof(mutation.error), "%s", error);
+        portEXIT_CRITICAL(&mutation_mux);
+    }
+    job->report(job->cancelled.load() || !strcmp(error, "storage_unavailable") ? LOG_DEBUG : LOG_WARN, error);
+    job->error.store(true);
+    job->done.store(true);
+    job->ready(503, error, nullptr, 0);
+    job->ready = nullptr;
+    job->release_owner();
+}
+
+void dispatch_pending() {
+    portENTER_CRITICAL(&admission_mux);
+    if (dispatching) {
+        portEXIT_CRITICAL(&admission_mux);
+        return;
+    }
+    dispatching = true;
+    portEXIT_CRITICAL(&admission_mux);
+    for (;;) {
+        std::shared_ptr<Job> job;
+        portENTER_CRITICAL(&admission_mux);
+        if (exclusive_operation || active_operations.load() >= MAX_ACTIVE_READS || !pending_count) {
+            dispatching = false;
+            portEXIT_CRITICAL(&admission_mux);
+            return;
         }
+        job = std::move(pending_reads[0]);
+        for (unsigned i = 1; i < pending_count; ++i)
+            pending_reads[i - 1] = std::move(pending_reads[i]);
+        --pending_count;
+        job->registered = true;
+        active_operations.fetch_add(1);
+        portEXIT_CRITICAL(&admission_mux);
+        activate(job);
+        // Destroy outside the lock. Failure may release this slot immediately;
+        // dispatching keeps that release from recursively draining the queue.
+    }
+}
+
+void release_slot() {
+    portENTER_CRITICAL(&admission_mux);
+    active_operations.fetch_sub(1);
+    exclusive_operation = false;
+    portEXIT_CRITICAL(&admission_mux);
+    dispatch_pending();
+}
+
+void cancel_pending(Job *target) {
+    std::shared_ptr<Job> job;
+    portENTER_CRITICAL(&admission_mux);
+    for (unsigned i = 0; i < pending_count; ++i) {
+        if (pending_reads[i].get() != target) continue;
+        job = std::move(pending_reads[i]);
+        for (unsigned j = i + 1; j < pending_count; ++j)
+            pending_reads[j - 1] = std::move(pending_reads[j]);
+        --pending_count;
+        break;
+    }
+    portEXIT_CRITICAL(&admission_mux);
+    if (!job) return; // An active producer handles its own cancellation.
+    job->ready = nullptr;
+    job->error.store(true);
+    job->done.store(true);
+    job->release_owner();
+}
+}  // namespace
+
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
+                  Released released, ListSink listing) {
+    if (!valid_request(request) || (listing && request.kind != Kind::List)) return StartResult::BadRequest;
+    if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
+    void *memory = aircannect::Memory::alloc_large(sizeof(Job));
+    if (!memory) {
+        Log::logf(CAT_STORAGE, LOG_WARN, "%s job_no_memory path=%s\n", kind_name(request.kind), request.path);
         return StartResult::Unavailable;
     }
+    auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
+        value->~Job();
+        free(value);
+    });
+    job->request = request;
+    job->ready = std::move(ready);
+    job->listing = std::move(listing);
+    const bool exclusive = mutating(request.kind);
+    bool accepted = false, queued = false;
+    portENTER_CRITICAL(&admission_mux);
+    if (!pending_count && !exclusive_operation &&
+        active_operations.load() < (exclusive ? 1u : MAX_ACTIVE_READS)) {
+        active_operations.fetch_add(1);
+        job->registered = true;
+        exclusive_operation = exclusive;
+        accepted = true;
+    } else if (!exclusive && pending_count < MAX_PENDING_READS) {
+        pending_reads[pending_count++] = job;
+        accepted = queued = true;
+    }
+    // Publish release ownership before a concurrent slot release can promote
+    // this descriptor. Pending jobs hold no SD session.
+    if (accepted) job->released = released;
+    portEXIT_CRITICAL(&admission_mux);
+    if (!accepted) {
+        job->report(LOG_DEBUG, exclusive ? "storage_busy" : "read_queue_full");
+        return StartResult::Busy;
+    }
+    active = job;
+    if (exclusive) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation = {};
+        mutation.active = true;
+        portEXIT_CRITICAL(&mutation_mux);
+    }
+    if (queued) {
+        Log::logf(CAT_STORAGE, LOG_DEBUG, "%s queued path=%s\n", kind_name(request.kind), request.path);
+        dispatch_pending();
+    } else activate(job);
     return StartResult::Started;
 }
 

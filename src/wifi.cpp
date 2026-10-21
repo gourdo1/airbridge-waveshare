@@ -3,6 +3,7 @@
 #include "debug_log.h"
 #include "network_hints.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <esp_wifi.h>
 #include <esp_sntp.h>
 #include <esp_netif.h>
@@ -22,6 +23,8 @@ typedef enum {
 
 static wifi_state_t wf_state = WF_OFF;
 static std::atomic<uint32_t> status_revision{0};
+static std::atomic<uint32_t> sta_address{0}, ap_address{0};
+static std::atomic<bool> ap_address_pending{false};
 static uint32_t state_entered_ms = 0;
 static bool ntp_done = false;
 
@@ -78,6 +81,45 @@ static uint32_t ap_quiet_since_ms = 0;
 static bool pending_ap_teardown = false;
 #define AP_TEARDOWN_QUIET_MS    120000
 
+static String mdns_hostname;
+static bool mdns_started = false;
+static bool mdns_attempted = false;
+static uint32_t mdns_last_attempt_ms = 0;
+#define MDNS_RETRY_INTERVAL_MS 30000
+
+static void stop_mdns() {
+    if (mdns_started) MDNS.end();
+    mdns_started = false;
+    mdns_attempted = false;
+}
+
+static void check_mdns() {
+    const wifi_mode_t mode = WiFi.getMode();
+    if (mode == WIFI_OFF) {
+        stop_mdns();
+        return;
+    }
+    // The responder follows STA and AP events without being recreated.
+    if (mdns_started) return;
+    const bool available = WiFi.status() == WL_CONNECTED ||
+        ((mode & WIFI_AP) && WiFi.softAPIP() != IPAddress());
+    if (!available) return;
+
+    const uint32_t now = millis();
+    if (mdns_attempted && now - mdns_last_attempt_ms < MDNS_RETRY_INTERVAL_MS) return;
+    mdns_attempted = true;
+    mdns_last_attempt_ms = now;
+    if (mdns_hostname.isEmpty() || !MDNS.begin(mdns_hostname)) {
+        // begin() can allocate the responder before failing to set its name.
+        MDNS.end();
+        Log::logf(CAT_WIFI, LOG_WARN, "mDNS start failed for '%s'; retry in %d s\n",
+                  mdns_hostname.c_str(), MDNS_RETRY_INTERVAL_MS / 1000);
+        return;
+    }
+    mdns_started = true;
+    Log::logf(CAT_WIFI, LOG_INFO, "mDNS: %s.local\n", mdns_hostname.c_str());
+}
+
 
 static volatile uint32_t ntp_sync_counter = 0;
 
@@ -128,17 +170,27 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
         }
         break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        sta_address.store(info.got_ip.ip_info.ip.addr);
         got_ip = true;
         hint_refresh_pending = true;
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        sta_address.store(0);
         sta_disconnected = true;
         last_disconnect_reason = info.wifi_sta_disconnected.reason;
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
     case ARDUINO_EVENT_WIFI_STA_STOP:
+        sta_address.store(0);
+        status_revision.fetch_add(1);
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+        ap_address.store(0);
+        [[fallthrough]];
+    case ARDUINO_EVENT_WIFI_AP_START:
+        ap_address_pending.store(true);
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -150,6 +202,13 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     default:
         break;
     }
+}
+
+static void refresh_ap_address() {
+    if (!ap_address_pending.exchange(false)) return;
+    const uint32_t address = (WiFi.getMode() & WIFI_AP) ?
+        static_cast<uint32_t>(WiFi.softAPIP()) : 0;
+    if (ap_address.exchange(address) != address) status_revision.fetch_add(1);
 }
 
 
@@ -483,6 +542,7 @@ static void apply_country_code() {
 
 bool WiFiSetup::init() {
     auto &cfg = Config::get();
+    mdns_hostname = cfg.hostname;
 
     // STA_START reapplies Arduino's saved policy after every radio restart.
     if (!WiFi.setSleep(false)) {
@@ -547,6 +607,10 @@ static void apply_network_config() {
     status_revision.fetch_add(1);
     roam_connecting = false;
     const auto &cfg = Config::get();
+    if (cfg.wifi_mode == WIFI_MODE_OFF || mdns_hostname != cfg.hostname) {
+        stop_mdns();
+        mdns_hostname = cfg.hostname;
+    }
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
     clear_scan();
     got_ip = false;
@@ -646,6 +710,9 @@ void WiFiSetup::check() {
         if (pending & 1) apply_network_config();
         else if (pending & 4) apply_profile_changes();
     }
+
+    refresh_ap_address();
+    check_mdns();
 
     auto &cfg = Config::get();
     uint32_t elapsed = millis() - state_entered_ms;
@@ -930,6 +997,11 @@ void WiFiSetup::suspend_roaming() { roaming_suspended = true; }
 void WiFiSetup::resume_roaming()  { roaming_suspended = false; }
 
 uint32_t WiFiSetup::revision() { return status_revision.load(); }
+
+void WiFiSetup::addresses(uint32_t &sta, uint32_t &ap) {
+    sta = sta_address.load();
+    ap = ap_address.load();
+}
 
 const char *WiFiSetup::state_name() {
     switch (wf_state) {

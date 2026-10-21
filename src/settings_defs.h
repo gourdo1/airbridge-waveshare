@@ -43,7 +43,7 @@ static const var_def_t VAR_CATALOG[] PROGMEM = {
     {"ITX", "Ti Max",           SET_SCALED, 50, 2, NULL},
     {"ITT", "Ti",               SET_SCALED, 50, 2, NULL},
     {"RST", "Rise Time (ms)",   SET_INT,    1, 0, NULL},
-    {"IBR", "Target Pt Rate",   SET_INT,    1, 0, NULL},
+    {"IBR", "Target Pt Rate",   SET_SCALED,  5, 0, NULL},
 
     {"EBE", "Easy-Breathe",     SET_ENUM,   1, 0, "Off,On"},
     {"VTS", "Trigger Sens.",    SET_ENUM,   1, 0, "Very Low,Low,Med,High,Very High"},
@@ -53,17 +53,17 @@ static const var_def_t VAR_CATALOG[] PROGMEM = {
     {"WMV", "Target Va",        SET_SCALED, 10, 1, NULL},
     {"PHT", "Height (cm)",      SET_INT,    1, 0, NULL},
 
-    {"STP", "Start Pressure",   SET_SCALED, 50, 1, NULL},
-    {"STU", "Start Pressure",   SET_SCALED, 50, 1, NULL},
-    {"EPS", "Start EPAP",       SET_SCALED, 50, 1, NULL},
-    {"STV", "Start EPAP",       SET_SCALED, 50, 1, NULL},
-    {"STE", "Start EPAP",       SET_SCALED, 50, 1, NULL},
-    {"EAS", "Start EPAP",       SET_SCALED, 50, 1, NULL},
-    {"IVS", "Start EPAP",       SET_SCALED, 50, 1, NULL},
+    {"STP", "Ramp Start Pressure", SET_SCALED, 50, 1, NULL},
+    {"STU", "Ramp Start Pressure", SET_SCALED, 50, 1, NULL},
+    {"EPS", "Ramp Start EPAP",  SET_SCALED, 50, 1, NULL},
+    {"STV", "Ramp Start EPAP",  SET_SCALED, 50, 1, NULL},
+    {"STE", "Ramp Start EPAP",  SET_SCALED, 50, 1, NULL},
+    {"EAS", "Ramp Start EPAP",  SET_SCALED, 50, 1, NULL},
+    {"IVS", "Ramp Start EPAP",  SET_SCALED, 50, 1, NULL},
 
     {"EPR", "EPR Level",        SET_SCALED, 50, 0, NULL},
-    {"EPA", "EPR Clinical",     SET_ENUM,   1, 0, "Off,On"},
-    {"EPX", "EPR Patient",      SET_ENUM,   1, 0, "Off,On"},
+    {"EPA", "EPR (clinical)",   SET_ENUM,   1, 0, "Off,On"},
+    {"EPX", "Pressure Relief (patient)", SET_ENUM, 1, 0, "Off,On"},
     {"EPT", "EPR Type",         SET_ENUM,   1, 0, "Ramp Only,Full Time"},
 
     {"RMA", "Ramp",             SET_ENUM,   1, 0, "Off,On,Auto"},
@@ -97,7 +97,7 @@ static const var_def_t VAR_CATALOG[] PROGMEM = {
     {"NMF", "Non-Vent Mask",    SET_ENUM,   1, 0, "Off,On"},
     {"SPX", "Low SpO2 Alarm",   SET_INT,    1, 0, NULL},
     {"APX", "Apnea Alarm (s)",  SET_INT,    1, 0, NULL},
-    {"LMA", "Low MV Alarm",     SET_INT,    1, 0, NULL},
+    {"LMA", "Low MV Alarm",     SET_SCALED,  8, 0, NULL},
     {NULL, NULL, SET_INT, 0, 0, NULL}  // sentinel
 };
 

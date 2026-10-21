@@ -29,7 +29,7 @@ top-level WiFi-related config keys are:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hostname` | airbridge | DHCP hostname and AP SSID prefix |
+| `hostname` | airbridge | DHCP and mDNS hostname, and AP SSID prefix |
 | `wifi_mode` | 1 | Operating mode, see table below |
 | `wifi_roam` | true | Roam automatically between saved networks |
 | `wifi_country` | 01 | ISO 3166 country code; "01" = worldwide |
@@ -47,6 +47,10 @@ top-level WiFi-related config keys are:
 The softAP (when used) is named `<hostname>_<MAC>` with password `airbridge`,
 and serves the web UI at `192.168.4.1`.
 
+The client must support mDNS and the network must allow multicast traffic.
+If name resolution is unavailable, use the device IP address instead.
+For a non-default `http_port`, append `:<port>` to the URL.
+
 With no saved networks, Auto and STA+AP modes provide an access point for
 setup. STA-only does not start an access point.
 
@@ -63,6 +67,8 @@ log warning and the previous setting stays in effect.
 | `http_user` | admin | Web UI username |
 | `http_pass` | airbridge | Web UI password |
 | `auth_whitelist` | *(empty)* | Trusted IPv4 addresses that bypass web login. Comma-separated addresses, CIDR networks, start-end ranges or `*`; maximum 160 characters |
+| `ui_language` | auto | Web UI language: `auto` follows browser preferences; `en` selects English; `pl` selects Polish |
+| `ui_theme` | auto | Web UI theme: `auto` follows browser preferences; an available theme ID overrides them for all browsers. Default themes: `light`, `dark`; also selectable from the header button |
 
 ### OTA
 
@@ -168,13 +174,17 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$WIFI HINTS` | Show cached BSSID/channel/PMF hints |
 | `$WIFI HINTS CLEAR` | Drop all cached hints |
 | `$FLASH [block] [FORCE]` | Flash uploaded ResMed firmware |
-| `$FLASH STATUS` | Flash progress |
-| `$FLASH CANCEL` | Abort flash |
+| `$FLASH FILE "path" [block] [BLX] [FORCE]` | Install an image from the SD firmware repository |
+| `$FLASH LIST` / `$FLASH REFRESH` | List saved images or refresh the repository |
+| `$FLASH DUMP` | Save the device firmware to the SD repository |
+| `$FLASH CONFIRM id INSTALL_PATCHED_BOOTLOADER` | Confirm the offered bootloader installation, then retry that dump |
+| `$FLASH STATUS` | Upload, flash or dump progress and errors |
+| `$FLASH CANCEL` | Request cancellation; an in-progress programming sequence must finish |
 | `$LOG` | Show log levels |
 | `$LOG category level` | Set log level (ERROR/WARN/INFO/DEBUG) |
 | `$TRANSPARENT` | Raw UART passthrough (60s idle timeout) |
 | `$FRAMED` | Switch to framed UART mode |
-| `$VERSION` | Firmware version |
+| `$VERSION` | Firmware version, build time and target |
 | `$REBOOT` | Restart device |
 
 Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`,

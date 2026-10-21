@@ -1,4 +1,5 @@
 #include "clinical_settings.h"
+#include "custom_settings_protocol.h"
 #include "hex_util.h"
 #include <limits.h>
 #include "clinical_jobs.h"
@@ -65,16 +66,47 @@ int collect(Snapshot &snapshot) {
     if (!read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
+    int tmu = -1;
+    read_raw("TMU", tmu);
+
+    int aoa = -1;
+    read_raw("AOA", aoa);
+    bool leak_alert_active = false;
+    if (aoa == 0) {
+        char response[32] = {};
+        uint16_t length = sizeof(response);
+        const uint16_t remaining = ClinicalJobs::remaining_ms();
+        uint8_t flags = 0;
+        const bool ok = remaining && Arbiter::send_cmd("G C #ALR", CMD_SRC_TCP,
+            CMD_PRIO_NORMAL, response, &length, 0, remaining);
+        // ACT describes availability; the value of ALR only enables/disables it.
+        leak_alert_active = ok && length < sizeof(response) &&
+            CustomSettingsProtocol::parse_enum_flags(qframe_response_value(response), flags) &&
+            (flags & 0x01);
+    }
+    auto visible = [&](const char *name) {
+        if (!strcmp(name, "HTS")) return tmu == 0;
+        if (!strcmp(name, "HTF")) return tmu == 1;
+        if (!strcmp(name, "ALR")) return aoa != 1 && (aoa != 0 || leak_alert_active);
+        if (aoa != 0) return true;
+        for (const char *alarm : {"ALV", "HLE", "NMF", "LMA", "APX", "SPX"})
+            if (!strcmp(name, alarm)) return false;
+        return true;
+    };
+
     // Count the selected layout first, then allocate exactly its compact values.
     auto layout = [&](bool read) {
         uint16_t count = 0;
         auto stock = [&](const char *name, uint8_t group) {
-            if (snapshot.metadata_.find(name) >= 0) return;
+            if (!visible(name) || snapshot.metadata_.find(name) >= 0) return;
             const var_def_t *v = var_lookup(name);
             if (!v) return;
             if (read) {
-                int raw = mop;
-                bool ok = strcmp(name, "MOP") == 0 || read_raw(name, raw);
+                int raw = 0;
+                bool ok = true;
+                if (!strcmp(name, "MOP")) raw = mop;
+                else if (!strcmp(name, "TMU")) { raw = tmu; ok = tmu >= 0; }
+                else ok = read_raw(name, raw);
                 snapshot.values_[count] = {(uint32_t)raw, (uint16_t)(v - VAR_CATALOG),
                                           group, (uint8_t)(ok ? VALID : 0)};
             }
@@ -94,10 +126,13 @@ int collect(Snapshot &snapshot) {
             for (uint16_t i = 0; i < snapshot.metadata_.count(); i++) {
                 CustomSettings::entry_view_t entry;
                 snapshot.metadata_.entry(i, entry);
-                if (entry.category != group || !(entry.mop_mask & (1u << mop))) continue;
+                if (entry.category != group || !(entry.mop_mask & (1u << mop)) ||
+                    !visible(entry.name)) continue;
                 if (read) {
                     uint32_t raw = 0;
-                    bool ok = snapshot.metadata_.read_raw(i, raw);
+                    bool ok;
+                    if (!strcmp(entry.name, "TMU")) { raw = (uint32_t)tmu; ok = tmu >= 0; }
+                    else ok = snapshot.metadata_.read_raw(i, raw);
                     snapshot.values_[count] = {raw, i, group, (uint8_t)(CUSTOM | (ok ? VALID : 0))};
                 }
                 count++;

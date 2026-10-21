@@ -5,7 +5,13 @@
 #include "oxi_arbiter.h"
 #include "oxi_ble.h"
 #include "sleep_report.h"
+#include "clinical_jobs.h"
 #include "sd_storage.h"
+#include "wifi_setup.h"
+#include "app_config.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
+#include "resmed_ota.h"
 #include <string.h>
 
 namespace DeviceStatus {
@@ -20,6 +26,10 @@ struct Snapshot {
     bool feeding;
     char oxi_source[32];
     char oxi_name[32];
+    uint32_t ip = 0;
+    uint32_t ap_ip = 0;
+    char ui_language[16] = "auto";
+    char ui_theme[32] = "auto";
     SleepReport::Source report_source = SleepReport::Source::Device;
     uint32_t report_revision = 0;
     uint32_t report_data_revision = 0;
@@ -27,7 +37,11 @@ struct Snapshot {
     EdfReport::State report_state = EdfReport::State::Blocked;
     char report_error[48] = {};
     bool report_available = false;
+    uint32_t clinical_revision = 0;
     SdStorage::Status storage = {};
+    ResmedFirmwareRepository::Status firmware_repository = {};
+    ResmedFirmwareUpload::Status firmware_upload = {};
+    ResmedOta::Status resmed = {};
 };
 
 // Copy published owner state only; presentation must not query the device.
@@ -43,6 +57,9 @@ inline Snapshot snapshot() {
     out.feeding = OxiArbiter::is_feeding();
     OxiArbiter::get_source(out.oxi_source, sizeof(out.oxi_source),
                            out.oxi_name, sizeof(out.oxi_name));
+    WiFiSetup::addresses(out.ip, out.ap_ip);
+    strncpy(out.ui_language, Config::ui_language(), sizeof(out.ui_language) - 1);
+    strncpy(out.ui_theme, Config::ui_theme(), sizeof(out.ui_theme) - 1);
     SleepReport::Publication report;
     SleepReport::get_publication(report);
     out.report_source = report.source;
@@ -52,7 +69,11 @@ inline Snapshot snapshot() {
     out.report_state = report.local.state;
     memcpy(out.report_error, report.local.error, sizeof(out.report_error));
     out.report_available = report.local.available;
+    out.clinical_revision = ClinicalJobs::revision();
     SdStorage::get_status(out.storage);
+    ResmedFirmwareRepository::get_status(out.firmware_repository);
+    ResmedFirmwareUpload::get_status(out.firmware_upload);
+    ResmedOta::get_status(out.resmed);
     return out;
 }
 
