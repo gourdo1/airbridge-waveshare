@@ -53,6 +53,28 @@ namespace ResmedOta {
     // explicit consent bound to this operation ID; neither callback does I/O.
     bool start_dump(const char **error = nullptr);
     bool confirm_dump(uint32_t id, const char **error = nullptr);
+
+    // Fork: read-only UART link test (docs/resmed_link_test.md). Enters the
+    // bootloader like a dump, switches to `baud`, repeats `G S #BLS` `count`
+    // times, then returns to the application. Never erases or writes flash.
+    struct LinkTestResult {
+        bool valid = false;          // a test has been started since boot
+        bool running = false;
+        uint32_t baud = 0;
+        uint32_t requested = 0;
+        uint32_t sent = 0;
+        uint32_t ok = 0;
+        uint32_t no_reply = 0;       // likely ESP -> AirSense (TX) corruption
+        uint32_t bad_reply = 0;      // E reply or unexpected bootloader state
+        uint32_t rx_crc_errors = 0;  // AirSense -> ESP frames failing CRC
+        uint32_t first_failure = 0;  // 1-based exchange number, 0 = none
+        uint32_t max_round_trip_ms = 0;
+        uint32_t elapsed_ms = 0;
+        bool aborted = false;        // stopped after consecutive failures
+    };
+    bool start_link_test(uint32_t baud, uint32_t count, const char **error = nullptr);
+    void get_link_test(LinkTestResult &out);
+
     // Main-loop publication of cached admission facts. No UART/storage I/O.
     void poll();
     // Copy only; does not refresh admission or join other owners.

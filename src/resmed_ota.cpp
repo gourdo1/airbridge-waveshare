@@ -40,6 +40,9 @@ bool programming = false;  // Protected by status_mux, like published.
 
 struct Work {
     bool dump = false;
+    bool link_test = false;     // Fork: read-only UART link test
+    uint32_t test_baud = 0;
+    uint32_t test_count = 0;
     bool waiting = false;
     bool recovery = false;
     bool bootloader_entered = false;
@@ -811,6 +814,136 @@ bool run_dump() {
 bool run_dump() { return fail("sd_unsupported"); }
 #endif
 
+// Fork: read-only UART link test. Same bootloader entry, speed switch and
+// application restore as a dump, but the only traffic is `G S #BLS` status
+// reads: no erase, no flash data frames, no SD access.
+constexpr uint16_t LINK_TEST_REPLY_MS = 300;
+// The bootloader returns to the application after ~2 s without a valid
+// command; stop well before that so the exit stays the normal timeout path.
+constexpr uint32_t LINK_TEST_MAX_CONSECUTIVE_FAILURES = 4;
+LinkTestResult link_result;  // Protected by status_mux.
+
+bool claim_uart_for_link_test(const Plan &plan) {
+    // claim_uart() without its SD lease check; this test reads no image.
+    if (cancelled()) return false;
+    snprintf(work.expected_bid, sizeof(work.expected_bid), "%s", plan.bid);
+    snprintf(work.expected_serial, sizeof(work.expected_serial), "%s", plan.serial);
+    if (!AirSenseState::system_idle()) return fail("device_not_idle");
+    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    phase("Claim UART");
+    if (!Arbiter::wait_idle(3000)) return fail("uart_busy");
+    phase("Suspend streams");
+    if (!LiveStream::suspend_for_ota()) return fail("stream_suspend_failed");
+    char current_bid[32], current_serial[24];
+    if (!raw_text("G S #BID", current_bid, sizeof(current_bid)) ||
+        !raw_text("G S #SRN", current_serial, sizeof(current_serial)) ||
+        strcmp(current_bid, plan.bid) || strcmp(current_serial, plan.serial))
+        return fail("device_identity_changed");
+    if (cancelled()) return false;
+    CustomSettings::invalidate("ResMed link test");
+    AirSenseState::invalidate_identity();
+    return true;
+}
+
+enum class LinkReply : uint8_t { Ok, None, Bad };
+
+LinkReply link_exchange(const uint8_t *frame, size_t length) {
+    Arbiter::clear_rx_frames();
+    Arbiter::write_raw(frame, length);
+    const uint32_t started = millis();
+    qframe_t reply;
+    while (millis() - started < LINK_TEST_REPLY_MS) {
+        const uint16_t remaining = LINK_TEST_REPLY_MS - (millis() - started);
+        // Frames failing CRC never reach this queue; they are counted by the
+        // arbiter's error counter instead.
+        if (!Arbiter::wait_frame(&reply, remaining)) break;
+        if ((reply.type != QFRAME_TYPE_R && reply.type != QFRAME_TYPE_E) ||
+            !qframe_response_matches(frame, length, reply)) continue;
+        if (reply.type != QFRAME_TYPE_R) return LinkReply::Bad;
+        char text[64];
+        const size_t count = min(size_t(reply.payload_len), sizeof(text) - 1);
+        memcpy(text, reply.payload, count);
+        text[count] = 0;
+        const char *value = qframe_response_value(text);
+        char *end = nullptr;
+        const unsigned long state = value ? strtoul(value, &end, 16) : 0;
+        return value && end != value && !*end && (state == 1 || state == 2)
+            ? LinkReply::Ok : LinkReply::Bad;
+    }
+    return LinkReply::None;
+}
+
+bool run_link_test() {
+    Plan plan;
+    phase("Prepare link test");
+    if (!freeze_device(plan)) return false;
+    portENTER_CRITICAL(&status_mux);
+    snprintf(published.device_bid, sizeof(published.device_bid), "%s", plan.bid);
+    published.total = work.test_count;
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (!claim_uart_for_link_test(plan) || !enter_bootloader()) return false;
+    if (work.test_baud != 57600) {
+        phase("Baud negotiate");
+        const char *command = work.test_baud == 115200 ? "P S #BDD 0001" : "P S #BDD 0002";
+        if (!send_raw_cmd(command, nullptr, 0, 1000)) return fail("baud_negotiate_failed");
+        Arbiter::set_baud(work.test_baud);
+    }
+
+    uint8_t frame[64];
+    const int length = qframe_build_cmd("G S #BLS", frame, sizeof(frame));
+    if (length <= 0) return fail("link_test_frame_failed");
+    phase("Link test");
+    const uint32_t errors_before = Arbiter::get_error_count();
+    const uint32_t test_started = millis();
+    uint32_t consecutive = 0;
+    for (uint32_t i = 0; i < work.test_count && !cancelled(); ++i) {
+        const uint32_t started = millis();
+        const LinkReply reply = link_exchange(frame, length);
+        const uint32_t round_trip = millis() - started;
+        portENTER_CRITICAL(&status_mux);
+        LinkTestResult &r = link_result;
+        r.sent = i + 1;
+        if (reply == LinkReply::Ok) ++r.ok;
+        else if (reply == LinkReply::None) ++r.no_reply;
+        else ++r.bad_reply;
+        if (reply != LinkReply::Ok && !r.first_failure) r.first_failure = i + 1;
+        if (reply == LinkReply::Ok && round_trip > r.max_round_trip_ms) r.max_round_trip_ms = round_trip;
+        r.rx_crc_errors = Arbiter::get_error_count() - errors_before;
+        r.elapsed_ms = millis() - test_started;
+        published.sent = i + 1;
+        ++published.revision;
+        portEXIT_CRITICAL(&status_mux);
+        consecutive = reply == LinkReply::Ok ? 0 : consecutive + 1;
+        if (consecutive >= LINK_TEST_MAX_CONSECUTIVE_FAILURES) {
+            portENTER_CRITICAL(&status_mux);
+            link_result.aborted = true;
+            portEXIT_CRITICAL(&status_mux);
+            break;
+        }
+    }
+    if (cancelled()) return false;
+
+    portENTER_CRITICAL(&status_mux);
+    const LinkTestResult r = link_result;
+    portEXIT_CRITICAL(&status_mux);
+    const uint32_t failures = r.no_reply + r.bad_reply + r.rx_crc_errors;
+    Log::logf(CAT_OTA, failures ? LOG_WARN : LOG_INFO,
+        "ResMed link test %lu baud: %lu/%lu ok, no_reply=%lu bad_reply=%lu rx_crc=%lu%s\n",
+        static_cast<unsigned long>(r.baud), static_cast<unsigned long>(r.ok),
+        static_cast<unsigned long>(r.sent), static_cast<unsigned long>(r.no_reply),
+        static_cast<unsigned long>(r.bad_reply), static_cast<unsigned long>(r.rx_crc_errors),
+        r.aborted ? " (aborted)" : "");
+    if (r.aborted) return fail("link_test_aborted: %lu consecutive failures",
+                               static_cast<unsigned long>(LINK_TEST_MAX_CONSECUTIVE_FAILURES));
+    if (failures) return fail("link_test_errors: %lu", static_cast<unsigned long>(failures));
+    return true;
+}
+
+const char *operation_name() {
+    return work.link_test ? "link test" : work.dump ? "dump" : "install";
+}
+
 void finish(bool success) {
     portENTER_CRITICAL(&status_mux);
     const bool waiting = work.waiting && !cancel_requested.load() && !published.error[0];
@@ -864,14 +997,20 @@ void flash_task(void *) {
     Status status;
     get_status(status);
     Log::logf(CAT_OTA, LOG_INFO, "ResMed %s started id=%lu source=%s\n",
-        work.dump ? "dump" : "install", static_cast<unsigned long>(status.id), status.source_path);
-    bool success = work.dump ? run_dump() : run_install();  // Owners unwind here.
+        operation_name(), static_cast<unsigned long>(status.id), status.source_path);
+    bool success = work.link_test ? run_link_test() :
+        work.dump ? run_dump() : run_install();  // Owners unwind here.
     if (!restore_uart()) success = false;
+    if (work.link_test) {
+        portENTER_CRITICAL(&status_mux);
+        link_result.running = false;
+        portEXIT_CRITICAL(&status_mux);
+    }
     if (work.staged.token) ResmedFirmwareUpload::release_source(work.staged.token);
     finish(success);
     get_status(status);
     Log::logf(CAT_OTA, status.error[0] ? LOG_ERROR : LOG_INFO, "ResMed %s %s id=%lu bytes=%u: %s\n",
-        work.dump ? "dump" : "install", status.phase, static_cast<unsigned long>(status.id),
+        operation_name(), status.phase, static_cast<unsigned long>(status.id),
         unsigned(status.sent), status.error);
     // No timer infers our lifetime; this is the only normal reservation release.
     OtaManager::end_resmed_flash();
@@ -970,6 +1109,42 @@ bool start_dump(const char **error) {
     if (error) *error = "sd_unsupported";
     return false;
 #endif
+}
+
+bool start_link_test(uint32_t baud, uint32_t count, const char **error) {
+    if (error) *error = nullptr;
+    if (baud != 57600 && baud != 115200 && baud != 460800) {
+        if (error) *error = "baud must be 57600, 115200 or 460800";
+        return false;
+    }
+    if (count < 10 || count > 20000) {
+        if (error) *error = "count must be 10..20000";
+        return false;
+    }
+    if (!OtaManager::begin_resmed_flash(error)) return false;
+    Work next;
+    next.link_test = true;
+    next.test_baud = baud;
+    next.test_count = count;
+    snprintf(next.request.block, sizeof(next.request.block), "LINK");
+    portENTER_CRITICAL(&status_mux);
+    link_result = {};
+    link_result.valid = true;
+    link_result.running = true;
+    link_result.baud = baud;
+    link_result.requested = count;
+    portEXIT_CRITICAL(&status_mux);
+    if (launch(next, error)) return true;
+    portENTER_CRITICAL(&status_mux);
+    link_result.running = false;
+    portEXIT_CRITICAL(&status_mux);
+    return false;
+}
+
+void get_link_test(LinkTestResult &out) {
+    portENTER_CRITICAL(&status_mux);
+    out = link_result;
+    portEXIT_CRITICAL(&status_mux);
 }
 
 bool confirm_dump(uint32_t id, const char **error) {

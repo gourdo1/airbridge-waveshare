@@ -737,6 +737,42 @@ void dispatch_command(const char *line, String &response) {
             const char *error = nullptr;
             response = ResmedOta::start_dump(&error)
                 ? "OK: dump accepted; see FLASH STATUS\n" : "ERR: " + String(error) + "\n";
+        } else if (sub == "LINKTEST" || sub.startsWith("LINKTEST ")) {
+            // Fork: read-only bootloader UART link test (docs/resmed_link_test.md).
+            int pos = 8;
+            const String baud_text = parse_quoted_token(sub, &pos);
+            const String count_text = parse_quoted_token(sub, &pos);
+            if (baud_text.isEmpty()) {
+                ResmedOta::LinkTestResult r;
+                ResmedOta::get_link_test(r);
+                if (!r.valid) {
+                    response = "No link test since boot. Usage: FLASH LINKTEST <57600|115200|460800> [count]\n";
+                    return;
+                }
+                response = "baud: " + String(r.baud) + (r.running ? " (running)" : "") + "\n";
+                response += "exchanges: " + String(r.sent) + "/" + String(r.requested) + "\n";
+                response += "ok: " + String(r.ok) + "\n";
+                response += "no_reply: " + String(r.no_reply) + "\n";
+                response += "bad_reply: " + String(r.bad_reply) + "\n";
+                response += "rx_crc_errors: " + String(r.rx_crc_errors) + "\n";
+                if (r.first_failure) response += "first_failure: #" + String(r.first_failure) + "\n";
+                if (r.aborted) response += "aborted: consecutive failures\n";
+                response += "max_round_trip: " + String(r.max_round_trip_ms) + " ms\n";
+                response += "elapsed: " + String(r.elapsed_ms) + " ms\n";
+                const auto flash = DeviceStatus::snapshot().resmed;
+                if (!r.running && *flash.error) response += "error: " + String(flash.error) + "\n";
+                return;
+            }
+            uint32_t baud = 0, count = 2000;
+            if (!aircannect::parse_uint32_decimal(baud_text.c_str(), baud) ||
+                (!count_text.isEmpty() && !aircannect::parse_uint32_decimal(count_text.c_str(), count)) ||
+                parse_quoted_token(sub, &pos).length()) {
+                response = "ERR: FLASH LINKTEST <57600|115200|460800> [count]\n";
+                return;
+            }
+            const char *error = nullptr;
+            response = ResmedOta::start_link_test(baud, count, &error)
+                ? "OK: link test started; FLASH LINKTEST for result\n" : "ERR: " + String(error) + "\n";
         } else if (sub.startsWith("CONFIRM ")) {
             int pos = 8;
             const String id_text = parse_quoted_token(sub, &pos);
@@ -755,6 +791,7 @@ void dispatch_command(const char *line, String &response) {
                        "       FLASH FILE \"/airbridge/resmed-firmware/name.bin\" [block] [BLX] [FORCE]\n"
                        "       FLASH LIST | REFRESH\n"
                        "       FLASH DUMP\n"
+                       "       FLASH LINKTEST [57600|115200|460800] [count]  (read-only)\n"
                        "       FLASH CONFIRM <operation> INSTALL_PATCHED_BOOTLOADER\n"
                        "       FLASH STATUS | CANCEL\n"
                        "Without FILE, use the current completed staging upload.\n";
