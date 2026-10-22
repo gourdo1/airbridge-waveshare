@@ -2,7 +2,7 @@
 
 ESP32 bridge for ResMed AirSense 10 CPAP.
 
-![AirBridge feeding oximetry](docs/screenshots/airbridge-demo.jpg)
+![AirBridge feeding oximetry](docs/screenshots/airbridge-waveshare.jpg)
 
 ## What it does
 
