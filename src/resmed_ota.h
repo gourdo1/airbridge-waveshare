@@ -71,6 +71,7 @@ namespace ResmedOta {
         uint32_t max_round_trip_ms = 0;
         uint32_t elapsed_ms = 0;
         bool aborted = false;        // stopped after consecutive failures
+        bool time_limited = false;   // stopped at the bootloader time window
     };
     bool start_link_test(uint32_t baud, uint32_t count, const char **error = nullptr);
     void get_link_test(LinkTestResult &out);

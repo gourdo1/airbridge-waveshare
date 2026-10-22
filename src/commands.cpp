@@ -757,6 +757,8 @@ void dispatch_command(const char *line, String &response) {
                 response += "rx_crc_errors: " + String(r.rx_crc_errors) + "\n";
                 if (r.first_failure) response += "first_failure: #" + String(r.first_failure) + "\n";
                 if (r.aborted) response += "aborted: consecutive failures\n";
+                if (r.time_limited)
+                    response += "stopped: bootloader time window (4.5 s), not an error\n";
                 response += "max_round_trip: " + String(r.max_round_trip_ms) + " ms\n";
                 response += "elapsed: " + String(r.elapsed_ms) + " ms\n";
                 const auto flash = DeviceStatus::snapshot().resmed;

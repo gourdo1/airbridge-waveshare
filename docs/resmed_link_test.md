@@ -21,9 +21,18 @@ and may not keep up at 460800 baud.
 It never erases, writes or reads flash. It stops early after 4 failures in a
 row, well inside the bootloader's ~2 s inactivity timeout.
 
+The stock AirSense 10 bootloader leaves about 5 s after entry even while it
+keeps answering status reads (measured at both 57600 and 460800; a real write
+is unaffected because it starts erasing immediately). The test therefore
+stops 4.5 s after entering the bootloader and reports `stopped: bootloader
+time window`, which is not an error. That is roughly 500 exchanges at 57600
+and 2000+ at 460800; repeat runs to accumulate more.
+
 ## Running it
 
-Over telnet or the USB console:
+From the web UI console, the USB console, or the TCP command port (in
+PuTTY use connection type Raw; Telnet mode prefixes the first line with
+negotiation bytes, so it is forwarded to the AirSense instead):
 
 ```
 $FLASH LINKTEST 460800 2000     start (count defaults to 2000, range 10..20000)
@@ -43,6 +52,7 @@ Run 57600 first as a baseline, then 460800 (and 115200 if 460800 fails).
 | `rx_crc_errors` | AirSense to AirBridge (RX) frames that failed CRC |
 | `bad_reply` | Error reply or unexpected state value |
 | `first_failure` | Exchange number of the first failure |
+| `stopped` | The 4.5 s bootloader window ended the run before `count`; not an error |
 
 2000 exchanges move about as many bytes each way as a 16 KB bootloader write.
 Any failure at a given speed means: do not write at that speed over this

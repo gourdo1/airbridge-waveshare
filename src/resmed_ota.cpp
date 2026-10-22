@@ -821,6 +821,10 @@ constexpr uint16_t LINK_TEST_REPLY_MS = 300;
 // The bootloader returns to the application after ~2 s without a valid
 // command; stop well before that so the exit stays the normal timeout path.
 constexpr uint32_t LINK_TEST_MAX_CONSECUTIVE_FAILURES = 4;
+// Measured on an AirSense 10 stock bootloader: it leaves ~5 s after entry
+// even while answering `G S #BLS` (same at 57600 and 460800). Finish every
+// exchange inside this window so the timeout never counts as link errors.
+constexpr uint32_t LINK_TEST_WINDOW_MS = 4500;
 LinkTestResult link_result;  // Protected by status_mux.
 
 bool claim_uart_for_link_test(const Plan &plan) {
@@ -883,6 +887,7 @@ bool run_link_test() {
     ++published.revision;
     portEXIT_CRITICAL(&status_mux);
     if (!claim_uart_for_link_test(plan) || !enter_bootloader()) return false;
+    const uint32_t bootloader_entered = millis();
     if (work.test_baud != 57600) {
         phase("Baud negotiate");
         const char *command = work.test_baud == 115200 ? "P S #BDD 0001" : "P S #BDD 0002";
@@ -898,6 +903,12 @@ bool run_link_test() {
     const uint32_t test_started = millis();
     uint32_t consecutive = 0;
     for (uint32_t i = 0; i < work.test_count && !cancelled(); ++i) {
+        if (millis() - bootloader_entered > LINK_TEST_WINDOW_MS - LINK_TEST_REPLY_MS) {
+            portENTER_CRITICAL(&status_mux);
+            link_result.time_limited = true;
+            portEXIT_CRITICAL(&status_mux);
+            break;
+        }
         const uint32_t started = millis();
         const LinkReply reply = link_exchange(frame, length);
         const uint32_t round_trip = millis() - started;
@@ -933,7 +944,7 @@ bool run_link_test() {
         static_cast<unsigned long>(r.baud), static_cast<unsigned long>(r.ok),
         static_cast<unsigned long>(r.sent), static_cast<unsigned long>(r.no_reply),
         static_cast<unsigned long>(r.bad_reply), static_cast<unsigned long>(r.rx_crc_errors),
-        r.aborted ? " (aborted)" : "");
+        r.aborted ? " (aborted)" : r.time_limited ? " (time window reached)" : "");
     if (r.aborted) return fail("link_test_aborted: %lu consecutive failures",
                                static_cast<unsigned long>(LINK_TEST_MAX_CONSECUTIVE_FAILURES));
     if (failures) return fail("link_test_errors: %lu", static_cast<unsigned long>(failures));
